@@ -16,10 +16,6 @@ dependencies = [
     "lightning-bolts (>=0.7.0)",
 ]
 
-[tool.poetry]
-packages = [{include = "views_r2darts2", from = "src"}]
-
-
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"

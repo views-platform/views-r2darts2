@@ -36,7 +36,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
         self,
         model_path: ModelPathManager,
         wandb_notifications: bool = True,
-        use_prediction_store: bool = False,
+        use_prediction_store: bool = True,
     ) -> None:
         super().__init__(
             model_path=model_path,

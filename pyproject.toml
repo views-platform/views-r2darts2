@@ -11,6 +11,9 @@ readme = "README.md"
 requires-python = ">=3.11,<3.15"
 dependencies = [
     "views-pipeline-core (>=1.1.1,<2.0.0)"
+    "darts (==0.35.0)",
+    "pytorch-lightning-bolts (>=0.3.2.post1)",
+    "lightning-bolts (>=0.7.0)",
 ]
 
 [tool.poetry]

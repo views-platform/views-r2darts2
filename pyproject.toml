@@ -1,0 +1,22 @@
+[project]
+name = "views-r2darts2"
+version = "0.1.0"
+description = ""
+authors = [
+    "Xiaolong Sun <xiaolong.sun@pcr.uu.se>",
+    "Borbála Farkas <borbala.farkas@pcr.uu.se>",
+    "Dylan Pinheiro <dylpin@prio.org>"
+    ]
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "views-pipeline-core (>=1.1.1,<2.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "views_r2darts2", from = "src"}]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

@@ -3,9 +3,9 @@ name = "views-r2darts2"
 version = "0.1.0"
 description = ""
 authors = [
-    { name = "Dylan Pinheiro", email = "dylpin@prio.org" },
-    { name = "Xiaolong Sun", email = "xiaolong.sun@pcr.uu.se" },
-    { name = "Borbála Farkas", email = "borbala.farkas@pcr.uu.se" },
+    "Dylan Pinheiro <dylpin@prio.org>",
+    "Xiaolong Sun <xiaolong.sun@pcr.uu.se>",
+    "Borbála Farkas <borbala.farkas@pcr.uu.se>"
 ]
 readme = "README.md"
 requires-python = ">=3.11,<3.15"

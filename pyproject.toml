@@ -3,7 +3,7 @@ name = "views-r2darts2"
 version = "0.1.0"
 description = ""
 authors = [
-    { name = "Dylan Pinheiro", email = "dylpin@prio.org" }
+    { name = "Dylan Pinheiro", email = "dylpin@prio.org" },
     { name = "Xiaolong Sun", email = "xiaolong.sun@pcr.uu.se" },
     { name = "Borbála Farkas", email = "borbala.farkas@pcr.uu.se" },
 ]

@@ -46,7 +46,7 @@ class ModelCatalog:
         Returns:
             Model class corresponding to the provided name.
         """
-        return self.models.get(model_name)().to(self.device)
+        return self.models.get(model_name)()
     
     def list_models(self):
         """

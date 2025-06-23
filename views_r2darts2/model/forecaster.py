@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import List, Optional
-
+import torch
 from sklearn.preprocessing import (
     RobustScaler,
     StandardScaler,
@@ -14,6 +14,9 @@ from darts.models.forecasting.torch_forecasting_model import TorchForecastingMod
 
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
 from darts.dataprocessing.transformers import Scaler
+
+import logging
+logger = logging.getLogger(__name__)
 
 class DartsForecaster:
     def __init__(
@@ -37,6 +40,25 @@ class DartsForecaster:
         else:
             self.target_scaler = None
             self.feature_scaler = None
+
+        self.device = self.get_device()
+        logger.info(f"Using device: {self.device}")
+        if hasattr(self.model, "to_device"):
+            self.model.to_device(self.device)
+        elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
+            self.model.model.to(self.device)
+
+    @staticmethod
+    def get_device() -> str:
+        """
+        Returns the device type for model training.
+        """
+        if torch.backends.mps.is_available():
+            return "mps"
+        elif torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
 
     def _preprocess_timeseries(
         self,

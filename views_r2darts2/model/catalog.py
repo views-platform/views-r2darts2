@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 import torch
 import numpy as np
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
-
+from views_r2darts2.model.forecaster import DartsForecaster
 class ModelCatalog:
     """
     Catalog class to manage and provide access to various forecasting models.
@@ -34,6 +34,7 @@ class ModelCatalog:
             "DLinearModel": self._get_dlinear_model,
         }
         self.config = config
+        self.device = DartsForecaster.get_device()
 
     def get_model(self, model_name: str):
         """
@@ -45,7 +46,7 @@ class ModelCatalog:
         Returns:
             Model class corresponding to the provided name.
         """
-        return self.models.get(model_name)()
+        return self.models.get(model_name)().to(self.device)
     
     def list_models(self):
         """

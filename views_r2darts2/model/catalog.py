@@ -111,25 +111,25 @@ class ModelCatalog:
             # Keep temporal configuration unchanged
             input_chunk_length=self.config.get('input_chunk_length', 12*4),
             output_chunk_length=len(self.config['steps']),
-            output_chunk_shift=0,
+            output_chunk_shift=self.config.get('output_chunk_shift', 0),  # Default: 0
             
-            add_relative_index=True,
-            full_attention=False,
-            lstm_layers=4,
-            num_attention_heads=4, 
-            hidden_size=512, 
-            dropout=0.4,
+            add_relative_index=self.config.get('add_relative_index', True),  # Default: True
+            full_attention=self.config.get('full_attention', False),  # Default: False
+            lstm_layers= self.config.get('lstm_layers', 1),  # Default: 1
+            num_attention_heads= self.config.get('num_attention_heads', 4),  # Default: 4
+            hidden_size= self.config.get('hidden_size', 256),  # Default: 256 
+            dropout= self.config.get('dropout', 0.3),  # Default: 0.3
             
             # Critical training modifications
-            batch_size=batch_size,
+            batch_size=self.config.get('batch_size', batch_size),  # Default: 256
             loss_fn=WeightedHuberLoss(
-                zero_threshold=0.01,  # Adjusted for scaled data
-                delta=0.05,  # Tighter error sensitivity
-                non_zero_weight=8.0  # Stronger non-zero emphasis
+                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+                delta=self.config.get('delta', 0.05),  # Default: 0.05
+                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
             ),
             model_name='TFTModel',
             norm_type="RMSNorm",  # Better for scaled outputs
-            n_epochs=2,  # Essential for rare event learning
+            n_epochs= self.config.get('n_epochs', 2),
             
             # Learning rate schedule
             lr_scheduler_cls=LinearWarmupCosineAnnealingLR,

@@ -99,8 +99,9 @@ class DartsForecaster:
                 for s in timeseries
             ]
 
-        if self._scale:
+        if self.target_scaler:
             targets = self.target_scaler.fit_transform(targets)
+        if self.feature_scaler:
             past_cov = self.feature_scaler.fit_transform(past_cov)
 
         return targets, past_cov

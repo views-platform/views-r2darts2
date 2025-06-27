@@ -189,7 +189,7 @@ class DartsForecaster:
             print(f"Error during prediction: {e}")
             raise 
 
-        if self._scale:
+        if self.target_scaler:
             timeseries_pred = self.target_scaler.inverse_transform(timeseries_pred)
 
         # Process predictions into list format

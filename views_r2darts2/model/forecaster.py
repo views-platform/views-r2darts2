@@ -2,16 +2,9 @@ import pandas as pd
 import numpy as np
 from typing import List, Optional
 import torch
-from sklearn.preprocessing import (
-    RobustScaler,
-    StandardScaler,
-    MinMaxScaler,
-    MaxAbsScaler,
-    KernelCenterer,
-)
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
-
+from views_r2darts2.utils.scaling import ScalerSelector
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
 from darts.dataprocessing.transformers import Scaler
 
@@ -24,22 +17,30 @@ class DartsForecaster:
         dataset: _ViewsDatasetDarts,
         model: TorchForecastingModel,
         partition_dict: dict,
-        scale: bool = True,
+        feature_scaler: str = None,
+        target_scaler: str = None,
     ):
         self.dataset = dataset
         self.model = model
         self._train_start, self._train_end = partition_dict["train"]
         self._test_start, self._test_end = partition_dict["test"]
-        self._scale = scale
+        self._feature_scaler = feature_scaler
+        self._target_scaler = target_scaler
 
         self.scaler_fitted = False  # Track scaler state
-        
-        if self._scale:
-            self.target_scaler = Scaler(MinMaxScaler())
-            self.feature_scaler = Scaler(MinMaxScaler())
+
+        if self._target_scaler:
+            self.target_scaler = Scaler(ScalerSelector.get_scaler(self._target_scaler)())
         else:
             self.target_scaler = None
+
+        if self._feature_scaler:
+            self.feature_scaler = Scaler(ScalerSelector.get_scaler(self._feature_scaler)())
+        else:
             self.feature_scaler = None
+
+        logger.info(f"Using feature scaler: {self._feature_scaler}")
+        logger.info(f"Using target scaler: {self._target_scaler}")
 
         self.device = self.get_device()
         logger.info(f"Using device: {self.device}")

@@ -68,7 +68,8 @@ class DartsForecastingModelManager(ForecastingModelManager):
             ),
             model=model_object,
             partition_dict=self._data_loader.partition_dict,
-            scale=self.config.get("scale_data", True),
+            feature_scaler=self.config.get("feature_scaler", None),
+            target_scaler=self.config.get("target_scaler", None),
         )
         forecaster.train()
 

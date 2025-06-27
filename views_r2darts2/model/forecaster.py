@@ -30,12 +30,12 @@ class DartsForecaster:
         self.scaler_fitted = False  # Track scaler state
 
         if self._target_scaler:
-            self.target_scaler = Scaler(ScalerSelector.get_scaler(self._target_scaler)())
+            self.target_scaler = Scaler(ScalerSelector.get_scaler(self._target_scaler))
         else:
             self.target_scaler = None
 
         if self._feature_scaler:
-            self.feature_scaler = Scaler(ScalerSelector.get_scaler(self._feature_scaler)())
+            self.feature_scaler = Scaler(ScalerSelector.get_scaler(self._feature_scaler))
         else:
             self.feature_scaler = None
 

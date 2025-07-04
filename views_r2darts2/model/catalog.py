@@ -1,4 +1,3 @@
-from token import NL
 from darts.models.forecasting.nbeats import NBEATSModel
 from darts.models.forecasting.tft_model import TFTModel
 from darts.models.forecasting.tcn_model import TCNModel
@@ -132,13 +131,13 @@ class ModelCatalog:
             n_epochs= self.config.get('n_epochs', 2),
             
             # Learning rate schedule
-            lr_scheduler_cls=LinearWarmupCosineAnnealingLR,
-            lr_scheduler_kwargs={
-                "warmup_epochs": 50,
-                "max_epochs": 300,
-                "warmup_start_lr": 1e-6,
-                "eta_min": 1e-7
-            },
+            # lr_scheduler_cls=LinearWarmupCosineAnnealingLR,
+            # lr_scheduler_kwargs={
+            #     "warmup_epochs": 50,
+            #     "max_epochs": 300,
+            #     "warmup_start_lr": 1e-6,
+            #     "eta_min": 1e-7
+            # },
             
             # Training controls
             pl_trainer_kwargs={
@@ -162,7 +161,7 @@ class ModelCatalog:
         )
     
     def _get_nbeats(self):
-        torch.serialization.add_safe_globals([NBEATSModel])
+        torch.serialization.add_safe_globals([NBEATSModel, WeightedHuberLoss])
         return NBEATSModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 2),
             output_chunk_length=len(self.config['steps']),
@@ -179,12 +178,12 @@ class ModelCatalog:
             batch_size=self.config.get('batch_size', 128),
             # loss_fn=torch.nn.HuberLoss(delta=0.5),
             loss_fn=WeightedHuberLoss(
-                zero_threshold=0.01,
-                delta=0.05, #0.05
-                non_zero_weight=6.0,
+                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+                delta=self.config.get('delta', 0.05),  # Default: 0.05
+                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
             ),
             model_name=self.config.get('name', 'NBEATSModel'),
-            force_reset=True,
+            force_reset=self.config.get('force_reset', True),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "gradient_clip_val": self.config.get('gradient_clip_val', 0.8),
@@ -204,35 +203,39 @@ class ModelCatalog:
                 "lr": self.config.get('lr', 3e-4),
                 "weight_decay": self.config.get('weight_decay', 1e-3)
             },
-            lr_scheduler_cls=OneCycleLR,
-            lr_scheduler_kwargs={
-                "max_lr": self.config.get('max_lr', 1e-3),
-                "epochs": self.config.get('n_epochs', 2),
-                "steps_per_epoch": 208,
-                "pct_start": self.config.get('pct_start', 0.3),
-                "anneal_strategy": self.config.get('anneal_strategy', "cos"),
-            }
+            # lr_scheduler_cls=OneCycleLR,
+            # lr_scheduler_kwargs={
+            #     "max_lr": self.config.get('max_lr', 1e-3),
+            #     "epochs": self.config.get('n_epochs', 2),
+            #     "steps_per_epoch": 208,
+            #     "pct_start": self.config.get('pct_start', 0.3),
+            #     "anneal_strategy": self.config.get('anneal_strategy', "cos"),
+            # }
         )
 
     def _get_tcn_model(self):
-        torch.serialization.add_safe_globals([TCNModel])
+        torch.serialization.add_safe_globals([TCNModel, WeightedHuberLoss])
         return TCNModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),
             output_chunk_length=len(self.config['steps']),
             output_chunk_shift=self.config.get('output_chunk_shift', 0),  # Default: 0
-            kernel_size=2,
-            num_filters=1,
+            kernel_size=self.config.get('kernel_size', 3),  # Default: 3
+            num_filters=self.config.get('num_filters', 64),  # Default: 64
             # dilation_base=2,
             # weight_norm=True, #BUG!
             dropout=0.25,
-            force_reset=True,
+            force_reset=self.config.get('force_reset', True),  # Reset the model if it already exists
             save_checkpoints=True,
             batch_size=self.config.get('batch_size', 64),
             model_name=self.config.get('name', 'TCNModel'),
             random_state=self.config.get('random_state', 42),
             n_epochs=self.config.get('n_epochs', 2),
-            loss_fn=torch.nn.HuberLoss(delta=0.45),
-            use_reversible_instance_norm=True, # https://openreview.net/forum?id=cGDAkQo1C0p
+            loss_fn=WeightedHuberLoss(
+                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+                delta=self.config.get('delta', 0.05),  # Default: 0.05
+                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            ),
+            use_reversible_instance_norm=self.config.get('use_reversible_instance_norm', False), # https://openreview.net/forum?id=cGDAkQo1C0p
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "gradient_clip_val": self.config.get('gradient_clip_val', 0.8),
@@ -252,18 +255,18 @@ class ModelCatalog:
                 "lr": self.config.get('lr', 3e-4),
                 "weight_decay": self.config.get('weight_decay', 1e-3)
             },
-            lr_scheduler_cls=OneCycleLR,
-            lr_scheduler_kwargs={
-                "max_lr": self.config.get('max_lr', 1e-3),
-                "epochs": self.config.get('n_epochs', 2),
-                "steps_per_epoch": 833,
-                "pct_start": self.config.get('pct_start', 0.3),
-                "anneal_strategy": self.config.get('anneal_strategy', "cos"),
-            },
+            # lr_scheduler_cls=OneCycleLR,
+            # lr_scheduler_kwargs={
+            #     "max_lr": self.config.get('max_lr', 1e-3),
+            #     "epochs": self.config.get('n_epochs', 2),
+            #     "steps_per_epoch": 833,
+            #     "pct_start": self.config.get('pct_start', 0.3),
+            #     "anneal_strategy": self.config.get('anneal_strategy', "cos"),
+            # },
         )
     
     def _get_rnn_model(self):
-        torch.serialization.add_safe_globals([BlockRNNModel])
+        torch.serialization.add_safe_globals([BlockRNNModel, WeightedHuberLoss])
         return BlockRNNModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),
             output_chunk_length=len(self.config['steps']),
@@ -277,9 +280,9 @@ class ModelCatalog:
             n_epochs=self.config.get('n_epochs', 7),  # Number of training epochs
             # loss_fn=torch.nn.HuberLoss(delta=0.5),
             loss_fn=WeightedHuberLoss(
-                zero_threshold=0.01,
-                delta=0.05, #0.05
-                non_zero_weight=6.0,
+                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+                delta=self.config.get('delta', 0.05),  # Default: 0.05
+                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
             ),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
@@ -299,14 +302,14 @@ class ModelCatalog:
                 "lr": self.config.get('lr', 1e-4),  # Learning rate
                 "weight_decay": self.config.get('weight_decay', 1e-4),  # L2 regularization
             },
-            lr_scheduler_cls=OneCycleLR,
-            lr_scheduler_kwargs={
-                "max_lr": self.config.get('max_lr', 1e-3),
-                "epochs": self.config.get('n_epochs', 2),
-                "steps_per_epoch": 208,
-                "pct_start": self.config.get('pct_start', 0.3),
-                "anneal_strategy": self.config.get('anneal_strategy', "cos"),
-            },
+            # lr_scheduler_cls=OneCycleLR,
+            # lr_scheduler_kwargs={
+            #     "max_lr": self.config.get('max_lr', 1e-3),
+            #     "epochs": self.config.get('n_epochs', 2),
+            #     "steps_per_epoch": 208,
+            #     "pct_start": self.config.get('pct_start', 0.3),
+            #     "anneal_strategy": self.config.get('anneal_strategy', "cos"),
+            # },
             use_reversible_instance_norm=True,
             model_name=self.config.get('name', 'BlockRNNModel'),  # Model name
             random_state=self.config.get('random_state', 42),  # Random seed for reproducibility
@@ -314,7 +317,7 @@ class ModelCatalog:
         )
 
     def _get_transformer_model(self):
-        torch.serialization.add_safe_globals([TransformerModel])
+        torch.serialization.add_safe_globals([TransformerModel, WeightedHuberLoss])
         return TransformerModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),  # Default: 72
             output_chunk_length=len(self.config['steps']),  # Output chunk length based on steps
@@ -329,7 +332,11 @@ class ModelCatalog:
             norm_type=self.config.get('norm_type', None),  # Default: None
             batch_size=self.config.get('batch_size', 256),  # Default: 32
             n_epochs=self.config.get('n_epochs', 2),  # Default: 100
-            loss_fn=torch.nn.HuberLoss(delta=0.5),
+            loss_fn=WeightedHuberLoss(
+                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+                delta=self.config.get('delta', 0.05),  # Default: 0.05
+                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            ),  # Default loss function
             model_name=self.config.get('name', 'TransformerModel'),  # Model name
             random_state=self.config.get('random_state', 42),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
@@ -351,18 +358,18 @@ class ModelCatalog:
                 "lr": self.config.get('lr', 3e-4),  # Default learning rate
                 "weight_decay": self.config.get('weight_decay', 1e-3),  # Default L2 regularization
             },
-            lr_scheduler_cls=OneCycleLR,
-            lr_scheduler_kwargs={
-                "max_lr": self.config.get('max_lr', 1e-3),  # Maximum learning rate
-                "epochs": self.config.get('n_epochs', 2),  # Number of epochs
-                "steps_per_epoch": self.config.get('steps_per_epoch', 208),  # Steps per epoch
-                "pct_start": self.config.get('pct_start', 0.3),  # Percentage of steps for increasing LR
-                "anneal_strategy": self.config.get('anneal_strategy', "cos"),  # Cosine annealing
-            },
+            # lr_scheduler_cls=OneCycleLR,
+            # lr_scheduler_kwargs={
+            #     "max_lr": self.config.get('max_lr', 1e-3),  # Maximum learning rate
+            #     "epochs": self.config.get('n_epochs', 2),  # Number of epochs
+            #     "steps_per_epoch": self.config.get('steps_per_epoch', 208),  # Steps per epoch
+            #     "pct_start": self.config.get('pct_start', 0.3),  # Percentage of steps for increasing LR
+            #     "anneal_strategy": self.config.get('anneal_strategy', "cos"),  # Cosine annealing
+            # },
         )
     
     def _get_nlinear_model(self):
-        torch.serialization.add_safe_globals([NLinearModel])
+        torch.serialization.add_safe_globals([NLinearModel, WeightedHuberLoss])
         return NLinearModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),  # Default: 72
             output_chunk_length=len(self.config['steps']),  # Output chunk length based on steps
@@ -373,7 +380,11 @@ class ModelCatalog:
             use_static_covariates=self.config.get('use_static_covariates', True),  # Default: True
             batch_size=self.config.get('batch_size', 64),  # Default: 64
             n_epochs=self.config.get('n_epochs', 2),  # Default: 2
-            loss_fn=torch.nn.HuberLoss(delta=0.5),  # Default loss function
+            loss_fn=WeightedHuberLoss(
+                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+                delta=self.config.get('delta', 0.05),  # Default: 0.05
+                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            ),  # Default loss function
             model_name=self.config.get('name', 'NLinearModel'),  # Model name
             random_state=self.config.get('random_state', 42),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
@@ -395,18 +406,18 @@ class ModelCatalog:
                 "lr": self.config.get('lr', 3e-4),  # Default learning rate
                 "weight_decay": self.config.get('weight_decay', 1e-3),  # Default L2 regularization
             },
-            lr_scheduler_cls=OneCycleLR,
-            lr_scheduler_kwargs={
-                "max_lr": self.config.get('max_lr', 1e-3),  # Maximum learning rate
-                "epochs": self.config.get('n_epochs', 2),  # Number of epochs
-                "steps_per_epoch": self.config.get('steps_per_epoch', 208),  # Steps per epoch
-                "pct_start": self.config.get('pct_start', 0.3),  # Percentage of steps for increasing LR
-                "anneal_strategy": self.config.get('anneal_strategy', "cos"),  # Cosine annealing
-            },
+            # lr_scheduler_cls=OneCycleLR,
+            # lr_scheduler_kwargs={
+            #     "max_lr": self.config.get('max_lr', 1e-3),  # Maximum learning rate
+            #     "epochs": self.config.get('n_epochs', 2),  # Number of epochs
+            #     "steps_per_epoch": self.config.get('steps_per_epoch', 208),  # Steps per epoch
+            #     "pct_start": self.config.get('pct_start', 0.3),  # Percentage of steps for increasing LR
+            #     "anneal_strategy": self.config.get('anneal_strategy', "cos"),  # Cosine annealing
+            # },
         )
     
     def _get_dlinear_model(self):
-        torch.serialization.add_safe_globals([DLinearModel])
+        torch.serialization.add_safe_globals([DLinearModel, WeightedHuberLoss])
         return DLinearModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),  # Default: 72
             output_chunk_length=len(self.config['steps']),  # Output chunk length based on steps
@@ -417,7 +428,11 @@ class ModelCatalog:
             use_static_covariates=self.config.get('use_static_covariates', True),  # Default: True
             batch_size=self.config.get('batch_size', 64),  # Default: 64
             n_epochs=self.config.get('n_epochs', 2),  # Default: 2
-            loss_fn=torch.nn.HuberLoss(delta=0.5),  # Default loss function
+            loss_fn=WeightedHuberLoss(
+                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+                delta=self.config.get('delta', 0.05),  # Default: 0.05
+                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            ),  # Default loss function
             model_name=self.config.get('name', 'DLinearModel'),  # Model name
             random_state=self.config.get('random_state', 42),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
@@ -439,14 +454,14 @@ class ModelCatalog:
                 "lr": self.config.get('lr', 3e-4),  # Default learning rate
                 "weight_decay": self.config.get('weight_decay', 1e-3),  # Default L2 regularization
             },
-            lr_scheduler_cls=OneCycleLR,
-            lr_scheduler_kwargs={
-                "max_lr": self.config.get('max_lr', 1e-3),  # Maximum learning rate
-                "epochs": self.config.get('n_epochs', 2),  # Number of epochs
-                "steps_per_epoch": self.config.get('steps_per_epoch', 208),  # Steps per epoch
-                "pct_start": self.config.get('pct_start', 0.3),  # Percentage of steps for increasing LR
-                "anneal_strategy": self.config.get('anneal_strategy', "cos"),  # Cosine annealing
-            },
+            # lr_scheduler_cls=OneCycleLR,
+            # lr_scheduler_kwargs={
+            #     "max_lr": self.config.get('max_lr', 1e-3),  # Maximum learning rate
+            #     "epochs": self.config.get('n_epochs', 2),  # Number of epochs
+            #     "steps_per_epoch": self.config.get('steps_per_epoch', 208),  # Steps per epoch
+            #     "pct_start": self.config.get('pct_start', 0.3),  # Percentage of steps for increasing LR
+            #     "anneal_strategy": self.config.get('anneal_strategy', "cos"),  # Cosine annealing
+            # },
         )
         
     def _get_tide_model(self):
@@ -507,12 +522,12 @@ class ModelCatalog:
             #     "pct_start": self.config.get('pct_start', 0.3),  # Percentage of steps for increasing LR
             #     "anneal_strategy": self.config.get('anneal_strategy', "cos"),  # Cosine annealing
             # },
-            lr_scheduler_cls=LinearWarmupCosineAnnealingLR,
-            lr_scheduler_kwargs={
-                "warmup_epochs": 50,
-                "max_epochs": 300,
-                "warmup_start_lr": 1e-6,
-                "eta_min": 1e-7
-            },
+            # lr_scheduler_cls=LinearWarmupCosineAnnealingLR,
+            # lr_scheduler_kwargs={
+            #     "warmup_epochs": 50,
+            #     "max_epochs": 300,
+            #     "warmup_start_lr": 1e-6,
+            #     "eta_min": 1e-7
+            # },
 
         )

@@ -190,7 +190,7 @@ class ModelCatalog:
                         min_delta=self.config.get('early_stopping_min_delta', 0.001),
                         mode="min"
                     ),
-                    LearningRateMonitor(log_momentum=True, log_weight_decay=True),
+                    LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
                 "logger": True,
@@ -238,7 +238,7 @@ class ModelCatalog:
                 #         min_delta=self.config.get('early_stopping_min_delta', 0.001),
                 #         mode="min"
                 #     ),
-                #     LearningRateMonitor(log_momentum=True, log_weight_decay=True),
+                #     LearningRateMonitor(log_momentum=True),
                 # ],
                 # "enable_progress_bar": True,
                 # "logger": True,
@@ -260,17 +260,22 @@ class ModelCatalog:
     def _get_rnn_model(self):
         torch.serialization.add_safe_globals([BlockRNNModel])
         return BlockRNNModel(
-            input_chunk_length=self.config.get('input_chunk_length', 12 * 4),
+            input_chunk_length=self.config.get('input_chunk_length', 12 * 6),
             output_chunk_length=len(self.config['steps']),
             output_chunk_shift=self.config.get('output_chunk_shift', 0),  # Default: 0
             model=self.config.get('rnn_type', 'LSTM'),  # Choose between 'LSTM', 'GRU', or 'RNN'
-            hidden_dim=self.config.get('hidden_dim', 25),  # Size of the hidden layers
+            hidden_dim=self.config.get('hidden_dim', 5),  # Size of the hidden layers
             activation=self.config.get('activation', 'ReLU'),
-            n_rnn_layers = 1,
-            dropout=self.config.get('dropout', 0.2),  # Dropout rate for regularization
+            n_rnn_layers = self.config.get('n_rnn_layers', 2),  # Number of RNN layers
+            dropout=self.config.get('dropout', 0.4),  # Dropout rate for regularization
             batch_size=self.config.get('batch_size', 256),  # Batch size for training
             n_epochs=self.config.get('n_epochs', 7),  # Number of training epochs
-            loss_fn=torch.nn.HuberLoss(delta=0.5),
+            # loss_fn=torch.nn.HuberLoss(delta=0.5),
+            loss_fn=WeightedHuberLoss(
+                zero_threshold=0.01,
+                delta=0.05, #0.05
+                non_zero_weight=6.0,
+            ),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 # "gradient_clip_val": self.config.get('gradient_clip_val', 0.8),
@@ -281,7 +286,6 @@ class ModelCatalog:
                         min_delta=self.config.get('early_stopping_min_delta', 0.001),
                         mode="min"
                     ),
-                    LearningRateMonitor(log_momentum=True, log_weight_decay=True),
                 ],
                 "enable_progress_bar": True,
                 "logger": True,
@@ -333,7 +337,7 @@ class ModelCatalog:
                         min_delta=self.config.get('early_stopping_min_delta', 0.001),
                         mode="min"
                     ),
-                    LearningRateMonitor(log_momentum=True, log_weight_decay=True),
+                    LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
                 "logger": True,
@@ -377,7 +381,7 @@ class ModelCatalog:
                         min_delta=self.config.get('early_stopping_min_delta', 0.001),
                         mode="min"
                     ),
-                    LearningRateMonitor(log_momentum=True, log_weight_decay=True),
+                    LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
                 "logger": True,
@@ -421,7 +425,7 @@ class ModelCatalog:
                         min_delta=self.config.get('early_stopping_min_delta', 0.001),
                         mode="min"
                     ),
-                    LearningRateMonitor(log_momentum=True, log_weight_decay=True),
+                    LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
                 "logger": True,

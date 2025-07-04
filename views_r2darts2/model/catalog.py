@@ -177,7 +177,12 @@ class ModelCatalog:
             random_state=self.config.get('random_state', 42),
             n_epochs=self.config.get('n_epochs', 2),
             batch_size=self.config.get('batch_size', 128),
-            loss_fn=torch.nn.HuberLoss(delta=0.5),
+            # loss_fn=torch.nn.HuberLoss(delta=0.5),
+            loss_fn=WeightedHuberLoss(
+                zero_threshold=0.01,
+                delta=0.05, #0.05
+                non_zero_weight=6.0,
+            ),
             model_name=self.config.get('name', 'NBEATSModel'),
             force_reset=True,
             pl_trainer_kwargs={

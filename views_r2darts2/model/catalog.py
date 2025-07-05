@@ -111,7 +111,7 @@ class ModelCatalog:
             input_chunk_length=self.config.get('input_chunk_length', 12*4),
             output_chunk_length=len(self.config['steps']),
             output_chunk_shift=self.config.get('output_chunk_shift', 0),  # Default: 0
-            
+            feed_forward=self.config.get('feed_forward', 'GatedResidualNetwork'),  # Default: True
             add_relative_index=self.config.get('add_relative_index', True),  # Default: True
             full_attention=self.config.get('full_attention', False),  # Default: False
             lstm_layers= self.config.get('lstm_layers', 1),  # Default: 1

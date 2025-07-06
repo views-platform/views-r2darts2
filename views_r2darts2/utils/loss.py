@@ -1,4 +1,28 @@
 import torch
+import torch.nn.functional as F
+
+
+class LossSelector:
+    @staticmethod
+    def get_loss_function(loss_name, **kwargs):
+        if loss_name == "WeightedSmoothL1Loss":
+            return WeightedSmoothL1Loss(**kwargs)
+        elif loss_name == "WeightedHuberLoss":
+            return WeightedHuberLoss(**kwargs)
+        elif loss_name == "TimeAwareWeightedHuberLoss":
+            return TimeAwareWeightedHuberLoss(**kwargs)
+        elif loss_name == "SpikeFocalLoss":
+            return SpikeFocalLoss(**kwargs)
+        elif loss_name == "AsymmetricSpikeLoss":
+            return AsymmetricSpikeLoss(**kwargs)
+        elif loss_name == "LogSpaceLoss":
+            return LogSpaceLoss(**kwargs)
+        elif loss_name == "ZeroInflatedTweedieLoss":
+            return ZeroInflatedTweedieLoss(**kwargs)
+        elif loss_name == "HybridSpikeLoss":
+            return HybridSpikeLoss(**kwargs)
+        else:
+            raise ValueError(f"Unknown loss function: {loss_name}")
 
 class WeightedSmoothL1Loss(torch.nn.Module):
     def __init__(self, beta=0.2, zero_weight=0.3, non_zero_weight=1.5):
@@ -14,19 +38,6 @@ class WeightedSmoothL1Loss(torch.nn.Module):
                             torch.full_like(target, self.weights[0]),
                             torch.full_like(target, self.weights[1]))
         return (loss * weights).mean()
-    
-# class WeightedHuberLoss(torch.nn.Module):
-#     def __init__(self, weights, zero_threshold=0.01, delta=0.5):
-#         super().__init__()
-#         self.weights = weights
-#         self.threshold = zero_threshold
-#         self.huber = torch.nn.HuberLoss(delta=delta)
-        
-#     def forward(self, preds, targets):
-#         # Create weight matrix
-#         weights = torch.where(torch.abs(targets) > self.threshold, 
-#                             self.weights[1], self.weights[0])
-#         return torch.mean(weights * self.huber(preds, targets))
     
 class WeightedHuberLoss(torch.nn.Module):
     def __init__(self, zero_threshold=0.01, delta=0.5, non_zero_weight=5.0):
@@ -80,3 +91,118 @@ class TimeAwareWeightedHuberLoss(torch.nn.Module):
         weights = time_weights * event_weights
         losses = self.huber(preds, targets)
         return (weights * losses).mean()
+    
+class SpikeFocalLoss(torch.nn.Module):
+    def __init__(self, alpha=0.8, gamma=2.0, threshold=0.1):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.threshold = threshold
+        
+    def forward(self, preds, targets):
+        errors = (preds - targets).abs()
+        is_spike = targets > self.threshold
+        
+        # Base loss
+        loss = errors ** 2
+        
+        # Focal component
+        focal_weights = torch.where(
+            is_spike,
+            self.alpha * (1 - torch.exp(-errors)) ** self.gamma,
+            (1 - self.alpha) * (torch.exp(-errors)) ** self.gamma
+        )
+        
+        return torch.mean(focal_weights * loss)
+    
+class AsymmetricSpikeLoss(torch.nn.Module):
+    def __init__(self, under_pred_penalty=4.0, over_pred_penalty=1.0, threshold=0.05):
+        super().__init__()
+        self.under_pred_penalty = under_pred_penalty
+        self.over_pred_penalty = over_pred_penalty
+        self.threshold = threshold
+        
+    def forward(self, preds, targets):
+        errors = targets - preds
+        is_spike = targets > self.threshold
+        
+        penalties = torch.where(
+            errors > 0,  # Under-prediction
+            self.under_pred_penalty,
+            torch.where(
+                errors < 0,  # Over-prediction
+                self.over_pred_penalty,
+                1.0  # Perfect prediction
+            )
+        )
+        
+        # Apply higher penalty for missing spikes
+        spike_penalties = torch.where(
+            is_spike,
+            penalties * 2.0,
+            penalties
+        )
+        
+        return torch.mean(spike_penalties * errors ** 2)
+    
+class LogSpaceLoss(torch.nn.Module):
+    def __init__(self, base_loss=torch.nn.HuberLoss(), epsilon=1e-8):
+        super().__init__()
+        self.base_loss = base_loss
+        self.epsilon = epsilon
+        
+    def forward(self, preds, targets):
+        # Transform to log space with smoothing
+        log_preds = torch.log(preds + self.epsilon)
+        log_targets = torch.log(targets + self.epsilon)
+        
+        # Calculate loss in log space
+        return self.base_loss(log_preds, log_targets)
+    
+class ZeroInflatedTweedieLoss(torch.nn.Module):
+    def __init__(self, p=1.5, zero_weight=0.3, eps=1e-8):
+        super().__init__()
+        self.p = p  # 1 < p < 2 (1.5 is Poisson-gamma compound)
+        self.zero_weight = zero_weight
+        self.eps = eps
+        
+    def forward(self, preds, targets):
+        # Add epsilon to avoid log(0)
+        preds = torch.clamp(preds, min=self.eps)
+        
+        # Zero-inflation weight
+        weights = torch.where(
+            targets == 0,
+            self.zero_weight,
+            1.0
+        )
+        
+        # Tweedie loss for p between 1-2
+        loss = -(
+            targets * torch.pow(preds, 1 - self.p) / (1 - self.p) - 
+            torch.pow(preds, 2 - self.p) / (2 - self.p)
+        )
+        
+        return torch.mean(weights * loss)
+    
+class HybridSpikeLoss(torch.nn.Module):
+    def __init__(self, spike_threshold=0.1, alpha=0.7):
+        super().__init__()
+        self.spike_threshold = spike_threshold
+        self.alpha = alpha  # Weighting between MSE and spike detection
+        
+    def forward(self, preds, targets):
+        # Standard MSE component
+        mse_loss = F.mse_loss(preds, targets, reduction='none')
+        
+        # Spike detection component (penalize missing spikes)
+        spike_mask = targets > self.spike_threshold
+        spike_loss = F.binary_cross_entropy_with_logits(
+            preds, 
+            (targets > self.spike_threshold).float(),
+            reduction='none'
+        )
+        
+        # Combine losses
+        hybrid_loss = self.alpha * mse_loss + (1 - self.alpha) * spike_loss
+        return torch.mean(hybrid_loss)

@@ -16,6 +16,8 @@ import torch
 import numpy as np
 from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from views_r2darts2.model.forecaster import DartsForecaster
+from views_r2darts2.utils.loss import LossSelector
+
 class ModelCatalog:
     """
     Catalog class to manage and provide access to various forecasting models.
@@ -99,7 +101,26 @@ class ModelCatalog:
     #     )
     
     def _get_tft_model(self):
-        torch.serialization.add_safe_globals([TFTModel, WeightedHuberLoss])
+        torch.serialization.add_safe_globals([TFTModel, LossSelector])
+        loss_name = self.config.get("loss_function", "WeightedHuberLoss")
+    
+        # Prepare loss arguments from config parameters
+        loss_args = {
+            "zero_threshold": self.config.get("zero_threshold", 0.01),
+            "delta": self.config.get("delta", 0.05),
+            "non_zero_weight": self.config.get("non_zero_weight", 6.0),
+            "beta": self.config.get("beta", 0.2),
+            "zero_weight": self.config.get("zero_weight", 0.3),
+            "decay_factor": self.config.get("decay_factor", 0.95),
+            "alpha": self.config.get("alpha", 0.7),
+            "gamma": self.config.get("gamma", 2.0),
+            "threshold": self.config.get("threshold", 0.1),
+            "under_pred_penalty": self.config.get("under_pred_penalty", 4.0),
+            "over_pred_penalty": self.config.get("over_pred_penalty", 1.0),
+            "p": self.config.get("p", 1.5),
+            "eps": self.config.get("eps", 1e-8),
+            "spike_threshold": self.config.get("spike_threshold", 0.1),
+        }
         
         # Revised training parameters
         batch_size = 256  # Reduced from 512 for better gradient variety
@@ -121,11 +142,12 @@ class ModelCatalog:
             
             # Critical training modifications
             batch_size=self.config.get('batch_size', batch_size),  # Default: 256
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
-                delta=self.config.get('delta', 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
-            ),
+            # loss_fn=WeightedHuberLoss(
+            #     zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+            #     delta=self.config.get('delta', 0.05),  # Default: 0.05
+            #     non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            # ),
+            loss_fn=LossSelector.get_loss_function(loss_name, **loss_args),
             model_name='TFTModel',
             norm_type="RMSNorm",  # Better for scaled outputs
             n_epochs= self.config.get('n_epochs', 2),

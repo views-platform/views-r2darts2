@@ -101,7 +101,7 @@ class ModelCatalog:
     #     )
     
     def _get_tft_model(self):
-        torch.serialization.add_safe_globals([TFTModel, *LossSelector.LOSS_CLASSES.values()])
+        torch.serialization.add_safe_globals([TFTModel, LossSelector])
         loss_name = self.config.get("loss_function", "WeightedHuberLoss")
     
         # Prepare loss arguments from config parameters
@@ -121,6 +121,7 @@ class ModelCatalog:
             "eps": self.config.get("eps", 1e-8),
             "spike_threshold": self.config.get("spike_threshold", 0.1),
         }
+        loss_fn = LossSelector.get_loss_function(loss_name, **loss_args)
         
         # Revised training parameters
         batch_size = 256  # Reduced from 512 for better gradient variety
@@ -147,7 +148,7 @@ class ModelCatalog:
             #     delta=self.config.get('delta', 0.05),  # Default: 0.05
             #     non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
             # ),
-            loss_fn=LossSelector.get_loss_function(loss_name, **loss_args),
+            loss_fn=loss_fn,
             model_name='TFTModel',
             norm_type="RMSNorm",  # Better for scaled outputs
             n_epochs= self.config.get('n_epochs', 2),

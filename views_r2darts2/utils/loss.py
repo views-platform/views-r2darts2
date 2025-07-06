@@ -1,29 +1,33 @@
 import torch
 import torch.nn.functional as F
-
+import inspect
 
 class LossSelector:
     @staticmethod
     def get_loss_function(loss_name, **kwargs):
-        if loss_name == "WeightedSmoothL1Loss":
-            return WeightedSmoothL1Loss(**kwargs)
-        elif loss_name == "WeightedHuberLoss":
-            return WeightedHuberLoss(**kwargs)
-        elif loss_name == "TimeAwareWeightedHuberLoss":
-            return TimeAwareWeightedHuberLoss(**kwargs)
-        elif loss_name == "SpikeFocalLoss":
-            return SpikeFocalLoss(**kwargs)
-        elif loss_name == "AsymmetricSpikeLoss":
-            return AsymmetricSpikeLoss(**kwargs)
-        elif loss_name == "LogSpaceLoss":
-            return LogSpaceLoss(**kwargs)
-        elif loss_name == "ZeroInflatedTweedieLoss":
-            return ZeroInflatedTweedieLoss(**kwargs)
-        elif loss_name == "HybridSpikeLoss":
-            return HybridSpikeLoss(**kwargs)
-        else:
+        # Map loss names to their classes
+        loss_classes = {
+            "WeightedSmoothL1Loss": WeightedSmoothL1Loss,
+            "WeightedHuberLoss": WeightedHuberLoss,
+            "TimeAwareWeightedHuberLoss": TimeAwareWeightedHuberLoss,
+            "SpikeFocalLoss": SpikeFocalLoss,
+            "AsymmetricSpikeLoss": AsymmetricSpikeLoss,
+            "LogSpaceLoss": LogSpaceLoss,
+            "ZeroInflatedTweedieLoss": ZeroInflatedTweedieLoss,
+            "HybridSpikeLoss": HybridSpikeLoss,
+        }
+        
+        if loss_name not in loss_classes:
             raise ValueError(f"Unknown loss function: {loss_name}")
-
+        
+        # Get the class constructor parameters
+        cls = loss_classes[loss_name]
+        params = inspect.signature(cls).parameters
+        
+        # Filter kwargs to only include valid parameters for this loss
+        valid_kwargs = {k: v for k, v in kwargs.items() if k in params}
+        
+        return cls(**valid_kwargs)
 class WeightedSmoothL1Loss(torch.nn.Module):
     def __init__(self, beta=0.2, zero_weight=0.3, non_zero_weight=1.5):
         super().__init__()

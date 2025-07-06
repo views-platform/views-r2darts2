@@ -101,7 +101,7 @@ class ModelCatalog:
     #     )
     
     def _get_tft_model(self):
-        torch.serialization.add_safe_globals([TFTModel, LossSelector])
+        torch.serialization.add_safe_globals([TFTModel, *LossSelector.LOSS_CLASSES.values()])
         loss_name = self.config.get("loss_function", "WeightedHuberLoss")
     
         # Prepare loss arguments from config parameters

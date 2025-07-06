@@ -198,6 +198,9 @@ class DartsForecaster:
         # Create final DataFrame
         df = pd.DataFrame(results)
         df = df.set_index([self.dataset._time_id, self.dataset._entity_id])
+
+        # Force nan to 0
+        df = df.fillna(0)
         return df.sort_index()
 
     def save_model(self, path: str) -> None:

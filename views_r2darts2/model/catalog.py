@@ -37,6 +37,27 @@ class ModelCatalog:
         self.config = config
         self.device = DartsForecaster.get_device()
 
+        self.loss_name = self.config.get("loss_function", "WeightedHuberLoss")
+    
+        # Prepare loss arguments from config parameters
+        self.loss_args = {
+            "zero_threshold": self.config.get("zero_threshold", 0.01),
+            "delta": self.config.get("delta", 0.05),
+            "non_zero_weight": self.config.get("non_zero_weight", 6.0),
+            "beta": self.config.get("beta", 0.2),
+            "zero_weight": self.config.get("zero_weight", 0.3),
+            "decay_factor": self.config.get("decay_factor", 0.95),
+            "alpha": self.config.get("alpha", 0.7),
+            "gamma": self.config.get("gamma", 2.0),
+            "threshold": self.config.get("threshold", 0.1),
+            "under_pred_penalty": self.config.get("under_pred_penalty", 4.0),
+            "over_pred_penalty": self.config.get("over_pred_penalty", 1.0),
+            "p": self.config.get("p", 1.5),
+            "eps": self.config.get("eps", 1e-8),
+            "spike_threshold": self.config.get("spike_threshold", 0.1),
+    }
+        self.loss_fn = LossSelector.get_loss_function(self.loss_name, **self.loss_args)
+
     def get_model(self, model_name: str):
         """
         Get a model class by its name.
@@ -57,6 +78,7 @@ class ModelCatalog:
             List of model names.
         """
         return list(self.models.keys())
+    
     
 
     # def _get_tft_model(self):
@@ -102,26 +124,6 @@ class ModelCatalog:
     
     def _get_tft_model(self):
         torch.serialization.add_safe_globals([TFTModel, LossSelector])
-        loss_name = self.config.get("loss_function", "WeightedHuberLoss")
-    
-        # Prepare loss arguments from config parameters
-        loss_args = {
-            "zero_threshold": self.config.get("zero_threshold", 0.01),
-            "delta": self.config.get("delta", 0.05),
-            "non_zero_weight": self.config.get("non_zero_weight", 6.0),
-            "beta": self.config.get("beta", 0.2),
-            "zero_weight": self.config.get("zero_weight", 0.3),
-            "decay_factor": self.config.get("decay_factor", 0.95),
-            "alpha": self.config.get("alpha", 0.7),
-            "gamma": self.config.get("gamma", 2.0),
-            "threshold": self.config.get("threshold", 0.1),
-            "under_pred_penalty": self.config.get("under_pred_penalty", 4.0),
-            "over_pred_penalty": self.config.get("over_pred_penalty", 1.0),
-            "p": self.config.get("p", 1.5),
-            "eps": self.config.get("eps", 1e-8),
-            "spike_threshold": self.config.get("spike_threshold", 0.1),
-        }
-        loss_fn = LossSelector.get_loss_function(loss_name, **loss_args)
         
         # Revised training parameters
         batch_size = 256  # Reduced from 512 for better gradient variety
@@ -148,7 +150,7 @@ class ModelCatalog:
             #     delta=self.config.get('delta', 0.05),  # Default: 0.05
             #     non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
             # ),
-            loss_fn=loss_fn,
+            loss_fn=self.loss_fn,
             model_name='TFTModel',
             norm_type="RMSNorm",  # Better for scaled outputs
             n_epochs= self.config.get('n_epochs', 2),
@@ -184,7 +186,7 @@ class ModelCatalog:
         )
     
     def _get_nbeats(self):
-        torch.serialization.add_safe_globals([NBEATSModel, WeightedHuberLoss])
+        torch.serialization.add_safe_globals([NBEATSModel, WeightedHuberLoss, LossSelector])
         return NBEATSModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 2),
             output_chunk_length=len(self.config['steps']),
@@ -200,11 +202,12 @@ class ModelCatalog:
             n_epochs=self.config.get('n_epochs', 2),
             batch_size=self.config.get('batch_size', 128),
             # loss_fn=torch.nn.HuberLoss(delta=0.5),
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
-                delta=self.config.get('delta', 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
-            ),
+            # loss_fn=WeightedHuberLoss(
+            #     zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+            #     delta=self.config.get('delta', 0.05),  # Default: 0.05
+            #     non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            # ),
+            loss_fn=self.loss_fn,
             model_name=self.config.get('name', 'NBEATSModel'),
             force_reset=self.config.get('force_reset', True),
             pl_trainer_kwargs={
@@ -237,7 +240,7 @@ class ModelCatalog:
         )
 
     def _get_tcn_model(self):
-        torch.serialization.add_safe_globals([TCNModel, WeightedHuberLoss])
+        torch.serialization.add_safe_globals([TCNModel, WeightedHuberLoss, LossSelector])
         return TCNModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),
             output_chunk_length=len(self.config['steps']),
@@ -253,11 +256,12 @@ class ModelCatalog:
             model_name=self.config.get('name', 'TCNModel'),
             random_state=self.config.get('random_state', 42),
             n_epochs=self.config.get('n_epochs', 2),
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
-                delta=self.config.get('delta', 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
-            ),
+            # loss_fn=WeightedHuberLoss(
+            #     zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+            #     delta=self.config.get('delta', 0.05),  # Default: 0.05
+            #     non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            # ),
+            loss_fn=self.loss_fn,
             use_reversible_instance_norm=self.config.get('use_reversible_instance_norm', False), # https://openreview.net/forum?id=cGDAkQo1C0p
             pl_trainer_kwargs={
                 "accelerator": "gpu",
@@ -289,7 +293,7 @@ class ModelCatalog:
         )
     
     def _get_rnn_model(self):
-        torch.serialization.add_safe_globals([BlockRNNModel, WeightedHuberLoss])
+        torch.serialization.add_safe_globals([BlockRNNModel, WeightedHuberLoss, LossSelector])
         return BlockRNNModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),
             output_chunk_length=len(self.config['steps']),
@@ -302,11 +306,12 @@ class ModelCatalog:
             batch_size=self.config.get('batch_size', 256),  # Batch size for training
             n_epochs=self.config.get('n_epochs', 7),  # Number of training epochs
             # loss_fn=torch.nn.HuberLoss(delta=0.5),
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
-                delta=self.config.get('delta', 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
-            ),
+            # loss_fn=WeightedHuberLoss(
+            #     zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+            #     delta=self.config.get('delta', 0.05),  # Default: 0.05
+            #     non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            # ),
+            loss_fn=self.loss_fn,
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 # "gradient_clip_val": self.config.get('gradient_clip_val', 0.8),
@@ -340,7 +345,7 @@ class ModelCatalog:
         )
 
     def _get_transformer_model(self):
-        torch.serialization.add_safe_globals([TransformerModel, WeightedHuberLoss])
+        torch.serialization.add_safe_globals([TransformerModel, WeightedHuberLoss, LossSelector])
         return TransformerModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),  # Default: 72
             output_chunk_length=len(self.config['steps']),  # Output chunk length based on steps
@@ -355,11 +360,12 @@ class ModelCatalog:
             norm_type=self.config.get('norm_type', None),  # Default: None
             batch_size=self.config.get('batch_size', 256),  # Default: 32
             n_epochs=self.config.get('n_epochs', 2),  # Default: 100
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
-                delta=self.config.get('delta', 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
-            ),  # Default loss function
+            # loss_fn=WeightedHuberLoss(
+            #     zero_threshold=self.config.get('zero_threshold', 0.01),  # Default: 0.01
+            #     delta=self.config.get('delta', 0.05),  # Default: 0.05
+            #     non_zero_weight=self.config.get('non_zero_weight', 6.0),  # Default: 6.0
+            # ),  # Default loss function
+            loss_fn=self.loss_fn,
             model_name=self.config.get('name', 'TransformerModel'),  # Model name
             random_state=self.config.get('random_state', 42),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
@@ -392,7 +398,7 @@ class ModelCatalog:
         )
     
     def _get_nlinear_model(self):
-        torch.serialization.add_safe_globals([NLinearModel, WeightedHuberLoss])
+        torch.serialization.add_safe_globals([NLinearModel, WeightedHuberLoss, LossSelector])
         return NLinearModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),  # Default: 72
             output_chunk_length=len(self.config['steps']),  # Output chunk length based on steps
@@ -440,7 +446,7 @@ class ModelCatalog:
         )
     
     def _get_dlinear_model(self):
-        torch.serialization.add_safe_globals([DLinearModel, WeightedHuberLoss])
+        torch.serialization.add_safe_globals([DLinearModel, WeightedHuberLoss, LossSelector])
         return DLinearModel(
             input_chunk_length=self.config.get('input_chunk_length', 12 * 6),  # Default: 72
             output_chunk_length=len(self.config['steps']),  # Output chunk length based on steps
@@ -488,7 +494,7 @@ class ModelCatalog:
         )
         
     def _get_tide_model(self):
-        torch.serialization.add_safe_globals([TiDEModel, WeightedHuberLoss, TimeAwareWeightedHuberLoss])
+        torch.serialization.add_safe_globals([TiDEModel, WeightedHuberLoss, TimeAwareWeightedHuberLoss, LossSelector])
         batch_size = 64  # Reduced from 512 for better gradient variety
         training_samples = 180000
         steps_per_epoch = int(np.ceil(training_samples / batch_size))
@@ -510,11 +516,12 @@ class ModelCatalog:
             use_static_covariates=self.config.get('use_static_covariates', True),  # Default: True
             batch_size=self.config.get('batch_size', batch_size),  # Default: 64
             n_epochs=self.config.get('n_epochs', 2),  # Default: 2
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=0.01,
-                delta=0.05, #0.05
-                non_zero_weight=6.0,
-            ),
+            # loss_fn=WeightedHuberLoss(
+            #     zero_threshold=0.01,
+            #     delta=0.05, #0.05
+            #     non_zero_weight=6.0,
+            # ),
+            loss_fn=self.loss_fn,
             # loss_fn = TimeAwareWeightedHuberLoss(non_zero_weight=5.0, zero_weight=1.0, decay_factor=0.1, delta=0.1),
             model_name=self.config.get('name', 'TiDEModel'),  # Model name
             random_state=self.config.get('random_state', 42),  # Random seed for reproducibility

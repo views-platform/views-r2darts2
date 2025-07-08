@@ -38,7 +38,7 @@ class ScalerSelector:
             'RobustScaler': RobustScaler,
             'MinMaxScaler': MinMaxScaler,
             'MaxAbsScaler': MaxAbsScaler,
-            'BoxCoxScaler': partial(PowerTransformer, method='box-cox'),
+            'YeoJohnsonTransform': partial(PowerTransformer, method='yeo-johnson'),
         }
         
         if scaler_name not in scalers:

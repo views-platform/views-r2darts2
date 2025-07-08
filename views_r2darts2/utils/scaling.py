@@ -8,7 +8,9 @@ from sklearn.preprocessing import (
     StandardScaler,
     MinMaxScaler,
     MaxAbsScaler,
+    PowerTransformer,
 )
+from functools import partial
 
 class ScalerSelector:
     @staticmethod
@@ -36,6 +38,7 @@ class ScalerSelector:
             'RobustScaler': RobustScaler,
             'MinMaxScaler': MinMaxScaler,
             'MaxAbsScaler': MaxAbsScaler,
+            'LogScaler': partial(PowerTransformer, method='log'),
         }
         
         if scaler_name not in scalers:

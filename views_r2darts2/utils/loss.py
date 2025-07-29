@@ -97,15 +97,15 @@ class TimeAwareWeightedHuberLoss(torch.nn.Module):
         return (weights * losses).mean()
     
 class SpikeFocalLoss(torch.nn.Module):
-    def __init__(self, alpha=0.8, gamma=2.0, threshold=0.1):
+    def __init__(self, alpha=0.8, gamma=2.0, spike_threshold=3.0445):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
-        self.threshold = threshold
+        self.spike_threshold = spike_threshold
         
     def forward(self, preds, targets):
         errors = (preds - targets).abs()
-        is_spike = targets > self.threshold
+        is_spike = targets > self.spike_threshold
         
         # Base loss
         loss = errors ** 2

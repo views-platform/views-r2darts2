@@ -55,6 +55,7 @@ class ModelCatalog:
             "p": self.config.get("p", 1.5),
             "eps": self.config.get("eps", 1e-8),
             "spike_threshold": self.config.get("spike_threshold", 0.1),
+            "onset_weight": self.config.get("onset_weight", 0.5),
     }
         self.loss_fn = LossSelector.get_loss_function(self.loss_name, **self.loss_args)
 

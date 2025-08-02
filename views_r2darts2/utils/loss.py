@@ -1,6 +1,9 @@
 import torch
 import torch.nn.functional as F
 import inspect
+import logging
+
+logger = logging.getLogger(__name__)
 
 class LossSelector:
     @staticmethod
@@ -15,6 +18,7 @@ class LossSelector:
             "LogSpaceLoss": LogSpaceLoss,
             "ZeroInflatedTweedieLoss": ZeroInflatedTweedieLoss,
             "HybridSpikeLoss": HybridSpikeLoss,
+            "WeightedPenaltyHuberLoss": WeightedPenaltyHuberLoss,
         }
         
         if loss_name not in loss_classes:
@@ -210,3 +214,64 @@ class HybridSpikeLoss(torch.nn.Module):
         # Combine losses
         hybrid_loss = self.alpha * mse_loss + (1 - self.alpha) * spike_loss
         return torch.mean(hybrid_loss)
+
+class WeightedPenaltyHuberLoss(torch.nn.Module):
+    def __init__(
+        self, 
+        zero_threshold=0.01, 
+        delta=0.5, 
+        non_zero_weight=5.0, 
+        false_positive_weight=10.0,
+        false_negative_weight=15.0
+    ):
+        super().__init__()
+        self.threshold = zero_threshold
+        self.delta = delta
+        self.non_zero_weight = non_zero_weight
+        self.false_positive_weight = false_positive_weight
+        self.false_negative_weight = false_negative_weight
+        logger.info(
+            f"Initialized WeightedPenaltyHuberLoss with zero_threshold={zero_threshold}, "
+            f"delta={delta}, non_zero_weight={non_zero_weight}, "
+            f"false_positive_weight={false_positive_weight}, "
+            f"false_negative_weight={false_negative_weight}"
+        )
+        
+    def forward(self, preds, targets):
+        # Identify non-zero targets and predictions (detach masks to prevent gradient flow)
+        is_target_nonzero = (torch.abs(targets) > self.threshold)
+        is_pred_nonzero = (torch.abs(preds) > self.threshold).detach()
+        
+        # Base weights: prioritize non-zero targets
+        base_weights = torch.where(
+            is_target_nonzero,
+            self.non_zero_weight,
+            1.0
+        )
+        
+        # Identify error types
+        false_positive_mask = ~is_target_nonzero & is_pred_nonzero
+        false_negative_mask = is_target_nonzero & ~is_pred_nonzero
+        
+        # Apply penalties to error types while preserving base weights
+        weights = torch.where(
+            false_positive_mask,
+            self.false_positive_weight,
+            torch.where(
+                false_negative_mask,
+                self.false_negative_weight,
+                base_weights
+            )
+        )
+        
+        # Calculate Huber loss
+        errors = targets - preds
+        huber_loss = torch.where(
+            torch.abs(errors) <= self.delta,
+            0.5 * errors ** 2,
+            self.delta * (torch.abs(errors) - 0.5 * self.delta)
+        )
+        
+        # Apply computed weights
+        weighted_loss = weights * huber_loss
+        return torch.mean(weighted_loss)

@@ -99,6 +99,9 @@ class ModelCatalog:
             model_name=self.config.get("name", "TSMixerModel"),
             random_state=self.config.get("random_state", 42),
             force_reset=True,
+            use_static_covariates=self.config.get(
+                "use_static_covariates", True
+            ),  # Default: True
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "callbacks": [
@@ -137,6 +140,9 @@ class ModelCatalog:
             ),  # Default: True
             add_relative_index=self.config.get(
                 "add_relative_index", True
+            ),  # Default: True
+            use_static_covariates=self.config.get(
+                "use_static_covariates", True
             ),  # Default: True
             full_attention=self.config.get("full_attention", False),  # Default: False
             lstm_layers=self.config.get("lstm_layers", 1),  # Default: 1

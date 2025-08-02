@@ -200,7 +200,8 @@ class DartsForecaster:
             if pred_values.ndim == 2:
                 pred_values = pred_values[..., np.newaxis]  # Add sample dimension
 
-            # Clip negative values for all samples
+            # Replace NaNs and infs with 0, then clip negative values for all samples
+            pred_values = np.nan_to_num(pred_values, nan=0.0, posinf=0.0, neginf=0.0)
             pred_values = np.clip(pred_values, a_min=0, a_max=None)
 
             # Convert to list format

@@ -202,7 +202,7 @@ class DartsForecaster:
 
             # Replace NaNs and infs with 0, convert to float64, then clip negative values for all samples
             pred_values = np.nan_to_num(pred_values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
-            pred_values = np.clip(pred_values, a_min=0, a_max=None)
+            pred_values = np.clip(pred_values, a_min=0, a_max=None).astype(np.float64)
 
             # Convert to list format
             for time_idx in range(pred_values.shape[0]):

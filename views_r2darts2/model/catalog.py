@@ -36,26 +36,16 @@ class ModelCatalog:
         self.config = config
         self.device = DartsForecaster.get_device()
 
-        self.loss_name = self.config.get("loss_function", "WeightedHuberLoss")
+        self.loss_name = self.config.get("loss_function", "WeightedPenaltyHuberLoss")
     
         # Prepare loss arguments from config parameters
         self.loss_args = {
             "zero_threshold": self.config.get("zero_threshold", 0.01),
-            "delta": self.config.get("delta", 0.05),
-            "non_zero_weight": self.config.get("non_zero_weight", 6.0),
-            "beta": self.config.get("beta", 0.2),
-            "zero_weight": self.config.get("zero_weight", 0.3),
-            "decay_factor": self.config.get("decay_factor", 0.95),
-            "alpha": self.config.get("alpha", 0.7),
-            "gamma": self.config.get("gamma", 2.0),
-            "threshold": self.config.get("threshold", 0.1),
-            "under_pred_penalty": self.config.get("under_pred_penalty", 4.0),
-            "over_pred_penalty": self.config.get("over_pred_penalty", 1.0),
-            "p": self.config.get("p", 1.5),
-            "eps": self.config.get("eps", 1e-8),
-            "spike_threshold": self.config.get("spike_threshold", 0.1),
-            "onset_weight": self.config.get("onset_weight", 0.5),
-    }
+            "delta": self.config.get("delta", 0.5),
+            "non_zero_weight": self.config.get("non_zero_weight", 5.0),
+            "false_negative_weight": self.config.get("false_negative_weight", 15.0),
+            "false_positive_weight": self.config.get("false_positive_weight", 10.0),
+        }
         self.loss_fn = LossSelector.get_loss_function(self.loss_name, **self.loss_args)
 
     def get_model(self, model_name: str):

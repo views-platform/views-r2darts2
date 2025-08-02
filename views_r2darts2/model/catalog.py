@@ -199,7 +199,7 @@ class ModelCatalog:
             force_reset=self.config.get("force_reset", True),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -243,7 +243,7 @@ class ModelCatalog:
             ),  # https://openreview.net/forum?id=cGDAkQo1C0p
             pl_trainer_kwargs={
                 "accelerator": "gpu",
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),
@@ -269,7 +269,7 @@ class ModelCatalog:
             loss_fn=self.loss_fn,
             pl_trainer_kwargs={
                 "accelerator": "gpu",
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",

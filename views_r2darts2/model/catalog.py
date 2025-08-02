@@ -226,7 +226,7 @@ class ModelCatalog:
             output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
             kernel_size=self.config.get("kernel_size", 3),  # Default: 3
             num_filters=self.config.get("num_filters", 64),  # Default: 64
-            # dilation_base=2,
+            dilation_base=self.config.get("dilation_base", 2),  # Default: 2
             # weight_norm=True, #BUG!
             dropout=0.25,
             force_reset=self.config.get(

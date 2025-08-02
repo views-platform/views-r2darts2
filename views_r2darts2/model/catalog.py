@@ -8,7 +8,7 @@ from darts.models.forecasting.nlinear import NLinearModel
 from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
 from pytorch_lightning.callbacks import EarlyStopping
-from views_r2darts2.utils.loss import WeightedSmoothL1Loss, WeightedHuberLoss, TimeAwareWeightedHuberLoss
+from views_r2darts2.utils.loss import WeightedHuberLoss
 from pytorch_lightning.callbacks import LearningRateMonitor
 import torch
 import numpy as np

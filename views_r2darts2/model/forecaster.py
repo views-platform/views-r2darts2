@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import List, Optional
+from typing import List
 import torch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
@@ -9,9 +9,28 @@ from views_r2darts2.data.handlers import _ViewsDatasetDarts
 from darts.dataprocessing.transformers import Scaler
 
 import logging
+
 logger = logging.getLogger(__name__)
 
+
 class DartsForecaster:
+    """
+    DartsForecaster is a wrapper class for time series forecasting using Darts models.
+    This class manages the workflow for training and predicting with a TorchForecastingModel,
+    including preprocessing, scaling, device management, and result formatting.
+        dataset (_ViewsDatasetDarts): The dataset containing time series, features, and targets.
+        model (TorchForecastingModel): The Darts forecasting model instance.
+        partition_dict (dict): Dictionary specifying 'train' and 'test' index ranges.
+    Methods:
+        get_device(): Returns the device type for model training (cpu, cuda, or mps).
+        _preprocess_timeseries(timeseries, start, end, train_mode): Preprocesses time series for training or prediction.
+        _process_predictions(timeseries_pred): Converts model predictions to structured list of dictionaries.
+        train(): Trains the forecasting model using the dataset.
+        predict(sequence_number, output_length, **predict_kwargs): Generates forecasts for a given sequence.
+        save_model(path): Saves the current model to the specified file path.
+        load_model(path): Loads a trained model from the specified file path.
+    """
+
     def __init__(
         self,
         dataset: _ViewsDatasetDarts,
@@ -20,6 +39,33 @@ class DartsForecaster:
         feature_scaler: str = None,
         target_scaler: str = None,
     ):
+        """
+        Initializes the forecaster with dataset, model, partition information, and optional scalers.
+
+        Args:
+            dataset (_ViewsDatasetDarts): The dataset to be used for forecasting.
+            model (TorchForecastingModel): The forecasting model instance.
+            partition_dict (dict): Dictionary containing 'train' and 'test' partition indices.
+            feature_scaler (str, optional): Name of the feature scaler to use. Defaults to None.
+            target_scaler (str, optional): Name of the target scaler to use. Defaults to None.
+
+        Attributes:
+            dataset (_ViewsDatasetDarts): The provided dataset.
+            model (TorchForecastingModel): The forecasting model.
+            _train_start (int): Start index for training partition.
+            _train_end (int): End index for training partition.
+            _test_start (int): Start index for testing partition.
+            _test_end (int): End index for testing partition.
+            _feature_scaler (str): Name of the feature scaler.
+            _target_scaler (str): Name of the target scaler.
+            scaler_fitted (bool): Indicates if scalers have been fitted.
+            target_scaler (Scaler or None): Target scaler instance if provided.
+            feature_scaler (Scaler or None): Feature scaler instance if provided.
+            device (torch.device): Device used for model computation.
+
+        Logs:
+            Information about selected scalers and device.
+        """
         self.dataset = dataset
         self.model = model
         self._train_start, self._train_end = partition_dict["train"]
@@ -35,7 +81,9 @@ class DartsForecaster:
             self.target_scaler = None
 
         if self._feature_scaler:
-            self.feature_scaler = Scaler(ScalerSelector.get_scaler(self._feature_scaler))
+            self.feature_scaler = Scaler(
+                ScalerSelector.get_scaler(self._feature_scaler)
+            )
         else:
             self.feature_scaler = None
 
@@ -69,8 +117,23 @@ class DartsForecaster:
         train_mode: bool = False,
     ) -> TimeSeries:
         """
-        Preprocesses time series with proper alignment for NBEATS input/output windows.
-        Ensures output_length=36 is maintained through correct temporal slicing.
+        Preprocesses a list of time series for training or prediction.
+
+        Converts each time series to float32, slices the series according to the specified
+        start and end indices, and applies scaling if scalers are provided. Handles both
+        training and prediction modes by adjusting the slicing logic for targets and features.
+
+        Args:
+            timeseries (TimeSeries): List of time series objects to preprocess.
+            start (int): Start timestamp for slicing the time series.
+            end (int): End timestamp for slicing the time series.
+            train_mode (bool, optional): If True, preprocesses for training by ensuring
+                full input and output window creation. If False, preprocesses for prediction.
+                Defaults to False.
+
+        Returns:
+            Tuple[List[TimeSeries], List[TimeSeries]]: A tuple containing the preprocessed
+            targets and past covariates (features).
         """
         timeseries = [s.astype(np.float32) for s in timeseries]
 
@@ -107,6 +170,24 @@ class DartsForecaster:
         return targets, past_cov
 
     def _process_predictions(self, timeseries_pred: List[TimeSeries]) -> list:
+        """
+        Processes a list of TimeSeries prediction objects into a structured list of dictionaries.
+
+        Each dictionary in the returned list corresponds to a single time step and entity, containing:
+            - The timestamp for the prediction.
+            - The entity ID.
+            - Predicted samples for each target component, clipped to non-negative values.
+
+        Handles both deterministic and probabilistic forecasts by ensuring the prediction values are 3D arrays.
+        Clips negative prediction values to zero.
+        Converts prediction samples for each target and time step into lists.
+
+        Args:
+            timeseries_pred (List[TimeSeries]): List of TimeSeries prediction objects.
+
+        Returns:
+            list: List of dictionaries, each containing time, entity ID, and predicted samples for each target.
+        """
         # Process predictions into list format
         results = []
         for pred in timeseries_pred:
@@ -140,10 +221,23 @@ class DartsForecaster:
         return results
 
     def train(self) -> None:
+        """
+        Trains the forecasting model using the dataset provided.
+
+        This method preprocesses the time series data and any associated features,
+        converts them to the appropriate data type, and fits the model using the
+        processed target series and past covariates.
+
+        Returns:
+            None
+        """
         timeseries = self.dataset.as_darts_timeseries()
 
         target_series, past_covariates = self._preprocess_timeseries(
-            timeseries=timeseries, start=self._train_start, end=self._train_end, train_mode=True
+            timeseries=timeseries,
+            start=self._train_start,
+            end=self._train_end,
+            train_mode=True,
         )
 
         target_series = [ts.astype(np.float32) for ts in target_series]
@@ -166,14 +260,29 @@ class DartsForecaster:
         output_length: int = 36,
         **predict_kwargs,
     ) -> pd.DataFrame:
+        """
+        Generates forecasts for a given sequence number using the trained model.
+
+        Args:
+            sequence_number (int): The index in the test set to start forecasting from.
+            output_length (int, optional): Number of time steps to forecast. Defaults to 36.
+            **predict_kwargs: Additional keyword arguments to pass to the model's predict method.
+
+        Returns:
+            pd.DataFrame: A DataFrame containing the forecasted values, indexed by time and entity.
+
+        Raises:
+            Exception: If an error occurs during prediction.
+        """
         timeseries = self.dataset.as_darts_timeseries()
 
-        # Get the input window for forecasting based on sequence_number 
+        # Get the input window for forecasting based on sequence_number
         target_series, past_covariates = self._preprocess_timeseries(
             timeseries=timeseries,
             # start=self._test_start + sequence_number - output_length,
             start=self._test_start + sequence_number - self.model.input_chunk_length,
-            end=self._test_start + sequence_number, #self._test_start + sequence_number is exclusive
+            end=self._test_start
+            + sequence_number,  # self._test_start + sequence_number is exclusive
         )
 
         # Generate forecasts
@@ -187,7 +296,7 @@ class DartsForecaster:
             )
         except Exception as e:
             print(f"Error during prediction: {e}")
-            raise 
+            raise
 
         if self.target_scaler:
             timeseries_pred = self.target_scaler.inverse_transform(timeseries_pred)
@@ -204,9 +313,27 @@ class DartsForecaster:
         return df.sort_index()
 
     def save_model(self, path: str) -> None:
+        """
+        Saves the current model to the specified file path.
+
+        Args:
+            path (str): The file path where the model should be saved.
+
+        Returns:
+            None
+        """
         path = str(path)
         self.model.save(path=path)
 
     def load_model(self, path: str) -> None:
+        """
+        Loads a trained model from the specified file path.
+
+        Args:
+            path (str): The file path to load the model from.
+
+        Returns:
+            None
+        """
         path = str(path)
         self.model = self.model.load(path=path)

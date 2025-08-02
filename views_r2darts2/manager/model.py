@@ -1,11 +1,5 @@
 import logging
-from os import path
-import pandas as pd
-import numpy as np
 import torch
-from sklearn.preprocessing import RobustScaler
-
-from views_r2darts2.model import forecaster
 from views_pipeline_core.configs.pipeline import PipelineConfig
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
 from views_r2darts2.model.forecaster import DartsForecaster
@@ -23,14 +17,59 @@ logger = logging.getLogger(__name__)
 # Save the original torch.load function
 _original_torch_load = torch.load
 
+
 # Function that forces weights_only=False
 def custom_torch_load(*args, **kwargs):
+    """
+    Loads a PyTorch model using the original torch load function, ensuring the 'weights_only' argument is set.
+
+    Args:
+        *args: Positional arguments to pass to the original torch load function.
+        **kwargs: Keyword arguments to pass to the original torch load function. If 'weights_only' is not provided, it defaults to False.
+
+    Returns:
+        The result of the original torch load function with the specified arguments.
+
+    """
     if "weights_only" not in kwargs:
         kwargs["weights_only"] = False
     return _original_torch_load(*args, **kwargs)
 
 
 class DartsForecastingModelManager(ForecastingModelManager):
+    """
+    DartsForecastingModelManager
+
+    Manages the lifecycle of Darts-based forecasting models, including training, evaluation, and artifact management.
+
+    This class extends ForecastingModelManager to provide specialized functionality for time series forecasting using the Darts library. It handles model initialization, training, evaluation, and prediction workflows, as well as artifact saving and loading. The manager integrates with external tools such as Weights & Biases for notifications and supports advanced features like Monte Carlo dropout inference and partitioned dataset handling.
+
+    Attributes:
+        model_path (ModelPathManager): Manager for model file paths and artifact directories.
+        wandb_notifications (bool): Enables or disables Weights & Biases notifications.
+        use_prediction_store (bool): Enables or disables the prediction store for caching predictions.
+
+    Methods:
+        __init__(model_path, wandb_notifications=True, use_prediction_store=True):
+            Initializes the model manager, overrides torch.load globally, and logs the current model architecture.
+
+        _train_model_artifact():
+            Trains a forecasting model using the configured dataset and algorithm, saves the trained model artifact, and returns the trained forecaster.
+
+        _evaluate_model_artifact(eval_type, artifact_name=None):
+            Evaluates a model artifact for a specified evaluation type, optionally using a specific artifact. Returns a list of prediction DataFrames for each evaluation sequence.
+
+        _forecast_model_artifact(artifact_name):
+            Loads a model artifact and generates forecasts using the current configuration. Returns a DataFrame of forecasted predictions.
+
+        _evaluate_sweep(eval_type, model):
+            Evaluates the model over a sweep of sequence numbers and returns a list of predictions.
+
+    Notes:
+        - Supports automatic artifact selection based on run type and timestamp extraction.
+        - Integrates with custom dataset and model catalog classes for flexible configuration.
+        - Provides options for feature and target scaling, parallel prediction jobs, and Monte Carlo inference.
+    """
 
     def __init__(
         self,
@@ -38,6 +77,19 @@ class DartsForecastingModelManager(ForecastingModelManager):
         wandb_notifications: bool = True,
         use_prediction_store: bool = True,
     ) -> None:
+        """
+        Initializes the model manager with the specified configuration.
+
+        Args:
+            model_path (ModelPathManager): Manager for model file paths.
+            wandb_notifications (bool, optional): Enable or disable Weights & Biases notifications on Slack. Defaults to True.
+            use_prediction_store (bool, optional): Enable or disable the prediction store. Defaults to True.
+
+        Side Effects:
+            Overrides the global torch.load function with custom_torch_load.
+            Logs the current model architecture.
+
+        """
         super().__init__(
             model_path=model_path,
             wandb_notifications=wandb_notifications,
@@ -45,9 +97,24 @@ class DartsForecastingModelManager(ForecastingModelManager):
         )
         # Override torch.load globally
         torch.load = custom_torch_load
-        logger.info(f"Current model architecture: \033[92m{self.configs['algorithm']}\033[0m")
+        logger.info(
+            f"Current model architecture: \033[92m{self.configs['algorithm']}\033[0m"
+        )
 
     def _train_model_artifact(self):
+        """
+        Trains a forecasting model using the specified configuration and dataset, and saves the trained model artifact.
+
+        This method performs the following steps:
+        1. Loads the raw dataset based on the configured run type.
+        2. Initializes the model object from the model catalog using the specified algorithm.
+        3. Constructs a DartsForecaster with the dataset, model, partitioning information, and optional scalers.
+        4. Trains the forecaster.
+        5. If not running a sweep, saves the trained model artifact to the designated artifacts directory.
+
+        Returns:
+            DartsForecaster: The trained forecaster object.
+        """
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
         run_type = self.config["run_type"]
@@ -84,6 +151,28 @@ class DartsForecastingModelManager(ForecastingModelManager):
         return forecaster
 
     def _evaluate_model_artifact(self, eval_type, artifact_name=None):
+        """
+        Evaluates a model artifact based on the specified evaluation type and artifact name.
+
+        Parameters
+        ----------
+        eval_type : str
+            The type of evaluation to perform. Can be one of "standard", "long", "complete", or "live".
+        artifact_name : str, optional
+            The name of the specific model artifact to use for evaluation. If not provided, the latest artifact
+            corresponding to the current run type will be used.
+
+        Returns
+        -------
+        list of pandas.DataFrame
+            A list of prediction DataFrames, one for each evaluation sequence number.
+
+        Notes
+        -----
+        - Updates the configuration with the timestamp extracted from the artifact name.
+        - Loads the relevant dataset and model, and performs predictions for the specified evaluation type.
+        - Supports additional configuration options such as number of samples, jobs, and dropout for Monte Carlo inference.
+        """
         # eval_type can be "standard", "long", "complete", "live"
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
@@ -143,6 +232,21 @@ class DartsForecastingModelManager(ForecastingModelManager):
         return df_predictions
 
     def _forecast_model_artifact(self, artifact_name):
+        """
+        Loads a model artifact and generates forecasts using the specified configuration.
+
+        Args:
+            artifact_name (str): The name of the model artifact to use. If None, uses the latest artifact based on run type.
+
+        Returns:
+            pd.DataFrame: DataFrame containing the forecasted predictions.
+
+        Logs:
+            Information about the artifact being used (default or specified).
+
+        Side Effects:
+            Updates self.config["timestamp"] with the timestamp extracted from the artifact path.
+        """
         # Commonly used paths
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
@@ -190,6 +294,16 @@ class DartsForecastingModelManager(ForecastingModelManager):
         return df_predictions
 
     def _evaluate_sweep(self, eval_type: str, model: any):
+        """
+        Evaluates the model over a sweep of sequence numbers and returns predictions.
+
+        Args:
+            eval_type (str): The type of evaluation to perform, used to resolve the total number of sequences.
+            model (any): The forecasting model instance with a `predict` method.
+
+        Returns:
+            list: A list of predictions generated by the model for each sequence number in the sweep.
+        """
 
         total_sequence_number = (
             ForecastingModelManager._resolve_evaluation_sequence_number(eval_type)

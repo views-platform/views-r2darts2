@@ -162,10 +162,20 @@ class DartsForecaster:
                 for s in timeseries
             ]
 
-        if self.target_scaler:
-            targets = self.target_scaler.fit_transform(targets)
-        if self.feature_scaler:
-            past_cov = self.feature_scaler.fit_transform(past_cov)
+        if train_mode:
+            logger.info(f"Fitting scalers for training data...")
+            if self.target_scaler:
+                targets = self.target_scaler.fit_transform(targets)
+            if self.feature_scaler:
+                past_cov = self.feature_scaler.fit_transform(past_cov)
+            self.scaler_fitted = True  # Mark scalers as fitted
+        else:
+            # Prediction mode: use fitted scalers
+            logger.info(f"Transforming scalers for prediction data...")
+            if self.target_scaler and self.scaler_fitted:
+                targets = self.target_scaler.transform(targets)
+            if self.feature_scaler and self.scaler_fitted:
+                past_cov = self.feature_scaler.transform(past_cov)
 
         return targets, past_cov
 
@@ -314,27 +324,34 @@ class DartsForecaster:
         return df.sort_index()
 
     def save_model(self, path: str) -> None:
-        """
-        Saves the current model to the specified file path.
-
-        Args:
-            path (str): The file path where the model should be saved.
-
-        Returns:
-            None
-        """
+        # Save scaler state along with model
         path = str(path)
         self.model.save(path=path)
+        scaler_path = path + ".scalers"
+        torch.save({
+            'target_scaler': self.target_scaler,
+            'feature_scaler': self.feature_scaler,
+            'scaler_fitted': self.scaler_fitted
+        }, scaler_path)
 
     def load_model(self, path: str) -> None:
-        """
-        Loads a trained model from the specified file path.
-
-        Args:
-            path (str): The file path to load the model from.
-
-        Returns:
-            None
-        """
+        # Load scaler state
         path = str(path)
+        scaler_path = path + ".scalers"
+        try:
+            scaler_data = torch.load(scaler_path, map_location='cpu')
+            self.target_scaler = scaler_data['target_scaler']
+            self.feature_scaler = scaler_data['feature_scaler']
+            self.scaler_fitted = scaler_data['scaler_fitted']
+        except FileNotFoundError:
+            logger.warning("Scaler state not found. Scaling disabled.")
+            self.scaler_fitted = False
+        
+        # Load the model
         self.model = self.model.load(path=path)
+        
+        # Move model to appropriate device
+        if hasattr(self.model, "to_device"):
+            self.model.to_device(self.device)
+        elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
+            self.model.model.to(self.device)

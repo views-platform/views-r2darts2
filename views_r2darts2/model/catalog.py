@@ -10,6 +10,7 @@ from darts.models.forecasting.dlinear import DLinearModel
 from pytorch_lightning.callbacks import EarlyStopping
 from views_r2darts2.utils.loss import WeightedHuberLoss
 from pytorch_lightning.callbacks import LearningRateMonitor
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch
 import numpy as np
 
@@ -58,6 +59,13 @@ class ModelCatalog:
             "false_positive_weight": self.config.get("false_positive_weight", 10.0),
         }
         self.loss_fn = LossSelector.get_loss_function(self.loss_name, **self.loss_args)
+        self.lr_scheduler_args = {
+            "mode": "min",
+            "factor": self.config.get("lr_scheduler_factor", 0.1),
+            "patience": self.config.get("lr_scheduler_patience", 3),
+            "min_lr": self.config.get("lr_scheduler_min_lr", 1e-6),
+            "monitor": "train_loss",
+        }
 
     def get_model(self, model_name: str):
         """
@@ -112,6 +120,14 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    ReduceLROnPlateau(
+                        monitor="train_loss",
+                        patience=self.config.get("lr_scheduler_patience", 2),
+                        factor=self.config.get("lr_scheduler_factor", 0.1),
+                        min_lr=self.config.get("lr_scheduler_min_lr", 1e-6),
+                        verbose=True,
+                        mode="min",
+                    )
                 ],
                 "enable_progress_bar": True,
                 "logger": True,
@@ -120,6 +136,8 @@ class ModelCatalog:
                 "lr": self.config.get("lr", 3e-4),
                 "weight_decay": self.config.get("weight_decay", 1e-3),
             },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
 
     def _get_tft_model(self):
@@ -176,6 +194,8 @@ class ModelCatalog:
                     "weight_decay", 1e-3
                 ),  # Default L2 regularization
             },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
 
     def _get_nbeats(self):
@@ -216,6 +236,8 @@ class ModelCatalog:
                 "lr": self.config.get("lr", 3e-4),
                 "weight_decay": self.config.get("weight_decay", 1e-3),
             },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_tcn_model(self):
@@ -244,11 +266,21 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "callbacks": [
+                    EarlyStopping(
+                        monitor="train_loss",
+                        patience=self.config.get("early_stopping_patience", 5),
+                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        mode="min",
+                    ),
+                ],
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),
                 "weight_decay": self.config.get("weight_decay", 1e-3),
             },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
 
     def _get_rnn_model(self):
@@ -293,6 +325,8 @@ class ModelCatalog:
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
 
     def _get_transformer_model(self):
@@ -347,6 +381,8 @@ class ModelCatalog:
                     "weight_decay", 1e-3
                 ),  # Default L2 regularization
             },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
 
     def _get_nlinear_model(self):
@@ -397,6 +433,8 @@ class ModelCatalog:
                     "weight_decay", 1e-3
                 ),  # Default L2 regularization
             },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
 
     def _get_dlinear_model(self):
@@ -447,6 +485,8 @@ class ModelCatalog:
                     "weight_decay", 1e-3
                 ),  # Default L2 regularization
             },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
 
     def _get_tide_model(self):
@@ -516,4 +556,6 @@ class ModelCatalog:
                     "weight_decay", 1e-5
                 ),  # Default L2 regularization
             },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,  
         )

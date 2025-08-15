@@ -344,8 +344,9 @@ class DartsForecaster:
             self.feature_scaler = scaler_data['feature_scaler']
             self.scaler_fitted = scaler_data['scaler_fitted']
         except FileNotFoundError:
-            logger.warning("Scaler state not found. Scaling disabled.")
-            self.scaler_fitted = False
+            logger.error("Scaler state not found. Please retrain the model.")
+            # self.scaler_fitted = False
+            raise
         
         # Load the model
         self.model = self.model.load(path=path)

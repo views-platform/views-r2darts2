@@ -11,6 +11,7 @@ from pytorch_lightning.callbacks import EarlyStopping
 from views_r2darts2.utils.loss import WeightedHuberLoss
 from pytorch_lightning.callbacks import LearningRateMonitor
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from pytorch_lightning.loggers import WandbLogger
 import torch
 import numpy as np
 
@@ -112,6 +113,7 @@ class ModelCatalog:
             ),  # Default: True
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -176,6 +178,7 @@ class ModelCatalog:
             # Training controls
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -219,6 +222,7 @@ class ModelCatalog:
             force_reset=self.config.get("force_reset", True),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
@@ -265,6 +269,7 @@ class ModelCatalog:
             ),  # https://openreview.net/forum?id=cGDAkQo1C0p
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
@@ -301,6 +306,7 @@ class ModelCatalog:
             loss_fn=self.loss_fn,
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
@@ -363,6 +369,7 @@ class ModelCatalog:
             force_reset=True,  # Reset the model if it already exists
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -415,6 +422,7 @@ class ModelCatalog:
             force_reset=True,  # Reset the model if it already exists
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -467,6 +475,7 @@ class ModelCatalog:
             force_reset=True,  # Reset the model if it already exists
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -538,6 +547,7 @@ class ModelCatalog:
             force_reset=True,  # Reset the model if it already exists
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",

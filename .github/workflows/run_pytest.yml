@@ -1,0 +1,38 @@
+name: Run Pytest
+
+on:
+    push:
+      branches: 
+        - main
+        - development
+    pull_request:
+      branches: 
+        - main
+        - development
+    workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11" 
+
+    - name: Install Poetry
+      run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+
+    - name: Install dependencies
+      run: |
+        poetry install 
+
+    - name: Run tests
+      run: |
+        set -e
+        poetry run pytest tests/

@@ -1,0 +1,43 @@
+name: Require Branch to Be Up-to-Date
+
+# Trigger this workflow on pull request events targeting a specific branch.
+on:
+  pull_request:
+    branches:
+      - main
+      - development
+
+  workflow_dispatch: # enables manual triggering
+
+jobs:
+  check-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine Comparison Branch
+        id: comparison
+        run: |
+          if [[ "${{ github.event.pull_request.base.ref }}" == "main" && "${{ github.event.pull_request.head.ref }}" == "development" ]]; then
+            echo "branch=main" >> $GITHUB_ENV
+          else
+            echo "branch=development" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout pull request branch
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Fetch comparison branch
+        run: |
+          git fetch --unshallow
+          git fetch origin ${{ env.branch }}
+
+      - name: Compare branch with ${{ env.branch }}
+        run: |
+          if git merge-base --is-ancestor origin/${{ env.branch }} HEAD; then
+            echo "::notice ::Branch is up-to-date with ${{ env.branch }}."
+          else
+            echo "::error ::Merge Blocked: Your branch is behind the latest commits on ${{ env.branch }}. Please update your branch before attempting to merge."
+
+            exit 1
+          fi

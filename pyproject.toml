@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "views-r2darts2"
+version = "0.1.0"
+description = ""
+authors = [
+    "Dylan Pinheiro <dylpin@prio.org>",
+    "Xiaolong Sun <xiaolong.sun@pcr.uu.se>",
+    "Borbála Farkas <borbala.farkas@pcr.uu.se>"
+]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.15"
+views-pipeline-core = ">=2.0.0,<3.0.0"
+darts = "=0.35.0"
+pytorch-lightning-bolts = ">=0.3.2.post1"
+lightning-bolts = ">=0.7.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

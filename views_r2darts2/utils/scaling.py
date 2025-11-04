@@ -14,6 +14,14 @@ from sklearn.preprocessing import (
 )
 from functools import partial
 
+def _log_transform(x):
+    """Log transform function: log(1 + x)"""
+    return np.log1p(x)
+
+def _inverse_log_transform(x):
+    """Inverse log transform function: exp(x) - 1"""
+    return np.expm1(x)
+
 
 class ScalerSelector:
     @staticmethod
@@ -44,8 +52,8 @@ class ScalerSelector:
             "YeoJohnsonTransform": partial(PowerTransformer, method="yeo-johnson"),
             "LogTransform": partial(
                 FunctionTransformer,
-                func=lambda x: np.log1p(x),  # log1p(x) = log(1 + x) handles zeros
-                inverse_func=lambda x: np.expm1(x),  # expm1(x) = exp(x) - 1
+                func=_log_transform,
+                inverse_func=_inverse_log_transform,
                 validate=True,
             ),
         }

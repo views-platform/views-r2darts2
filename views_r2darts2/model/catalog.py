@@ -122,14 +122,6 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
-                    ReduceLROnPlateau(
-                        monitor="train_loss",
-                        patience=self.config.get("lr_scheduler_patience", 2),
-                        factor=self.config.get("lr_scheduler_factor", 0.1),
-                        min_lr=self.config.get("lr_scheduler_min_lr", 1e-6),
-                        verbose=True,
-                        mode="min",
-                    )
                 ],
                 "enable_progress_bar": True,
                 "logger": True,

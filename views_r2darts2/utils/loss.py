@@ -189,21 +189,105 @@ class SpikeFocalLoss(torch.nn.Module):
         return torch.mean(focal_weights * loss)
 
 
+# class WeightedPenaltyHuberLoss(torch.nn.Module):
+#     """
+#     Custom weighted Huber loss with penalties for false positives and false negatives.
+
+#     This loss function extends the standard Huber loss by applying different weights to:
+#     - Non-zero targets (higher importance)
+#     - False positives (predicted non-zero when target is zero)
+#     - False negatives (predicted zero when target is non-zero)
+
+#     Args:
+#         zero_threshold (float, optional): Threshold to consider a value as zero. Defaults to 0.01.
+#         delta (float, optional): Huber loss delta parameter. Defaults to 0.5.
+#         non_zero_weight (float, optional): Weight for non-zero targets. Defaults to 5.0.
+#         false_positive_weight (float, optional): Penalty weight for false positives. Defaults to 10.0.
+#         false_negative_weight (float, optional): Penalty weight for false negatives. Defaults to 15.0.
+
+#     Forward Args:
+#         preds (torch.Tensor): Predicted values.
+#         targets (torch.Tensor): Ground truth values.
+
+#     Returns:
+#         torch.Tensor: Scalar mean of the weighted Huber loss.
+#     """
+
+#     def __init__(
+#         self,
+#         zero_threshold=0.01,
+#         delta=0.5,
+#         non_zero_weight=5.0,
+#         false_positive_weight=10.0,
+#         false_negative_weight=15.0,
+#     ):
+#         super().__init__()
+#         self.threshold = zero_threshold
+#         self.delta = delta
+#         self.non_zero_weight = non_zero_weight
+#         self.false_positive_weight = false_positive_weight
+#         self.false_negative_weight = false_negative_weight
+#         logger.info(
+#             "\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}".format(
+#                 "zero_threshold",
+#                 zero_threshold,
+#                 "delta",
+#                 delta,
+#                 "non_zero_weight",
+#                 non_zero_weight,
+#                 "false_positive_weight",
+#                 false_positive_weight,
+#                 "false_negative_weight",
+#                 false_negative_weight,
+#             )
+#         )
+
+#     def forward(self, preds, targets):
+#         # Identify non-zero targets and predictions (detach masks to prevent gradient flow)
+#         is_target_nonzero = torch.abs(targets) > self.threshold
+#         is_pred_nonzero = (torch.abs(preds) > self.threshold).detach()
+
+#         # Base weights: prioritize non-zero targets
+#         base_weights = torch.where(is_target_nonzero, self.non_zero_weight, 1.0)
+
+#         # Identify error types
+#         false_positive_mask = ~is_target_nonzero & is_pred_nonzero
+#         false_negative_mask = is_target_nonzero & ~is_pred_nonzero
+
+#         # Apply penalties to error types while preserving base weights
+#         weights = torch.where(
+#             false_positive_mask,
+#             self.false_positive_weight,
+#             torch.where(false_negative_mask, self.false_negative_weight, base_weights),
+#         )
+
+#         # Calculate Huber loss
+#         errors = targets - preds
+#         huber_loss = torch.where(
+#             torch.abs(errors) <= self.delta,
+#             0.5 * errors**2,
+#             self.delta * (torch.abs(errors) - 0.5 * self.delta),
+#         )
+
+#         # Apply computed weights
+#         weighted_loss = weights * huber_loss
+#         return torch.mean(weighted_loss)
+
 class WeightedPenaltyHuberLoss(torch.nn.Module):
     """
-    Custom weighted Huber loss with penalties for false positives and false negatives.
+    Custom weighted Huber loss with multiplicative penalties for false positives and false negatives.
 
     This loss function extends the standard Huber loss by applying different weights to:
-    - Non-zero targets (higher importance)
-    - False positives (predicted non-zero when target is zero)
-    - False negatives (predicted zero when target is non-zero)
+    - Non-zero targets (higher importance via non_zero_weight)
+    - False positives (predicted non-zero when target is zero) - multiplied by false_positive_weight
+    - False negatives (predicted zero when target is non-zero) - multiplied by false_negative_weight
 
     Args:
         zero_threshold (float, optional): Threshold to consider a value as zero. Defaults to 0.01.
         delta (float, optional): Huber loss delta parameter. Defaults to 0.5.
-        non_zero_weight (float, optional): Weight for non-zero targets. Defaults to 5.0.
-        false_positive_weight (float, optional): Penalty weight for false positives. Defaults to 10.0.
-        false_negative_weight (float, optional): Penalty weight for false negatives. Defaults to 15.0.
+        non_zero_weight (float, optional): Base weight for non-zero targets. Defaults to 5.0.
+        false_positive_weight (float, optional): Multiplier applied to base weight for false positives. Defaults to 2.0.
+        false_negative_weight (float, optional): Multiplier applied to base weight for false negatives. Defaults to 3.0.
 
     Forward Args:
         preds (torch.Tensor): Predicted values.
@@ -211,6 +295,12 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
 
     Returns:
         torch.Tensor: Scalar mean of the weighted Huber loss.
+    
+    Example weights:
+        - Zero target, zero pred: weight = 1.0
+        - Non-zero target, correct pred: weight = non_zero_weight (e.g., 5.0)
+        - Zero target, non-zero pred (FP): weight = 1.0 * false_positive_weight (e.g., 2.0)
+        - Non-zero target, zero pred (FN): weight = non_zero_weight * false_negative_weight (e.g., 5.0 * 3.0 = 15.0)
     """
 
     def __init__(
@@ -218,8 +308,8 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         zero_threshold=0.01,
         delta=0.5,
         non_zero_weight=5.0,
-        false_positive_weight=10.0,
-        false_negative_weight=15.0,
+        false_positive_weight=2.0,
+        false_negative_weight=3.0,
     ):
         super().__init__()
         self.threshold = zero_threshold
@@ -228,7 +318,7 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         self.false_positive_weight = false_positive_weight
         self.false_negative_weight = false_negative_weight
         logger.info(
-            "\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}".format(
+            "\n{:<30} {:<10}\n{:<30} {:<10}\n{:<30} {:<10}\n{:<30} {:<10}\n{:<30} {:<10}".format(
                 "zero_threshold",
                 zero_threshold,
                 "delta",
@@ -243,7 +333,7 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         )
 
     def forward(self, preds, targets):
-        # Identify non-zero targets and predictions (detach masks to prevent gradient flow)
+        # Identify non-zero targets and predictions (detach pred mask to prevent gradient flow)
         is_target_nonzero = torch.abs(targets) > self.threshold
         is_pred_nonzero = (torch.abs(preds) > self.threshold).detach()
 
@@ -251,14 +341,18 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         base_weights = torch.where(is_target_nonzero, self.non_zero_weight, 1.0)
 
         # Identify error types
-        false_positive_mask = ~is_target_nonzero & is_pred_nonzero
-        false_negative_mask = is_target_nonzero & ~is_pred_nonzero
+        false_positive_mask = ~is_target_nonzero & is_pred_nonzero  # Predicted conflict when none exists
+        false_negative_mask = is_target_nonzero & ~is_pred_nonzero  # Missed a real conflict
 
-        # Apply penalties to error types while preserving base weights
+        # Apply multiplicative penalties on top of base weights
         weights = torch.where(
             false_positive_mask,
-            self.false_positive_weight,
-            torch.where(false_negative_mask, self.false_negative_weight, base_weights),
+            base_weights * self.false_positive_weight,  # e.g., 1.0 * 2.0 = 2.0
+            torch.where(
+                false_negative_mask,
+                base_weights * self.false_negative_weight,  # e.g., 5.0 * 3.0 = 15.0
+                base_weights  # No error: use base weight
+            ),
         )
 
         # Calculate Huber loss

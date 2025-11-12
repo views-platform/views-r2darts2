@@ -246,7 +246,7 @@ class ModelCatalog:
             num_filters=self.config.get("num_filters", 64),  # Default: 64
             dilation_base=self.config.get("dilation_base", 2),  # Default: 2
             # weight_norm=True, #BUG!
-            dropout=0.25,
+            dropout=self.config.get("dropout", 0.2),  # Default: 0.2
             force_reset=self.config.get(
                 "force_reset", True
             ),  # Reset the model if it already exists

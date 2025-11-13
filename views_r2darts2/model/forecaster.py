@@ -12,7 +12,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 class DartsForecaster:
     """
     DartsForecaster is a wrapper class for time series forecasting using Darts models.
@@ -38,6 +37,8 @@ class DartsForecaster:
         partition_dict: dict,
         feature_scaler: str = None,
         target_scaler: str = None,
+        log_targets: bool = False,
+        log_features: list[str] | None = None,
     ):
         """
         Initializes the forecaster with dataset, model, partition information, and optional scalers.
@@ -70,25 +71,19 @@ class DartsForecaster:
         self.model = model
         self._train_start, self._train_end = partition_dict["train"]
         self._test_start, self._test_end = partition_dict["test"]
-        self._feature_scaler = feature_scaler
-        self._target_scaler = target_scaler
 
-        self.scaler_fitted = False  # Track scaler state
+        self._feature_scaler_cfg = feature_scaler
+        self._target_scaler_cfg = target_scaler
+        self._log_targets = bool(log_targets)
+        self._log_features = set(log_features or [])
 
-        if self._target_scaler:
-            self.target_scaler = Scaler(ScalerSelector.get_scaler(self._target_scaler))
-        else:
-            self.target_scaler = None
+        self.scaler_fitted = False
 
-        if self._feature_scaler:
-            self.feature_scaler = Scaler(
-                ScalerSelector.get_scaler(self._feature_scaler)
-            )
-        else:
-            self.feature_scaler = None
+        self.target_scaler = self._instantiate_scaler(self._target_scaler_cfg)
+        self.feature_scaler = self._instantiate_scaler(self._feature_scaler_cfg)
 
-        logger.info(f"Using feature scaler: {self._feature_scaler}")
-        logger.info(f"Using target scaler: {self._target_scaler}")
+        logger.info(f"Using feature scaler: {self._feature_scaler_cfg}")
+        logger.info(f"Using target scaler: {self._target_scaler_cfg}")
 
         self.device = self.get_device()
         logger.info(f"Using device: {self.device}")
@@ -97,12 +92,117 @@ class DartsForecaster:
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
             self.model.model.to(self.device)
 
+    def _instantiate_scaler(self, scaler_cfg):
+        """
+        Instantiate and wrap a scaler config.
+        Accepts:
+          - None
+          - String (e.g. 'StandardScaler')
+          - Dict: {'name': <str>, 'kwargs': <dict>}
+        Returns:
+          Darts Scaler wrapper or None.
+        """
+        if scaler_cfg is None:
+            return None
+        from darts.dataprocessing.transformers import Scaler
+
+        if isinstance(scaler_cfg, str):
+            estimator = ScalerSelector.get_scaler(scaler_cfg)
+            return Scaler(estimator)
+        if isinstance(scaler_cfg, dict):
+            name = scaler_cfg.get("name")
+            kwargs = scaler_cfg.get("kwargs", {})
+            if name is None:
+                raise ValueError("Scaler config dict must have a 'name' key.")
+            estimator = ScalerSelector.get_scaler(name, **kwargs)
+            return Scaler(estimator)
+        raise TypeError("Scaler config must be None, str, or dict.")
+    
+    def _apply_log_to_targets(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
+        """
+        Vectorized log1p for target series.
+        FIX: Darts TimeSeries.map passes the full ndarray, not scalars. Prior lambda assumed scalar.
+        We now:
+          - Clip negatives to 0.
+          - Apply log1p.
+          - Cast back to float32 (numpy log1p returns float64).
+        """
+        if not self._log_targets:
+            return series_list
+        logger.info("Applying vectorized log1p transform to target series...")
+        out = []
+        for ts in series_list:
+            out.append(ts.map(lambda arr: np.log1p(np.maximum(arr, 0)).astype(np.float32)))
+        return out
+
+    def _inverse_log_on_predictions(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
+        """
+        Inverse of _apply_log_to_targets.
+        - Ensure non-negative before expm1 (safety for any numerical drift).
+        - Cast to float32.
+        """
+        if not self._log_targets:
+            return series_list
+        logger.info("Applying vectorized expm1 inverse transform to predicted series...")
+        out = []
+        for ts in series_list:
+            out.append(ts.map(lambda arr: np.expm1(np.maximum(arr, 0)).astype(np.float32)))
+        return out
+    
+    def _apply_log_to_feature_series(self, ts: TimeSeries) -> TimeSeries:
+        """
+        Applies log1p to selected feature components in a single TimeSeries.
+        Only components whose names appear in self._log_features are transformed.
+        Rationale:
+          - Early weak signals (small positive feature counts) expanded.
+          - Variance stabilized for heavy-tailed covariates.
+        Note:
+          - No inverse needed; past covariates not reconstructed post-prediction.
+          - Negative values clipped to 0 before log1p.
+        """
+        if not self._log_features:
+            return ts
+        comps = ts.components
+        if not any(c in self._log_features for c in comps):
+            return ts
+        arr = ts.all_values(copy=True)
+        # Deterministic: (time, features); Probabilistic: (time, features, samples)
+        if arr.ndim == 2:
+            for idx, name in enumerate(comps):
+                if name in self._log_features:
+                    arr[:, idx] = np.log1p(np.maximum(arr[:, idx], 0.0))
+        elif arr.ndim == 3:
+            # Apply to each sample identically
+            for idx, name in enumerate(comps):
+                if name in self._log_features:
+                    arr[:, idx, :] = np.log1p(np.maximum(arr[:, idx, :], 0.0))
+        # Rebuild TimeSeries preserving metadata
+        new_ts = TimeSeries.from_times_and_values(
+            times=ts.time_index,
+            values=arr.astype(np.float32),
+            columns=comps,
+            freq=ts.freq,
+            static_covariates=ts.static_covariates,
+        )
+        return new_ts
+    
+    def _apply_log_to_features(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
+        """
+        Batch wrapper to apply feature log transform.
+        """
+        if not self._log_features:
+            return series_list
+        logger.info(f"Applying vectorized log1p transform to selected feature components: {self._log_features}...")
+        out = [self._apply_log_to_feature_series(ts) for ts in series_list]
+        return out
+
     @staticmethod
     def get_device() -> str:
         """
         Returns the device type for model training.
         """
         if torch.backends.mps.is_available():
+            torch.set_default_dtype(torch.float32)
             return "mps"
         elif torch.cuda.is_available():
             return "cuda"
@@ -135,47 +235,52 @@ class DartsForecaster:
             Tuple[List[TimeSeries], List[TimeSeries]]: A tuple containing the preprocessed
             targets and past covariates (features).
         """
-        timeseries = [s.astype(np.float32) for s in timeseries]
-
-        # Calculate valid prediction window boundaries
+        timeseries_float = [s.astype(np.float32) for s in timeseries]
 
         self.min_length = self.model.input_chunk_length + self.model.output_chunk_length
-
-        if train_mode:  # Training mode
-            # Slice targets to allow full input+output window creation
+        if train_mode:
             targets = [
                 s.slice(start_ts=start, end_ts=end - self.model.output_chunk_length)[
                     self.dataset.targets
                 ]
-                for s in timeseries
+                for s in timeseries_float
                 if len(s) >= self.min_length
             ]
-            past_cov = [s[self.dataset.features] for s in timeseries]
-        else:  # Prediction mode
-            # Get last valid input window for forecasting
+            past_cov = [s[self.dataset.features].astype(np.float32) for s in timeseries_float]
+        else:
             targets = [
                 s.slice(start_ts=start, end_ts=end)[self.dataset.targets]
-                for s in timeseries
+                for s in timeseries_float
             ]
             past_cov = [
-                s.slice(start_ts=start, end_ts=end)[self.dataset.features]
-                for s in timeseries
+                s.slice(start_ts=start, end_ts=end)[self.dataset.features].astype(np.float32)
+                for s in timeseries_float
             ]
 
+
+        # Log transform selected feature components before scaling
+        past_cov = self._apply_log_to_features(past_cov)
+
+        # Log transform before scaling (can create float64)
+        targets = self._apply_log_to_targets(targets)
+
         if train_mode:
-            logger.info(f"Fitting scalers for training data...")
+            logger.info("Fitting scalers for training data...")
             if self.target_scaler:
                 targets = self.target_scaler.fit_transform(targets)
             if self.feature_scaler:
                 past_cov = self.feature_scaler.fit_transform(past_cov)
-            self.scaler_fitted = True  # Mark scalers as fitted
+            self.scaler_fitted = True
         else:
-            # Prediction mode: use fitted scalers
-            logger.info(f"Transforming scalers for prediction data...")
+            logger.info("Transforming scalers for prediction data...")
             if self.target_scaler and self.scaler_fitted:
                 targets = self.target_scaler.transform(targets)
             if self.feature_scaler and self.scaler_fitted:
                 past_cov = self.feature_scaler.transform(past_cov)
+
+        # DOWNCAST after scaler/log (they yield float64)
+        targets = [ts.astype(np.float32) for ts in targets]
+        past_cov = [pc.astype(np.float32) for pc in past_cov]
 
         return targets, past_cov
 
@@ -202,33 +307,20 @@ class DartsForecaster:
         results = []
         for pred in timeseries_pred:
             entity_id = int(pred.static_covariates.iat[0, 0])
-
-            # Get all samples as numpy array (timesteps x components x samples)
             pred_values = pred.all_values(copy=False)
-
-            # Ensure 3D array (time, components, samples) even for deterministic forecasts
             if pred_values.ndim == 2:
-                pred_values = pred_values[..., np.newaxis]  # Add sample dimension
-
-            # Replace NaNs and infs with 0, convert to float64, then clip negative values for all samples
-            pred_values = np.nan_to_num(pred_values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
-            pred_values = np.clip(pred_values, a_min=0, a_max=None).astype(np.float64)
-
-            # Convert to list format
+                pred_values = pred_values[..., np.newaxis]
+            pred_values = np.nan_to_num(pred_values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            pred_values = np.clip(pred_values, a_min=0, a_max=None).astype(np.float32)
             for time_idx in range(pred_values.shape[0]):
                 time_stamp = pred.start_time() + time_idx * pred.freq
                 row_data = {
                     self.dataset._time_id: time_stamp,
                     self.dataset._entity_id: entity_id,
                 }
-
                 for comp_idx, target in enumerate(self.dataset.targets):
-                    # Extract all samples for this component and time step
-                    samples = pred_values[time_idx, comp_idx, :].tolist()
-                    row_data[f"pred_{target}"] = samples
-
+                    row_data[f"pred_{target}"] = pred_values[time_idx, comp_idx, :].tolist()
                 results.append(row_data)
-
         return results
 
     def train(self) -> None:
@@ -312,6 +404,8 @@ class DartsForecaster:
         if self.target_scaler:
             timeseries_pred = self.target_scaler.inverse_transform(timeseries_pred)
 
+        timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
+
         # Process predictions into list format
         results = self._process_predictions(timeseries_pred)
 
@@ -331,7 +425,9 @@ class DartsForecaster:
         torch.save({
             'target_scaler': self.target_scaler,
             'feature_scaler': self.feature_scaler,
-            'scaler_fitted': self.scaler_fitted
+            'scaler_fitted': self.scaler_fitted,
+            'log_targets': self._log_targets,
+            'log_features': list(self._log_features),
         }, scaler_path)
 
     def load_model(self, path: str) -> None:
@@ -343,6 +439,8 @@ class DartsForecaster:
             self.target_scaler = scaler_data['target_scaler']
             self.feature_scaler = scaler_data['feature_scaler']
             self.scaler_fitted = scaler_data['scaler_fitted']
+            self._log_targets = scaler_data.get('log_targets', False)
+            self._log_features = set(scaler_data.get('log_features', []))
         except FileNotFoundError:
             logger.error("Scaler state not found. Please retrain the model.")
             # self.scaler_fitted = False

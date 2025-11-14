@@ -113,6 +113,7 @@ class ModelCatalog:
             ),  # Default: True
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
@@ -171,6 +172,7 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -215,7 +217,7 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -262,7 +264,7 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -299,7 +301,7 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -361,6 +363,7 @@ class ModelCatalog:
             force_reset=True,  # Reset the model if it already exists
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
@@ -415,6 +418,7 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -467,6 +471,7 @@ class ModelCatalog:
             force_reset=True,  # Reset the model if it already exists
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
@@ -540,6 +545,7 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",

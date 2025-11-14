@@ -1,11 +1,17 @@
-# views-r2darts2: Advanced Deep Learning Conflict Forecasting Suite 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/4cd8129b-9ad6-4fa3-a4ca-8288b0ab610f" alt="r2darts2 Banner" width="85%">
+</p>
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="GitHub License" />
+  &nbsp;&nbsp;
+   <img src="https://img.shields.io/badge/darts-0.35.0%2B-green.svg" alt="GitHub License" />
+  &nbsp;&nbsp;
+</p>
 
-[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![Darts Version](https://img.shields.io/badge/darts-0.35.0%2B-green.svg)](https://unit8co.github.io/darts/)
+<p align="center">
+  A time series forecasting package designed for conflict prediction within the VIEWS (Violence and Impacts Early-Warning System) ecosystem. It employs state-of-the-art deep learning models from the Darts library to produce forecasts and conflict-related metrics
+</p>
 
----
-
-**views-r2darts2** is a time series forecasting package designed for conflict prediction within the VIEWS (Violence and Impacts Early-Warning System) ecosystem. It employs state-of-the-art deep learning models from the Darts library to produce forecasts and conflict-related metrics.
 
 ---
 

@@ -241,7 +241,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
         
         logger.info(f"Starting parallel prediction with {max_workers} workers for {total_sequence_number} sequences")
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             # Submit all tasks and maintain order
             futures = {
                 executor.submit(predict_sequence, seq_num): seq_num

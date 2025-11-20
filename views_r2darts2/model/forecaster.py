@@ -430,6 +430,31 @@ class DartsForecaster:
             'log_features': list(self._log_features),
         }, scaler_path)
 
+    # def load_model(self, path: str) -> None:
+    #     # Load scaler state
+    #     path = str(path)
+    #     scaler_path = path + ".scalers"
+    #     try:
+    #         scaler_data = torch.load(scaler_path, map_location='cpu')
+    #         self.target_scaler = scaler_data['target_scaler']
+    #         self.feature_scaler = scaler_data['feature_scaler']
+    #         self.scaler_fitted = scaler_data['scaler_fitted']
+    #         self._log_targets = scaler_data.get('log_targets', False)
+    #         self._log_features = set(scaler_data.get('log_features', []))
+    #     except FileNotFoundError:
+    #         logger.error("Scaler state not found. Please retrain the model.")
+    #         # self.scaler_fitted = False
+    #         raise
+        
+    #     # Load the model
+    #     self.model = self.model.load(path=path)
+        
+    #     # Move model to appropriate device
+    #     if hasattr(self.model, "to_device"):
+    #         self.model.to_device(self.device)
+    #     elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
+    #         self.model.model.to(self.device)
+
     def load_model(self, path: str) -> None:
         # Load scaler state
         path = str(path)
@@ -443,14 +468,15 @@ class DartsForecaster:
             self._log_features = set(scaler_data.get('log_features', []))
         except FileNotFoundError:
             logger.error("Scaler state not found. Please retrain the model.")
-            # self.scaler_fitted = False
             raise
         
-        # Load the model
-        self.model = self.model.load(path=path)
+        # Load the model - use the class method to get a new instance
+        self.model = self.model.__class__.load(path=path, map_location=str(self.device))
         
-        # Move model to appropriate device
+        # Ensure model is on the correct device
         if hasattr(self.model, "to_device"):
             self.model.to_device(self.device)
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
             self.model.model.to(self.device)
+        
+        logger.info(f"Model loaded and moved to device: {self.device}")

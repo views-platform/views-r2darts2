@@ -125,7 +125,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),
@@ -168,6 +167,9 @@ class ModelCatalog:
             model_name="TFTModel",
             norm_type="RMSNorm",  # Better for scaled outputs
             n_epochs=self.config.get("n_epochs", 2),
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # https://openreview.net/forum?id=cGDAkQo1C0p - good for non-stationary conflict data
             # Training controls
             pl_trainer_kwargs={
                 "accelerator": "gpu",
@@ -183,7 +185,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),  # Default learning rate
@@ -228,7 +229,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),
@@ -259,8 +259,8 @@ class ModelCatalog:
             n_epochs=self.config.get("n_epochs", 2),
             loss_fn=self.loss_fn,
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),  # https://openreview.net/forum?id=cGDAkQo1C0p
+                "use_reversible_instance_norm", True
+            ),  # https://openreview.net/forum?id=cGDAkQo1C0p - good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
@@ -311,7 +311,6 @@ class ModelCatalog:
                     ),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 1e-4),  # Learning rate
@@ -319,7 +318,9 @@ class ModelCatalog:
                     "weight_decay", 1e-4
                 ),  # L2 regularization
             },
-            use_reversible_instance_norm=True,
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Config-based, default True for non-stationary conflict data
             model_name=self.config.get("name", "BlockRNNModel"),  # Model name
             random_state=self.config.get(
                 "random_state", 42
@@ -361,6 +362,9 @@ class ModelCatalog:
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
@@ -375,7 +379,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),  # Default learning rate
@@ -405,16 +408,15 @@ class ModelCatalog:
             ),  # Default: True
             batch_size=self.config.get("batch_size", 64),  # Default: 64
             n_epochs=self.config.get("n_epochs", 2),  # Default: 2
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get("zero_threshold", 0.01),  # Default: 0.01
-                delta=self.config.get("delta", 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get("non_zero_weight", 6.0),  # Default: 6.0
-            ),  # Default loss function
+            loss_fn=self.loss_fn,  # Use configured loss function from LossSelector
             model_name=self.config.get("name", "NLinearModel"),  # Model name
             random_state=self.config.get(
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
@@ -429,7 +431,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),  # Default learning rate
@@ -459,16 +460,15 @@ class ModelCatalog:
             ),  # Default: True
             batch_size=self.config.get("batch_size", 64),  # Default: 64
             n_epochs=self.config.get("n_epochs", 2),  # Default: 2
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get("zero_threshold", 0.01),  # Default: 0.01
-                delta=self.config.get("delta", 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get("non_zero_weight", 6.0),  # Default: 6.0
-            ),  # Default loss function
+            loss_fn=self.loss_fn,  # Use configured loss function from LossSelector
             model_name=self.config.get("name", "DLinearModel"),  # Model name
             random_state=self.config.get(
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
@@ -483,7 +483,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),  # Default learning rate
@@ -542,6 +541,9 @@ class ModelCatalog:
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
@@ -556,7 +558,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 2e-3),  # Default learning rate was 3e-4

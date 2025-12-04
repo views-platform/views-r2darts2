@@ -74,17 +74,16 @@ class DartsForecastingModelManager(ForecastingModelManager):
     def __init__(
         self,
         model_path: ModelPathManager,
-        wandb_notifications: bool = True,
-        use_prediction_store: bool = True,
+        wandb_notifications: bool = False,
+        use_prediction_store: bool = False,
     ) -> None:
         """
         Initializes the model manager with the specified configuration.
 
         Args:
             model_path (ModelPathManager): Manager for model file paths.
-            wandb_notifications (bool, optional): Enable or disable Weights & Biases notifications on Slack. Defaults to True.
-            use_prediction_store (bool, optional): Enable or disable the prediction store. Defaults to True.
-
+            wandb_notifications (bool, optional): Enable or disable Weights & Biases notifications on Slack. Defaults to False.
+            use_prediction_store (bool, optional): Enable or disable the prediction store. Defaults to False.
         Side Effects:
             Overrides the global torch.load function with custom_torch_load.
             Logs the current model architecture.

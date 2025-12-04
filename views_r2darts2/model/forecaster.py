@@ -77,6 +77,23 @@ class DartsForecaster:
         self._log_targets = bool(log_targets)
         self._log_features = set(log_features or [])
 
+        # Warn about potential double log transform
+        if self._log_targets and target_scaler == "LogTransform":
+            logger.warning(
+                "Both log_targets=True and target_scaler='LogTransform' are set. "
+                "This will apply log transform twice! Consider using only one. "
+                "Disabling manual log_targets to avoid double transformation."
+            )
+            self._log_targets = False
+        
+        if self._log_features and feature_scaler == "LogTransform":
+            logger.error(
+                "Both log_features and feature_scaler='LogTransform' are set. "
+                "This may apply log transform twice on overlapping features! "
+                "Consider using only one transformation method."
+            )
+            raise
+
         self.scaler_fitted = False
 
         self.target_scaler = self._instantiate_scaler(self._target_scaler_cfg)
@@ -429,31 +446,6 @@ class DartsForecaster:
             'log_targets': self._log_targets,
             'log_features': list(self._log_features),
         }, scaler_path)
-
-    # def load_model(self, path: str) -> None:
-    #     # Load scaler state
-    #     path = str(path)
-    #     scaler_path = path + ".scalers"
-    #     try:
-    #         scaler_data = torch.load(scaler_path, map_location='cpu')
-    #         self.target_scaler = scaler_data['target_scaler']
-    #         self.feature_scaler = scaler_data['feature_scaler']
-    #         self.scaler_fitted = scaler_data['scaler_fitted']
-    #         self._log_targets = scaler_data.get('log_targets', False)
-    #         self._log_features = set(scaler_data.get('log_features', []))
-    #     except FileNotFoundError:
-    #         logger.error("Scaler state not found. Please retrain the model.")
-    #         # self.scaler_fitted = False
-    #         raise
-        
-    #     # Load the model
-    #     self.model = self.model.load(path=path)
-        
-    #     # Move model to appropriate device
-    #     if hasattr(self.model, "to_device"):
-    #         self.model.to_device(self.device)
-    #     elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
-    #         self.model.model.to(self.device)
 
     def load_model(self, path: str) -> None:
         # Load scaler state

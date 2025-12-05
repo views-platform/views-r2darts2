@@ -138,6 +138,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             partition_dict=self._data_loader.partition_dict,
             feature_scaler=self.config.get("feature_scaler", None),
             target_scaler=self.config.get("target_scaler", None),
+            feature_scaler_map=self.config.get("feature_scaler_map", None),
         )
         forecaster.train()
 
@@ -214,8 +215,8 @@ class DartsForecastingModelManager(ForecastingModelManager):
             feature_scaler=self.configs.get("feature_scaler", None),
             target_scaler=self.configs.get("target_scaler", None),
             log_targets=self.configs.get("log_targets", False),
-            log_features=self.config.get("log_features", []),
-            
+            log_features=self.configs.get("log_features", []),
+            feature_scaler_map=self.configs.get("feature_scaler_map", None),
         )
         forecaster.load_model(path=path_artifact)
 
@@ -315,6 +316,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             target_scaler=self.config.get("target_scaler", None),
             log_targets=self.config.get("log_targets", False),
             log_features=self.config.get("log_features", []),
+            feature_scaler_map=self.config.get("feature_scaler_map", None),
         )
         forecaster.load_model(path=path_artifact)
 

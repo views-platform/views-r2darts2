@@ -1,10 +1,10 @@
 import pandas as pd
 import numpy as np
-from typing import List
+from typing import List, Dict, Any, Optional, Union
 import torch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
-from views_r2darts2.utils.scaling import ScalerSelector
+from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
 from darts.dataprocessing.transformers import Scaler
 
@@ -39,6 +39,7 @@ class DartsForecaster:
         target_scaler: str = None,
         log_targets: bool = False,
         log_features: list[str] | None = None,
+        feature_scaler_map: Optional[Dict[str, Any]] = None,
     ):
         """
         Initializes the forecaster with dataset, model, partition information, and optional scalers.
@@ -47,8 +48,44 @@ class DartsForecaster:
             dataset (_ViewsDatasetDarts): The dataset to be used for forecasting.
             model (TorchForecastingModel): The forecasting model instance.
             partition_dict (dict): Dictionary containing 'train' and 'test' partition indices.
-            feature_scaler (str, optional): Name of the feature scaler to use. Defaults to None.
+            feature_scaler (str, optional): Name of the feature scaler to use for all features.
+                Ignored if feature_scaler_map is provided. Defaults to None.
             target_scaler (str, optional): Name of the target scaler to use. Defaults to None.
+            log_targets (bool, optional): Whether to apply log1p transform to targets. Defaults to False.
+            log_features (list[str], optional): List of feature names to apply log1p transform. Defaults to None.
+            feature_scaler_map (dict, optional): Mapping of scalers to specific feature groups.
+                When provided, this takes precedence over feature_scaler.
+                
+                Supported formats:
+                
+                1. Named group format:
+                ```python
+                {
+                    "conflict": {
+                        "scaler": "RobustScaler",
+                        "features": ["ged_sb", "ged_ns", "acled_sb"]
+                    },
+                    "wdi": {
+                        "scaler": "StandardScaler", 
+                        "features": ["wdi_ny_gdp_mktp_kd"]
+                    },
+                    "vdem": {
+                        "scaler": "MinMaxScaler",
+                        "features": ["vdem_v2x_polyarchy"]
+                    }
+                }
+                ```
+                
+                2. Simple format:
+                ```python
+                {
+                    "RobustScaler": ["ged_sb", "ged_ns", "acled_sb"],
+                    "StandardScaler": ["wdi_ny_gdp_mktp_kd"],
+                    "MinMaxScaler": ["vdem_v2x_polyarchy"]
+                }
+                ```
+                
+                Features not listed in feature_scaler_map will use feature_scaler as default.
 
         Attributes:
             dataset (_ViewsDatasetDarts): The provided dataset.
@@ -61,7 +98,7 @@ class DartsForecaster:
             _target_scaler (str): Name of the target scaler.
             scaler_fitted (bool): Indicates if scalers have been fitted.
             target_scaler (Scaler or None): Target scaler instance if provided.
-            feature_scaler (Scaler or None): Feature scaler instance if provided.
+            feature_scaler (Scaler, FeatureScalerManager, or None): Feature scaler instance.
             device (torch.device): Device used for model computation.
 
         Logs:
@@ -74,6 +111,7 @@ class DartsForecaster:
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler
+        self._feature_scaler_map_cfg = feature_scaler_map
         self._log_targets = bool(log_targets)
         self._log_features = set(log_features or [])
 
@@ -96,10 +134,22 @@ class DartsForecaster:
 
         self.scaler_fitted = False
 
+        # Initialize target scaler
         self.target_scaler = self._instantiate_scaler(self._target_scaler_cfg)
-        self.feature_scaler = self._instantiate_scaler(self._feature_scaler_cfg)
 
-        logger.info(f"Using feature scaler: {self._feature_scaler_cfg}")
+        # Initialize feature scaler(s)
+        # feature_scaler_map takes precedence over feature_scaler
+        if self._feature_scaler_map_cfg:
+            self.feature_scaler = FeatureScalerManager(
+                feature_scaler_map=self._feature_scaler_map_cfg,
+                default_scaler=self._feature_scaler_cfg,  # fallback for unmapped features
+                all_features=self.dataset.features,
+            )
+            logger.info(f"Using feature scaler map: {self.feature_scaler}")
+        else:
+            self.feature_scaler = self._instantiate_scaler(self._feature_scaler_cfg)
+            logger.info(f"Using feature scaler: {self._feature_scaler_cfg}")
+
         logger.info(f"Using target scaler: {self._target_scaler_cfg}")
 
         self.device = self.get_device()
@@ -439,12 +489,19 @@ class DartsForecaster:
         path = str(path)
         self.model.save(path=path)
         scaler_path = path + ".scalers"
+        
+        # Determine if using FeatureScalerManager
+        using_feature_scaler_map = isinstance(self.feature_scaler, FeatureScalerManager)
+        
         torch.save({
             'target_scaler': self.target_scaler,
             'feature_scaler': self.feature_scaler,
             'scaler_fitted': self.scaler_fitted,
             'log_targets': self._log_targets,
             'log_features': list(self._log_features),
+            'using_feature_scaler_map': using_feature_scaler_map,
+            'feature_scaler_map_cfg': self._feature_scaler_map_cfg,
+            'feature_scaler_cfg': self._feature_scaler_cfg,
         }, scaler_path)
 
     def load_model(self, path: str) -> None:
@@ -452,12 +509,14 @@ class DartsForecaster:
         path = str(path)
         scaler_path = path + ".scalers"
         try:
-            scaler_data = torch.load(scaler_path, map_location='cpu')
+            scaler_data = torch.load(scaler_path, map_location='cpu', weights_only=False)
             self.target_scaler = scaler_data['target_scaler']
             self.feature_scaler = scaler_data['feature_scaler']
             self.scaler_fitted = scaler_data['scaler_fitted']
             self._log_targets = scaler_data.get('log_targets', False)
             self._log_features = set(scaler_data.get('log_features', []))
+            self._feature_scaler_map_cfg = scaler_data.get('feature_scaler_map_cfg')
+            self._feature_scaler_cfg = scaler_data.get('feature_scaler_cfg')
         except FileNotFoundError:
             logger.error("Scaler state not found. Please retrain the model.")
             raise

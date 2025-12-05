@@ -1,7 +1,9 @@
 import pytest
 import numpy as np
 from sklearn.exceptions import NotFittedError
-from views_r2darts2.utils.scaling import ScalerSelector
+from darts import TimeSeries
+import pandas as pd
+from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager
 
 
 class TestScalerSelector:
@@ -330,3 +332,253 @@ class TestScalerSelectorIntegration:
             X_transformed, 
             X_transformed_loaded
         )
+
+
+class TestFeatureScalerManager:
+    """Tests for FeatureScalerManager - multi-scaler feature handling."""
+    
+    @pytest.fixture
+    def sample_timeseries_list(self):
+        """Create sample TimeSeries for testing."""
+        # Create a sample DataFrame with different feature types
+        np.random.seed(42)
+        n_time = 50
+        
+        # Simulate different data types
+        data = {
+            # Zero-inflated conflict data (lots of zeros, occasional spikes)
+            "ged_sb": np.concatenate([np.zeros(30), np.random.exponential(10, 20)]),
+            "ged_ns": np.concatenate([np.zeros(35), np.random.exponential(5, 15)]),
+            "acled_sb": np.concatenate([np.zeros(25), np.random.exponential(15, 25)]),
+            # WDI-style continuous data
+            "wdi_gdp": np.random.normal(1000, 200, n_time),
+            "wdi_pop": np.random.normal(1e6, 1e5, n_time),
+            # V-Dem bounded indices (0-1)
+            "vdem_polyarchy": np.random.beta(2, 5, n_time),
+            "vdem_liberal": np.random.beta(2, 5, n_time),
+        }
+        
+        times = pd.date_range("2000-01", periods=n_time, freq="MS")
+        
+        ts1 = TimeSeries.from_times_and_values(
+            times=times,
+            values=np.column_stack([data[k] for k in data]),
+            columns=list(data.keys()),
+        )
+        
+        # Create a second series with different values
+        data2 = {k: v * 1.1 + np.random.normal(0, 0.1, n_time) for k, v in data.items()}
+        ts2 = TimeSeries.from_times_and_values(
+            times=times,
+            values=np.column_stack([data2[k] for k in data2]),
+            columns=list(data2.keys()),
+        )
+        
+        return [ts1, ts2]
+    
+    def test_simple_format_parsing(self):
+        """Test parsing of simple format: {'ScalerName': ['feat1', 'feat2']}"""
+        config = {
+            "RobustScaler": ["ged_sb", "ged_ns"],
+            "MinMaxScaler": ["vdem_polyarchy"],
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            default_scaler="StandardScaler",
+            all_features=["ged_sb", "ged_ns", "vdem_polyarchy", "wdi_gdp"],
+        )
+        
+        mapping = manager.get_feature_scaler_mapping()
+        
+        assert mapping["ged_sb"] == "scaler_RobustScaler"
+        assert mapping["ged_ns"] == "scaler_RobustScaler"
+        assert mapping["vdem_polyarchy"] == "scaler_MinMaxScaler"
+        assert mapping["wdi_gdp"] == "default"  # Not in map, uses default
+    
+    def test_named_group_format_parsing(self):
+        """Test parsing of named group format."""
+        config = {
+            "conflict": {
+                "scaler": "RobustScaler",
+                "features": ["ged_sb", "ged_ns", "acled_sb"]
+            },
+            "democracy": {
+                "scaler": "MinMaxScaler",
+                "features": ["vdem_polyarchy", "vdem_liberal"]
+            },
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            default_scaler="StandardScaler",
+            all_features=["ged_sb", "ged_ns", "acled_sb", "vdem_polyarchy", "vdem_liberal", "wdi_gdp"],
+        )
+        
+        mapping = manager.get_feature_scaler_mapping()
+        
+        assert mapping["ged_sb"] == "group_conflict"
+        assert mapping["acled_sb"] == "group_conflict"
+        assert mapping["vdem_polyarchy"] == "group_democracy"
+        assert mapping["wdi_gdp"] == "default"
+    
+    def test_fit_transform(self, sample_timeseries_list):
+        """Test fit_transform applies different scalers to different features."""
+        config = {
+            "RobustScaler": ["ged_sb", "ged_ns", "acled_sb"],
+            "StandardScaler": ["wdi_gdp", "wdi_pop"],
+            "MinMaxScaler": ["vdem_polyarchy", "vdem_liberal"],
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            all_features=list(sample_timeseries_list[0].components),
+        )
+        
+        assert not manager.is_fitted
+        
+        transformed = manager.fit_transform(sample_timeseries_list)
+        
+        assert manager.is_fitted
+        assert len(transformed) == len(sample_timeseries_list)
+        
+        # Check that transformed series have same shape and components
+        for orig, trans in zip(sample_timeseries_list, transformed):
+            assert list(trans.components) == list(orig.components)
+            assert len(trans) == len(orig)
+    
+    def test_transform_requires_fit(self, sample_timeseries_list):
+        """Test that transform raises error if not fitted."""
+        config = {"RobustScaler": ["ged_sb"]}
+        manager = FeatureScalerManager(feature_scaler_map=config)
+        
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            manager.transform(sample_timeseries_list)
+    
+    def test_inverse_transform(self, sample_timeseries_list):
+        """Test inverse transform recovers original values."""
+        config = {
+            "StandardScaler": ["wdi_gdp", "wdi_pop"],
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            all_features=list(sample_timeseries_list[0].components),
+        )
+        
+        # Get original values
+        orig_values = [ts.all_values(copy=True) for ts in sample_timeseries_list]
+        
+        # Transform and inverse transform
+        transformed = manager.fit_transform(sample_timeseries_list)
+        recovered = manager.inverse_transform(transformed)
+        
+        # Check recovery for features that were scaled
+        wdi_gdp_idx = list(sample_timeseries_list[0].components).index("wdi_gdp")
+        
+        for orig_ts, recovered_ts in zip(sample_timeseries_list, recovered):
+            orig_arr = orig_ts.all_values()
+            rec_arr = recovered_ts.all_values()
+            
+            # WDI features should be recovered (with some floating point tolerance)
+            np.testing.assert_array_almost_equal(
+                orig_arr[:, wdi_gdp_idx],
+                rec_arr[:, wdi_gdp_idx],
+                decimal=5
+            )
+    
+    def test_duplicate_feature_raises_error(self):
+        """Test that assigning a feature to multiple scalers raises an error."""
+        config = {
+            "RobustScaler": ["ged_sb", "ged_ns"],
+            "StandardScaler": ["ged_sb", "wdi_gdp"],  # ged_sb is duplicate!
+        }
+        
+        with pytest.raises(ValueError, match="assigned to multiple"):
+            FeatureScalerManager(feature_scaler_map=config)
+    
+    def test_empty_config(self, sample_timeseries_list):
+        """Test that empty config returns data unchanged."""
+        manager = FeatureScalerManager(feature_scaler_map={})
+        
+        result = manager.fit_transform(sample_timeseries_list)
+        
+        for orig, res in zip(sample_timeseries_list, result):
+            np.testing.assert_array_equal(
+                orig.all_values(),
+                res.all_values()
+            )
+    
+    def test_scaler_with_kwargs(self):
+        """Test using scaler with custom kwargs via dict format."""
+        config = {
+            "robust_custom": {
+                "scaler": {"name": "RobustScaler", "kwargs": {"quantile_range": (10, 90)}},
+                "features": ["ged_sb"]
+            }
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            all_features=["ged_sb", "other"],
+        )
+        
+        # Should not raise
+        assert "group_robust_custom" in manager._scalers
+    
+    def test_repr(self):
+        """Test string representation."""
+        config = {
+            "RobustScaler": ["feat1", "feat2"],
+            "MinMaxScaler": ["feat3"],
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            all_features=["feat1", "feat2", "feat3"],
+        )
+        
+        repr_str = repr(manager)
+        assert "FeatureScalerManager" in repr_str
+        assert "fitted=False" in repr_str
+    
+    def test_no_default_scaler_when_all_mapped(self, sample_timeseries_list):
+        """Test that no default scaler is created when all features are mapped."""
+        all_features = list(sample_timeseries_list[0].components)
+        
+        config = {
+            "RobustScaler": ["ged_sb", "ged_ns", "acled_sb"],
+            "StandardScaler": ["wdi_gdp", "wdi_pop"],
+            "MinMaxScaler": ["vdem_polyarchy", "vdem_liberal"],
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            default_scaler="StandardScaler",
+            all_features=all_features,
+        )
+        
+        # Should not have a "default" key since all features are mapped
+        assert "default" not in manager._scalers
+    
+    def test_different_scalers_produce_different_results(self, sample_timeseries_list):
+        """Test that different scalers actually produce different transformations."""
+        # Create managers with different scalers for the same features
+        config1 = {"StandardScaler": ["ged_sb"]}
+        config2 = {"MinMaxScaler": ["ged_sb"]}
+        
+        manager1 = FeatureScalerManager(feature_scaler_map=config1)
+        manager2 = FeatureScalerManager(feature_scaler_map=config2)
+        
+        transformed1 = manager1.fit_transform(sample_timeseries_list)
+        manager2.fit_transform(sample_timeseries_list)
+        transformed2 = manager2.transform(sample_timeseries_list)
+        
+        ged_sb_idx = list(sample_timeseries_list[0].components).index("ged_sb")
+        
+        # The transformations should be different
+        vals1 = transformed1[0].all_values()[:, ged_sb_idx]
+        vals2 = transformed2[0].all_values()[:, ged_sb_idx]
+        
+        # They shouldn't be exactly equal (different scalers)
+        assert not np.allclose(vals1, vals2)

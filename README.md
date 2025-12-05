@@ -387,6 +387,3 @@ original_scale = manager.inverse_transform(predictions)
 
 - **Darts**: [unit8co/darts](https://github.com/unit8co/darts) - Time series library
 - **VIEWS**: [Violence Early-Warning System](https://viewsforecasting.org/) - Conflict forecasting platform
-- **Tweedie Distribution**: Jørgensen, B. (1987). Exponential dispersion models.
-- **Quantile Regression**: Koenker, R., & Bassett Jr, G. (1978). Regression quantiles.
-

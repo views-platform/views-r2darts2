@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_array, check_is_fitted
@@ -321,7 +322,8 @@ class FeatureScalerManager:
         """
         Fit scalers on the data and transform.
         
-        Each scaler is fit only on its assigned feature columns.
+        Each scaler is fit on ALL time series combined (not per-series) to ensure
+        consistent statistics across the entire dataset.
         
         Args:
             series_list: List of TimeSeries with features as components.
@@ -332,16 +334,67 @@ class FeatureScalerManager:
         if not self._scalers:
             return series_list
         
-        # For each scaler, extract its features, fit, and transform
-        # We need to handle this carefully to preserve TimeSeries structure
+        # First, fit all scalers on the combined data from all series
+        self._fit_scalers_on_all_series(series_list)
         
+        # Then transform each series using the fitted scalers
         result = []
         for ts in series_list:
-            transformed_ts = self._transform_single_series(ts, fit=True)
+            transformed_ts = self._transform_single_series(ts, fit=False)
             result.append(transformed_ts)
         
         self._fitted = True
         return result
+    
+    def _fit_scalers_on_all_series(self, series_list: List[TimeSeries]):
+        """
+        Fit all scalers using combined data from all time series.
+        
+        This ensures that scalers like StandardScaler compute statistics
+        (mean, std) over the entire dataset, not per-series.
+        """
+        if not series_list:
+            return
+        
+        components = list(series_list[0].components)
+        
+        for scaler_key, scaler in self._scalers.items():
+            feature_names = self._scaler_to_features.get(scaler_key, [])
+            
+            # Find indices of features belonging to this scaler
+            feature_indices = [
+                i for i, comp in enumerate(components) 
+                if comp in feature_names
+            ]
+            
+            if not feature_indices:
+                continue
+            
+            # Collect data from all series for these features
+            all_subsets = []
+            for ts in series_list:
+                arr = ts.all_values(copy=False)
+                if arr.ndim == 2:
+                    subset = arr[:, feature_indices]
+                else:  # ndim == 3 (probabilistic)
+                    subset = arr[:, feature_indices, :]
+                all_subsets.append(subset)
+            
+            # Stack all data vertically (along time dimension)
+            combined_data = np.concatenate(all_subsets, axis=0)
+            
+            # Create a single TimeSeries from combined data for fitting
+            subset_names = [components[i] for i in feature_indices]
+            # Use a dummy time index for fitting
+            dummy_times = pd.date_range('2000-01-01', periods=len(combined_data), freq='MS')
+            combined_ts = TimeSeries.from_times_and_values(
+                times=dummy_times,
+                values=combined_data.astype(np.float32),
+                columns=subset_names,
+            )
+            
+            # Fit the scaler on combined data
+            scaler.fit([combined_ts])
     
     def transform(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
         """

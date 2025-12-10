@@ -481,10 +481,11 @@ class TestFeatureScalerManager:
             rec_arr = recovered_ts.all_values()
             
             # WDI features should be recovered (with some floating point tolerance)
+            # Use decimal=4 for float32 precision (allows ~1e-4 absolute error)
             np.testing.assert_array_almost_equal(
                 orig_arr[:, wdi_gdp_idx],
                 rec_arr[:, wdi_gdp_idx],
-                decimal=5
+                decimal=4
             )
     
     def test_duplicate_feature_raises_error(self):

@@ -332,6 +332,20 @@ class ModelCatalog:
 
     def _get_transformer_model(self):
         torch.serialization.add_safe_globals([TransformerModel, LossSelector])
+        
+        # Get d_model and nhead, ensure compatibility
+        d_model = self.config.get("d_model", 128)
+        nhead = self.config.get("nhead", self.config.get("num_attention_heads", 4))
+        
+        # Validate d_model is divisible by nhead
+        if d_model % nhead != 0:
+            import logging
+            logging.warning(
+                f"d_model ({d_model}) not divisible by nhead ({nhead}). "
+                f"Adjusting nhead to {d_model // (d_model // nhead)}."
+            )
+            nhead = max(1, d_model // 32)  # Ensure at least 32 dims per head
+        
         return TransformerModel(
             input_chunk_length=self.config.get(
                 "input_chunk_length", 12 * 6
@@ -340,10 +354,8 @@ class ModelCatalog:
                 self.config["steps"]
             ),  # Output chunk length based on steps
             output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            d_model=self.config.get("d_model", 64),  # Default: 64
-            nhead=self.config.get(
-                "num_attention_heads", 4
-            ),  # Default: 4 attention heads
+            d_model=d_model,
+            nhead=nhead,
             num_encoder_layers=self.config.get(
                 "num_encoder_layers", 3
             ),  # Default: 3 encoder layers
@@ -352,9 +364,9 @@ class ModelCatalog:
             ),  # Default: 3 decoder layers
             dim_feedforward=self.config.get("dim_feedforward", 512),  # Default: 512
             dropout=self.config.get("dropout", 0.1),  # Default: 0.1
-            activation=self.config.get("activation", "ReLU"),  # Default: 'ReLU'
-            norm_type=self.config.get("norm_type", None),  # Default: None
-            batch_size=self.config.get("batch_size", 256),  # Default: 32
+            activation=self.config.get("activation", "gelu"),  # GELU more stable than ReLU
+            norm_type=self.config.get("norm_type", "LayerNorm"),  # LayerNorm CRITICAL for stability!
+            batch_size=self.config.get("batch_size", 256),  # Default: 256
             n_epochs=self.config.get("n_epochs", 2),  # Default: 100
             loss_fn=self.loss_fn,
             model_name=self.config.get("name", "TransformerModel"),  # Model name
@@ -381,7 +393,7 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),  # Default learning rate
+                "lr": self.config.get("lr", 1e-4),  # Lower default LR for transformers
                 "weight_decay": self.config.get(
                     "weight_decay", 1e-3
                 ),  # Default L2 regularization

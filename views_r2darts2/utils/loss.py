@@ -337,38 +337,63 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         )
 
     def forward(self, preds, targets):
+        # Ensure same dtype and device for numerical stability
+        device = preds.device
+        dtype = preds.dtype
+        
+        # Check for NaN/Inf in inputs and handle gracefully
+        if torch.isnan(preds).any() or torch.isinf(preds).any():
+            logger.warning("NaN or Inf detected in predictions!")
+            preds = torch.nan_to_num(preds, nan=0.0, posinf=1e6, neginf=-1e6)
+        if torch.isnan(targets).any() or torch.isinf(targets).any():
+            logger.warning("NaN or Inf detected in targets!")
+            targets = torch.nan_to_num(targets, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         # Identify non-zero targets and predictions (detach pred mask to prevent gradient flow)
         is_target_nonzero = torch.abs(targets) > self.threshold
         is_pred_nonzero = (torch.abs(preds) > self.threshold).detach()
 
-        # Base weights: prioritize non-zero targets
-        base_weights = torch.where(is_target_nonzero, self.non_zero_weight, 1.0)
+        # Base weights: prioritize non-zero targets (ensure correct dtype/device)
+        non_zero_w = torch.tensor(self.non_zero_weight, device=device, dtype=dtype)
+        one = torch.tensor(1.0, device=device, dtype=dtype)
+        base_weights = torch.where(is_target_nonzero, non_zero_w, one)
 
         # Identify error types
         false_positive_mask = ~is_target_nonzero & is_pred_nonzero  # Predicted conflict when none exists
         false_negative_mask = is_target_nonzero & ~is_pred_nonzero  # Missed a real conflict
 
-        # Apply multiplicative penalties on top of base weights
+        # Apply multiplicative penalties on top of base weights (ensure correct dtype/device)
+        fp_weight = torch.tensor(self.false_positive_weight, device=device, dtype=dtype)
+        fn_weight = torch.tensor(self.false_negative_weight, device=device, dtype=dtype)
+        
         weights = torch.where(
             false_positive_mask,
-            base_weights * self.false_positive_weight,  # e.g., 1.0 * 2.0 = 2.0
+            base_weights * fp_weight,  # e.g., 1.0 * 2.0 = 2.0
             torch.where(
                 false_negative_mask,
-                base_weights * self.false_negative_weight,  # e.g., 5.0 * 3.0 = 15.0
+                base_weights * fn_weight,  # e.g., 5.0 * 3.0 = 15.0
                 base_weights  # No error: use base weight
             ),
         )
 
         # Calculate Huber loss
         errors = targets - preds
+        delta_t = torch.tensor(self.delta, device=device, dtype=dtype)
+        abs_errors = torch.abs(errors)
         huber_loss = torch.where(
-            torch.abs(errors) <= self.delta,
+            abs_errors <= delta_t,
             0.5 * errors**2,
-            self.delta * (torch.abs(errors) - 0.5 * self.delta),
+            delta_t * (abs_errors - 0.5 * delta_t),
         )
 
-        # Apply computed weights
+        # Apply computed weights and handle potential NaN
         weighted_loss = weights * huber_loss
+        
+        # Final NaN check
+        if torch.isnan(weighted_loss).any():
+            logger.warning("NaN in weighted_loss, replacing with 0")
+            weighted_loss = torch.nan_to_num(weighted_loss, nan=0.0)
+        
         return torch.mean(weighted_loss)
 
 

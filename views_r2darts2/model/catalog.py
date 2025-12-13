@@ -131,7 +131,7 @@ class ModelCatalog:
                 "weight_decay": self.config.get("weight_decay", 1e-3),
             },
             lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,  
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_tft_model(self):
@@ -164,6 +164,7 @@ class ModelCatalog:
             # Critical training modifications
             batch_size=self.config.get("batch_size", batch_size),  # Default: 256
             loss_fn=self.loss_fn,
+            random_state=self.config.get("random_state", 42),
             model_name="TFTModel",
             norm_type="RMSNorm",  # Better for scaled outputs
             n_epochs=self.config.get("n_epochs", 2),
@@ -193,7 +194,7 @@ class ModelCatalog:
                 ),  # Default L2 regularization
             },
             lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,  
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_nbeats(self):
@@ -279,7 +280,7 @@ class ModelCatalog:
                 "weight_decay": self.config.get("weight_decay", 1e-3),
             },
             lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,  
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_rnn_model(self):
@@ -327,7 +328,7 @@ class ModelCatalog:
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
             lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,  
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_transformer_model(self):
@@ -387,7 +388,7 @@ class ModelCatalog:
                 ),  # Default L2 regularization
             },
             lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,  
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_nlinear_model(self):
@@ -439,7 +440,7 @@ class ModelCatalog:
                 ),  # Default L2 regularization
             },
             lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,  
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_dlinear_model(self):
@@ -491,7 +492,7 @@ class ModelCatalog:
                 ),  # Default L2 regularization
             },
             lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,  
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_tide_model(self):
@@ -566,5 +567,5 @@ class ModelCatalog:
                 ),  # Default L2 regularization
             },
             lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,  
+            lr_scheduler_kwargs=self.lr_scheduler_args,
         )

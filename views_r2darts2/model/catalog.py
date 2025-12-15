@@ -198,6 +198,8 @@ class ModelCatalog:
 
     def _get_nbeats(self):
         torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
+        dropout_value = self.config.get("dropout", 0.2)
+        print(f"DEBUG: N-BEATS dropout value: {dropout_value}")
         return NBEATSModel(
             input_chunk_length=self.config.get("input_chunk_length", 12 * 2),
             output_chunk_length=len(self.config["steps"]),
@@ -206,7 +208,7 @@ class ModelCatalog:
             num_stacks=self.config.get("num_stacks", 4),
             num_blocks=self.config.get("num_blocks", 2),
             num_layers=self.config.get("num_layers", 2),
-            layer_widths=self.config.get("layer_width", 128),
+            layer_widths=self.config.get("layer_widths", 128),
             activation=self.config.get("activation", "ReLU"),
             dropout=self.config.get("dropout", 0.2),
             random_state=self.config.get("random_state", 42),

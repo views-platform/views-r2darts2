@@ -66,60 +66,121 @@ def _patched_block_forward(self, x):
     return x_hat, y_hat
 
 def patch_nbeats_dropout_issue():
+
     try:
+
         _Block.__init__ = _patched_block_init
+
         _Block.forward = _patched_block_forward
+
         logger.info("Successfully patched Darts NBEATSModel.")
+
     except Exception as e:
+
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
-# --- Sanity Check Script ---
 
-# 1. Apply the monkey-patch
+
+# Apply the monkey-patch on import
+
 patch_nbeats_dropout_issue()
 
-# 2. Define model parameters
-input_chunk_length = 20
-output_chunk_length = 5
-# Use a fixed random_state to ensure deterministic initialization
-random_seed = 42
-
-# Create a dummy TimeSeries to trigger model creation
-dummy_data = np.random.randn(input_chunk_length + output_chunk_length)
-dummy_series = TimeSeries.from_values(dummy_data)
 
 
-# 3. Create a model with layer_width=64
-model64 = NBEATSModel(
-    input_chunk_length=input_chunk_length,
-    output_chunk_length=output_chunk_length,
-    layer_widths=64,
-    n_epochs=1, # not training, just instantiating
-    random_state=random_seed
-)
-model64.fit(dummy_series, verbose=False)
+if __name__ == '__main__':
+
+    # --- Sanity Check Script ---
 
 
-# 4. Create a model with layer_width=128
-model128 = NBEATSModel(
-    input_chunk_length=input_chunk_length,
-    output_chunk_length=output_chunk_length,
-    layer_widths=128,
-    n_epochs=1, # not training, just instantiating
-    random_state=random_seed
-)
-model128.fit(dummy_series, verbose=False)
 
-# 5. Get the total number of parameters for each model
-params_total64 = sum(p.numel() for p in model64.model.parameters())
-params_total128 = sum(p.numel() for p in model128.model.parameters())
+    # 2. Define model parameters
 
-print(f"Total parameters for model with layer_width=64: {params_total64}")
-print(f"Total parameters for model with layer_width=128: {params_total128}")
+    input_chunk_length = 20
 
-if params_total64 == params_total128:
-    print("\nCRITICAL ERROR: Models have the exact same number of parameters!")
-    print("This confirms the `layer_widths` parameter is not being used correctly during model creation.")
-else:
-    print("\nSUCCESS: Models have a different number of parameters, as expected.")
-    print("This suggests the problem may lie in your training/evaluation script, not the model architecture itself.")
+    output_chunk_length = 5
+
+    # Use a fixed random_state to ensure deterministic initialization
+
+    random_seed = 42
+
+
+
+    # Create a dummy TimeSeries to trigger model creation
+
+    dummy_data = np.random.randn(input_chunk_length + output_chunk_length)
+
+    dummy_series = TimeSeries.from_values(dummy_data)
+
+
+
+
+
+    # 3. Create a model with layer_width=64
+
+    model64 = NBEATSModel(
+
+        input_chunk_length=input_chunk_length,
+
+        output_chunk_length=output_chunk_length,
+
+        layer_widths=64,
+
+        n_epochs=1, # not training, just instantiating
+
+        random_state=random_seed
+
+    )
+
+    model64.fit(dummy_series, verbose=False)
+
+
+
+
+
+    # 4. Create a model with layer_width=128
+
+    model128 = NBEATSModel(
+
+        input_chunk_length=input_chunk_length,
+
+        output_chunk_length=output_chunk_length,
+
+        layer_widths=128,
+
+        n_epochs=1, # not training, just instantiating
+
+        random_state=random_seed
+
+    )
+
+    model128.fit(dummy_series, verbose=False)
+
+
+
+    # 5. Get the total number of parameters for each model
+
+    params_total64 = sum(p.numel() for p in model64.model.parameters())
+
+    params_total128 = sum(p.numel() for p in model128.model.parameters())
+
+
+
+    print(f"Total parameters for model with layer_width=64: {params_total64}")
+
+    print(f"Total parameters for model with layer_width=128: {params_total128}")
+
+
+
+    if params_total64 == params_total128:
+
+        print("\nCRITICAL ERROR: Models have the exact same number of parameters!")
+
+        print("This confirms the `layer_widths` parameter is not being used correctly during model creation.")
+
+    else:
+
+        print("\nSUCCESS: Models have a different number of parameters, as expected.")
+
+        print("This suggests the problem may lie in your training/evaluation script, not the model architecture itself.")
+
+

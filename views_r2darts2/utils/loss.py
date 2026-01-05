@@ -5,6 +5,17 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# CHANGES MADE BY GEMINI CLI AGENT:
+# - Added the following standard PyTorch loss functions to LossSelector.get_loss_function:
+#   - MSELoss (torch.nn.MSELoss)
+#   - L1Loss (torch.nn.L1Loss)
+#   - HuberLoss (torch.nn.HuberLoss)
+#   - SmoothL1Loss (torch.nn.SmoothL1Loss)
+#   - PoissonNLLLoss (torch.nn.PoissonNLLLoss)
+# - The docstring for LossSelector.get_loss_function was updated to reflect these additions.
+#
+# This comment is added to facilitate updating the test suite for these new loss functions.
+
 
 class LossSelector:
     @staticmethod
@@ -18,6 +29,11 @@ class LossSelector:
                 - "TimeAwareWeightedHuberLoss"
                 - "SpikeFocalLoss"
                 - "WeightedPenaltyHuberLoss"
+                - "MSELoss"
+                - "L1Loss"
+                - "HuberLoss"
+                - "SmoothL1Loss"
+                - "PoissonNLLLoss"
             **kwargs: Arbitrary keyword arguments to pass to the loss function's constructor.
                 Only arguments matching the constructor's parameters will be used.
 
@@ -39,6 +55,12 @@ class LossSelector:
             "TweedieLoss": TweedieLoss,
             "AsymmetricQuantileLoss": AsymmetricQuantileLoss,
             "ZeroInflatedLoss": ZeroInflatedLoss,
+            # Standard PyTorch losses
+            "MSELoss": torch.nn.MSELoss,
+            "L1Loss": torch.nn.L1Loss,
+            "HuberLoss": torch.nn.HuberLoss,
+            "SmoothL1Loss": torch.nn.SmoothL1Loss,
+            "PoissonNLLLoss": torch.nn.PoissonNLLLoss,
         }
 
         if loss_name not in loss_classes:

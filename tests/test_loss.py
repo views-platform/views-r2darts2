@@ -62,6 +62,29 @@ class TestLossSelector:
         assert isinstance(loss, WeightedHuberLoss)
         assert loss.delta == 1.0
 
+    def test_get_mse_loss(self):
+        loss = LossSelector.get_loss_function("MSELoss")
+        assert isinstance(loss, torch.nn.MSELoss)
+
+    def test_get_l1_loss(self):
+        loss = LossSelector.get_loss_function("L1Loss")
+        assert isinstance(loss, torch.nn.L1Loss)
+
+    def test_get_huber_loss_standard(self):
+        loss = LossSelector.get_loss_function("HuberLoss", delta=0.7)
+        assert isinstance(loss, torch.nn.HuberLoss)
+        assert loss.delta == 0.7
+
+    def test_get_smooth_l1_loss(self):
+        loss = LossSelector.get_loss_function("SmoothL1Loss", beta=0.6)
+        assert isinstance(loss, torch.nn.SmoothL1Loss)
+        assert loss.beta == 0.6
+
+    def test_get_poisson_nll_loss(self):
+        loss = LossSelector.get_loss_function("PoissonNLLLoss", log_input=False)
+        assert isinstance(loss, torch.nn.PoissonNLLLoss)
+        assert loss.log_input == False
+
 
 class TestWeightedHuberLoss:
     @pytest.fixture
@@ -338,3 +361,51 @@ class TestLossIntegration:
         good_loss = loss_fn(good_preds, targets)
 
         assert good_loss.item() < bad_loss.item()
+
+
+class TestTweedieLoss:
+    @pytest.fixture
+    def loss_fn(self):
+        # Placeholder for TweedieLoss instance
+        pass
+
+    def test_initialization(self):
+        pass
+
+    def test_forward_pass(self):
+        pass
+
+    def test_output_shape(self):
+        pass
+
+
+class TestAsymmetricQuantileLoss:
+    @pytest.fixture
+    def loss_fn(self):
+        # Placeholder for AsymmetricQuantileLoss instance
+        pass
+
+    def test_initialization(self):
+        pass
+
+    def test_forward_pass(self):
+        pass
+
+    def test_output_shape(self):
+        pass
+
+
+class TestZeroInflatedLoss:
+    @pytest.fixture
+    def loss_fn(self):
+        # Placeholder for ZeroInflatedLoss instance
+        pass
+
+    def test_initialization(self):
+        pass
+
+    def test_forward_pass(self):
+        pass
+
+    def test_output_shape(self):
+        pass

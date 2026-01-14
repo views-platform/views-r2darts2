@@ -452,7 +452,7 @@ class DartsForecaster:
         path = str(path)
         scaler_path = path + ".scalers"
         try:
-            scaler_data = torch.load(scaler_path, map_location='cpu')
+            scaler_data = torch.load(scaler_path, map_location='cpu', weights_only=False)
             self.target_scaler = scaler_data['target_scaler']
             self.feature_scaler = scaler_data['feature_scaler']
             self.scaler_fitted = scaler_data['scaler_fitted']

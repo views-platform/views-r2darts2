@@ -6,6 +6,8 @@ from unittest.mock import Mock, MagicMock, patch, call
 from pathlib import Path
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
+from sklearn.preprocessing import StandardScaler
+from darts.dataprocessing.transformers import Scaler
 from views_r2darts2.model.forecaster import DartsForecaster
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
 
@@ -54,15 +56,18 @@ def forecaster(mock_dataset, mock_model, partition_dict):
 
 @pytest.fixture
 def forecaster_with_scalers(mock_dataset, mock_model, partition_dict):
-    """Create a DartsForecaster with scalers."""
-    with patch('views_r2darts2.model.forecaster.ScalerSelector') as mock_scaler_selector:
-        mock_scaler_selector.get_scaler.return_value = Mock()
+    """Create a DartsForecaster with real, picklable scalers."""
+    # Use a real scaler that can be pickled by torch.save
+    real_scaler = Scaler(StandardScaler())
+    
+    # We patch the selector to return our real scaler instance
+    with patch('views_r2darts2.model.forecaster.ScalerSelector.get_scaler', return_value=StandardScaler()) as mock_get_scaler:
         forecaster = DartsForecaster(
             dataset=mock_dataset,
             model=mock_model,
             partition_dict=partition_dict,
             feature_scaler="StandardScaler",
-            target_scaler="RobustScaler"
+            target_scaler="StandardScaler" # Using the same for simplicity
         )
     return forecaster
 
@@ -91,15 +96,15 @@ class TestDartsForecaster:
                 target_scaler="RobustScaler"
             )
             
-            assert forecaster._feature_scaler == "StandardScaler"
-            assert forecaster._target_scaler == "RobustScaler"
+            assert forecaster._feature_scaler_cfg == "StandardScaler"
+            assert forecaster._target_scaler_cfg == "RobustScaler"
             assert forecaster.feature_scaler is not None
             assert forecaster.target_scaler is not None
 
     def test_initialization_without_scalers(self, forecaster):
         """Test initialization without scalers."""
-        assert forecaster._feature_scaler is None
-        assert forecaster._target_scaler is None
+        assert forecaster._feature_scaler_cfg is None
+        assert forecaster._target_scaler_cfg is None
         assert forecaster.feature_scaler is None
         assert forecaster.target_scaler is None
 
@@ -423,49 +428,99 @@ class TestDartsForecaster:
             assert 'feature_scaler' in call_args[0][0]
             assert 'scaler_fitted' in call_args[0][0]
 
-    def test_load_model(self, forecaster_with_scalers, tmp_path):
-        """Test loading model and scalers."""
+    def test_load_model(self, forecaster_with_scalers, mock_dataset, partition_dict, tmp_path):
+        """
+        Test loading model restores a FUNCTIONAL scaler.
+        This is a robust behavioral test, not a fragile internal state check.
+        It verifies that a scaler fitted and saved can be loaded and used
+        to correctly perform an inverse_transform, which is its core function.
+        """
         model_path = tmp_path / "model.pt"
-        
-        mock_scaler_data = {
-            'target_scaler': Mock(),
-            'feature_scaler': Mock(),
-            'scaler_fitted': True
-        }
-        
-        forecaster_with_scalers.model.load = Mock(return_value=forecaster_with_scalers.model)
-        
-        with patch('torch.load', return_value=mock_scaler_data):
-            forecaster_with_scalers.load_model(str(model_path))
-            
-            assert forecaster_with_scalers.scaler_fitted is True
-            forecaster_with_scalers.model.load.assert_called_once_with(path=str(model_path))
+
+        # 1. ARRANGE: Create known data and a new TimeSeries for it.
+        # We need to test the target_scaler, so we only need one component.
+        mock_dataset.targets = ["target1"]
+        known_data = np.array([[[10.0]], [[20.0]], [[30.0]]])
+        known_ts = TimeSeries.from_values(known_data)
+
+        # 2. ACT (Fit, Save, Load)
+        # Fit the scaler on our original forecaster and get the transformed data
+        transformed_ts = forecaster_with_scalers.target_scaler.fit_transform(known_ts)
+        forecaster_with_scalers.scaler_fitted = True
+
+        # Mock the model's save/load methods since we only test scaler serialization
+        forecaster_with_scalers.model.save = Mock()
+
+        # Save the forecaster state (including the fitted scaler)
+        forecaster_with_scalers.save_model(str(model_path))
+
+        # Create a new forecaster instance to load the state into
+        # The mock model's __class__ needs a 'load' method for this to work
+        forecaster_with_scalers.model.__class__.load = Mock(return_value=forecaster_with_scalers.model)
+        new_forecaster = DartsForecaster(
+            dataset=mock_dataset,
+            model=forecaster_with_scalers.model,
+            partition_dict=partition_dict,
+            target_scaler=forecaster_with_scalers._target_scaler_cfg,
+            feature_scaler=forecaster_with_scalers._feature_scaler_cfg,
+        )
+        new_forecaster.load_model(str(model_path))
+
+        # 3. ASSERT
+        # The critical part: use the loaded scaler to perform a round-trip
+        round_trip_ts = new_forecaster.target_scaler.inverse_transform(transformed_ts)
+
+        # The inverse transform should return the original data, proving the
+        # scaler's fitted state was correctly saved and loaded.
+        assert new_forecaster.scaler_fitted is True
+        assert np.allclose(known_ts.values(), round_trip_ts.values())
 
     def test_load_model_missing_scalers(self, forecaster_with_scalers, tmp_path):
         """Test loading model when scaler file is missing."""
         model_path = tmp_path / "model.pt"
-        
-        with patch('torch.load', side_effect=FileNotFoundError):
-            with pytest.raises(FileNotFoundError):
-                forecaster_with_scalers.load_model(str(model_path))
+
+        # The model file itself might exist, but the scaler file (`.pt.scalers`) won't.
+        # DartsForecaster.load_model should raise FileNotFoundError in this case.
+        with open(model_path, "w") as f:
+            f.write("dummy model data")
+
+        forecaster_with_scalers.model.__class__.load = Mock()
+
+        with pytest.raises(FileNotFoundError):
+            forecaster_with_scalers.load_model(str(model_path))
+
+        # Ensure we didn't even attempt to load the Darts model
+        forecaster_with_scalers.model.__class__.load.assert_not_called()
 
     def test_load_model_moves_to_device(self, forecaster_with_scalers, tmp_path):
-        """Test that loaded model is moved to correct device."""
+        """
+        Test that `load_model` respects the forecaster's device setting.
+        This test verifies that the `map_location` argument is correctly passed
+        to the underlying Darts model's load method.
+        """
         model_path = tmp_path / "model.pt"
-        
-        mock_scaler_data = {
-            'target_scaler': Mock(),
-            'feature_scaler': Mock(),
-            'scaler_fitted': True
-        }
-        
-        forecaster_with_scalers.model.load = Mock(return_value=forecaster_with_scalers.model)
         forecaster_with_scalers.device = 'cuda'
-        
-        with patch('torch.load', return_value=mock_scaler_data):
-            forecaster_with_scalers.load_model(str(model_path))
-            
-            forecaster_with_scalers.model.to_device.assert_called()
+
+        # Mock the model's save method
+        forecaster_with_scalers.model.save = Mock()
+        # Mock the class's load method to return a model instance
+        forecaster_with_scalers.model.__class__.load = Mock(return_value=forecaster_with_scalers.model)
+
+        # 1. Save the model first (the contents don't matter for this test)
+        forecaster_with_scalers.scaler_fitted = True
+        forecaster_with_scalers.save_model(str(model_path))
+
+        # 2. Now, load the model
+        forecaster_with_scalers.load_model(str(model_path))
+
+        # 3. ASSERT
+        # The main point of this test: assert that the underlying Darts `load`
+        # was called with the correct `map_location`.
+        forecaster_with_scalers.model.__class__.load.assert_called_once_with(path=str(model_path), map_location='cuda')
+
+        # Also verify that the `to_device` method was called after loading
+        # to ensure the model is on the correct device.
+        forecaster_with_scalers.model.to_device.assert_called_with('cuda')
 
     def test_predict_with_kwargs(self, forecaster):
         """Test prediction with additional kwargs."""

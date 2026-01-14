@@ -18,7 +18,7 @@
 ## Key Features
 
 - 🚀 **Production-Ready Integration**: Seamlessly integrates with the VIEWS pipeline ecosystem
-- � **Zero-Inflated Data Handling**: Specialized scalers and loss functions for conflict data
+-  **Zero-Inflated Data Handling**: Specialized scalers and loss functions for conflict data
 - 🧠 **Multiple Model Architectures**: Supports 8+ cutting-edge forecasting models
 - 📈 **Probabilistic Forecasting**: Quantifies uncertainty through multiple samples
 - ⚙️ **Hyperparameter Management**: Centralized configuration for all models
@@ -104,4 +104,3 @@ For GPU support, install the correct PyTorch version for your CUDA setup. See [P
 - **Data Shape Mismatches:** Check input dimensions and required columns.
 - **Scaling Issues:** Verify scalers are fitted before prediction.
 - **Getting Help:** Open an issue on GitHub or contact maintainers.
-

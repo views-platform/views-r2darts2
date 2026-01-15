@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import inspect
 import logging
+from typing import Tuple, Union, Dict, Any, Type
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,10 @@ class LossSelector:
                 - "TimeAwareWeightedHuberLoss"
                 - "SpikeFocalLoss"
                 - "WeightedPenaltyHuberLoss"
+                - "TweedieLoss"
+                - "AsymmetricQuantileLoss"
+                - "ZeroInflatedLoss"
+                - "ShrinkageLoss"
                 - "MSELoss"
                 - "L1Loss"
                 - "HuberLoss"
@@ -46,7 +51,7 @@ class LossSelector:
         Example:
             >>> loss = get_loss_function("WeightedHuberLoss", delta=1.0, weight=0.5)
         """
-        # Map loss names to their classes
+        # Standard PyTorch losses
         loss_classes = {
             "WeightedHuberLoss": WeightedHuberLoss,
             "TimeAwareWeightedHuberLoss": TimeAwareWeightedHuberLoss,
@@ -55,6 +60,7 @@ class LossSelector:
             "TweedieLoss": TweedieLoss,
             "AsymmetricQuantileLoss": AsymmetricQuantileLoss,
             "ZeroInflatedLoss": ZeroInflatedLoss,
+            "ShrinkageLoss": ShrinkageLoss,
             # Standard PyTorch losses
             "MSELoss": torch.nn.MSELoss,
             "L1Loss": torch.nn.L1Loss,
@@ -75,6 +81,61 @@ class LossSelector:
 
         return cls(**valid_kwargs)
 
+
+class ShrinkageLoss(torch.nn.Module):
+    """
+    Implementation of the Shrinkage Loss for regression, as described in
+    "Deep Object Tracking with Shrinkage Loss" by Lu et al. (2018).
+
+    This loss function is designed to handle data imbalance in regression tasks by
+    penalizing the importance of easy samples (those with small errors),
+    allowing the model to focus more on hard samples. It is particularly effective
+    for zero-inflated data where the model might otherwise be biased towards
+    predicting zeros.
+
+    The loss is calculated as:
+    LS = (exp(targets) * (preds - targets)**2) / (1 + exp(a * (c - |preds - targets|)))
+
+    Args:
+        a (float, optional): Controls the shrinkage speed. Higher values lead to
+            faster shrinkage of the loss for easy samples. Defaults to 10.0,
+            as recommended in the paper.
+        c (float, optional): Represents the threshold (localization) of what is
+            considered an "easy" sample. Errors below this value will be more
+            heavily penalized (i.e., their contribution to the loss will be shrunk).
+            Defaults to 0.2, as recommended for a target range of [0, 1].
+
+    Returns:
+        torch.Tensor: A scalar tensor representing the mean Shrinkage Loss over the batch.
+    """
+
+    def __init__(self, a: float = 10.0, c: float = 0.2):
+        super().__init__()
+        self.a = a
+        self.c = c
+        logger.info(
+            "\n{:<25} {:<10}\n{:<25} {:<10}".format(
+                "a (shrinkage speed)",
+                self.a,
+                "c (easy sample threshold)",
+                self.c,
+            )
+        )
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        l = torch.abs(preds - targets)
+        # The denominator is the core of the shrinkage mechanism.
+        # For small l (easy samples), exp() is large, so the denominator is large, shrinking the loss.
+        # For large l (hard samples), exp() is small, so the denominator is close to 1, leaving the loss largely unchanged.
+        shrinkage_factor = 1 + torch.exp(self.a * (self.c - l))
+        
+        # The numerator contains the squared error and an importance factor exp(targets).
+        # This gives higher weight to larger target values, which is useful in cases
+        # where missing a high-value event is more critical than missing a low-value one.
+        base_loss = torch.exp(targets) * l**2
+
+        loss = base_loss / shrinkage_factor
+        return torch.mean(loss)
 
 class WeightedHuberLoss(torch.nn.Module):
     """

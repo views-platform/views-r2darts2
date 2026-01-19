@@ -71,9 +71,9 @@ The loss is a weighted sum of two distinct loss components: a binary classificat
 
 ## 6. Practical Guidance & Parameter Tuning
 
-- **`delta` Parameter:** Similar to other Huber-type losses, the `delta` parameter of the Pseudo-Huber component is highly sensitive to the scale of the pre-processed data. If your data is scaled to `[0, 1]`, the default `delta=0.5` is likely too large, causing most errors to be treated quadratically (MSE-like) instead of linearly (MAE-like).
-    - **Recommendation:** For `[0, 1]` scaled data, explore a smaller range for `delta`, such as **`[0.05, 0.1, 0.25]`**.
-- **`zero_weight` and `count_weight`:** These parameters control the balance between the zero-inflation (classification) and count (regression) components. Given the often high zero-inflation in conflict data, careful tuning is required to prevent one component from dominating the other.
-    - **Recommendation:** Explore a wider range for both `zero_weight` and `count_weight`, such as **`[0.5, 1.0, 2.0, 5.0]`**, to find the optimal balance for your dataset.
-- **Hardcoded Sigmoid Multiplier (`sigmoid(-10 * preds)`):** The `10x` multiplier within the `sigmoid` function for `p_zero` makes the zero-component very sensitive to small changes in `preds`. This aggressive scaling means that even small differences in raw predictions can lead to large changes in the predicted probability of being zero. While effective for steep transitions, it can make initial training unstable or difficult to optimize.
-    - **Consideration:** If the loss proves highly unstable, making this multiplier a configurable hyperparameter might be beneficial, but it would require modifying the loss function implementation itself. For now, be aware of its aggressive nature.
+- **CRITICAL: The `delta` parameter of the Pseudo-Huber component is highly sensitive to the scale of the data it receives after all pre-processing transformations.** A `delta` value that is appropriate for raw data will be unstable for data scaled to a `[0, 1]` range, and vice-versa.
+- The `zero_weight` and `count_weight` parameters balance the two components of the loss.
+- The hardcoded `10x` multiplier in the `sigmoid(-10 * preds)` for the zero-component makes it very sensitive.
+
+- For detailed recommendations and a matrix of suggested `delta` ranges for common pipelines, please refer to the central guide:
+  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**

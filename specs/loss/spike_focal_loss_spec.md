@@ -65,6 +65,7 @@ The loss is the mean of the element-wise focal-weighted squared error.
 
 ## 6. Practical Guidance & Parameter Tuning
 
-- **Critical: `spike_threshold` Parameter:** The `spike_threshold` parameter is the most important hyperparameter for this loss function, and its value is entirely dependent on the scale of the pre-processed target data.
-- The `is_spike` condition is defined as `targets > spike_threshold`. If your data pipeline scales targets to a `[0, 1]` range (e.g., using `MinMaxScaler`), then **any `spike_threshold` greater than 1 will be non-functional**, as the condition will never be met. This disables the core mechanism of the loss function.
-- **Recommendation:** For data scaled to `[0, 1]`, the `spike_threshold` should be set to a high quantile of the expected data distribution to isolate only the most extreme events. A good starting range to explore is **`[0.75, 0.9, 0.95]`**.
+- **CRITICAL: The `spike_threshold` parameter is entirely dependent on the scale of the data it receives after all pre-processing transformations.** A `spike_threshold` that is appropriate for raw count data will be non-functional for data scaled to a `[0, 1]` range.
+- **The `is_spike` condition (`targets > spike_threshold`) will never be met if the threshold is set outside the bounds of the transformed data, disabling the core mechanism of this loss function.**
+- For detailed recommendations and a matrix of suggested `spike_threshold` ranges for common pipelines, please refer to the central guide:
+  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**

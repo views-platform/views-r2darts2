@@ -66,7 +66,7 @@ The implementation uses a common simplified form which is equivalent up to scali
 
 ## 6. Practical Guidance & Parameter Tuning
 
-- The Tweedie loss is specifically designed to handle zero-inflated data through its `p` parameter. A `p` value between 1 and 2 creates a Compound Poisson-Gamma distribution that has a positive probability mass at exactly zero.
-- Because the loss function has a built-in statistical mechanism for handling zeros, the `non_zero_weight` parameter should be tuned with care.
-- Applying a large `non_zero_weight` might interfere with the natural shape of the loss function and may not always improve performance.
-- **Recommendation:** When tuning, it is highly recommended to include `1.0` in the search space for `non_zero_weight`. This allows the sweep to test the "pure" statistical loss against versions with additional artificial weighting on the non-zero targets.
+- **`p` Parameter:** The `p` parameter (power) is the key to this loss, defining the distribution's shape. It must be in `(1, 2)`. Values closer to 1 are more Poisson-like, while values closer to 2 are more Gamma-like. `p=1.5` is a common starting point. This parameter is scale-invariant.
+- **`non_zero_weight` Parameter:** Since the loss already handles zeros statistically, this weight should be tuned with care. It is recommended to test `1.0` (no additional weight) as a baseline.
+- For more detailed guidance, see the central guide:
+  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**

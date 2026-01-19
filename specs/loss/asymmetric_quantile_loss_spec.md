@@ -60,9 +60,7 @@ The implementation uses `(tau - 1) * e` for the overestimation case, which is eq
 
 ## 6. Practical Guidance & Parameter Tuning
 
-- **`tau` Parameter:** The `tau` parameter (must be between 0 and 1) directly controls the asymmetry of the penalties for underestimation versus overestimation.
-    - If `tau > 0.5`, underestimation is penalized more heavily than overestimation (e.g., `tau=0.75` means underestimation is penalized 3x more than overestimation). This is typically desired in conflict forecasting.
-    - If `tau < 0.5`, overestimation is penalized more heavily.
-    - If `tau = 0.5`, the loss becomes symmetric, equivalent to `0.5 * MAE`.
-- **`non_zero_weight` Parameter:** This parameter applies an additional weighting to non-zero targets. While useful for some losses, quantile loss inherently handles asymmetric costs through `tau`. Adding `non_zero_weight` might be redundant or could interfere with the desired statistical properties.
-    - **Recommendation:** When tuning, it is highly recommended to include `1.0` in the search space for `non_zero_weight`. This allows the sweep to test the "pure" quantile loss against versions with additional artificial weighting on the non-zero targets.
+- **`tau` Parameter:** The `tau` parameter (must be between 0 and 1) directly controls the asymmetry of the penalties. A `tau > 0.5` penalizes underestimation more heavily. This parameter is scale-invariant.
+- **`non_zero_weight` Parameter:** This applies an additional weight to non-zero targets. It should be tuned with care, and `1.0` (no extra weight) should be tested as a baseline.
+- For more detailed guidance, see the central guide:
+  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**

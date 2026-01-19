@@ -57,10 +57,11 @@ The weight `w` for each sample is determined by the target value:
 - The loss is always non-negative.
 - The loss is convex and minimized at `preds = targets`.
 
+- The loss is convex and minimized at `preds = targets`.
+
 ## 6. Practical Guidance & Parameter Tuning
 
-- **Critical: `delta` Parameter:** The `delta` parameter is highly sensitive to the scale of the pre-processed data that the loss function receives.
-- If your data pipeline includes transformations that scale data to a `[0, 1]` range, the default `delta` values often used (e.g., 0.5, 1.0) are typically too large. This can cause most errors to fall into the quadratic (MSE-like) part of the loss, leading to instability when combined with `non_zero_weight`.
-- **Recommendation:** For data scaled to `[0, 1]`, start with a much smaller `delta` to ensure the robust, linear part of the Huber loss is properly engaged for meaningful errors. A good starting range to explore for `delta` is **`[0.05, 0.1, 0.25]`**.
-- **`non_zero_weight`:** This parameter controls the importance given to non-zero target events. Experiment with values from `[2.0, 5.0, 10.0]` or higher, depending on the severity of false negatives versus false positives in your application.
-- **`zero_threshold`:** This threshold defines what is considered a "zero" target. It should be chosen carefully based on the smallest meaningful non-zero value in your scaled target data. The default `0.01` is often appropriate for `[0, 1]` scaled data.
+- **CRITICAL: The `delta` parameter is highly sensitive to the scale of the data it receives after all pre-processing transformations.** A `delta` value that is appropriate for raw data will be unstable for data scaled to a `[0, 1]` range, and vice-versa.
+
+- **Recommendation:** Always tune `delta` based on your specific data pipeline. For detailed recommendations and a matrix of suggested `delta` ranges for common pipelines, please refer to the central guide:
+  - **[Loss Function Pipeline Tuning Guide](../../specs/loss_function_tuning_guide.md)**

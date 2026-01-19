@@ -68,7 +68,7 @@ For a sequence of length `seq_len`, the weight at time step `i` (from 0 to `seq_
 
 ## 6. Practical Guidance & Parameter Tuning
 
-- **Critical:** The `delta` parameter is highly sensitive to the scale of the pre-processed data that the loss function receives.
-- If your data pipeline includes transformations that scale data to a `[0, 1]` range, the default `delta` values used in some sweeps (e.g., 0.5, 1.0) may be too large. This can cause the loss to behave like a weighted MSE instead of a robust Huber loss, leading to instability.
-- **Recommendation:** For data scaled to `[0, 1]`, start with a much smaller `delta` to ensure the robust, linear part of the loss is engaged for meaningful errors. A good starting range to explore for `delta` is **`[0.05, 0.1, 0.25]`**.
-- The `decay_factor` controls how much to penalize older errors. A value close to 1.0 (e.g., 0.99) results in very little decay, while a smaller value (e.g., 0.8) decays older errors more aggressively.
+- **CRITICAL: The `delta` parameter is highly sensitive to the scale of the data it receives after all pre-processing transformations.** A `delta` value that is appropriate for raw data will be unstable for data scaled to a `[0, 1]` range, and vice-versa.
+- The `decay_factor` controls how much to penalize older errors. A value close to 1.0 (e.g., 0.99) results in very little decay.
+- For detailed recommendations and a matrix of suggested `delta` ranges for common pipelines, please refer to the central guide:
+  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**

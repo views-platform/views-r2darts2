@@ -49,6 +49,7 @@ The loss is calculated as:
 
 ## 6. Practical Guidance & Parameter Tuning
 
-- **Tuning `c` (Threshold):** The `c` parameter is the most critical to tune. It defines what the model considers an "easy" vs. a "hard" sample. Its value should be set relative to the expected distribution of errors (`|preds - targets|`) on the pre-processed (e.g., log-transformed and scaled) data. A good starting point is to set `c` to be near the median or 75th percentile of the observed errors during initial training. If `c` is too high, all samples will be treated as "easy"; if too low, all will be "hard", defeating the purpose of the loss.
-- **Tuning `a` (Speed):** The `a` parameter controls how aggressively the loss for easy samples is "shrunk." A very high `a` can cause the gradients for easy samples to vanish quickly, preventing the model from learning from them. A lower `a` provides a gentler shrinkage. This is a trade-off that should be explored via hyperparameter sweeps.
-- **`importance_weight` Term:** Note that the `exp(targets)` term adds an additional weight based on the magnitude of the target value itself. Since the model's targets are typically log-transformed and scaled to `[0, 1]`, this results in a weight multiplier between `1.0` and `2.718`. This gives a slight priority to predicting larger events correctly.
+- **CRITICAL: The `c` (error threshold) parameter is highly sensitive to the scale of the errors (`|preds-targets|`) produced by your specific data pipeline.** An effective `c` should be set relative to the distribution of errors you expect.
+- **The `a` (shrinkage speed) parameter controls the aggressiveness of the shrinkage. A very high `a` can cause vanishing gradients for easy samples.**
+- For detailed recommendations and a matrix of suggested `c` ranges for common pipelines, please refer to the central guide:
+  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**

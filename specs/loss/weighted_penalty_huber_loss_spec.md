@@ -73,7 +73,7 @@ This leads to the following weight outcomes:
 
 ## 6. Practical Guidance & Parameter Tuning
 
-- **Critical:** The `delta` parameter is highly sensitive to the scale of the pre-processed data that the loss function receives.
-- If your data pipeline includes transformations (e.g., `log1p`) followed by a scaler (e.g., `MinMaxScaler` that scales data to `[0, 1]`), the errors seen by the loss function will be in that same `[0, 1]` range.
-- In this scenario, the default `delta=0.5` may be too large. A large `delta` will cause most errors to fall into the quadratic (MSE-like) part of the loss, which can lead to instability when combined with high penalty weights.
-- **Recommendation:** For data scaled to `[0, 1]`, start with a much smaller `delta` to ensure the robust, linear part of the loss is engaged for meaningful errors. A good starting range to explore for `delta` is **`[0.05, 0.1, 0.25]`**.
+- **CRITICAL: The `delta` parameter is highly sensitive to the scale of the data it receives after all pre-processing transformations.** A `delta` value that is appropriate for raw data will be unstable for data scaled to a `[0, 1]` range, and vice-versa.
+- The various weight parameters (`non_zero_weight`, `false_positive_weight`, `false_negative_weight`) also must be tuned carefully to balance the costs of different error types.
+- For detailed recommendations and a matrix of suggested `delta` ranges for common pipelines, please refer to the central guide:
+  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**

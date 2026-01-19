@@ -114,12 +114,188 @@ Apply different scalers to different feature groups based on their data characte
 }
 ```
 
+### 🔗 Chained Scalers
+
+For complex data distributions, a single scaler may not be enough. **Chained scalers** allow you to apply multiple transformations sequentially, combining the benefits of each.
+
+#### Why Chain Scalers?
+
+Consider fatality data:
+1. **Zero-inflated**: Most observations are 0
+2. **Heavy-tailed**: Rare mass atrocity events (1000+ deaths)
+3. **Need bounded output**: Neural networks train better with bounded inputs
+
+A single `AsinhTransform` handles zeros and compresses outliers, but the output range varies. Adding `MinMaxScaler` afterwards bounds the output to [0, 1]:
+
+```
+Raw data:     [0, 0, 1, 5, 10, 1000, 0, 3]
+                    ↓ AsinhTransform
+Asinh output: [0, 0, 0.88, 2.31, 2.99, 7.60, 0, 1.82]
+                    ↓ MinMaxScaler  
+Final output: [0, 0, 0.12, 0.30, 0.39, 1.0, 0, 0.24]
+```
+
+#### Chain Syntax
+
+Use the `->` operator to chain scalers. Transforms are applied **left to right**:
+
+```python
+# Single chain for target
+"target_scaler": "AsinhTransform->StandardScaler"
+
+# Feature-specific chains in feature_scaler_map
+"feature_scaler_map": {
+    "AsinhTransform->MinMaxScaler": ["ged_sb", "ged_ns", "acled_sb"],
+    "LogTransform->StandardScaler": ["wdi_ny_gdp_mktp_kd"],
+    "SqrtTransform->MinMaxScaler": ["wdi_sp_dyn_imrt_fe_in"],
+}
+```
+
+#### How It Works
+
+**Forward transform** (during training):
+```
+X → Scaler₁.fit_transform(X) → Scaler₂.fit_transform(X') → ... → X_scaled
+```
+
+**Inverse transform** (during prediction):
+```
+X_scaled → Scaler_n.inverse_transform(X) → ... → Scaler₁.inverse_transform(X') → X_original
+```
+
+The inverse is applied in **reverse order** to correctly recover the original data.
+
+#### Mathematical Verification
+
+For `AsinhTransform->StandardScaler`:
+
+```python
+# Forward: X → asinh(X) → standardize(asinh(X))
+X_asinh = np.arcsinh(X)                    # Step 1: Asinh
+X_scaled = (X_asinh - μ) / σ               # Step 2: Standardize
+
+# Inverse: X_scaled → unstandardize → sinh
+X_asinh_recovered = X_scaled * σ + μ       # Step 1: Unstandardize
+X_recovered = np.sinh(X_asinh_recovered)   # Step 2: Sinh (inverse of asinh)
+
+# X_recovered == X (within floating-point precision)
+```
+
+#### Complete Configuration Example
+
+```python
+# config_hyperparameters.py
+def get_hp_config():
+    return {
+        "steps": [*range(1, 37)],
+        "input_chunk_length": 36,
+        "output_chunk_shift": 0,
+        
+        # Target scaling: asinh to handle zeros, then standardize
+        "target_scaler": "AsinhTransform->StandardScaler",
+        
+        # No global feature scaler - using feature_scaler_map instead
+        "feature_scaler": None,
+        
+        # Feature-specific chained scalers
+        "feature_scaler_map": {
+            # Zero-inflated counts: asinh + bounded output
+            "AsinhTransform->MinMaxScaler": [
+                "ged_sb", "ged_ns", "ged_os",
+                "acled_sb", "acled_os",
+                "splag_1_ged_sb", "splag_1_ged_ns",
+            ],
+            # Large economic values: log + standardize
+            "LogTransform->StandardScaler": [
+                "wdi_ny_gdp_mktp_kd", 
+                "wdi_pop_totl",
+            ],
+            # Distance features: sqrt + bounded
+            "SqrtTransform->MinMaxScaler": [
+                "dist_to_capital", 
+                "dist_to_border",
+            ],
+            # Already bounded (0-1): just MinMax for consistency
+            "MinMaxScaler": [
+                "vdem_v2x_polyarchy", 
+                "vdem_v2x_libdem",
+            ],
+        },
+        
+        # Model architecture...
+        "hidden_size": 128,
+        "num_encoder_layers": 2,
+        # ...
+    }
+```
+
+#### Alternative Configuration Formats
+
+The `feature_scaler_map` also supports list and dict formats for chains:
+
+```python
+# Format 1: Arrow syntax (recommended)
+"feature_scaler_map": {
+    "AsinhTransform->MinMaxScaler": ["ged_sb", "ged_ns"],
+}
+
+# Format 2: List syntax
+"feature_scaler_map": {
+    "conflict_features": {
+        "scaler": ["AsinhTransform", "MinMaxScaler"],
+        "features": ["ged_sb", "ged_ns"]
+    }
+}
+
+# Format 3: Dict with chain key
+"feature_scaler_map": {
+    "conflict_features": {
+        "scaler": {"chain": ["AsinhTransform", "MinMaxScaler"]},
+        "features": ["ged_sb", "ged_ns"]
+    }
+}
+```
+
+#### Triple Chains
+
+For extreme cases, you can chain three or more scalers:
+
+```python
+# Apply asinh, then robust scaling, then bound to [0,1]
+"AsinhTransform->RobustScaler->MinMaxScaler": ["ged_sb"]
+```
+
+#### Verifying Correctness
+
+You can verify that chained scaling is invertible:
+
+```python
+from views_r2darts2.utils.scaling import ScalerSelector
+import numpy as np
+
+# Create test data with zeros and outliers
+X = np.array([[0], [1], [10], [100], [1000], [10000]])
+
+# Create chained scaler
+chained = ScalerSelector.get_chained_scaler("AsinhTransform->StandardScaler")
+
+# Forward transform
+X_scaled = chained.fit_transform(X)
+print(f"Scaled mean: {X_scaled.mean():.10f}")  # Should be ~0
+print(f"Scaled std:  {X_scaled.std():.10f}")   # Should be ~1
+
+# Inverse transform
+X_recovered = chained.inverse_transform(X_scaled)
+max_error = np.max(np.abs(X - X_recovered))
+print(f"Max recovery error: {max_error:.2e}")  # Should be ~1e-14
+```
+
 ### Recommended Scaler by Data Source
 
 | Data Source | Feature Type | Recommended Scaler | Rationale |
 |-------------|--------------|-------------------|-----------|
-| **UCDP/ACLED** | Fatality counts | AsinhTransform | Zero-inflated with extreme outliers |
-| **WDI** | GDP, population | AsinhTransform | Spans millions to trillions |
+| **UCDP/ACLED** | Fatality counts | AsinhTransform->MinMaxScaler | Zero-inflated with extreme outliers |
+| **WDI** | GDP, population | LogTransform->StandardScaler | Spans millions to trillions |
 | **WDI** | Percentages (`_zs` suffix) | MinMaxScaler | Already bounded 0-100 |
 | **WDI** | Growth rates | StandardScaler | Can be negative, roughly normal |
 | **V-Dem** | Democracy indices | MinMaxScaler | Already bounded 0-1 |

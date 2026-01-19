@@ -129,10 +129,12 @@ class ShrinkageLoss(torch.nn.Module):
         # For large l (hard samples), exp() is small, so the denominator is close to 1, leaving the loss largely unchanged.
         shrinkage_factor = 1 + torch.exp(self.a * (self.c - l))
         
-        # The numerator contains the squared error and an importance factor exp(targets).
-        # This gives higher weight to larger target values, which is useful in cases
-        # where missing a high-value event is more critical than missing a low-value one.
-        base_loss = torch.exp(targets) * l**2
+        # The numerator contains the squared error and an importance factor.
+        # This term is intended to work with log1p-transformed targets.
+        # torch.exp(torch.log1p(y)) = 1 + y, applying a linear weight to the loss
+        # based on the original magnitude of the target value.
+        importance_weight = torch.exp(targets)
+        base_loss = importance_weight * l**2
 
         loss = base_loss / shrinkage_factor
         return torch.mean(loss)
@@ -213,10 +215,16 @@ class TimeAwareWeightedHuberLoss(torch.nn.Module):
     def forward(self, preds, targets):
         # Temporal decay weights
         seq_len = targets.size(1)
+        # Corrected exponent to give higher weight to more recent events
         time_weights = torch.tensor(
-            [self.decay_factor ** (seq_len - i) for i in range(seq_len)],
+            [self.decay_factor ** (seq_len - 1 - i) for i in range(seq_len)],
             device=targets.device,
         )
+
+        # Reshape for broadcasting: (seq_len,) -> (1, seq_len, 1, ...)
+        # This allows multiplication with (batch, seq_len, features, ...)
+        view_shape = (1, seq_len) + (1,) * (targets.dim() - 2)
+        time_weights = time_weights.view(*view_shape)
 
         # Event weights
         event_weights = torch.where(
@@ -634,7 +642,7 @@ class ZeroInflatedLoss(torch.nn.Module):
         targets_flat = targets.reshape(-1)
         
         # Binary component: classify zero vs non-zero
-        is_zero = (torch.abs(targets_flat) < self.threshold).float()
+        is_zero = (torch.abs(targets_flat) < self.threshold).to(preds.dtype)
         
         # Soft zero detection using sigmoid
         # Higher predictions -> lower probability of zero

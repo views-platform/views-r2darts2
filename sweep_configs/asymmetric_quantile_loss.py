@@ -1,14 +1,14 @@
-# file: sweep_configs/weighted_penalty_huber.py
+# file: sweep_configs/asymmetric_quantile_loss.py
 
 def get_sweep_config():
     """
     Contains the configuration for hyperparameter sweeps using WandB.
-    This sweep tests the WeightedPenaltyHuberLoss.
+    This sweep tests the AsymmetricQuantileLoss.
     """
 
     sweep_config = {
         'method': 'grid',
-        'name': 'weighted_penalty_huber_test',
+        'name': 'asymmetric_quantile_loss_test',
         'metric': {
             'name': 'time_series_wise_msle_mean_sb',
             'goal': 'minimize'
@@ -26,13 +26,9 @@ def get_sweep_config():
         'generic_architecture': {'values': [True]},
 
         # --- Loss Function ---
-        'loss_function': {'values': ['WeightedPenaltyHuberLoss']},
-        'zero_threshold': {'values': [0.01]},
-        'delta': {'values': [0.05, 0.1, 0.25]},
-        'non_zero_weight': {'values': [2.0, 5.0, 10.0]},
-        'false_positive_weight': {'values': [2.0, 5.0, 10.0]},
-        'false_negative_weight': {'values': [3.0, 5.0, 10.0, 20.0]},
-
+        'loss_function': {'values': ['AsymmetricQuantileLoss']},
+        'tau': {'values': [0.75, 0.85, 0.95]},
+        'non_zero_weight': {'values': [1.0, 5.0, 10.0]},
 
         # --- Trainer & Optimizer ---
         'n_epochs': {'values': [300]},

@@ -28,6 +28,7 @@ def get_sweep_config():
         # --- Loss Function ---
         'loss_function': {'values': ['TweedieLoss']},
         'p': {'values': [1.2, 1.5, 1.8]}, # Tweedie power parameter
+        'non_zero_weight': {'values': [1.0, 5.0, 10.0]},
 
         # --- Trainer & Optimizer ---
         'n_epochs': {'values': [300]},

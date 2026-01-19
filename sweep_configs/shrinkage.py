@@ -33,8 +33,8 @@ def get_sweep_config():
 
         # --- Loss Function ---
         'loss_function': {'values': ['ShrinkageLoss']},
-        'a': {'values': [2.0, 5.0, 10.0]}, # Whether the predictions are log-transformed
-        'c': {'values': [0.1, 0.2, 0.5]},     # Whether to include the Stirling approximation term
+        'a': {'values': [1.0, 5.0, 15.0, 30.0]}, 
+        'c': {'values': [0.05, 0.15, 0.3, 0.6]},
 
         # --- Trainer & Optimizer ---
         'n_epochs': {'values': [300]},

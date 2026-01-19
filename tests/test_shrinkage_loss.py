@@ -60,6 +60,12 @@ def test_shrinkage_loss_init():
         # base_loss = exp(0.0) * 0.1^2 = 0.01
         # expected_loss = 0.01 / 3.718 = 0.002689
         (torch.tensor([0.1]), torch.tensor([0.0]), 10.0, 0.2, 0.002689),
+
+        # Golden value: Easy sample (error l=0.01 is much smaller than c=0.2)
+        (torch.tensor([0.1]), torch.tensor([0.11]), 10.0, 0.2, 1.452e-05),
+
+        # Golden value: Hard sample (error l=0.4 is much larger than c=0.2)
+        (torch.tensor([0.1]), torch.tensor([0.5]), 10.0, 0.2, 0.23234),
     ],
 )
 def test_shrinkage_loss_forward_calculation(preds, targets, a, c, expected_loss):
@@ -69,6 +75,33 @@ def test_shrinkage_loss_forward_calculation(preds, targets, a, c, expected_loss)
     loss_fn = ShrinkageLoss(a=a, c=c)
     loss = loss_fn(preds, targets)
     assert torch.isclose(loss, torch.tensor(expected_loss), atol=1e-4)
+
+
+def test_shrinkage_loss_target_weighting():
+    """
+    Tests that the loss correctly applies exponential weighting based on target magnitude,
+    even when the absolute error is the same.
+    """
+    loss_fn = ShrinkageLoss(a=10.0, c=0.2)
+
+    # Case 1: Small target, small error
+    preds_low = torch.tensor([0.2])
+    targets_low = torch.tensor([0.1])  # Error l = 0.1
+    loss_low = loss_fn(preds_low, targets_low)
+
+    # Case 2: High target, same small error
+    preds_high = torch.tensor([0.6])
+    targets_high = torch.tensor([0.5]) # Error l = 0.1
+    loss_high = loss_fn(preds_high, targets_high)
+
+    # The shrinkage factor is identical for both cases since 'l' is the same.
+    # The only difference should come from the base_loss: exp(0.5) * 0.1^2 vs exp(0.1) * 0.1^2
+    assert loss_high.item() > loss_low.item()
+    
+    # Check the ratio is correct: loss_high / loss_low should be exp(0.5) / exp(0.1) = exp(0.4)
+    expected_ratio = torch.exp(targets_high - targets_low).item()
+    actual_ratio = loss_high.item() / loss_low.item()
+    assert np.isclose(actual_ratio, expected_ratio, atol=1e-6)
 
 
 @pytest.mark.skip(reason="Plotting is a manual verification step, not for automated testing.")
@@ -170,3 +203,25 @@ def test_shrinkage_loss_with_darts_models(model_name, model_tuple, seed):
     except Exception as e:
         pytest.fail(f"Prediction for {model_name} with ShrinkageLoss and seed {seed} failed after training: {e}")
 
+
+def test_shrinkage_loss_gradient_check():
+    """
+    Performs a gradient check for ShrinkageLoss using torch.autograd.gradcheck.
+    This is critical for ensuring the loss is implemented correctly for backpropagation.
+    """
+    from torch.autograd import gradcheck
+    # gradcheck needs double precision and a requires_grad=True input
+    loss_fn = ShrinkageLoss(a=10.0, c=0.2)
+    
+    # Test with typical inputs
+    preds = torch.randn(2, 2, dtype=torch.double, requires_grad=True)
+    targets = torch.randn(2, 2, dtype=torch.double)
+    
+    # The check will be True if the analytical and numerical gradients match
+    assert gradcheck(loss_fn, (preds, targets), eps=1e-6, atol=1e-4)
+
+    # Test near the 'c' threshold, which can be unstable
+    preds_near_c = torch.tensor([[0.3], [0.5]], dtype=torch.double, requires_grad=True)
+    targets_near_c = torch.tensor([[0.1], [0.8]], dtype=torch.double) # errors are 0.2 and 0.3
+    
+    assert gradcheck(loss_fn, (preds_near_c, targets_near_c), eps=1e-6, atol=1e-4)

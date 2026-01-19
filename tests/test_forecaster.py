@@ -91,15 +91,15 @@ class TestDartsForecaster:
                 target_scaler="RobustScaler"
             )
             
-            assert forecaster._feature_scaler == "StandardScaler"
-            assert forecaster._target_scaler == "RobustScaler"
+            assert forecaster._feature_scaler_cfg == "StandardScaler"
+            assert forecaster._target_scaler_cfg == "RobustScaler"
             assert forecaster.feature_scaler is not None
             assert forecaster.target_scaler is not None
 
     def test_initialization_without_scalers(self, forecaster):
         """Test initialization without scalers."""
-        assert forecaster._feature_scaler is None
-        assert forecaster._target_scaler is None
+        assert forecaster._feature_scaler_cfg is None
+        assert forecaster._target_scaler_cfg is None
         assert forecaster.feature_scaler is None
         assert forecaster.target_scaler is None
 
@@ -151,6 +151,9 @@ class TestDartsForecaster:
         mock_ts.astype = Mock(return_value=mock_ts)
         mock_ts.slice = Mock(return_value=mock_ts)
         mock_ts.__getitem__ = Mock(return_value=mock_ts)
+        # Mock all_values to return a numpy array for _check_data_sanity
+        mock_ts.all_values = Mock(return_value=np.array([[1.0, 2.0], [3.0, 4.0]]))
+        mock_ts.components = pd.Index(['target1', 'target2'])
         
         timeseries = [mock_ts]
         
@@ -178,6 +181,9 @@ class TestDartsForecaster:
         mock_ts.astype = Mock(return_value=mock_ts)
         mock_ts.slice = Mock(return_value=mock_ts)
         mock_ts.__getitem__ = Mock(return_value=mock_ts)
+        # Mock all_values to return a numpy array for _check_data_sanity
+        mock_ts.all_values = Mock(return_value=np.array([[1.0, 2.0], [3.0, 4.0]]))
+        mock_ts.components = pd.Index(['target1', 'target2'])
         
         timeseries = [mock_ts]
         
@@ -433,13 +439,16 @@ class TestDartsForecaster:
             'scaler_fitted': True
         }
         
-        forecaster_with_scalers.model.load = Mock(return_value=forecaster_with_scalers.model)
+        # Mock the class's load static method
+        mock_loaded_model = Mock(spec=TorchForecastingModel)
+        mock_loaded_model.to_device = Mock()
         
-        with patch('torch.load', return_value=mock_scaler_data):
+        with patch('torch.load', return_value=mock_scaler_data), \
+             patch.object(forecaster_with_scalers.model.__class__, 'load', return_value=mock_loaded_model) as mock_load:
             forecaster_with_scalers.load_model(str(model_path))
             
             assert forecaster_with_scalers.scaler_fitted is True
-            forecaster_with_scalers.model.load.assert_called_once_with(path=str(model_path))
+            mock_load.assert_called_once_with(path=str(model_path), map_location=str(forecaster_with_scalers.device))
 
     def test_load_model_missing_scalers(self, forecaster_with_scalers, tmp_path):
         """Test loading model when scaler file is missing."""
@@ -459,13 +468,17 @@ class TestDartsForecaster:
             'scaler_fitted': True
         }
         
-        forecaster_with_scalers.model.load = Mock(return_value=forecaster_with_scalers.model)
+        # Mock the class's load static method
+        mock_loaded_model = Mock(spec=TorchForecastingModel)
+        mock_loaded_model.to_device = Mock()
         forecaster_with_scalers.device = 'cuda'
         
-        with patch('torch.load', return_value=mock_scaler_data):
+        with patch('torch.load', return_value=mock_scaler_data), \
+             patch.object(forecaster_with_scalers.model.__class__, 'load', return_value=mock_loaded_model):
             forecaster_with_scalers.load_model(str(model_path))
             
-            forecaster_with_scalers.model.to_device.assert_called()
+            # The loaded model should have to_device called
+            mock_loaded_model.to_device.assert_called_with('cuda')
 
     def test_predict_with_kwargs(self, forecaster):
         """Test prediction with additional kwargs."""

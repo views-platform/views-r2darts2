@@ -151,6 +151,9 @@ class TestDartsForecaster:
         mock_ts.astype = Mock(return_value=mock_ts)
         mock_ts.slice = Mock(return_value=mock_ts)
         mock_ts.__getitem__ = Mock(return_value=mock_ts)
+        # Mock all_values to return a numpy array for _check_data_sanity
+        mock_ts.all_values = Mock(return_value=np.array([[1.0, 2.0], [3.0, 4.0]]))
+        mock_ts.components = pd.Index(['target1', 'target2'])
         
         timeseries = [mock_ts]
         
@@ -178,6 +181,9 @@ class TestDartsForecaster:
         mock_ts.astype = Mock(return_value=mock_ts)
         mock_ts.slice = Mock(return_value=mock_ts)
         mock_ts.__getitem__ = Mock(return_value=mock_ts)
+        # Mock all_values to return a numpy array for _check_data_sanity
+        mock_ts.all_values = Mock(return_value=np.array([[1.0, 2.0], [3.0, 4.0]]))
+        mock_ts.components = pd.Index(['target1', 'target2'])
         
         timeseries = [mock_ts]
         

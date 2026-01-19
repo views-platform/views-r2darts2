@@ -66,6 +66,86 @@ def _inverse_asinh_transform(x):
     return np.sinh(x)
 
 
+class ChainedScaler(BaseEstimator, TransformerMixin):
+    """
+    A scaler that chains multiple sklearn scalers/transformers in sequence.
+    
+    Applies transforms in order during fit_transform/transform, and applies
+    inverse transforms in reverse order during inverse_transform.
+    
+    Example:
+        # First apply asinh, then standardize
+        chained = ChainedScaler([
+            ScalerSelector.get_scaler("AsinhTransform"),
+            ScalerSelector.get_scaler("StandardScaler"),
+        ])
+        X_transformed = chained.fit_transform(X)
+        X_original = chained.inverse_transform(X_transformed)
+    
+    Config usage:
+        "feature_scaler_map": {
+            "AsinhTransform->StandardScaler": ["ged_sb", "ged_ns"],
+            "LogTransform->RobustScaler": ["wdi_ny_gdp_mktp_kd"],
+        }
+    """
+    
+    def __init__(self, scalers: List[BaseEstimator]):
+        """
+        Initialize the chained scaler.
+        
+        Args:
+            scalers: List of sklearn-compatible scalers/transformers to chain.
+                     Applied in order during transform, reversed during inverse.
+        """
+        if not scalers:
+            raise ValueError("ChainedScaler requires at least one scaler.")
+        self.scalers = scalers
+        self._is_fitted = False
+    
+    def fit(self, X, y=None):
+        """Fit all scalers in sequence."""
+        X_current = X
+        for scaler in self.scalers:
+            X_current = scaler.fit_transform(X_current)
+        self._is_fitted = True
+        return self
+    
+    def transform(self, X):
+        """Apply all transforms in order."""
+        check_is_fitted(self, '_is_fitted')
+        X_current = X
+        for scaler in self.scalers:
+            X_current = scaler.transform(X_current)
+        return X_current
+    
+    def fit_transform(self, X, y=None):
+        """Fit and transform in one step."""
+        X_current = X
+        for scaler in self.scalers:
+            X_current = scaler.fit_transform(X_current)
+        self._is_fitted = True
+        return X_current
+    
+    def inverse_transform(self, X):
+        """Apply inverse transforms in reverse order."""
+        check_is_fitted(self, '_is_fitted')
+        X_current = X
+        # Apply inverse transforms in reverse order
+        for scaler in reversed(self.scalers):
+            if hasattr(scaler, 'inverse_transform'):
+                X_current = scaler.inverse_transform(X_current)
+            else:
+                raise ValueError(
+                    f"Scaler {scaler.__class__.__name__} does not support inverse_transform. "
+                    f"Cannot use it in a chain that requires inversion."
+                )
+        return X_current
+    
+    def __repr__(self) -> str:
+        scaler_names = [s.__class__.__name__ for s in self.scalers]
+        return f"ChainedScaler({' -> '.join(scaler_names)})"
+
+
 class ScalerSelector:
     @staticmethod
     def get_scaler(scaler_name: str, **kwargs) -> BaseEstimator:
@@ -155,6 +235,67 @@ class ScalerSelector:
 
         return scalers[scaler_name](**kwargs)
 
+    @staticmethod
+    def get_chained_scaler(scaler_chain: str) -> ChainedScaler:
+        """
+        Create a ChainedScaler from a chain specification string.
+        
+        Parameters
+        ----------
+        scaler_chain : str
+            Chain specification using '->' separator.
+            Example: "AsinhTransform->StandardScaler"
+            
+        Returns
+        -------
+        ChainedScaler
+            A ChainedScaler instance with the specified scalers.
+            
+        Example
+        -------
+        >>> chained = ScalerSelector.get_chained_scaler("AsinhTransform->StandardScaler")
+        >>> # Equivalent to: ChainedScaler([AsinhTransform(), StandardScaler()])
+        """
+        scaler_names = [s.strip() for s in scaler_chain.split("->")]
+        if len(scaler_names) < 2:
+            raise ValueError(
+                f"Chain specification '{scaler_chain}' must contain at least 2 scalers "
+                f"separated by '->'. Got {len(scaler_names)} scaler(s)."
+            )
+        
+        scalers = [ScalerSelector.get_scaler(name) for name in scaler_names]
+        return ChainedScaler(scalers)
+    
+    @staticmethod
+    def is_chain_spec(scaler_name: str) -> bool:
+        """Check if a scaler name is a chain specification."""
+        return "->" in scaler_name
+    
+    @staticmethod
+    def get_scaler_or_chain(scaler_spec: str, **kwargs) -> BaseEstimator:
+        """
+        Get either a single scaler or a chained scaler based on the specification.
+        
+        Parameters
+        ----------
+        scaler_spec : str
+            Either a single scaler name or a chain specification.
+            Examples: "StandardScaler", "AsinhTransform->StandardScaler"
+            
+        Returns
+        -------
+        BaseEstimator
+            Either a single scaler or a ChainedScaler instance.
+        """
+        if ScalerSelector.is_chain_spec(scaler_spec):
+            if kwargs:
+                raise ValueError(
+                    "kwargs are not supported for chained scalers. "
+                    "Use the named group format with individual scaler configs instead."
+                )
+            return ScalerSelector.get_chained_scaler(scaler_spec)
+        return ScalerSelector.get_scaler(scaler_spec, **kwargs)
+
 
 class FeatureScalerManager:
     """
@@ -164,8 +305,12 @@ class FeatureScalerManager:
     data characteristics (e.g., RobustScaler for zero-inflated conflict data,
     MinMaxScaler for bounded V-Dem indices, StandardScaler for WDI indicators).
     
+    Supports chained scalers using '->' syntax or list format. Chained scalers
+    apply transforms in order and inverse transforms in reverse order.
+    
     Configuration format in config_hyperparameters.py:
     
+    Named group format:
     ```python
     "feature_scaler_map": {
         "conflict": {
@@ -180,18 +325,35 @@ class FeatureScalerManager:
             "scaler": "MinMaxScaler",
             "features": ["vdem_v2x_polyarchy", "vdem_v2x_libdem"]
         },
-        # Features not listed will use the default scaler
+        # Chained scalers using list format
+        "conflict_chained": {
+            "scaler": ["AsinhTransform", "StandardScaler"],  # Applied in order
+            "features": ["ged_sb", "ged_ns"]
+        },
+        # Or using chain key
+        "wdi_chained": {
+            "scaler": {"chain": ["LogTransform", "RobustScaler"]},
+            "features": ["wdi_ny_gdp_mktp_kd"]
+        },
     }
     ```
     
-    Alternative simple format:
+    Simple format (recommended):
     ```python
     "feature_scaler_map": {
-        "RobustScaler": ["ged_sb", "ged_ns", "acled_sb"],
-        "MinMaxScaler": ["vdem_v2x_polyarchy"],
-        "StandardScaler": ["wdi_ny_gdp_mktp_kd"],
+        # Single scalers
+        "RobustScaler": ["topic_tokens_t1", "topic_tokens_t1_splag"],
+        "MinMaxScaler": ["vdem_v2x_polyarchy", "vdem_v2x_libdem"],
+        
+        # Chained scalers using '->' syntax
+        "AsinhTransform->StandardScaler": ["ged_sb", "ged_ns", "acled_sb"],
+        "LogTransform->RobustScaler": ["wdi_ny_gdp_mktp_kd", "wdi_sm_pop_netm"],
     }
     ```
+    
+    Chained scalers apply transforms in sequence:
+    - Forward: AsinhTransform -> StandardScaler (first asinh, then standardize)
+    - Inverse: StandardScaler.inverse -> AsinhTransform.inverse (reverse order)
     """
     
     def __init__(
@@ -305,18 +467,59 @@ class FeatureScalerManager:
                 self._feature_to_scaler[feat] = scaler_key
     
     def _instantiate_scaler(self, scaler_cfg) -> Scaler:
-        """Create a Darts Scaler wrapper from config."""
+        """
+        Create a Darts Scaler wrapper from config.
+        
+        Supports:
+        - String: "StandardScaler" or "AsinhTransform->StandardScaler" (chained)
+        - List: ["AsinhTransform", "StandardScaler"] (chained)
+        - Dict: {"name": "RobustScaler", "kwargs": {...}}
+        - Dict with chain: {"chain": ["AsinhTransform", "StandardScaler"]}
+        """
         if isinstance(scaler_cfg, str):
-            estimator = ScalerSelector.get_scaler(scaler_cfg)
+            # Check if it's a chain specification
+            estimator = ScalerSelector.get_scaler_or_chain(scaler_cfg)
             return Scaler(estimator)
+        
+        if isinstance(scaler_cfg, list):
+            # List of scalers to chain: ["AsinhTransform", "StandardScaler"]
+            if len(scaler_cfg) == 1:
+                estimator = ScalerSelector.get_scaler(scaler_cfg[0])
+            else:
+                scalers = [ScalerSelector.get_scaler(name) for name in scaler_cfg]
+                estimator = ChainedScaler(scalers)
+            return Scaler(estimator)
+        
         if isinstance(scaler_cfg, dict):
+            # Check if it's a chain config
+            if "chain" in scaler_cfg:
+                chain_list = scaler_cfg["chain"]
+                if isinstance(chain_list, str):
+                    # "chain": "AsinhTransform->StandardScaler"
+                    estimator = ScalerSelector.get_chained_scaler(chain_list)
+                elif isinstance(chain_list, list):
+                    # "chain": ["AsinhTransform", "StandardScaler"]
+                    scalers = [ScalerSelector.get_scaler(name) for name in chain_list]
+                    estimator = ChainedScaler(scalers)
+                else:
+                    raise TypeError(
+                        f"'chain' must be a string or list, got {type(chain_list).__name__}"
+                    )
+                return Scaler(estimator)
+            
+            # Standard dict format with name and optional kwargs
             name = scaler_cfg.get("name")
             kwargs = scaler_cfg.get("kwargs", {})
             if name is None:
-                raise ValueError("Scaler config dict must have a 'name' key.")
-            estimator = ScalerSelector.get_scaler(name, **kwargs)
+                raise ValueError(
+                    "Scaler config dict must have a 'name' key or a 'chain' key."
+                )
+            estimator = ScalerSelector.get_scaler_or_chain(name, **kwargs)
             return Scaler(estimator)
-        raise TypeError("Scaler config must be str or dict.")
+        
+        raise TypeError(
+            f"Scaler config must be str, list, or dict. Got {type(scaler_cfg).__name__}."
+        )
     
     def fit_transform(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
         """

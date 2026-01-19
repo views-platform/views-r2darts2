@@ -7,13 +7,57 @@ from darts.models.forecasting.tsmixer_model import TSMixerModel
 from darts.models.forecasting.nlinear import NLinearModel
 from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
-from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_lightning.callbacks import EarlyStopping, Callback
 from views_r2darts2.utils.loss import WeightedHuberLoss
 from pytorch_lightning.callbacks import LearningRateMonitor
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from pytorch_lightning.loggers import WandbLogger
 import torch
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class NaNDetectionCallback(Callback):
+    """
+    Callback to detect NaN loss and stop training early.
+    
+    When a model becomes numerically unstable (producing NaN loss), continuing
+    training is pointless and wastes compute. This callback:
+    1. Detects NaN loss
+    2. Logs useful debugging info
+    3. Stops training immediately
+    """
+    
+    def __init__(self, patience: int = 3):
+        """
+        Args:
+            patience: Number of consecutive NaN batches before stopping.
+                      Set to 1 for immediate stop, higher for transient NaN tolerance.
+        """
+        super().__init__()
+        self.patience = patience
+        self.nan_count = 0
+    
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        loss = outputs.get('loss') if isinstance(outputs, dict) else outputs
+        if loss is not None and torch.isnan(loss):
+            self.nan_count += 1
+            logger.warning(
+                f"NaN loss detected at epoch {trainer.current_epoch}, batch {batch_idx} "
+                f"(consecutive NaN count: {self.nan_count}/{self.patience})"
+            )
+            if self.nan_count >= self.patience:
+                logger.error(
+                    "Training stopped due to persistent NaN loss. "
+                    "Suggestions: lower learning rate, increase gradient clipping, "
+                    "check data scaling, verify norm_type='LayerNorm'"
+                )
+                trainer.should_stop = True
+        else:
+            self.nan_count = 0  # Reset on valid loss
+
 
 # from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from views_r2darts2.model.forecaster import DartsForecaster
@@ -389,8 +433,10 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    NaNDetectionCallback(patience=5),  # Stop if 5 consecutive NaN batches
                 ],
                 "enable_progress_bar": True,
+                "detect_anomaly": self.config.get("detect_anomaly", False),  # Set True to debug NaN source
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 1e-4),  # Lower default LR for transformers

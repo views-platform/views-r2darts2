@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.exceptions import NotFittedError
 from darts import TimeSeries
 import pandas as pd
-from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager
+from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager, ChainedScaler
 
 
 class TestScalerSelector:
@@ -583,3 +583,238 @@ class TestFeatureScalerManager:
         
         # They shouldn't be exactly equal (different scalers)
         assert not np.allclose(vals1, vals2)
+
+
+class TestChainedScaler:
+    """Tests for ChainedScaler - chaining multiple scalers in sequence."""
+    
+    def test_chained_scaler_creation(self):
+        """Test creating a chained scaler from list of scalers."""
+        scalers = [
+            ScalerSelector.get_scaler("AsinhTransform"),
+            ScalerSelector.get_scaler("StandardScaler"),
+        ]
+        chained = ChainedScaler(scalers)
+        assert len(chained.scalers) == 2
+    
+    def test_chained_scaler_empty_raises_error(self):
+        """Test that empty scaler list raises error."""
+        with pytest.raises(ValueError, match="at least one scaler"):
+            ChainedScaler([])
+    
+    def test_chained_scaler_fit_transform(self):
+        """Test fit_transform applies scalers in order."""
+        X = np.array([[0, 1], [10, 100], [1000, 10000]]).astype(np.float64)
+        
+        chained = ChainedScaler([
+            ScalerSelector.get_scaler("AsinhTransform"),
+            ScalerSelector.get_scaler("StandardScaler"),
+        ])
+        
+        X_transformed = chained.fit_transform(X)
+        
+        # Should have mean ~0 and std ~1 after StandardScaler
+        assert X_transformed.shape == X.shape
+        assert np.allclose(X_transformed.mean(axis=0), 0, atol=1e-6)
+        assert np.allclose(X_transformed.std(axis=0), 1, atol=1e-6)
+    
+    def test_chained_scaler_inverse_transform(self):
+        """Test inverse_transform recovers original values."""
+        X = np.array([[0, 1], [10, 100], [1000, 10000]]).astype(np.float64)
+        
+        chained = ChainedScaler([
+            ScalerSelector.get_scaler("AsinhTransform"),
+            ScalerSelector.get_scaler("StandardScaler"),
+        ])
+        
+        X_transformed = chained.fit_transform(X)
+        X_recovered = chained.inverse_transform(X_transformed)
+        
+        np.testing.assert_array_almost_equal(X, X_recovered, decimal=5)
+    
+    def test_chained_scaler_transform_requires_fit(self):
+        """Test that transform raises error if not fitted."""
+        X = np.array([[1, 2], [3, 4]])
+        chained = ChainedScaler([ScalerSelector.get_scaler("StandardScaler")])
+        
+        with pytest.raises(Exception):  # NotFittedError or similar
+            chained.transform(X)
+    
+    def test_chained_scaler_repr(self):
+        """Test string representation."""
+        chained = ChainedScaler([
+            ScalerSelector.get_scaler("AsinhTransform"),
+            ScalerSelector.get_scaler("StandardScaler"),
+        ])
+        repr_str = repr(chained)
+        assert "ChainedScaler" in repr_str
+        assert "FunctionTransformer" in repr_str  # AsinhTransform is a FunctionTransformer
+        assert "StandardScaler" in repr_str
+
+
+class TestScalerSelectorChaining:
+    """Tests for ScalerSelector chain-related methods."""
+    
+    def test_is_chain_spec(self):
+        """Test detection of chain specifications."""
+        assert ScalerSelector.is_chain_spec("AsinhTransform->StandardScaler")
+        assert ScalerSelector.is_chain_spec("A->B->C")
+        assert not ScalerSelector.is_chain_spec("StandardScaler")
+        assert not ScalerSelector.is_chain_spec("RobustScaler")
+    
+    def test_get_chained_scaler(self):
+        """Test creating chained scaler from string."""
+        chained = ScalerSelector.get_chained_scaler("AsinhTransform->StandardScaler")
+        assert isinstance(chained, ChainedScaler)
+        assert len(chained.scalers) == 2
+    
+    def test_get_chained_scaler_with_spaces(self):
+        """Test that spaces around -> are handled."""
+        chained = ScalerSelector.get_chained_scaler("AsinhTransform -> StandardScaler")
+        assert isinstance(chained, ChainedScaler)
+        assert len(chained.scalers) == 2
+    
+    def test_get_chained_scaler_single_raises_error(self):
+        """Test that single scaler in chain format raises error."""
+        with pytest.raises(ValueError, match="at least 2 scalers"):
+            ScalerSelector.get_chained_scaler("StandardScaler")
+    
+    def test_get_scaler_or_chain_single(self):
+        """Test get_scaler_or_chain returns single scaler."""
+        scaler = ScalerSelector.get_scaler_or_chain("StandardScaler")
+        assert scaler.__class__.__name__ == "StandardScaler"
+    
+    def test_get_scaler_or_chain_chained(self):
+        """Test get_scaler_or_chain returns chained scaler."""
+        scaler = ScalerSelector.get_scaler_or_chain("AsinhTransform->StandardScaler")
+        assert isinstance(scaler, ChainedScaler)
+    
+    def test_three_scaler_chain(self):
+        """Test chaining three scalers."""
+        chained = ScalerSelector.get_chained_scaler(
+            "AsinhTransform->StandardScaler->MinMaxScaler"
+        )
+        assert len(chained.scalers) == 3
+        
+        X = np.array([[0, 1], [10, 100], [1000, 10000]]).astype(np.float64)
+        X_transformed = chained.fit_transform(X)
+        X_recovered = chained.inverse_transform(X_transformed)
+        
+        np.testing.assert_array_almost_equal(X, X_recovered, decimal=4)
+
+
+class TestFeatureScalerManagerChaining:
+    """Tests for FeatureScalerManager with chained scalers."""
+    
+    @pytest.fixture
+    def sample_timeseries_list(self):
+        """Create sample TimeSeries for testing."""
+        np.random.seed(42)
+        n_time = 50
+        
+        data = {
+            "ged_sb": np.concatenate([np.zeros(30), np.random.exponential(10, 20)]),
+            "ged_ns": np.concatenate([np.zeros(35), np.random.exponential(5, 15)]),
+            "wdi_gdp": np.random.normal(1000, 200, n_time),
+            "vdem_polyarchy": np.random.beta(2, 5, n_time),
+        }
+        
+        times = pd.date_range("2000-01", periods=n_time, freq="MS")
+        
+        ts1 = TimeSeries.from_times_and_values(
+            times=times,
+            values=np.column_stack([data[k] for k in data]),
+            columns=list(data.keys()),
+        )
+        
+        return [ts1]
+    
+    def test_simple_format_chained_scaler(self, sample_timeseries_list):
+        """Test simple format with chained scaler using -> syntax."""
+        config = {
+            "AsinhTransform->StandardScaler": ["ged_sb", "ged_ns"],
+            "MinMaxScaler": ["vdem_polyarchy"],
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            default_scaler="StandardScaler",
+            all_features=list(sample_timeseries_list[0].components),
+        )
+        
+        # Should have created the chained scaler
+        assert "scaler_AsinhTransform->StandardScaler" in manager._scalers
+        
+        # Test that fit_transform works
+        transformed = manager.fit_transform(sample_timeseries_list)
+        assert len(transformed) == 1
+        assert transformed[0].n_components == 4
+    
+    def test_named_group_format_chained_list(self, sample_timeseries_list):
+        """Test named group format with list-based chain."""
+        config = {
+            "conflict": {
+                "scaler": ["AsinhTransform", "StandardScaler"],
+                "features": ["ged_sb", "ged_ns"]
+            },
+            "democracy": {
+                "scaler": "MinMaxScaler",
+                "features": ["vdem_polyarchy"]
+            },
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            default_scaler="RobustScaler",
+            all_features=list(sample_timeseries_list[0].components),
+        )
+        
+        transformed = manager.fit_transform(sample_timeseries_list)
+        assert manager.is_fitted
+        assert len(transformed) == 1
+    
+    def test_named_group_format_chain_dict(self, sample_timeseries_list):
+        """Test named group format with chain dict config."""
+        config = {
+            "conflict": {
+                "scaler": {"chain": ["AsinhTransform", "RobustScaler"]},
+                "features": ["ged_sb", "ged_ns"]
+            },
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            default_scaler="StandardScaler",
+            all_features=list(sample_timeseries_list[0].components),
+        )
+        
+        transformed = manager.fit_transform(sample_timeseries_list)
+        assert manager.is_fitted
+    
+    def test_chained_inverse_transform(self, sample_timeseries_list):
+        """Test that inverse_transform works with chained scalers."""
+        config = {
+            "AsinhTransform->StandardScaler": ["ged_sb", "ged_ns"],
+        }
+        
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            all_features=["ged_sb", "ged_ns"],
+        )
+        
+        # Get original values
+        orig_values = sample_timeseries_list[0].all_values(copy=True)
+        
+        # Transform
+        transformed = manager.fit_transform(sample_timeseries_list)
+        
+        # Inverse transform
+        recovered = manager.inverse_transform(transformed)
+        
+        # Check recovery (with tolerance for floating point)
+        ged_sb_idx = list(sample_timeseries_list[0].components).index("ged_sb")
+        np.testing.assert_array_almost_equal(
+            orig_values[:, ged_sb_idx],
+            recovered[0].all_values()[:, ged_sb_idx],
+            decimal=4
+        )

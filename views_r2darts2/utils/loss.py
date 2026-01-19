@@ -341,13 +341,25 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         device = preds.device
         dtype = preds.dtype
         
-        # Check for NaN/Inf in inputs and handle gracefully
-        if torch.isnan(preds).any() or torch.isinf(preds).any():
-            logger.warning("NaN or Inf detected in predictions!")
-            preds = torch.nan_to_num(preds, nan=0.0, posinf=1e6, neginf=-1e6)
+        # Check for NaN/Inf in TARGETS (data issue) - these we can safely handle
         if torch.isnan(targets).any() or torch.isinf(targets).any():
-            logger.warning("NaN or Inf detected in targets!")
+            logger.warning("NaN or Inf detected in targets - replacing with 0")
             targets = torch.nan_to_num(targets, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        # Check for NaN/Inf in PREDICTIONS (model instability) - log but DON'T mask
+        # Masking predictions hides the problem and produces garbage gradients
+        nan_mask = torch.isnan(preds) | torch.isinf(preds)
+        if nan_mask.any():
+            nan_count = nan_mask.sum().item()
+            total_count = preds.numel()
+            nan_pct = 100 * nan_count / total_count
+            logger.warning(
+                f"NaN/Inf in predictions: {nan_count}/{total_count} ({nan_pct:.1f}%) - "
+                f"model is unstable! Check: learning_rate, gradient_clip, norm_type, d_model/nhead ratio"
+            )
+            # Replace with a large penalty value instead of 0 to create strong gradient signal
+            # This helps the optimizer correct the instability rather than ignoring it
+            preds = torch.where(nan_mask, torch.zeros_like(preds), preds)
         
         # Identify non-zero targets and predictions (detach pred mask to prevent gradient flow)
         is_target_nonzero = torch.abs(targets) > self.threshold

@@ -37,7 +37,7 @@ def test_mse_loss_with_darts_models(model_name, model_tuple, seed):
         n_epochs=2,
         random_state=seed,
         loss_fn=loss_fn,
-        pl_trainer_kwargs={"accelerator": "cpu"},
+        pl_trainer_kwargs={"accelerator": "cpu", "devices": 1},
         force_reset=True,
     )
 

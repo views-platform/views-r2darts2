@@ -1,14 +1,14 @@
-# file: sweep_configs/l1.py
+# file: sweep_configs/weighted_penalty_huber_f_sweep.py
 
 def get_sweep_config():
     """
     Contains the configuration for hyperparameter sweeps using WandB.
-    This sweep tests the baseline L1Loss (MAE).
+    This sweep tests the WeightedPenaltyHuberLoss for Pipeline F: pure_asinh.
     """
 
     sweep_config = {
         'method': 'grid',
-        'name': 'baseline_l1_test',
+        'name': 'weighted_penalty_huber_F_pipeline_test',
         'metric': {
             'name': 'time_series_wise_msle_mean_sb',
             'goal': 'minimize'
@@ -26,7 +26,13 @@ def get_sweep_config():
         'generic_architecture': {'values': [True]},
 
         # --- Loss Function ---
-        'loss_function': {'values': ['L1Loss']},
+        'loss_function': {'values': ['WeightedPenaltyHuberLoss']},
+        'zero_threshold': {'values': [0.01, 0.1]}, # Adjusted for asinh-scale
+        'delta': {'values': [0.2, 0.5, 1.0]}, # From tuning guide for pure_asinh
+        'non_zero_weight': {'values': [2.0, 5.0, 10.0]},
+        'false_positive_weight': {'values': [2.0, 5.0, 10.0]},
+        'false_negative_weight': {'values': [3.0, 5.0, 10.0, 20.0]},
+
 
         # --- Trainer & Optimizer ---
         'n_epochs': {'values': [300]},
@@ -46,9 +52,9 @@ def get_sweep_config():
         'output_chunk_length': {'values': [36]},
         'output_chunk_shift': {'values': [0]},
         'batch_size': {'values': [8]},
-        'target_scaler': {'values': ['MinMaxScaler']},
+        'target_scaler': {'values': [None]}, # No explicit scaler
         'feature_scaler': {'values': ['MinMaxScaler']},
-        'log_targets': {'values': [True]},
+        'log_targets': {'values': [False]}, # asinh transform
         'log_features': {'values': [None]},
         
         # --- Other ---

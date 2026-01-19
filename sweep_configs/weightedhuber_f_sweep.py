@@ -1,23 +1,19 @@
-# file: sweep_configs/shrinkage.py
+# file: sweep_configs/weightedhuber_f_sweep.py
 
 def get_sweep_config():
     """
     Contains the configuration for hyperparameter sweeps using WandB.
-
-    This is a targeted 4-run grid search to test if the best-performing
-    1x6 block architecture can be improved by slightly tuning the number
-    of blocks and the dropout rate.
+    This sweep tests the WeightedHuberLoss for Pipeline F: pure_asinh.
     """
 
     sweep_config = {
         'method': 'grid',
-        'name': 'emerging_principles_14',
+        'name': 'weighted_huber_F_pipeline_test',
         'metric': {
             'name': 'time_series_wise_msle_mean_sb',
             'goal': 'minimize'
         },
     }
-
 
     parameters = {
         # --- N-BEATS Architecture ---
@@ -29,12 +25,11 @@ def get_sweep_config():
         'activation': {'values': ['LeakyReLU']},
         'generic_architecture': {'values': [True]},
 
-
-
         # --- Loss Function ---
-        'loss_function': {'values': ['ShrinkageLoss']},
-        'a': {'values': [1.0, 5.0, 15.0, 30.0]}, 
-        'c': {'values': [0.05, 0.15, 0.3, 0.6]},
+        'loss_function': {'values': ['WeightedHuberLoss']},
+        'delta': {'values': [0.2, 0.5, 1.0]}, # From tuning guide for pure_asinh
+        'non_zero_weight': {'values': [2.0, 5.0, 10.0]},
+        'zero_threshold': {'values': [0.01, 0.1]}, # Adjusted for asinh-scale
 
         # --- Trainer & Optimizer ---
         'n_epochs': {'values': [300]},
@@ -54,9 +49,9 @@ def get_sweep_config():
         'output_chunk_length': {'values': [36]},
         'output_chunk_shift': {'values': [0]},
         'batch_size': {'values': [8]},
-        'target_scaler': {'values': ['MinMaxScaler']},
+        'target_scaler': {'values': [None]}, # No explicit scaler
         'feature_scaler': {'values': ['MinMaxScaler']},
-        'log_targets': {'values': [True]},
+        'log_targets': {'values': [False]}, # asinh is used instead of log1p
         'log_features': {'values': [None]},
         
         # --- Other ---

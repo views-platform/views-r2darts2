@@ -1,14 +1,14 @@
-# file: sweep_configs/time_aware_weighted_huber.py
+# file: sweep_configs/timeaware_weighted_huber_e_sweep.py
 
 def get_sweep_config():
     """
     Contains the configuration for hyperparameter sweeps using WandB.
-    This sweep tests the TimeAwareWeightedHuberLoss.
+    This sweep tests the TimeAwareWeightedHuberLoss for Pipeline E: pure_log1p.
     """
 
     sweep_config = {
         'method': 'grid',
-        'name': 'time_aware_weighted_huber_test',
+        'name': 'time_aware_weighted_huber_E_pipeline_test',
         'metric': {
             'name': 'time_series_wise_msle_mean_sb',
             'goal': 'minimize'
@@ -27,11 +27,11 @@ def get_sweep_config():
 
         # --- Loss Function ---
         'loss_function': {'values': ['TimeAwareWeightedHuberLoss']},
-        'delta': {'values': [0.05, 0.1, 0.25]},
+        'delta': {'values': [0.2, 0.5, 1.0]}, # From tuning guide for pure_log1p
         'decay_factor': {'values': [0.9, 0.95]},
         'zero_weight': {'values': [1.0]},
         'non_zero_weight': {'values': [5.0, 10.0, 20.0]},
-
+        
         # --- Trainer & Optimizer ---
         'n_epochs': {'values': [300]},
         'lr': {'values': [0.0006]},
@@ -50,9 +50,9 @@ def get_sweep_config():
         'output_chunk_length': {'values': [36]},
         'output_chunk_shift': {'values': [0]},
         'batch_size': {'values': [8]},
-        'target_scaler': {'values': ['MinMaxScaler']},
+        'target_scaler': {'values': [None]}, # No explicit scaler
         'feature_scaler': {'values': ['MinMaxScaler']},
-        'log_targets': {'values': [True]},
+        'log_targets': {'values': [True]}, # log1p transform
         'log_features': {'values': [None]},
         
         # --- Other ---

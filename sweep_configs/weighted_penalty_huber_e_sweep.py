@@ -1,14 +1,14 @@
-# file: sweep_configs/zero_inflated_loss.py
+# file: sweep_configs/weighted_penalty_huber_e_sweep.py
 
 def get_sweep_config():
     """
     Contains the configuration for hyperparameter sweeps using WandB.
-    This sweep tests the ZeroInflatedLoss.
+    This sweep tests the WeightedPenaltyHuberLoss for Pipeline E: pure_log1p.
     """
 
     sweep_config = {
         'method': 'grid',
-        'name': 'zero_inflated_loss_test',
+        'name': 'weighted_penalty_huber_E_pipeline_test',
         'metric': {
             'name': 'time_series_wise_msle_mean_sb',
             'goal': 'minimize'
@@ -26,10 +26,13 @@ def get_sweep_config():
         'generic_architecture': {'values': [True]},
 
         # --- Loss Function ---
-        'loss_function': {'values': ['ZeroInflatedLoss']},
-        'zero_weight': {'values': [0.5, 1.0, 2.0, 5.0]},
-        'count_weight': {'values': [0.5, 1.0, 2.0, 5.0]},
-        'delta': {'values': [0.05, 0.1, 0.25]},
+        'loss_function': {'values': ['WeightedPenaltyHuberLoss']},
+        'zero_threshold': {'values': [0.01, 0.1]}, # Adjusted for log-scale
+        'delta': {'values': [0.2, 0.5, 1.0]}, # From tuning guide for pure_log1p
+        'non_zero_weight': {'values': [2.0, 5.0, 10.0]},
+        'false_positive_weight': {'values': [2.0, 5.0, 10.0]},
+        'false_negative_weight': {'values': [3.0, 5.0, 10.0, 20.0]},
+
 
         # --- Trainer & Optimizer ---
         'n_epochs': {'values': [300]},
@@ -49,9 +52,9 @@ def get_sweep_config():
         'output_chunk_length': {'values': [36]},
         'output_chunk_shift': {'values': [0]},
         'batch_size': {'values': [8]},
-        'target_scaler': {'values': ['MinMaxScaler']},
+        'target_scaler': {'values': [None]}, # No explicit scaler
         'feature_scaler': {'values': ['MinMaxScaler']},
-        'log_targets': {'values': [True]},
+        'log_targets': {'values': [True]}, # log1p transform
         'log_features': {'values': [None]},
         
         # --- Other ---

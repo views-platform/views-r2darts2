@@ -1,14 +1,14 @@
-# file: sweep_configs/asymmetric_quantile_loss.py
+# file: sweep_configs/zero_inflated_f_sweep.py
 
 def get_sweep_config():
     """
     Contains the configuration for hyperparameter sweeps using WandB.
-    This sweep tests the AsymmetricQuantileLoss.
+    This sweep tests the ZeroInflatedLoss for Pipeline F: pure_asinh.
     """
 
     sweep_config = {
         'method': 'grid',
-        'name': 'asymmetric_quantile_loss_test',
+        'name': 'zero_inflated_F_pipeline_test',
         'metric': {
             'name': 'time_series_wise_msle_mean_sb',
             'goal': 'minimize'
@@ -26,9 +26,11 @@ def get_sweep_config():
         'generic_architecture': {'values': [True]},
 
         # --- Loss Function ---
-        'loss_function': {'values': ['AsymmetricQuantileLoss']},
-        'tau': {'values': [0.75, 0.85, 0.95]},
-        'non_zero_weight': {'values': [1.0, 5.0, 10.0]},
+        'loss_function': {'values': ['ZeroInflatedLoss']},
+        'zero_weight': {'values': [0.5, 1.0, 2.0, 5.0]},
+        'count_weight': {'values': [0.5, 1.0, 2.0, 5.0]},
+        'delta': {'values': [0.2, 0.5, 1.0]}, # From tuning guide for pure_asinh
+        'zero_threshold': {'values': [0.01, 0.1]}, # Adjusted for asinh-scale
 
         # --- Trainer & Optimizer ---
         'n_epochs': {'values': [300]},
@@ -48,9 +50,9 @@ def get_sweep_config():
         'output_chunk_length': {'values': [36]},
         'output_chunk_shift': {'values': [0]},
         'batch_size': {'values': [8]},
-        'target_scaler': {'values': ['MinMaxScaler']},
+        'target_scaler': {'values': [None]}, # No explicit scaler
         'feature_scaler': {'values': ['MinMaxScaler']},
-        'log_targets': {'values': [True]},
+        'log_targets': {'values': [False]}, # asinh transform
         'log_features': {'values': [None]},
         
         # --- Other ---

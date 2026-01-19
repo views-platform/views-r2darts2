@@ -1,15 +1,12 @@
-# file: sweep_configs/weighted_penalty_huber_a_sweep.py
-
-
 def get_sweep_config():
     """
     Contains the configuration for hyperparameter sweeps using WandB.
-    This sweep tests the WeightedPenaltyHuberLoss for Pipeline A: log1p + minmax(0,1).
+    This sweep tests the ShrinkageLoss for Pipeline F: pure_asinh.
     """
 
     sweep_config = {
         "method": "grid",
-        "name": "weighted_penalty_huber_A_pipeline_test",
+        "name": "shrinkage_F_pipeline_test",
         "metric": {"name": "time_series_wise_msle_mean_sb", "goal": "minimize"},
     }
 
@@ -23,12 +20,9 @@ def get_sweep_config():
         "activation": {"values": ["LeakyReLU"]},
         "generic_architecture": {"values": [True]},
         # --- Loss Function ---
-        "loss_function": {"values": ["WeightedPenaltyHuberLoss"]},
-        "zero_threshold": {"values": [0.01]},
-        "delta": {"values": [0.05, 0.1, 0.25]},
-        "non_zero_weight": {"values": [2.0, 5.0, 10.0]},
-        "false_positive_weight": {"values": [2.0, 5.0, 10.0]},
-        "false_negative_weight": {"values": [3.0, 5.0, 10.0, 20.0]},
+        "loss_function": {"values": ["ShrinkageLoss"]},
+        "a": {"values": [1.0, 5.0, 15.0, 30.0]},
+        "c": {"values": [0.2, 1.0]},  # From tuning guide for pure_asinh
         # --- Trainer & Optimizer ---
         "n_epochs": {"values": [300]},
         "lr": {"values": [0.0006]},
@@ -46,9 +40,9 @@ def get_sweep_config():
         "output_chunk_length": {"values": [36]},
         "output_chunk_shift": {"values": [0]},
         "batch_size": {"values": [8]},
-        "target_scaler": {"values": ["MinMaxScaler"]},
+        "target_scaler": {"values": [None]},  # No explicit scaler
         "feature_scaler": {"values": ["MinMaxScaler"]},
-        "log_targets": {"values": [True]},
+        "log_targets": {"values": [False]},  # asinh transform
         "log_features": {"values": [None]},
         # --- Other ---
         "steps": {"values": [[*range(1, 37)]]},

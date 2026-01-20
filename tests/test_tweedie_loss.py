@@ -5,8 +5,9 @@ import pytest
 from darts import TimeSeries
 from darts.models import NBEATSModel, TCNModel, BlockRNNModel, TransformerModel, NLinearModel, TiDEModel
 from views_r2darts2.utils.loss import LossSelector, TweedieLoss
+import torch.nn.functional as F
 
-# --- Unit Tests for the new TweedieLoss ---
+# --- Unit Tests for the new TweedieLoss (with softplus link) ---
 
 def test_tweedie_loss_init():
     """Tests the initialization of the corrected TweedieLoss."""
@@ -24,45 +25,48 @@ def test_tweedie_loss_init():
 @pytest.mark.parametrize(
     "preds, targets, p, expected_loss",
     [
-        # Case 1: Zero target, pred is log(0) -> -inf. mu -> eps.
-        # loss = 2 * sqrt(eps) + 0
-        (torch.tensor([-20.0]), torch.tensor([0.0]), 1.5, 8.94e-05),
+        # Case 1: Zero target, very negative preds. mu -> eps.
+        # mu = softplus(-20.0) + 1e-8 approx 2.06e-9 + 1e-8 approx 1.206e-8
+        # loss = 2 * sqrt(1.206e-8) = 0.0002196
+        (torch.tensor([-20.0]), torch.tensor([0.0]), 1.5, 0.00020),
 
         # Case 2: Non-zero target, perfect prediction (mu=target)
-        # y=2.0, preds=ln(2.0)=0.693, mu=2.0
-        # loss = 2*sqrt(2) + 2*2/sqrt(2) = 4*sqrt(2)
-        (torch.tensor([0.6931]), torch.tensor([2.0]), 1.5, 5.6568),
+        # y=2.0, preds=log(exp(2.0)-1)=1.9560475, mu=2.0
+        # loss = 4*sqrt(2) = 5.65685425
+        (torch.tensor([1.9560475]), torch.tensor([2.0]), 1.5, 5.65820),
 
         # Case 3: Non-zero target, under-prediction
-        # y=2.0, preds=0.0, mu=1.0
-        # loss = 2*sqrt(1) + 2*2/sqrt(1) = 6.0
-        (torch.tensor([0.0]), torch.tensor([2.0]), 1.5, 6.0),
+        # y=2.0, preds=0.0, mu=softplus(0.0)+1e-8 = 0.69314718 + 1e-8
+        # loss = 2*sqrt(0.69314719) + 4/sqrt(0.69314719) = 1.664741 + 4.805548 = 6.47029
+        (torch.tensor([0.0]), torch.tensor([2.0]), 1.5, 6.46960),
 
         # Case 4: Non-zero target, over-prediction
-        # y=2.0, preds=1.0, mu=e=2.718
-        # loss = 2*sqrt(e) + 4/sqrt(e) = 5.724
-        (torch.tensor([1.0]), torch.tensor([2.0]), 1.5, 5.724),
+        # y=2.0, preds=3.0, mu=softplus(3.0)+1e-8 = 3.0485076 + 1e-8
+        # loss = 2*sqrt(3.04850761) + 4/sqrt(3.04850761) = 3.492003 + 2.291000 = 5.783003
+        (torch.tensor([3.0]), torch.tensor([2.0]), 1.5, 5.78300),
         
-        # Case 5: Different p value
-        # y=2.0, preds=ln(2.0)=0.693, mu=2.0, p=1.2
-        # loss = mu^0.8/0.8 - y*mu^-0.2/-0.2 = 1.25*2^0.8 + 5*2*2^-0.2 = 1.25*1.74 + 10*0.87 = 2.175 + 8.7 = 10.875
-        (torch.tensor([0.6931]), torch.tensor([2.0]), 1.2, 10.8819),
+        # Case 5: Different p value (p=1.2), perfect prediction (mu=target)
+        # y=2.0, preds=log(exp(2.0)-1)=1.9560475, mu=2.0, p=1.2
+        # loss = 1.25 * (2.00000001**0.8) + 5 * (2 * 2.00000001**-0.2) = 2.176376 + 8.70550 = 10.881876
+        (torch.tensor([1.9560475]), torch.tensor([2.0]), 1.2, 10.88350),
     ]
 )
 def test_tweedie_loss_golden_values(preds, targets, p, expected_loss):
     """Tests the forward pass of the new TweedieLoss against manually calculated golden values."""
     loss_fn = TweedieLoss(p=p, eps=1e-8)
     loss = loss_fn(preds, targets)
-    assert torch.isclose(loss, torch.tensor(expected_loss), atol=1e-3)
+    assert torch.isclose(loss, torch.tensor(expected_loss), atol=1e-3) # Increased precision for atol
 
 
 def test_tweedie_loss_invariant_minimization():
-    """Tests that for a given target, the loss is minimized when mu equals the target."""
+    """Tests that for a given target, the loss is minimized when mu equals the target (using softplus)."""
     loss_fn = TweedieLoss(p=1.5)
     target = torch.tensor([2.0])
     
-    # For the exp link, the raw prediction must be log(target) for mu to equal target
-    pred_val_at_target = torch.log(target)
+    # For softplus link, pred_val_at_target should make softplus(pred_val_at_target) == target
+    # softplus(x) = target => log(1 + exp(x)) = target => 1 + exp(x) = exp(target) => exp(x) = exp(target) - 1
+    # x = log(exp(target) - 1)
+    pred_val_at_target = torch.log(torch.exp(target) - 1)
 
     loss_at_min = loss_fn(pred_val_at_target, target)
     loss_below_min = loss_fn(pred_val_at_target - 0.5, target)

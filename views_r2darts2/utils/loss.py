@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 import inspect
 import logging
-from typing import Tuple, Union, Dict, Any, Type
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +465,7 @@ class TweedieLoss(torch.nn.Module):
     This loss is statistically appropriate for modeling targets that have a point mass at zero
     followed by continuous, right-skewed positive values. It assumes the targets follow a
     Tweedie distribution. The model's raw output is treated as the linear predictor (eta),
-    which is mapped to the distribution's mean (mu) via the canonical log-link function.
+    which is mapped to the distribution's mean (mu) via the softplus link function.
 
     The loss is the negative log-likelihood of the Tweedie distribution, which, up to
     constants, is:
@@ -496,10 +495,9 @@ class TweedieLoss(torch.nn.Module):
         )
 
     def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # `preds` are the raw output of the network, the linear predictor eta.
-        # We use the canonical log-link to get the mean `mu`.
+        # We use the softplus link function to get the mean `mu`.
         # Clamp is used for numerical stability if eta is a large negative number.
-        mu = torch.clamp(torch.exp(preds), min=self.eps)
+        mu = F.softplus(preds) + self.eps
 
         # Negative log-likelihood formula (up to constants)
         loss = (torch.pow(mu, 2 - self.p) / (2 - self.p)) - (

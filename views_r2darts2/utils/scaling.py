@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from copy import deepcopy
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_array, check_is_fitted
@@ -586,18 +587,27 @@ class FeatureScalerManager:
             # Stack all data vertically (along time dimension)
             combined_data = np.concatenate(all_subsets, axis=0)
             
-            # Create a single TimeSeries from combined data for fitting
-            subset_names = [components[i] for i in feature_indices]
-            # Use a dummy time index for fitting
-            dummy_times = pd.date_range('2000-01-01', periods=len(combined_data), freq='MS')
-            combined_ts = TimeSeries.from_times_and_values(
-                times=dummy_times,
-                values=combined_data.astype(np.float32),
-                columns=subset_names,
-            )
+            # Fit the sklearn scaler directly on numpy array (avoids date range overflow
+            # for large datasets like priogrid with 60k+ series)
+            # Handle 3D probabilistic data by reshaping to 2D
+            if combined_data.ndim == 3:
+                # Shape: (time, features, samples) -> (time * samples, features)
+                n_time, n_features, n_samples = combined_data.shape
+                combined_data_2d = combined_data.transpose(0, 2, 1).reshape(-1, n_features)
+            else:
+                combined_data_2d = combined_data
             
-            # Fit the scaler on combined data
-            scaler.fit([combined_ts])
+            # Get the underlying sklearn scaler from the Darts Scaler wrapper
+            # The Darts Scaler stores the sklearn transformer in 'transformer' attribute
+            # and the fitted result in '_fitted_params'
+            underlying_scaler = deepcopy(scaler.transformer)
+            fitted_scaler = underlying_scaler.fit(combined_data_2d.astype(np.float64))
+            
+            # Store the fitted scaler in Darts' expected format
+            # _fitted_params is a tuple of fitted parameters (one per series when not global_fit,
+            # or a single tuple when global_fit=True). Since we're doing global fit, wrap in tuple.
+            scaler._fitted_params = (fitted_scaler,)
+            scaler._fit_called = True
     
     def transform(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
         """

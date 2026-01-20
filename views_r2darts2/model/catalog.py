@@ -211,6 +211,7 @@ class ModelCatalog:
             model_name="TFTModel",
             norm_type="RMSNorm",  # Better for scaled outputs
             n_epochs=self.config.get("n_epochs", 2),
+            random_state=self.config.get("random_state", 42),
             use_reversible_instance_norm=self.config.get(
                 "use_reversible_instance_norm", True
             ),  # https://openreview.net/forum?id=cGDAkQo1C0p - good for non-stationary conflict data

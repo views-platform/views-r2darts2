@@ -1,72 +1,47 @@
-# Loss Specification Sheet: TweedieLoss v1.0
+# Loss Specification Sheet: TweedieLoss v2.0
 
 ## 1. Intended Statistical Model & Purpose
 
 - **Name:** `TweedieLoss`
-- **Version:** 1.0
-- **Purpose:** To model zero-inflated, non-negative continuous targets, which are common in conflict data (e.g., battle deaths). The Tweedie distribution with a power parameter `p` between 1 and 2 naturally handles a mix of exact zeros and positive, often skewed, continuous values.
-- **Statistical Model:** The loss implements the unit deviance of a Tweedie distribution, which is equivalent to the Poisson deviance when `p->1` and the Gamma deviance when `p=2`. This implementation is for `1 < p < 2`.
+- **Version:** 2.0
+- **Purpose:** To serve as a statistically robust loss function for zero-inflated, non-negative continuous targets, such as conflict fatalities. The loss is the negative log-likelihood (NLL) of the Tweedie distribution.
+- **Statistical Model:** By minimizing the Tweedie NLL, the model is trained to predict the conditional mean `μ` of a Tweedie distribution, `Y ~ Tweedie(μ, φ, p)`. For `1 < p < 2`, this distribution naturally models a mixture of exact zeros and continuous, right-skewed positive values.
 
 ## 2. Canonical Formula & Code Mapping
 
-The loss is a weighted version of the Tweedie unit deviance.
+The loss function implements the Tweedie Negative Log-Likelihood for `1 < p < 2`. The model's raw output is treated as the linear predictor `eta`, which is mapped to the mean `μ` via the canonical log-link, `μ = exp(eta)`.
 
-`loss = mean( w * D(targets, mu) )`
+The loss, up to constants that do not depend on `μ`, is:
+`L(y, μ) = (μ**(2-p) / (2-p)) - (y * μ**(1-p) / (1-p))`
 
-### Tweedie Unit Deviance (`D(y, mu)`):
-The formula for the unit deviance for `1 < p < 2` is:
-`D(y, mu) = 2 * ( y^(2-p) / ((1-p)(2-p)) - y*mu^(1-p)/(1-p) + mu^(2-p)/(2-p) )`
-
-The implementation uses a common simplified form which is equivalent up to scaling factors and terms that don't depend on the prediction `mu`. The form used is:
-`D_simplified(y, mu) = mu^(2-p) / (2-p) - y * mu^(1-p) / (1-p)`
-
-**Note:** The model's raw prediction (`preds`) is mapped to the positive mean `mu` via a `softplus` function to ensure `mu > 0`.
-`mu = softplus(preds) + eps`
-
-### Weighting Formula (`w`):
-`w = non_zero_weight` if `|targets| > zero_threshold`
-`w = 1.0` if `|targets| <= zero_threshold`
-
-### Code Mapping:
-
-| Symbol / Term | Formula | Code Variable | Description |
-| :--- | :--- | :--- | :--- |
-| `y` | `targets` | `targets` | The ground truth target values. |
-| `mu`| `softplus(preds)+eps`| `preds_pos` | The predicted positive mean of the distribution. |
-| `p` | `p` | `self.p` | The power parameter of the Tweedie distribution. |
-| `w` | `w` | `weights` | The weight for each sample based on target magnitude. |
+### Critical Property
+Minimizing the expected value of this loss function with respect to `μ` recovers the true conditional mean, `arg min E[L(y, μ)] => μ = E[Y]`. This property makes the loss function ideal for tasks where mean calibration is a primary objective.
 
 ### Parameters:
 
 | Symbol | Code Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `p` | `self.p` | 1.5 | Power parameter, must be in (1, 2). |
-| `nzw` | `self.non_zero_weight`| 5.0 | The weight for non-zero targets. |
-| `zt` | `self.threshold` | 0.01 | (`zero_threshold`) Threshold for considering a target non-zero. |
-| `eps`| `self.eps` | 1e-8 | Small constant for numerical stability after `softplus`. |
+| `p` | `self.p` | 1.5 | The power parameter of the Tweedie distribution, controlling the variance structure `Var(Y) = φμ^p`. Must be in the interval `(1, 2)`. |
+| `eps` | `self.eps` | 1e-6 | A small positive constant to clamp the minimum value of `μ`, ensuring numerical stability (`mu = clamp(exp(eta), min=eps)`). |
 
 ## 3. Domain Constraints
 
-- **`targets`**: Must be non-negative (`>= 0`).
-- **`preds`**: Real-valued. The `softplus` function ensures the mean `mu` is positive.
-- **`p`**: Must be strictly between 1 and 2. The constructor enforces this.
-- All other parameters must be non-negative.
+- **`preds` (`eta`)**: `torch.Tensor`, should be real-valued numbers.
+- **`targets` (`y`)**: `torch.Tensor`, must be non-negative (`y >= 0`).
+- **`p`**: `float`, must be strictly between 1 and 2.
 
 ## 4. Edge Case Policy
 
-- **`targets = 0`:** The deviance simplifies to `mu^(2-p) / (2-p)`. The loss is finite and well-defined.
-- **`preds -> -inf`:** `softplus(preds)` approaches 0. `mu` approaches `eps`. The loss will be large but finite, dominated by the `mu^(1-p)` term if `y > 0`.
+- **`eta -> -inf`:** If the raw model output `eta` is a large negative number, `exp(eta)` can underflow to zero. The implementation prevents this by clamping `μ` at a small positive value `eps`, i.e., `mu = torch.clamp(torch.exp(eta), min=self.eps)`. This ensures the terms `μ**(1-p)` and `μ**(2-p)` do not result in division by zero.
 
 ## 5. Known Equivalences & Invariants
 
-- If `non_zero_weight = 1.0`, the weighting is disabled.
-- The loss is always non-negative for valid inputs.
-- For a fixed target `y > 0`, the loss should be minimized when the predicted mean `mu` is equal to `y`.
-- The `softplus` function makes the loss a function of `preds` rather than `mu` directly, which is a standard technique for constraining the output of a neural network to be positive.
+- As `p -> 1`, the Tweedie distribution approaches a scaled Poisson distribution.
+- As `p -> 2`, the Tweedie distribution approaches a Gamma distribution.
+- The loss function is a proper scoring rule, meaning it is uniquely minimized in expectation when the predicted mean equals the true mean.
+- The dispersion `φ` is treated as a constant nuisance parameter during training and can be fixed to 1 without affecting the optimization of model weights.
 
 ## 6. Practical Guidance & Parameter Tuning
 
-- **`p` Parameter:** The `p` parameter (power) is the key to this loss, defining the distribution's shape. It must be in `(1, 2)`. Values closer to 1 are more Poisson-like, while values closer to 2 are more Gamma-like. `p=1.5` is a common starting point. This parameter is scale-invariant.
-- **`non_zero_weight` Parameter:** Since the loss already handles zeros statistically, this weight should be tuned with care. It is recommended to test `1.0` (no additional weight) as a baseline.
-- For more detailed guidance, see the central guide:
-  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**
+- **The power parameter `p` is a critical hyperparameter.** It should be tuned based on the characteristics of the data. A common method is to perform a grid search over a range of `p` values (e.g., `[1.2, 1.5, 1.8]`) and select the value that yields the best performance on a validation set.
+- The raw output of the neural network should be used directly as the `preds` (`eta`) input to this loss function. No final activation function (like `ReLU` or `Softplus`) is required on the model's output layer, as the loss function itself applies the `exp` link function.

@@ -56,11 +56,11 @@ The following table provides a catalog of the sweep configuration files, detaili
 | `timeaware_weighted_huber_c_sweep.py` | `TimeAwareWeightedHuberLoss` | C | `delta: [0.5, 1.5]`, `decay_factor: [0.9, 0.95]`, `zero_weight: [1.0]`, `non_zero_weight: [5.0, 10.0, 20.0]` | `StandardScaler` | `False` |
 | `timeaware_weighted_huber_e_sweep.py` | `TimeAwareWeightedHuberLoss` | E | `delta: [0.2, 0.5, 1.0]`, `decay_factor: [0.9, 0.95]`, `zero_weight: [1.0]`, `non_zero_weight: [5.0, 10.0, 20.0]` | `None` | `True` |
 | `timeaware_weighted_huber_f_sweep.py` | `TimeAwareWeightedHuberLoss` | F | `delta: [0.2, 0.5, 1.0]`, `decay_factor: [0.9, 0.95]`, `zero_weight: [1.0]`, `non_zero_weight: [5.0, 10.0, 20.0]` | `None` | `False` |
-| `tweedie_a_sweep.py` | `TweedieLoss` | A | `p: [1.2, 1.5, 1.8]`, `non_zero_weight: [1.0, 5.0, 10.0]` | `MinMaxScaler` | `True` |
-| `tweedie_b_sweep.py` | `TweedieLoss` | B | `p: [1.2, 1.5, 1.8]`, `non_zero_weight: [1.0, 5.0, 10.0]` | `None` | `False` |
-| `tweedie_c_sweep.py` | `TweedieLoss` | C | `p: [1.2, 1.5, 1.8]`, `non_zero_weight: [1.0, 5.0, 10.0]` | `StandardScaler` | `False` |
-| `tweedie_e_sweep.py` | `TweedieLoss` | E | `p: [1.2, 1.5, 1.8]`, `non_zero_weight: [1.0, 5.0, 10.0]` | `None` | `True` |
-| `tweedie_f_sweep.py` | `TweedieLoss` | F | `p: [1.2, 1.5, 1.8]`, `non_zero_weight: [1.0, 5.0, 10.0]` | `None` | `False` |
+| `tweedie_a_sweep.py` | `TweedieLoss` | A | `p: [1.2, 1.5, 1.8]` | `MinMaxScaler` | `True` |
+| `tweedie_b_sweep.py` | `TweedieLoss` | B | `p: [1.2, 1.5, 1.8]` | `None` | `False` |
+| `tweedie_c_sweep.py` | `TweedieLoss` | C | `p: [1.2, 1.5, 1.8]` | `StandardScaler` | `False` |
+| `tweedie_e_sweep.py` | `TweedieLoss` | E | `p: [1.2, 1.5, 1.8]` | `None` | `True` |
+| `tweedie_f_sweep.py` | `TweedieLoss` | F | `p: [1.2, 1.5, 1.8]` | `None` | `False` |
 | `weightedhuber_a_sweep.py` | `WeightedHuberLoss` | A | `delta: [0.05, 0.1, 0.25]`, `non_zero_weight: [2.0, 5.0, 10.0]`, `zero_threshold: [0.01]` | `MinMaxScaler` | `True` |
 | `weightedhuber_b_sweep.py` | `WeightedHuberLoss` | B | `delta: [50.0, 100.0, 200.0]`, `non_zero_weight: [2.0, 5.0, 10.0]`, `zero_threshold: [0.1, 0.5, 1.0]` | `None` | `False` |
 | `weightedhuber_c_sweep.py` | `WeightedHuberLoss` | C | `delta: [0.5, 1.5]`, `non_zero_weight: [2.0, 5.0, 10.0]`, `zero_threshold: [0.001]` | `StandardScaler` | `False` |

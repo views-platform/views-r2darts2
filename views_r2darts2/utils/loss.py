@@ -94,7 +94,7 @@ class ShrinkageLoss(torch.nn.Module):
     predicting zeros.
 
     The loss is calculated as:
-    LS = (exp(targets) * (preds - targets)**2) / (1 + exp(a * (c - |preds - targets|)))
+    LS = (preds - targets)**2 / (1 + exp(a * (c - |preds - targets|)))
 
     Args:
         a (float, optional): Controls the shrinkage speed. Higher values lead to
@@ -128,13 +128,9 @@ class ShrinkageLoss(torch.nn.Module):
         # For small l (easy samples), exp() is large, so the denominator is large, shrinking the loss.
         # For large l (hard samples), exp() is small, so the denominator is close to 1, leaving the loss largely unchanged.
         shrinkage_factor = 1 + torch.exp(self.a * (self.c - l))
-        
-        # The numerator contains the squared error and an importance factor.
-        # This term is intended to work with log1p-transformed targets.
-        # torch.exp(torch.log1p(y)) = 1 + y, applying a linear weight to the loss
-        # based on the original magnitude of the target value.
-        importance_weight = torch.exp(targets)
-        base_loss = importance_weight * l**2
+
+        # The numerator contains the squared error.
+        base_loss = l**2
 
         loss = base_loss / shrinkage_factor
         return torch.mean(loss)
@@ -465,67 +461,52 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
 
 class TweedieLoss(torch.nn.Module):
     """
-    Tweedie loss for zero-inflated continuous data.
-    
-    The Tweedie distribution is a family of distributions that includes:
-    - p=1: Poisson (discrete counts)
-    - p=2: Gamma (continuous positive)
-    - 1<p<2: Compound Poisson-Gamma (zero-inflated continuous)
-    
-    For conflict forecasting, p=1.5 is a good starting point as it naturally
-    handles the excess zeros and heavy-tailed positive values typical of conflict data.
+    Tweedie Negative Log-Likelihood loss for regression on zero-inflated continuous data.
+
+    This loss is statistically appropriate for modeling targets that have a point mass at zero
+    followed by continuous, right-skewed positive values. It assumes the targets follow a
+    Tweedie distribution. The model's raw output is treated as the linear predictor (eta),
+    which is mapped to the distribution's mean (mu) via the canonical log-link function.
+
+    The loss is the negative log-likelihood of the Tweedie distribution, which, up to
+    constants, is:
+    L(y, mu) = (mu**(2-p) / (2-p)) - (y * mu**(1-p) / (1-p))
+
+    Minimizing this loss with respect to mu results in an unbiased estimate of the
+    conditional mean, making it ideal for forecasting tasks where mean-calibration is critical.
 
     Args:
-        p (float, optional): Power parameter in (1, 2). p=1.5 is good for zero-inflated data. Defaults to 1.5.
-        non_zero_weight (float, optional): Additional weight for non-zero targets. Defaults to 5.0.
-        zero_threshold (float, optional): Threshold to determine if a target is considered zero. Defaults to 0.01.
-        eps (float, optional): Small constant for numerical stability. Defaults to 1e-8.
-
-    Forward Args:
-        preds (torch.Tensor): Predicted values (will be passed through softplus to ensure positivity).
-        targets (torch.Tensor): Ground truth target values.
-
-    Returns:
-        torch.Tensor: The mean weighted Tweedie loss over the batch.
+        p (float, optional): The power parameter of the Tweedie distribution, where 1 < p < 2.
+            This parameter controls the variance structure of the distribution.
+            - p -> 1: Approaches a Poisson distribution.
+            - p -> 2: Approaches a Gamma distribution.
+            A common starting point is p=1.5. Defaults to 1.5.
+        eps (float, optional): A small positive constant to ensure numerical stability by
+            preventing the predicted mean (mu) from being exactly zero. Defaults to 1e-6.
     """
 
-    def __init__(self, p=1.5, non_zero_weight=5.0, zero_threshold=0.01, eps=1e-8):
+    def __init__(self, p: float = 1.5, eps: float = 1e-6):
         super().__init__()
         if not (1 < p < 2):
-            raise ValueError(f"Power parameter p must be in (1, 2), got {p}")
+            raise ValueError(f"Tweedie power parameter p must be in (1, 2), but got {p}")
         self.p = p
-        self.non_zero_weight = non_zero_weight
-        self.threshold = zero_threshold
         self.eps = eps
         logger.info(
-            "\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}".format(
-                "p (Tweedie power)", p,
-                "non_zero_weight", non_zero_weight,
-                "zero_threshold", zero_threshold,
-            )
+            "\n{:<25} {:<10}".format("Tweedie power (p)", self.p)
         )
 
-    def forward(self, preds, targets):
-        # Ensure predictions are positive via softplus
-        preds_pos = F.softplus(preds) + self.eps
-        
-        # Tweedie deviance for 1 < p < 2 (Compound Poisson-Gamma)
-        # D(y, mu) = 2 * (y^(2-p)/((1-p)(2-p)) - y*mu^(1-p)/(1-p) + mu^(2-p)/(2-p))
-        # Simplified form used in practice:
-        loss = (
-            torch.pow(preds_pos, 2 - self.p) / (2 - self.p)
-            - targets * torch.pow(preds_pos, 1 - self.p) / (1 - self.p)
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # `preds` are the raw output of the network, the linear predictor eta.
+        # We use the canonical log-link to get the mean `mu`.
+        # Clamp is used for numerical stability if eta is a large negative number.
+        mu = torch.clamp(torch.exp(preds), min=self.eps)
+
+        # Negative log-likelihood formula (up to constants)
+        loss = (torch.pow(mu, 2 - self.p) / (2 - self.p)) - (
+            targets * torch.pow(mu, 1 - self.p) / (1 - self.p)
         )
-        
-        # Weight non-zero targets more heavily
-        # Use float tensor for weights to ensure MPS compatibility
-        weights = torch.where(
-            torch.abs(targets) > self.threshold, 
-            torch.tensor(self.non_zero_weight, device=targets.device, dtype=targets.dtype),
-            torch.tensor(1.0, device=targets.device, dtype=targets.dtype)
-        )
-        
-        return (weights * loss).mean()
+
+        return loss.mean()
 
 
 class AsymmetricQuantileLoss(torch.nn.Module):

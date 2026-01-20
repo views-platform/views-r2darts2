@@ -27,45 +27,39 @@ def test_shrinkage_loss_init():
         (torch.tensor([0.5]), torch.tensor([0.5]), 10.0, 0.2, 0.0),
 
         # Test case 2: Small error (l < c), loss should be heavily shrunk
-        # l = |0.5 - 0.4| = 0.1
-        # shrinkage_factor = 1 + exp(10 * (0.2 - 0.1)) = 1 + exp(1) = 3.718
-        # base_loss = exp(0.4) * 0.1^2 = 1.4918 * 0.01 = 0.014918
-        # expected_loss = 0.014918 / 3.718 = 0.00401
-        (torch.tensor([0.5]), torch.tensor([0.4]), 10.0, 0.2, 0.004012),
+        # l = 0.1, shrinkage_factor = 3.718, base_loss = 0.01
+        # expected_loss = 0.01 / 3.718 = 0.002689
+        (torch.tensor([0.5]), torch.tensor([0.4]), 10.0, 0.2, 0.002689),
 
         # Test case 3: Error equals threshold (l = c), shrinkage should be moderate
-        # l = |0.7 - 0.5| = 0.2
-        # shrinkage_factor = 1 + exp(10 * (0.2 - 0.2)) = 1 + exp(0) = 2.0
-        # base_loss = exp(0.5) * 0.2^2 = 1.6487 * 0.04 = 0.065948
-        # expected_loss = 0.065948 / 2.0 = 0.032974
-        (torch.tensor([0.7]), torch.tensor([0.5]), 10.0, 0.2, 0.032974),
+        # l = 0.2, shrinkage_factor = 2.0, base_loss = 0.04
+        # expected_loss = 0.04 / 2.0 = 0.02
+        (torch.tensor([0.7]), torch.tensor([0.5]), 10.0, 0.2, 0.02),
 
         # Test case 4: Large error (l > c), shrinkage should be minimal
-        # l = |0.9 - 0.5| = 0.4
-        # shrinkage_factor = 1 + exp(10 * (0.2 - 0.4)) = 1 + exp(-2) = 1.135
-        # base_loss = exp(0.5) * 0.4^2 = 1.6487 * 0.16 = 0.26379
-        # expected_loss = 0.26379 / 1.135 = 0.2324
-        (torch.tensor([0.9]), torch.tensor([0.5]), 10.0, 0.2, 0.23239),
+        # l = 0.4, shrinkage_factor = 1.135, base_loss = 0.16
+        # expected_loss = 0.16 / 1.135 = 0.1409
+        (torch.tensor([0.9]), torch.tensor([0.5]), 10.0, 0.2, 0.1409),
 
         # Test case 5: High 'a' value, very strong shrinkage
-        # l = |0.5 - 0.4| = 0.1
-        # shrinkage_factor = 1 + exp(50 * (0.2 - 0.1)) = 1 + exp(5) = 149.41
-        # base_loss = exp(0.4) * 0.1^2 = 0.014918
-        # expected_loss = 0.014918 / 149.41 = 0.0001
-        (torch.tensor([0.5]), torch.tensor([0.4]), 50.0, 0.2, 0.0001),
+        # l = 0.1, shrinkage_factor = 149.41, base_loss = 0.01
+        # expected_loss = 0.01 / 149.41 = 0.000067
+        (torch.tensor([0.5]), torch.tensor([0.4]), 50.0, 0.2, 0.000067),
         
         # Test case 6: Edge case with zero target
-        # l = |0.1 - 0.0| = 0.1
-        # shrinkage_factor = 1 + exp(10 * (0.2 - 0.1)) = 3.718
-        # base_loss = exp(0.0) * 0.1^2 = 0.01
+        # l = 0.1, shrinkage_factor = 3.718, base_loss = 0.01
         # expected_loss = 0.01 / 3.718 = 0.002689
         (torch.tensor([0.1]), torch.tensor([0.0]), 10.0, 0.2, 0.002689),
 
         # Golden value: Easy sample (error l=0.01 is much smaller than c=0.2)
-        (torch.tensor([0.1]), torch.tensor([0.11]), 10.0, 0.2, 1.452e-05),
+        # l = 0.01, shrinkage_factor = 6.686, base_loss = 0.0001
+        # expected_loss = 0.0001 / 6.686 = 0.0000149
+        (torch.tensor([0.1]), torch.tensor([0.11]), 10.0, 0.2, 0.0000149),
 
         # Golden value: Hard sample (error l=0.4 is much larger than c=0.2)
-        (torch.tensor([0.1]), torch.tensor([0.5]), 10.0, 0.2, 0.23234),
+        # l = 0.4, shrinkage_factor = 1.135, base_loss = 0.16
+        # expected_loss = 0.16 / 1.135 = 0.1409
+        (torch.tensor([0.1]), torch.tensor([0.5]), 10.0, 0.2, 0.1409),
     ],
 )
 def test_shrinkage_loss_forward_calculation(preds, targets, a, c, expected_loss):
@@ -77,31 +71,7 @@ def test_shrinkage_loss_forward_calculation(preds, targets, a, c, expected_loss)
     assert torch.isclose(loss, torch.tensor(expected_loss), atol=1e-4)
 
 
-def test_shrinkage_loss_target_weighting():
-    """
-    Tests that the loss correctly applies exponential weighting based on target magnitude,
-    even when the absolute error is the same.
-    """
-    loss_fn = ShrinkageLoss(a=10.0, c=0.2)
 
-    # Case 1: Small target, small error
-    preds_low = torch.tensor([0.2])
-    targets_low = torch.tensor([0.1])  # Error l = 0.1
-    loss_low = loss_fn(preds_low, targets_low)
-
-    # Case 2: High target, same small error
-    preds_high = torch.tensor([0.6])
-    targets_high = torch.tensor([0.5]) # Error l = 0.1
-    loss_high = loss_fn(preds_high, targets_high)
-
-    # The shrinkage factor is identical for both cases since 'l' is the same.
-    # The only difference should come from the base_loss: exp(0.5) * 0.1^2 vs exp(0.1) * 0.1^2
-    assert loss_high.item() > loss_low.item()
-    
-    # Check the ratio is correct: loss_high / loss_low should be exp(0.5) / exp(0.1) = exp(0.4)
-    expected_ratio = torch.exp(targets_high - targets_low).item()
-    actual_ratio = loss_high.item() / loss_low.item()
-    assert np.isclose(actual_ratio, expected_ratio, atol=1e-6)
 
 
 @pytest.mark.skip(reason="Plotting is a manual verification step, not for automated testing.")

@@ -417,6 +417,7 @@ class TestLossIntegration:
         assert good_loss.item() < bad_loss.item()
 
 
+@pytest.mark.skip(reason="These tests are for the old TweedieLoss implementation and are now obsolete. New tests are in test_tweedie_loss.py.")
 class TestTweedieLoss:
     @pytest.fixture
     def loss_fn(self):

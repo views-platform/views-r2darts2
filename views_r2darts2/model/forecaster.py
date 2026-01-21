@@ -121,7 +121,6 @@ class DartsForecaster:
         """
         if scaler_cfg is None:
             return None
-        from darts.dataprocessing.transformers import Scaler
 
         if isinstance(scaler_cfg, str):
             estimator = ScalerSelector.get_scaler(scaler_cfg)

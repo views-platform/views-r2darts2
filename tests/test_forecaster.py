@@ -1,9 +1,7 @@
 import pytest
 import pandas as pd
 import numpy as np
-import torch
-from unittest.mock import Mock, MagicMock, patch, call
-from pathlib import Path
+from unittest.mock import Mock, patch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
 from sklearn.preprocessing import StandardScaler

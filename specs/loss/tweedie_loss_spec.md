@@ -9,7 +9,9 @@
 
 ## 2. Canonical Formula & Code Mapping
 
-The loss function implements the Tweedie Negative Log-Likelihood for `1 < p < 2`. The model's raw output is treated as the linear predictor `eta`, which is mapped to the mean `μ` via the canonical log-link, `μ = exp(eta)`.
+The loss function implements the Tweedie Negative Log-Likelihood for `1 < p < 2`. The model's raw output is treated as the linear predictor `eta`.
+
+For numerical stability, `eta` is mapped to the mean `μ` via the `softplus` link function: `μ = softplus(eta)`. While the canonical link for the Tweedie GLM is the log link (`μ = exp(eta)`), `softplus` is used as a more robust alternative that prevents the exploding gradients that can occur with `exp` in a deep learning context.
 
 The loss, up to constants that do not depend on `μ`, is:
 `L(y, μ) = (μ**(2-p) / (2-p)) - (y * μ**(1-p) / (1-p))`
@@ -22,7 +24,7 @@ Minimizing the expected value of this loss function with respect to `μ` recover
 | Symbol | Code Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `p` | `self.p` | 1.5 | The power parameter of the Tweedie distribution, controlling the variance structure `Var(Y) = φμ^p`. Must be in the interval `(1, 2)`. |
-| `eps` | `self.eps` | 1e-6 | A small positive constant to clamp the minimum value of `μ`, ensuring numerical stability (`mu = clamp(exp(eta), min=eps)`). |
+| `eps` | `self.eps` | 1e-6 | A small positive constant added to `μ` to ensure numerical stability (`mu = softplus(eta) + eps`). |
 
 ## 3. Domain Constraints
 
@@ -32,7 +34,7 @@ Minimizing the expected value of this loss function with respect to `μ` recover
 
 ## 4. Edge Case Policy
 
-- **`eta -> -inf`:** If the raw model output `eta` is a large negative number, `exp(eta)` can underflow to zero. The implementation prevents this by clamping `μ` at a small positive value `eps`, i.e., `mu = torch.clamp(torch.exp(eta), min=self.eps)`. This ensures the terms `μ**(1-p)` and `μ**(2-p)` do not result in division by zero.
+- **`eta -> -inf`:** If the raw model output `eta` is a large negative number, `softplus(eta)` will approach zero. A small `eps` is added to the result to ensure `μ` is strictly positive, preventing the terms `μ**(1-p)` and `μ**(2-p)` from resulting in division by zero.
 
 ## 5. Known Equivalences & Invariants
 
@@ -44,4 +46,4 @@ Minimizing the expected value of this loss function with respect to `μ` recover
 ## 6. Practical Guidance & Parameter Tuning
 
 - **The power parameter `p` is a critical hyperparameter.** It should be tuned based on the characteristics of the data. A common method is to perform a grid search over a range of `p` values (e.g., `[1.2, 1.5, 1.8]`) and select the value that yields the best performance on a validation set.
-- The raw output of the neural network should be used directly as the `preds` (`eta`) input to this loss function. No final activation function (like `ReLU` or `Softplus`) is required on the model's output layer, as the loss function itself applies the `exp` link function.
+- The raw output of the neural network should be used directly as the `preds` (`eta`) input to this loss function. No final activation function (like `ReLU`) is required on the model's output layer, as the loss function itself applies the `softplus` link function.

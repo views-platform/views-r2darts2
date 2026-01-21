@@ -466,6 +466,9 @@ class TweedieLoss(torch.nn.Module):
     followed by continuous, right-skewed positive values. It assumes the targets follow a
     Tweedie distribution. The model's raw output is treated as the linear predictor (eta),
     which is mapped to the distribution's mean (mu) via the softplus link function.
+    While the canonical link for the Tweedie distribution is the log link (making `mu = exp(eta)`),
+    the `softplus` function is used here as a more robust and numerically stable alternative
+    that prevents the exploding gradients that can occur with `exp` in a deep learning context.
 
     The loss is the negative log-likelihood of the Tweedie distribution, which, up to
     constants, is:

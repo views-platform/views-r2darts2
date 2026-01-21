@@ -8,14 +8,12 @@ from darts.models.forecasting.nlinear import NLinearModel
 from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
 from pytorch_lightning.callbacks import EarlyStopping
-from views_r2darts2.utils.loss import WeightedHuberLoss
 from pytorch_lightning.callbacks import LearningRateMonitor
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from pytorch_lightning.loggers import WandbLogger
 import torch
 import numpy as np
 
-# from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from views_r2darts2.model.forecaster import DartsForecaster
 from views_r2darts2.utils.loss import LossSelector
 
@@ -25,15 +23,6 @@ class ModelCatalog:
     def __init__(self, config: dict):
         """
         Initializes the model catalog with configuration parameters.
-        Args:
-            config (dict): Configuration dictionary containing model and loss function parameters.
-        Attributes:
-            models (dict): Mapping of model names to their respective getter methods.
-            config (dict): Stores the provided configuration dictionary.
-            device: The device (CPU/GPU) to be used for model training and inference.
-            loss_name (str): Name of the loss function to be used, defaults to 'WeightedPenaltyHuberLoss'.
-            loss_args (dict): Arguments for the loss function, extracted from the configuration.
-            loss_fn: The selected loss function instance, initialized with the specified arguments.
         """
         self.models = {
             "NBEATSModel": self._get_nbeats,
@@ -51,15 +40,33 @@ class ModelCatalog:
 
         self.loss_name = self.config.get("loss_function", "WeightedPenaltyHuberLoss")
 
-        # Prepare loss arguments from config parameters
+        # Prepare loss arguments from config parameters by dynamically grabbing all
+        # potential loss-related keys from the config.
         self.loss_args = {
-            "zero_threshold": self.config.get("zero_threshold", 0.01),
-            "delta": self.config.get("delta", 0.5),
-            "non_zero_weight": self.config.get("non_zero_weight", 5.0),
-            "false_negative_weight": self.config.get("false_negative_weight", 15.0),
-            "false_positive_weight": self.config.get("false_positive_weight", 10.0),
+            # Huber-family params
+            "zero_threshold": self.config.get("zero_threshold"),
+            "delta": self.config.get("delta"),
+            "non_zero_weight": self.config.get("non_zero_weight"),
+            "false_negative_weight": self.config.get("false_negative_weight"),
+            "false_positive_weight": self.config.get("false_positive_weight"),
+            # Quantile-family params
+            "tau": self.config.get("tau"),
+            # Shrinkage-family params
+            "a": self.config.get("a"),
+            "c": self.config.get("c"),
+            # SpikeFocal-family params
+            "alpha": self.config.get("alpha"),
+            "gamma": self.config.get("gamma"),
+            "spike_threshold": self.config.get("spike_threshold"),
+            # ZeroInflated-family params
+            "zero_weight": self.config.get("zero_weight"),
+            "count_weight": self.config.get("count_weight"),
         }
+        # Filter out None values, so that loss function defaults can apply
+        self.loss_args = {k: v for k, v in self.loss_args.items() if v is not None}
+
         self.loss_fn = LossSelector.get_loss_function(self.loss_name, **self.loss_args)
+
         self.lr_scheduler_args = {
             "mode": "min",
             "factor": self.config.get("lr_scheduler_factor", 0.1),
@@ -71,21 +78,12 @@ class ModelCatalog:
     def get_model(self, model_name: str):
         """
         Get a model class by its name.
-
-        Args:
-            model_name (str): The name of the model.
-
-        Returns:
-            Model class corresponding to the provided name.
         """
         return self.models.get(model_name)()
 
     def list_models(self):
         """
         List all available models in the catalog.
-
-        Returns:
-            List of model names.
         """
         return list(self.models.keys())
 
@@ -473,8 +471,8 @@ class ModelCatalog:
             ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -498,9 +496,7 @@ class ModelCatalog:
 
     def _get_tide_model(self):
         torch.serialization.add_safe_globals([TiDEModel, LossSelector])
-        batch_size = 64  # Reduced from 512 for better gradient variety
-        training_samples = 180000
-        steps_per_epoch = int(np.ceil(training_samples / batch_size))
+        batch_size = 64
         return TiDEModel(
             input_chunk_length=self.config.get(
                 "input_chunk_length", 12 * 4
@@ -521,12 +517,6 @@ class ModelCatalog:
             temporal_width_future=self.config.get(
                 "temporal_width_future", 4
             ),  # Default: 4
-            temporal_hidden_size_past=self.config.get(
-                "temporal_hidden_size_past", None
-            ),  # Default: None
-            temporal_hidden_size_future=self.config.get(
-                "temporal_hidden_size_future", None
-            ),  # Default: None
             temporal_decoder_hidden=self.config.get(
                 "temporal_decoder_hidden", 32
             ),  # Default: 32
@@ -562,7 +552,7 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 2e-3),  # Default learning rate was 3e-4
+                "lr": self.config.get("lr", 2e-3),
                 "weight_decay": self.config.get(
                     "weight_decay", 1e-5
                 ),  # Default L2 regularization

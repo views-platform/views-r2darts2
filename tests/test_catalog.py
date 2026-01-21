@@ -1,6 +1,5 @@
 import pytest
-import torch
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch, MagicMock
 from views_r2darts2.model.catalog import ModelCatalog
 from darts.models.forecasting.nbeats import NBEATSModel
 from darts.models.forecasting.tft_model import TFTModel
@@ -440,11 +439,12 @@ class TestConfigurationHandling:
     def test_default_values_applied(self, basic_config):
         """Test that default values are applied when not in config."""
         catalog = ModelCatalog(basic_config)
-        
-        # Check default loss function parameters
-        assert catalog.loss_args["zero_threshold"] == 0.01
-        assert catalog.loss_args["delta"] == 0.5
-        assert catalog.loss_args["non_zero_weight"] == 5.0
+
+        # With the new, corrected implementation, if loss-specific parameters are
+        # not in the main config, the loss_args dictionary will be empty.
+        # This allows the specific loss function's constructor to handle its
+        # own default values, which is the desired behavior.
+        assert catalog.loss_args == {}
 
     def test_custom_values_override_defaults(self):
         """Test that custom values override defaults."""

@@ -122,14 +122,14 @@ class ShrinkageLoss(torch.nn.Module):
         )
 
     def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        l = torch.abs(preds - targets)
+        abs_error = torch.abs(preds - targets)
         # The denominator is the core of the shrinkage mechanism.
         # For small l (easy samples), exp() is large, so the denominator is large, shrinking the loss.
         # For large l (hard samples), exp() is small, so the denominator is close to 1, leaving the loss largely unchanged.
-        shrinkage_factor = 1 + torch.exp(self.a * (self.c - l))
+        shrinkage_factor = 1 + torch.exp(self.a * (self.c - abs_error))
 
         # The numerator contains the squared error.
-        base_loss = l**2
+        base_loss = abs_error**2
 
         loss = base_loss / shrinkage_factor
         return torch.mean(loss)
@@ -619,7 +619,6 @@ class ZeroInflatedLoss(torch.nn.Module):
     def forward(self, preds, targets):
         # Ensure shapes match by flattening if needed
         # Darts may pass (batch, time, features) or (batch, time) tensors
-        original_shape = preds.shape
         preds_flat = preds.reshape(-1)
         targets_flat = targets.reshape(-1)
         

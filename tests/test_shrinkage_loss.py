@@ -1,9 +1,10 @@
 # file: tests/test_shrinkage_loss.py
 
 import torch
-import numpy as np
 import pytest
 from views_r2darts2.utils.loss import ShrinkageLoss
+from darts import TimeSeries
+from darts.models import NBEATSModel, TCNModel, BlockRNNModel, TransformerModel, NLinearModel, TiDEModel
 
 # --- Unit Tests for ShrinkageLoss ---
 
@@ -84,7 +85,6 @@ def test_plot_shrinkage_loss_landscape():
 
     a = 10.0
     c = 0.2
-    loss_fn = ShrinkageLoss(a=a, c=c)
     mse_fn = torch.nn.MSELoss()
 
     # Define a range of prediction errors
@@ -96,12 +96,11 @@ def test_plot_shrinkage_loss_landscape():
     preds = targets + errors
 
     # Calculate losses
-    shrinkage_losses = loss_fn(preds, targets)
     
     # Recalculate manually to isolate components for plotting
-    l = torch.abs(preds - targets)
-    shrinkage_factor = 1 + torch.exp(a * (c - l))
-    base_loss = torch.exp(targets) * l**2
+    abs_error = torch.abs(preds - targets)
+    shrinkage_factor = 1 + torch.exp(a * (c - abs_error))
+    base_loss = torch.exp(targets) * abs_error**2
     manual_shrinkage_losses = base_loss / shrinkage_factor
 
     mse_losses = mse_fn(preds, targets)
@@ -122,9 +121,7 @@ def test_plot_shrinkage_loss_landscape():
 
 # --- Integration Tests with Darts Models ---
 
-# A simple TimeSeries for testing
-from darts import TimeSeries
-from darts.models import NBEATSModel, TCNModel, BlockRNNModel, TransformerModel, NLinearModel, TiDEModel
+
 
 # Define a small, consistent dataset for all integration tests
 ts_train = TimeSeries.from_values(torch.arange(0, 100, dtype=torch.float32).unsqueeze(1)) # Increased length

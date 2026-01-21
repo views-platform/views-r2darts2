@@ -91,10 +91,6 @@ def test_weighted_huber_loss_gradient_check():
     targets = torch.randn(2, 2, dtype=torch.double)
     assert gradcheck(loss_fn, (preds, targets), eps=1e-6, atol=1e-4)
 
-    # Test near the delta threshold
-    # errors will be [0.1, 0.5, 0.9], hitting quadratic, boundary, and linear parts
-    preds_near_delta = torch.tensor([0.1, 0.5, 0.9], dtype=torch.double, requires_grad=True)
-    targets_near_delta = torch.zeros(3, dtype=torch.double)
     # The gradient is not defined at the boundary (|error|=delta).
     # `gradcheck` will fail here as expected. We need to test on either side.
     # We will test only points where the gradient is defined.

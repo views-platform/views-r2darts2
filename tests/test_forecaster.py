@@ -5,7 +5,6 @@ from unittest.mock import Mock, patch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
 from sklearn.preprocessing import StandardScaler
-from darts.dataprocessing.transformers import Scaler
 from views_r2darts2.model.forecaster import DartsForecaster
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
 
@@ -56,10 +55,9 @@ def forecaster(mock_dataset, mock_model, partition_dict):
 def forecaster_with_scalers(mock_dataset, mock_model, partition_dict):
     """Create a DartsForecaster with real, picklable scalers."""
     # Use a real scaler that can be pickled by torch.save
-    real_scaler = Scaler(StandardScaler())
     
     # We patch the selector to return our real scaler instance
-    with patch('views_r2darts2.model.forecaster.ScalerSelector.get_scaler', return_value=StandardScaler()) as mock_get_scaler:
+    with patch('views_r2darts2.model.forecaster.ScalerSelector.get_scaler', return_value=StandardScaler()):
         forecaster = DartsForecaster(
             dataset=mock_dataset,
             model=mock_model,
@@ -148,7 +146,6 @@ class TestDartsForecaster:
     def test_preprocess_timeseries_train_mode(self, forecaster_with_scalers, mock_dataset):
         """Test preprocessing in training mode."""
         # Create mock TimeSeries
-        times = pd.date_range('2020-01-01', periods=120, freq='M')
         mock_ts = Mock(spec=TimeSeries)
         mock_ts.__len__ = Mock(return_value=120)
         mock_ts.astype = Mock(return_value=mock_ts)

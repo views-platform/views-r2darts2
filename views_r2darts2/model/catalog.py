@@ -12,7 +12,6 @@ from pytorch_lightning.callbacks import LearningRateMonitor
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from pytorch_lightning.loggers import WandbLogger
 import torch
-import numpy as np
 
 from views_r2darts2.model.forecaster import DartsForecaster
 from views_r2darts2.utils.loss import LossSelector
@@ -137,8 +136,6 @@ class ModelCatalog:
 
         # Revised training parameters
         batch_size = 256  # Reduced from 512 for better gradient variety
-        training_samples = 180000
-        steps_per_epoch = int(np.ceil(training_samples / batch_size))
 
         return TFTModel(
             # Keep temporal configuration unchanged

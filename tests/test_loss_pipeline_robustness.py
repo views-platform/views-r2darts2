@@ -87,8 +87,7 @@ def test_huber_delta_sensibility_across_pipelines(loss_class, pipeline):
     targets = torch.from_numpy(targets_np)
     errors = torch.abs(preds - targets)
 
-    # Define default kwargs for each loss class
-    kwargs_common = {"delta": good_delta}
+    # Define kwargs for each loss class
     kwargs_good = {}
     kwargs_bad = {}
 
@@ -110,16 +109,14 @@ def test_huber_delta_sensibility_across_pipelines(loss_class, pipeline):
     kwargs_bad["delta"] = bad_delta
 
     # 2. Test with a "good" delta
-    loss_good = loss_class(**kwargs_good)
     proportion_large_good = (errors > good_delta).float().mean().item()
     assert 0.05 < proportion_large_good < 0.95, \
-        f"SANITY CHECK FAILED: Pipeline '{pipeline}' with good delta={good_delta} should partition errors, but proportion of large errors was {proportion_large_good:.2%}"
+        f"Pipeline {pipeline}: Proportion of large errors for 'good' delta ({good_delta}) is too extreme ({proportion_large_good})"
 
     # 3. Test with a "bad" delta - THIS IS MEANT TO FAIL in some cases
-    loss_bad = loss_class(**kwargs_bad)
     proportion_large_bad = (errors > bad_delta).float().mean().item()
     assert proportion_large_bad < 0.05 or proportion_large_bad > 0.95, \
-        f"PROOF FAILED: For pipeline '{pipeline}', bad delta={bad_delta} was expected to partition poorly, but proportion of large errors was {proportion_large_bad:.2%}"
+        f"Pipeline {pipeline}: Proportion of large errors for 'bad' delta ({bad_delta}) is not extreme ({proportion_large_bad})"
 
 
 @pytest.mark.parametrize("pipeline", PIPELINES)

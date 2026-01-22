@@ -86,7 +86,7 @@ class TestLossSelector:
     def test_get_poisson_nll_loss(self):
         loss = LossSelector.get_loss_function("PoissonNLLLoss", log_input=False)
         assert isinstance(loss, torch.nn.PoissonNLLLoss)
-        assert loss.log_input == False
+        assert not loss.log_input
 
 
 class TestWeightedHuberLoss:
@@ -510,9 +510,6 @@ class TestTweedieLoss:
 
         # Test zero prediction if softplus wasn't there
         # Without softplus, preds_pos could be zero leading to pow(0, negative_exponent)
-        loss_fn_no_softplus_test = TweedieLoss(p=1.5, eps=0.0)
-        # Manually create a zero preds_pos for this check
-        preds_pos_manual_zero = torch.tensor([0.0])
         
         # Ensure that with softplus, preds_pos is always > eps
         preds_neg_inf = torch.tensor([-1000.0])

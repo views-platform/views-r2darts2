@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 from darts.logging import raise_if_not, raise_log, get_logger
 from darts.models.forecasting.nbeats import _GType, _TrendGenerator, _SeasonalityGenerator, ACTIVATIONS, _Block

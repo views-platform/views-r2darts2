@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -58,7 +57,7 @@ def analyze_loss_functions():
 
         # Plot Tweedie Loss
         ax_loss = axs[i, 0]
-        ax_loss.plot(preds_range.numpy(), tweedie_losses, label=f'TweedieLoss (p=1.5)')
+        ax_loss.plot(preds_range.numpy(), tweedie_losses, label='TweedieLoss (p=1.5)')
         ax_loss.set_title(f'Tweedie Loss vs. Prediction ({trans_name} Targets)')
         ax_loss.set_xlabel('Prediction Value (eta)')
         ax_loss.set_ylabel('Mean Loss')
@@ -78,7 +77,7 @@ def analyze_loss_functions():
 
         # Plot Shrinkage Loss
         ax_grad = axs[i, 1]
-        ax_grad.plot(preds_range.numpy(), shrinkage_losses, label=f'ShrinkageLoss (a=5.0, c=0.5)', color='orange')
+        ax_grad.plot(preds_range.numpy(), shrinkage_losses, label='ShrinkageLoss (a=5.0, c=0.5)', color='orange')
         ax_grad.set_title(f'Shrinkage Loss vs. Prediction ({trans_name} Targets)')
         ax_grad.set_xlabel('Prediction Value')
         ax_grad.set_ylabel('Mean Loss')

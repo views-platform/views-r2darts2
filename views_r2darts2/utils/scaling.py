@@ -1,12 +1,10 @@
 import numpy as np
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils.validation import check_array, check_is_fitted
 
 # from sklearn.exceptions import NotFittedError
 from sklearn.preprocessing import (
     RobustScaler,
-    StandardScaler,
     MinMaxScaler,
     MaxAbsScaler,
     PowerTransformer,

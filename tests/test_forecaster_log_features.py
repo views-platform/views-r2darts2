@@ -1,7 +1,6 @@
 import pytest
 import pandas as pd
 import numpy as np
-from darts import TimeSeries
 from darts.models.forecasting.tcn_model import TCNModel
 
 from views_r2darts2.data.handlers import _ViewsDatasetDarts

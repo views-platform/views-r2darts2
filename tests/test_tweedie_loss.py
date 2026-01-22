@@ -5,7 +5,6 @@ import pytest
 from darts import TimeSeries
 from darts.models import NBEATSModel, TCNModel, BlockRNNModel, TransformerModel, NLinearModel, TiDEModel
 from views_r2darts2.utils.loss import LossSelector, TweedieLoss
-import torch.nn.functional as F
 
 # --- Unit Tests for the new TweedieLoss (with softplus link) ---
 

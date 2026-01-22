@@ -4,8 +4,6 @@ from darts import TimeSeries
 from darts.models import NLinearModel
 from views_r2darts2.utils.loss import LossSelector
 import logging
-import sys
-from pytorch_lightning.callbacks import Callback
 
 # --- Suppress excessive logging ---
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)

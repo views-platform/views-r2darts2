@@ -1,4 +1,5 @@
 from darts.models.forecasting.nbeats import NBEATSModel
+from darts.models.forecasting.nhits import NHiTSModel
 from darts.models.forecasting.tft_model import TFTModel
 from darts.models.forecasting.tcn_model import TCNModel
 from darts.models.forecasting.block_rnn_model import BlockRNNModel
@@ -81,6 +82,7 @@ class ModelCatalog:
         """
         self.models = {
             "NBEATSModel": self._get_nbeats,
+            "NHiTSModel": self._get_nhits,
             "TFTModel": self._get_tft_model,
             "TCNModel": self._get_tcn_model,
             "BlockRNNModel": self._get_rnn_model,
@@ -260,6 +262,59 @@ class ModelCatalog:
             loss_fn=self.loss_fn,
             model_name=self.config.get("name", "NBEATSModel"),
             force_reset=self.config.get("force_reset", True),
+            pl_trainer_kwargs={
+                "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "callbacks": [
+                    EarlyStopping(
+                        monitor="train_loss",
+                        patience=self.config.get("early_stopping_patience", 5),
+                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        mode="min",
+                    ),
+                    LearningRateMonitor(log_momentum=True),
+                ],
+                "enable_progress_bar": True,
+            },
+            optimizer_kwargs={
+                "lr": self.config.get("lr", 3e-4),
+                "weight_decay": self.config.get("weight_decay", 1e-3),
+            },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,
+        )
+
+    def _get_nhits(self):
+        """N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting.
+        
+        Similar to N-BEATS but with multi-rate sampling for better performance
+        at lower computational cost. Uses MaxPooling for input downsampling
+        and multi-scale interpolation for outputs.
+        """
+        torch.serialization.add_safe_globals([NHiTSModel, LossSelector])
+        return NHiTSModel(
+            input_chunk_length=self.config.get("input_chunk_length", 12 * 2),
+            output_chunk_length=len(self.config["steps"]),
+            output_chunk_shift=self.config.get("output_chunk_shift", 0),
+            num_stacks=self.config.get("num_stacks", 3),  # Default: 3
+            num_blocks=self.config.get("num_blocks", 1),  # Default: 1
+            num_layers=self.config.get("num_layers", 2),  # Default: 2
+            layer_widths=self.config.get("layer_width", 512),  # Default: 512
+            pooling_kernel_sizes=self.config.get("pooling_kernel_sizes", None),  # Auto-configured
+            n_freq_downsample=self.config.get("n_freq_downsample", None),  # Auto-configured
+            activation=self.config.get("activation", "ReLU"),
+            MaxPool1d=self.config.get("max_pool_1d", True),  # Use MaxPool (vs AvgPool)
+            dropout=self.config.get("dropout", 0.1),
+            random_state=self.config.get("random_state", 42),
+            n_epochs=self.config.get("n_epochs", 2),
+            batch_size=self.config.get("batch_size", 128),
+            loss_fn=self.loss_fn,
+            model_name=self.config.get("name", "NHiTSModel"),
+            force_reset=self.config.get("force_reset", True),
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", False
+            ),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),

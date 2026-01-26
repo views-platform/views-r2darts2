@@ -7,13 +7,57 @@ from darts.models.forecasting.tsmixer_model import TSMixerModel
 from darts.models.forecasting.nlinear import NLinearModel
 from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
-from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_lightning.callbacks import EarlyStopping, Callback
 from views_r2darts2.utils.loss import WeightedHuberLoss
 from pytorch_lightning.callbacks import LearningRateMonitor
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from pytorch_lightning.loggers import WandbLogger
 import torch
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class NaNDetectionCallback(Callback):
+    """
+    Callback to detect NaN loss and stop training early.
+    
+    When a model becomes numerically unstable (producing NaN loss), continuing
+    training is pointless and wastes compute. This callback:
+    1. Detects NaN loss
+    2. Logs useful debugging info
+    3. Stops training immediately
+    """
+    
+    def __init__(self, patience: int = 3):
+        """
+        Args:
+            patience: Number of consecutive NaN batches before stopping.
+                      Set to 1 for immediate stop, higher for transient NaN tolerance.
+        """
+        super().__init__()
+        self.patience = patience
+        self.nan_count = 0
+    
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        loss = outputs.get('loss') if isinstance(outputs, dict) else outputs
+        if loss is not None and torch.isnan(loss):
+            self.nan_count += 1
+            logger.warning(
+                f"NaN loss detected at epoch {trainer.current_epoch}, batch {batch_idx} "
+                f"(consecutive NaN count: {self.nan_count}/{self.patience})"
+            )
+            if self.nan_count >= self.patience:
+                logger.error(
+                    "Training stopped due to persistent NaN loss. "
+                    "Suggestions: lower learning rate, increase gradient clipping, "
+                    "check data scaling, verify norm_type='LayerNorm'"
+                )
+                trainer.should_stop = True
+        else:
+            self.nan_count = 0  # Reset on valid loss
+
 
 # from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from views_r2darts2.model.forecaster import DartsForecaster
@@ -113,6 +157,7 @@ class ModelCatalog:
             ),  # Default: True
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
@@ -122,17 +167,8 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
-                    ReduceLROnPlateau(
-                        monitor="train_loss",
-                        patience=self.config.get("lr_scheduler_patience", 2),
-                        factor=self.config.get("lr_scheduler_factor", 0.1),
-                        min_lr=self.config.get("lr_scheduler_min_lr", 1e-6),
-                        verbose=True,
-                        mode="min",
-                    )
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),
@@ -175,10 +211,15 @@ class ModelCatalog:
             model_name="TFTModel",
             norm_type="RMSNorm",  # Better for scaled outputs
             n_epochs=self.config.get("n_epochs", 2),
+            random_state=self.config.get("random_state", 42),
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # https://openreview.net/forum?id=cGDAkQo1C0p - good for non-stationary conflict data
             # Training controls
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -189,7 +230,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),  # Default learning rate
@@ -223,7 +263,7 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -234,7 +274,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),
@@ -254,7 +293,7 @@ class ModelCatalog:
             num_filters=self.config.get("num_filters", 64),  # Default: 64
             dilation_base=self.config.get("dilation_base", 2),  # Default: 2
             # weight_norm=True, #BUG!
-            dropout=0.25,
+            dropout=self.config.get("dropout", 0.2),  # Default: 0.2
             force_reset=self.config.get(
                 "force_reset", True
             ),  # Reset the model if it already exists
@@ -265,12 +304,12 @@ class ModelCatalog:
             n_epochs=self.config.get("n_epochs", 2),
             loss_fn=self.loss_fn,
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),  # https://openreview.net/forum?id=cGDAkQo1C0p
+                "use_reversible_instance_norm", True
+            ),  # https://openreview.net/forum?id=cGDAkQo1C0p - good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -307,7 +346,7 @@ class ModelCatalog:
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                # "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -317,7 +356,6 @@ class ModelCatalog:
                     ),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 1e-4),  # Learning rate
@@ -325,7 +363,9 @@ class ModelCatalog:
                     "weight_decay", 1e-4
                 ),  # L2 regularization
             },
-            use_reversible_instance_norm=True,
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Config-based, default True for non-stationary conflict data
             model_name=self.config.get("name", "BlockRNNModel"),  # Model name
             random_state=self.config.get(
                 "random_state", 42
@@ -337,6 +377,20 @@ class ModelCatalog:
 
     def _get_transformer_model(self):
         torch.serialization.add_safe_globals([TransformerModel, LossSelector])
+        
+        # Get d_model and nhead, ensure compatibility
+        d_model = self.config.get("d_model", 128)
+        nhead = self.config.get("nhead", self.config.get("num_attention_heads", 4))
+        
+        # Validate d_model is divisible by nhead
+        if d_model % nhead != 0:
+            import logging
+            logging.warning(
+                f"d_model ({d_model}) not divisible by nhead ({nhead}). "
+                f"Adjusting nhead to {d_model // (d_model // nhead)}."
+            )
+            nhead = max(1, d_model // 32)  # Ensure at least 32 dims per head
+        
         return TransformerModel(
             input_chunk_length=self.config.get(
                 "input_chunk_length", 12 * 6
@@ -345,10 +399,8 @@ class ModelCatalog:
                 self.config["steps"]
             ),  # Output chunk length based on steps
             output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            d_model=self.config.get("d_model", 64),  # Default: 64
-            nhead=self.config.get(
-                "num_attention_heads", 4
-            ),  # Default: 4 attention heads
+            d_model=d_model,
+            nhead=nhead,
             num_encoder_layers=self.config.get(
                 "num_encoder_layers", 3
             ),  # Default: 3 encoder layers
@@ -357,9 +409,9 @@ class ModelCatalog:
             ),  # Default: 3 decoder layers
             dim_feedforward=self.config.get("dim_feedforward", 512),  # Default: 512
             dropout=self.config.get("dropout", 0.1),  # Default: 0.1
-            activation=self.config.get("activation", "ReLU"),  # Default: 'ReLU'
-            norm_type=self.config.get("norm_type", None),  # Default: None
-            batch_size=self.config.get("batch_size", 256),  # Default: 32
+            activation=self.config.get("activation", "gelu"),  # GELU more stable than ReLU
+            norm_type=self.config.get("norm_type", "LayerNorm"),  # LayerNorm CRITICAL for stability!
+            batch_size=self.config.get("batch_size", 256),  # Default: 256
             n_epochs=self.config.get("n_epochs", 2),  # Default: 100
             loss_fn=self.loss_fn,
             model_name=self.config.get("name", "TransformerModel"),  # Model name
@@ -367,8 +419,12 @@ class ModelCatalog:
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
@@ -378,12 +434,13 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    NaNDetectionCallback(patience=5),  # Stop if 5 consecutive NaN batches
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
+                "detect_anomaly": self.config.get("detect_anomaly", False),  # Set True to debug NaN source
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),  # Default learning rate
+                "lr": self.config.get("lr", 1e-4),  # Lower default LR for transformers
                 "weight_decay": self.config.get(
                     "weight_decay", 1e-3
                 ),  # Default L2 regularization
@@ -410,19 +467,19 @@ class ModelCatalog:
             ),  # Default: True
             batch_size=self.config.get("batch_size", 64),  # Default: 64
             n_epochs=self.config.get("n_epochs", 2),  # Default: 2
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get("zero_threshold", 0.01),  # Default: 0.01
-                delta=self.config.get("delta", 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get("non_zero_weight", 6.0),  # Default: 6.0
-            ),  # Default loss function
+            loss_fn=self.loss_fn,  # Use configured loss function from LossSelector
             model_name=self.config.get("name", "NLinearModel"),  # Model name
             random_state=self.config.get(
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -433,7 +490,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),  # Default learning rate
@@ -463,18 +519,18 @@ class ModelCatalog:
             ),  # Default: True
             batch_size=self.config.get("batch_size", 64),  # Default: 64
             n_epochs=self.config.get("n_epochs", 2),  # Default: 2
-            loss_fn=WeightedHuberLoss(
-                zero_threshold=self.config.get("zero_threshold", 0.01),  # Default: 0.01
-                delta=self.config.get("delta", 0.05),  # Default: 0.05
-                non_zero_weight=self.config.get("non_zero_weight", 6.0),  # Default: 6.0
-            ),  # Default loss function
+            loss_fn=self.loss_fn,  # Use configured loss function from LossSelector
             model_name=self.config.get("name", "DLinearModel"),  # Model name
             random_state=self.config.get(
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
@@ -486,7 +542,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 3e-4),  # Default learning rate
@@ -545,9 +600,13 @@ class ModelCatalog:
                 "random_state", 42
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config.get(
+                "use_reversible_instance_norm", True
+            ),  # Good for non-stationary conflict data
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
@@ -558,7 +617,6 @@ class ModelCatalog:
                     LearningRateMonitor(log_momentum=True),
                 ],
                 "enable_progress_bar": True,
-                "logger": True,
             },
             optimizer_kwargs={
                 "lr": self.config.get("lr", 2e-3),  # Default learning rate was 3e-4

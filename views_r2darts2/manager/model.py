@@ -74,17 +74,16 @@ class DartsForecastingModelManager(ForecastingModelManager):
     def __init__(
         self,
         model_path: ModelPathManager,
-        wandb_notifications: bool = True,
-        use_prediction_store: bool = True,
+        wandb_notifications: bool = False,
+        use_prediction_store: bool = False,
     ) -> None:
         """
         Initializes the model manager with the specified configuration.
 
         Args:
             model_path (ModelPathManager): Manager for model file paths.
-            wandb_notifications (bool, optional): Enable or disable Weights & Biases notifications on Slack. Defaults to True.
-            use_prediction_store (bool, optional): Enable or disable the prediction store. Defaults to True.
-
+            wandb_notifications (bool, optional): Enable or disable Weights & Biases notifications on Slack. Defaults to False.
+            use_prediction_store (bool, optional): Enable or disable the prediction store. Defaults to False.
         Side Effects:
             Overrides the global torch.load function with custom_torch_load.
             Logs the current model architecture.
@@ -133,10 +132,13 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 targets=self.config.get("targets"),
                 broadcast_features=True,
             ),
+            log_features=self.config.get("log_features", []),
+            log_targets=self.config.get("log_targets", False),
             model=model_object,
             partition_dict=self._data_loader.partition_dict,
             feature_scaler=self.config.get("feature_scaler", None),
             target_scaler=self.config.get("target_scaler", None),
+            feature_scaler_map=self.config.get("feature_scaler_map", None),
         )
         forecaster.train()
 
@@ -172,11 +174,14 @@ class DartsForecastingModelManager(ForecastingModelManager):
         - Updates the configuration with the timestamp extracted from the artifact name.
         - Loads the relevant dataset and model, and performs predictions for the specified evaluation type.
         - Supports additional configuration options such as number of samples, jobs, and dropout for Monte Carlo inference.
+        - Predictions are generated in parallel while maintaining sequence order.
         """
+        import concurrent.futures
+        
         # eval_type can be "standard", "long", "complete", "live"
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
-        run_type = self.config["run_type"]
+        run_type = self.configs["run_type"]
 
         if artifact_name:
             logger.info(f"Using (non-default) artifact: {artifact_name}")
@@ -190,45 +195,74 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 run_type
             )  # Path to the latest model artifact if it exists
 
-        self.config["timestamp"] = path_artifact.stem[
-            -15:
-        ]  # Extract the timestamp from the artifact name
+        self._config_manager.add_config({"timestamp": path_artifact.stem[-15:]})
 
         df_viewser = read_dataframe(
             path_raw / f"{run_type}_viewser_df{PipelineConfig.dataframe_format}"
         )
 
-        model_object = ModelCatalog(config=self.config).get_model(
-            model_name=self.config["algorithm"]
+        model_object = ModelCatalog(config=self.configs).get_model(
+            model_name=self.configs["algorithm"]
         )
         forecaster = DartsForecaster(
             dataset=_ViewsDatasetDarts(
                 source=df_viewser,
-                targets=self.config.get("targets"),
+                targets=self.configs.get("targets"),
                 broadcast_features=True,
             ),
             model=model_object,
             partition_dict=self._data_loader.partition_dict,
-            feature_scaler=self.config.get("feature_scaler", None),
-            target_scaler=self.config.get("target_scaler", None),
+            feature_scaler=self.configs.get("feature_scaler", None),
+            target_scaler=self.configs.get("target_scaler", None),
+            log_targets=self.configs.get("log_targets", False),
+            log_features=self.configs.get("log_features", []),
+            feature_scaler_map=self.configs.get("feature_scaler_map", None),
         )
         forecaster.load_model(path=path_artifact)
 
-        total_sequence_number = (
-            ForecastingModelManager._resolve_evaluation_sequence_number(eval_type)
-        )
+        total_sequence_number = 12
 
-        df_predictions = [
-            forecaster.predict(
+        # Parallel prediction with order preservation
+        def predict_sequence(sequence_number):
+            """Helper function to predict a single sequence."""
+            logger.info(f"Starting prediction for sequence {sequence_number + 1}/{total_sequence_number}")
+            result = forecaster.predict(
                 sequence_number,
-                max(self.config["steps"]),
-                num_samples=self.config.get("num_samples", 1),
-                n_jobs=self.config.get("n_jobs", 1),
-                mc_dropout=self.config.get("mc_dropout", False),
+                max(self.configs["steps"]),
+                num_samples=self.configs.get("num_samples", 1),
+                n_jobs=self.configs.get("n_jobs", 1),
+                mc_dropout=self.configs.get("mc_dropout", False),
             )
-            for sequence_number in range(total_sequence_number)
-        ]
+            logger.info(f"✓ Completed prediction for sequence {sequence_number + 1}/{total_sequence_number}")
+            return result
 
+        # Use ThreadPoolExecutor for I/O-bound tasks or ProcessPoolExecutor for CPU-bound
+        max_workers = self.configs.get("parallel_workers", None)
+        
+        logger.info(f"Starting parallel prediction with {max_workers} workers for {total_sequence_number} sequences")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            # Submit all tasks and maintain order
+            futures = {
+                executor.submit(predict_sequence, seq_num): seq_num
+                for seq_num in range(total_sequence_number)
+            }
+            
+            # Track completed futures and maintain order
+            df_predictions = [None] * total_sequence_number
+            completed = 0
+            
+            for future in concurrent.futures.as_completed(futures):
+                seq_num = futures[future]
+                try:
+                    df_predictions[seq_num] = future.result()
+                    completed += 1
+                    logger.info(f"Progress: {completed}/{total_sequence_number} sequences completed")
+                except Exception as e:
+                    logger.error(f"Sequence {seq_num + 1} failed with error: {e}")
+                    raise
+
+        logger.info(f"All {total_sequence_number} predictions completed successfully")
         return df_predictions
 
     def _forecast_model_artifact(self, artifact_name):
@@ -280,6 +314,9 @@ class DartsForecastingModelManager(ForecastingModelManager):
             partition_dict=self._data_loader.partition_dict,
             feature_scaler=self.config.get("feature_scaler", None),
             target_scaler=self.config.get("target_scaler", None),
+            log_targets=self.config.get("log_targets", False),
+            log_features=self.config.get("log_features", []),
+            feature_scaler_map=self.config.get("feature_scaler_map", None),
         )
         forecaster.load_model(path=path_artifact)
 
@@ -305,9 +342,13 @@ class DartsForecastingModelManager(ForecastingModelManager):
             list: A list of predictions generated by the model for each sequence number in the sweep.
         """
 
-        total_sequence_number = (
-            ForecastingModelManager._resolve_evaluation_sequence_number(eval_type)
+        # total_sequence_number = (
+        #     ForecastingModelManager._resolve_evaluation_sequence_number(eval_type)
+        # )
+        logger.warning(
+            "Using fixed total_sequence_number=12 for sweep evaluation eval_type will soon be deprecated."
         )
+        total_sequence_number = 12
 
         df_predictions = [
             model.predict(sequence_number, max(self.config["steps"]))

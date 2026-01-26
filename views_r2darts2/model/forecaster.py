@@ -1,17 +1,16 @@
 import pandas as pd
 import numpy as np
-from typing import List
+from typing import List, Dict, Any, Optional, Union
 import torch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
-from views_r2darts2.utils.scaling import ScalerSelector
+from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
 from darts.dataprocessing.transformers import Scaler
 
 import logging
 
 logger = logging.getLogger(__name__)
-
 
 class DartsForecaster:
     """
@@ -38,6 +37,9 @@ class DartsForecaster:
         partition_dict: dict,
         feature_scaler: str = None,
         target_scaler: str = None,
+        log_targets: bool = False,
+        log_features: list[str] | None = None,
+        feature_scaler_map: Optional[Dict[str, Any]] = None,
     ):
         """
         Initializes the forecaster with dataset, model, partition information, and optional scalers.
@@ -46,8 +48,44 @@ class DartsForecaster:
             dataset (_ViewsDatasetDarts): The dataset to be used for forecasting.
             model (TorchForecastingModel): The forecasting model instance.
             partition_dict (dict): Dictionary containing 'train' and 'test' partition indices.
-            feature_scaler (str, optional): Name of the feature scaler to use. Defaults to None.
+            feature_scaler (str, optional): Name of the feature scaler to use for all features.
+                Ignored if feature_scaler_map is provided. Defaults to None.
             target_scaler (str, optional): Name of the target scaler to use. Defaults to None.
+            log_targets (bool, optional): Whether to apply log1p transform to targets. Defaults to False.
+            log_features (list[str], optional): List of feature names to apply log1p transform. Defaults to None.
+            feature_scaler_map (dict, optional): Mapping of scalers to specific feature groups.
+                When provided, this takes precedence over feature_scaler.
+                
+                Supported formats:
+                
+                1. Named group format:
+                ```python
+                {
+                    "conflict": {
+                        "scaler": "RobustScaler",
+                        "features": ["ged_sb", "ged_ns", "acled_sb"]
+                    },
+                    "wdi": {
+                        "scaler": "StandardScaler", 
+                        "features": ["wdi_ny_gdp_mktp_kd"]
+                    },
+                    "vdem": {
+                        "scaler": "MinMaxScaler",
+                        "features": ["vdem_v2x_polyarchy"]
+                    }
+                }
+                ```
+                
+                2. Simple format:
+                ```python
+                {
+                    "RobustScaler": ["ged_sb", "ged_ns", "acled_sb"],
+                    "StandardScaler": ["wdi_ny_gdp_mktp_kd"],
+                    "MinMaxScaler": ["vdem_v2x_polyarchy"]
+                }
+                ```
+                
+                Features not listed in feature_scaler_map will use feature_scaler as default.
 
         Attributes:
             dataset (_ViewsDatasetDarts): The provided dataset.
@@ -60,7 +98,7 @@ class DartsForecaster:
             _target_scaler (str): Name of the target scaler.
             scaler_fitted (bool): Indicates if scalers have been fitted.
             target_scaler (Scaler or None): Target scaler instance if provided.
-            feature_scaler (Scaler or None): Feature scaler instance if provided.
+            feature_scaler (Scaler, FeatureScalerManager, or None): Feature scaler instance.
             device (torch.device): Device used for model computation.
 
         Logs:
@@ -70,25 +108,49 @@ class DartsForecaster:
         self.model = model
         self._train_start, self._train_end = partition_dict["train"]
         self._test_start, self._test_end = partition_dict["test"]
-        self._feature_scaler = feature_scaler
-        self._target_scaler = target_scaler
 
-        self.scaler_fitted = False  # Track scaler state
+        self._feature_scaler_cfg = feature_scaler
+        self._target_scaler_cfg = target_scaler
+        self._feature_scaler_map_cfg = feature_scaler_map
+        self._log_targets = bool(log_targets)
+        self._log_features = set(log_features or [])
 
-        if self._target_scaler:
-            self.target_scaler = Scaler(ScalerSelector.get_scaler(self._target_scaler))
-        else:
-            self.target_scaler = None
-
-        if self._feature_scaler:
-            self.feature_scaler = Scaler(
-                ScalerSelector.get_scaler(self._feature_scaler)
+        # Warn about potential double log transform
+        if self._log_targets and target_scaler == "LogTransform":
+            logger.warning(
+                "Both log_targets=True and target_scaler='LogTransform' are set. "
+                "This will apply log transform twice! Consider using only one. "
+                "Disabling manual log_targets to avoid double transformation."
             )
-        else:
-            self.feature_scaler = None
+            self._log_targets = False
+        
+        if self._log_features and feature_scaler == "LogTransform":
+            logger.error(
+                "Both log_features and feature_scaler='LogTransform' are set. "
+                "This may apply log transform twice on overlapping features! "
+                "Consider using only one transformation method."
+            )
+            raise
 
-        logger.info(f"Using feature scaler: {self._feature_scaler}")
-        logger.info(f"Using target scaler: {self._target_scaler}")
+        self.scaler_fitted = False
+
+        # Initialize target scaler
+        self.target_scaler = self._instantiate_scaler(self._target_scaler_cfg)
+
+        # Initialize feature scaler(s)
+        # feature_scaler_map takes precedence over feature_scaler
+        if self._feature_scaler_map_cfg:
+            self.feature_scaler = FeatureScalerManager(
+                feature_scaler_map=self._feature_scaler_map_cfg,
+                default_scaler=self._feature_scaler_cfg,  # fallback for unmapped features
+                all_features=self.dataset.features,
+            )
+            logger.info(f"Using feature scaler map: {self.feature_scaler}")
+        else:
+            self.feature_scaler = self._instantiate_scaler(self._feature_scaler_cfg)
+            logger.info(f"Using feature scaler: {self._feature_scaler_cfg}")
+
+        logger.info(f"Using target scaler: {self._target_scaler_cfg}")
 
         self.device = self.get_device()
         logger.info(f"Using device: {self.device}")
@@ -97,12 +159,215 @@ class DartsForecaster:
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
             self.model.model.to(self.device)
 
+    def _instantiate_scaler(self, scaler_cfg):
+        """
+        Instantiate and wrap a scaler config.
+        
+        Accepts:
+          - None
+          - String: 'StandardScaler' or 'AsinhTransform->StandardScaler' (chained)
+          - List: ['AsinhTransform', 'StandardScaler'] (chained)
+          - Dict: {'name': <str>, 'kwargs': <dict>}
+          - Dict with chain: {'chain': ['AsinhTransform', 'StandardScaler']}
+          
+        Returns:
+          Darts Scaler wrapper or None.
+        """
+        if scaler_cfg is None:
+            return None
+        from darts.dataprocessing.transformers import Scaler
+        from views_r2darts2.utils.scaling import ChainedScaler
+
+        if isinstance(scaler_cfg, str):
+            # Supports both single scalers and chain syntax "Scaler1->Scaler2"
+            estimator = ScalerSelector.get_scaler_or_chain(scaler_cfg)
+            return Scaler(estimator)
+        
+        if isinstance(scaler_cfg, list):
+            # List of scalers to chain: ["AsinhTransform", "StandardScaler"]
+            if len(scaler_cfg) == 1:
+                estimator = ScalerSelector.get_scaler(scaler_cfg[0])
+            else:
+                scalers = [ScalerSelector.get_scaler(name) for name in scaler_cfg]
+                estimator = ChainedScaler(scalers)
+            return Scaler(estimator)
+        
+        if isinstance(scaler_cfg, dict):
+            # Check for chain config
+            if "chain" in scaler_cfg:
+                chain_list = scaler_cfg["chain"]
+                if isinstance(chain_list, str):
+                    estimator = ScalerSelector.get_chained_scaler(chain_list)
+                elif isinstance(chain_list, list):
+                    scalers = [ScalerSelector.get_scaler(name) for name in chain_list]
+                    estimator = ChainedScaler(scalers)
+                else:
+                    raise TypeError(
+                        f"'chain' must be a string or list, got {type(chain_list).__name__}"
+                    )
+                return Scaler(estimator)
+            
+            # Standard dict format
+            name = scaler_cfg.get("name")
+            kwargs = scaler_cfg.get("kwargs", {})
+            if name is None:
+                raise ValueError(
+                    "Scaler config dict must have a 'name' key or a 'chain' key."
+                )
+            estimator = ScalerSelector.get_scaler_or_chain(name, **kwargs)
+            return Scaler(estimator)
+        
+        raise TypeError(
+            f"Scaler config must be None, str, list, or dict. Got {type(scaler_cfg).__name__}."
+        )
+    
+    def _apply_log_to_targets(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
+        """
+        Vectorized log1p for target series.
+        FIX: Darts TimeSeries.map passes the full ndarray, not scalars. Prior lambda assumed scalar.
+        We now:
+          - Clip negatives to 0.
+          - Apply log1p.
+          - Cast back to float32 (numpy log1p returns float64).
+        """
+        if not self._log_targets:
+            return series_list
+        logger.info("Applying vectorized log1p transform to target series...")
+        out = []
+        for ts in series_list:
+            out.append(ts.map(lambda arr: np.log1p(np.maximum(arr, 0)).astype(np.float32)))
+        return out
+    
+    def _check_data_sanity(self, series_list: List[TimeSeries], name: str, max_abs_val: float = 100.0):
+        """
+        Check for NaN, Inf, or extreme values in time series data.
+        
+        Extreme values in attention-based models can cause numerical instability:
+        - Attention scores: softmax(Q @ K.T / sqrt(d)) can overflow with large inputs
+        - LayerNorm: can produce NaN if input variance is near-zero or extreme
+        
+        Args:
+            series_list: List of TimeSeries to check
+            name: Name of the data (for logging)
+            max_abs_val: Values beyond this threshold are flagged as extreme (default 100)
+        """
+        total_nan = 0
+        total_inf = 0
+        total_extreme = 0
+        total_values = 0
+        extreme_features = set()
+        
+        for ts in series_list:
+            arr = ts.all_values(copy=False)
+            total_values += arr.size
+            
+            nan_count = np.isnan(arr).sum()
+            inf_count = np.isinf(arr).sum()
+            extreme_mask = np.abs(arr) > max_abs_val
+            extreme_count = extreme_mask.sum()
+            
+            total_nan += nan_count
+            total_inf += inf_count
+            total_extreme += extreme_count
+            
+            # Find which features have extreme values
+            if extreme_count > 0 and hasattr(ts, 'components'):
+                components = list(ts.components)
+                if arr.ndim == 2:
+                    for feat_idx in range(arr.shape[1]):
+                        if np.any(extreme_mask[:, feat_idx]):
+                            max_val = np.max(np.abs(arr[:, feat_idx]))
+                            extreme_features.add((components[feat_idx], float(max_val)))
+                elif arr.ndim == 3:
+                    for feat_idx in range(arr.shape[1]):
+                        if np.any(extreme_mask[:, feat_idx, :]):
+                            max_val = np.max(np.abs(arr[:, feat_idx, :]))
+                            extreme_features.add((components[feat_idx], float(max_val)))
+        
+        if total_nan > 0:
+            logger.error(f"DATA SANITY FAILED [{name}]: {total_nan} NaN values found!")
+        if total_inf > 0:
+            logger.error(f"DATA SANITY FAILED [{name}]: {total_inf} Inf values found!")
+        if total_extreme > 0:
+            logger.warning(
+                f"DATA SANITY WARNING [{name}]: {total_extreme}/{total_values} values "
+                f"({100*total_extreme/total_values:.2f}%) exceed ±{max_abs_val}. "
+                f"This may cause NaN in attention layers."
+            )
+            if extreme_features:
+                sorted_features = sorted(extreme_features, key=lambda x: -x[1])[:10]
+                logger.warning(
+                    f"Top extreme features: {[(f, f'{v:.1f}') for f, v in sorted_features]}"
+                )
+
+    def _inverse_log_on_predictions(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
+        """
+        Inverse of _apply_log_to_targets.
+        - Ensure non-negative before expm1 (safety for any numerical drift).
+        - Cast to float32.
+        """
+        if not self._log_targets:
+            return series_list
+        logger.info("Applying vectorized expm1 inverse transform to predicted series...")
+        out = []
+        for ts in series_list:
+            out.append(ts.map(lambda arr: np.expm1(np.maximum(arr, 0)).astype(np.float32)))
+        return out
+    
+    def _apply_log_to_feature_series(self, ts: TimeSeries) -> TimeSeries:
+        """
+        Applies log1p to selected feature components in a single TimeSeries.
+        Only components whose names appear in self._log_features are transformed.
+        Rationale:
+          - Early weak signals (small positive feature counts) expanded.
+          - Variance stabilized for heavy-tailed covariates.
+        Note:
+          - No inverse needed; past covariates not reconstructed post-prediction.
+          - Negative values clipped to 0 before log1p.
+        """
+        if not self._log_features:
+            return ts
+        comps = ts.components
+        if not any(c in self._log_features for c in comps):
+            return ts
+        arr = ts.all_values(copy=True)
+        # Deterministic: (time, features); Probabilistic: (time, features, samples)
+        if arr.ndim == 2:
+            for idx, name in enumerate(comps):
+                if name in self._log_features:
+                    arr[:, idx] = np.log1p(np.maximum(arr[:, idx], 0.0))
+        elif arr.ndim == 3:
+            # Apply to each sample identically
+            for idx, name in enumerate(comps):
+                if name in self._log_features:
+                    arr[:, idx, :] = np.log1p(np.maximum(arr[:, idx, :], 0.0))
+        # Rebuild TimeSeries preserving metadata
+        new_ts = TimeSeries.from_times_and_values(
+            times=ts.time_index,
+            values=arr.astype(np.float32),
+            columns=comps,
+            freq=ts.freq,
+            static_covariates=ts.static_covariates,
+        )
+        return new_ts
+    
+    def _apply_log_to_features(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
+        """
+        Batch wrapper to apply feature log transform.
+        """
+        if not self._log_features:
+            return series_list
+        logger.info(f"Applying vectorized log1p transform to selected feature components: {self._log_features}...")
+        out = [self._apply_log_to_feature_series(ts) for ts in series_list]
+        return out
+
     @staticmethod
     def get_device() -> str:
         """
         Returns the device type for model training.
         """
         if torch.backends.mps.is_available():
+            torch.set_default_dtype(torch.float32)
             return "mps"
         elif torch.cuda.is_available():
             return "cuda"
@@ -135,47 +400,56 @@ class DartsForecaster:
             Tuple[List[TimeSeries], List[TimeSeries]]: A tuple containing the preprocessed
             targets and past covariates (features).
         """
-        timeseries = [s.astype(np.float32) for s in timeseries]
-
-        # Calculate valid prediction window boundaries
+        timeseries_float = [s.astype(np.float32) for s in timeseries]
 
         self.min_length = self.model.input_chunk_length + self.model.output_chunk_length
-
-        if train_mode:  # Training mode
-            # Slice targets to allow full input+output window creation
+        if train_mode:
             targets = [
                 s.slice(start_ts=start, end_ts=end - self.model.output_chunk_length)[
                     self.dataset.targets
                 ]
-                for s in timeseries
+                for s in timeseries_float
                 if len(s) >= self.min_length
             ]
-            past_cov = [s[self.dataset.features] for s in timeseries]
-        else:  # Prediction mode
-            # Get last valid input window for forecasting
+            past_cov = [s[self.dataset.features].astype(np.float32) for s in timeseries_float]
+        else:
             targets = [
                 s.slice(start_ts=start, end_ts=end)[self.dataset.targets]
-                for s in timeseries
+                for s in timeseries_float
             ]
             past_cov = [
-                s.slice(start_ts=start, end_ts=end)[self.dataset.features]
-                for s in timeseries
+                s.slice(start_ts=start, end_ts=end)[self.dataset.features].astype(np.float32)
+                for s in timeseries_float
             ]
 
+
+        # Log transform selected feature components before scaling
+        past_cov = self._apply_log_to_features(past_cov)
+
+        # Log transform before scaling (can create float64)
+        targets = self._apply_log_to_targets(targets)
+
         if train_mode:
-            logger.info(f"Fitting scalers for training data...")
+            logger.info("Fitting scalers for training data...")
             if self.target_scaler:
                 targets = self.target_scaler.fit_transform(targets)
             if self.feature_scaler:
                 past_cov = self.feature_scaler.fit_transform(past_cov)
-            self.scaler_fitted = True  # Mark scalers as fitted
+            self.scaler_fitted = True
         else:
-            # Prediction mode: use fitted scalers
-            logger.info(f"Transforming scalers for prediction data...")
+            logger.info("Transforming scalers for prediction data...")
             if self.target_scaler and self.scaler_fitted:
                 targets = self.target_scaler.transform(targets)
             if self.feature_scaler and self.scaler_fitted:
                 past_cov = self.feature_scaler.transform(past_cov)
+
+        # DOWNCAST after scaler/log (they yield float64)
+        targets = [ts.astype(np.float32) for ts in targets]
+        past_cov = [pc.astype(np.float32) for pc in past_cov]
+        
+        # Data sanity check: detect extreme values that could cause NaN in attention
+        self._check_data_sanity(targets, "targets")
+        self._check_data_sanity(past_cov, "past_covariates")
 
         return targets, past_cov
 
@@ -202,33 +476,20 @@ class DartsForecaster:
         results = []
         for pred in timeseries_pred:
             entity_id = int(pred.static_covariates.iat[0, 0])
-
-            # Get all samples as numpy array (timesteps x components x samples)
             pred_values = pred.all_values(copy=False)
-
-            # Ensure 3D array (time, components, samples) even for deterministic forecasts
             if pred_values.ndim == 2:
-                pred_values = pred_values[..., np.newaxis]  # Add sample dimension
-
-            # Replace NaNs and infs with 0, convert to float64, then clip negative values for all samples
-            pred_values = np.nan_to_num(pred_values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
-            pred_values = np.clip(pred_values, a_min=0, a_max=None).astype(np.float64)
-
-            # Convert to list format
+                pred_values = pred_values[..., np.newaxis]
+            pred_values = np.nan_to_num(pred_values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            pred_values = np.clip(pred_values, a_min=0, a_max=None).astype(np.float32)
             for time_idx in range(pred_values.shape[0]):
                 time_stamp = pred.start_time() + time_idx * pred.freq
                 row_data = {
                     self.dataset._time_id: time_stamp,
                     self.dataset._entity_id: entity_id,
                 }
-
                 for comp_idx, target in enumerate(self.dataset.targets):
-                    # Extract all samples for this component and time step
-                    samples = pred_values[time_idx, comp_idx, :].tolist()
-                    row_data[f"pred_{target}"] = samples
-
+                    row_data[f"pred_{target}"] = pred_values[time_idx, comp_idx, :].tolist()
                 results.append(row_data)
-
         return results
 
     def train(self) -> None:
@@ -312,6 +573,8 @@ class DartsForecaster:
         if self.target_scaler:
             timeseries_pred = self.target_scaler.inverse_transform(timeseries_pred)
 
+        timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
+
         # Process predictions into list format
         results = self._process_predictions(timeseries_pred)
 
@@ -328,10 +591,19 @@ class DartsForecaster:
         path = str(path)
         self.model.save(path=path)
         scaler_path = path + ".scalers"
+        
+        # Determine if using FeatureScalerManager
+        using_feature_scaler_map = isinstance(self.feature_scaler, FeatureScalerManager)
+        
         torch.save({
             'target_scaler': self.target_scaler,
             'feature_scaler': self.feature_scaler,
-            'scaler_fitted': self.scaler_fitted
+            'scaler_fitted': self.scaler_fitted,
+            'log_targets': self._log_targets,
+            'log_features': list(self._log_features),
+            'using_feature_scaler_map': using_feature_scaler_map,
+            'feature_scaler_map_cfg': self._feature_scaler_map_cfg,
+            'feature_scaler_cfg': self._feature_scaler_cfg,
         }, scaler_path)
 
     def load_model(self, path: str) -> None:
@@ -339,20 +611,25 @@ class DartsForecaster:
         path = str(path)
         scaler_path = path + ".scalers"
         try:
-            scaler_data = torch.load(scaler_path, map_location='cpu')
+            scaler_data = torch.load(scaler_path, map_location='cpu', weights_only=False)
             self.target_scaler = scaler_data['target_scaler']
             self.feature_scaler = scaler_data['feature_scaler']
             self.scaler_fitted = scaler_data['scaler_fitted']
+            self._log_targets = scaler_data.get('log_targets', False)
+            self._log_features = set(scaler_data.get('log_features', []))
+            self._feature_scaler_map_cfg = scaler_data.get('feature_scaler_map_cfg')
+            self._feature_scaler_cfg = scaler_data.get('feature_scaler_cfg')
         except FileNotFoundError:
             logger.error("Scaler state not found. Please retrain the model.")
-            # self.scaler_fitted = False
             raise
         
-        # Load the model
-        self.model = self.model.load(path=path)
+        # Load the model - use the class method to get a new instance
+        self.model = self.model.__class__.load(path=path, map_location=str(self.device))
         
-        # Move model to appropriate device
+        # Ensure model is on the correct device
         if hasattr(self.model, "to_device"):
             self.model.to_device(self.device)
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
             self.model.model.to(self.device)
+        
+        logger.info(f"Model loaded and moved to device: {self.device}")

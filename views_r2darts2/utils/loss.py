@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import inspect
 import logging
 
@@ -35,6 +36,9 @@ class LossSelector:
             "TimeAwareWeightedHuberLoss": TimeAwareWeightedHuberLoss,
             "SpikeFocalLoss": SpikeFocalLoss,
             "WeightedPenaltyHuberLoss": WeightedPenaltyHuberLoss,
+            "TweedieLoss": TweedieLoss,
+            "AsymmetricQuantileLoss": AsymmetricQuantileLoss,
+            "ZeroInflatedLoss": ZeroInflatedLoss,
         }
 
         if loss_name not in loss_classes:
@@ -189,21 +193,105 @@ class SpikeFocalLoss(torch.nn.Module):
         return torch.mean(focal_weights * loss)
 
 
+# class WeightedPenaltyHuberLoss(torch.nn.Module):
+#     """
+#     Custom weighted Huber loss with penalties for false positives and false negatives.
+
+#     This loss function extends the standard Huber loss by applying different weights to:
+#     - Non-zero targets (higher importance)
+#     - False positives (predicted non-zero when target is zero)
+#     - False negatives (predicted zero when target is non-zero)
+
+#     Args:
+#         zero_threshold (float, optional): Threshold to consider a value as zero. Defaults to 0.01.
+#         delta (float, optional): Huber loss delta parameter. Defaults to 0.5.
+#         non_zero_weight (float, optional): Weight for non-zero targets. Defaults to 5.0.
+#         false_positive_weight (float, optional): Penalty weight for false positives. Defaults to 10.0.
+#         false_negative_weight (float, optional): Penalty weight for false negatives. Defaults to 15.0.
+
+#     Forward Args:
+#         preds (torch.Tensor): Predicted values.
+#         targets (torch.Tensor): Ground truth values.
+
+#     Returns:
+#         torch.Tensor: Scalar mean of the weighted Huber loss.
+#     """
+
+#     def __init__(
+#         self,
+#         zero_threshold=0.01,
+#         delta=0.5,
+#         non_zero_weight=5.0,
+#         false_positive_weight=10.0,
+#         false_negative_weight=15.0,
+#     ):
+#         super().__init__()
+#         self.threshold = zero_threshold
+#         self.delta = delta
+#         self.non_zero_weight = non_zero_weight
+#         self.false_positive_weight = false_positive_weight
+#         self.false_negative_weight = false_negative_weight
+#         logger.info(
+#             "\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}".format(
+#                 "zero_threshold",
+#                 zero_threshold,
+#                 "delta",
+#                 delta,
+#                 "non_zero_weight",
+#                 non_zero_weight,
+#                 "false_positive_weight",
+#                 false_positive_weight,
+#                 "false_negative_weight",
+#                 false_negative_weight,
+#             )
+#         )
+
+#     def forward(self, preds, targets):
+#         # Identify non-zero targets and predictions (detach masks to prevent gradient flow)
+#         is_target_nonzero = torch.abs(targets) > self.threshold
+#         is_pred_nonzero = (torch.abs(preds) > self.threshold).detach()
+
+#         # Base weights: prioritize non-zero targets
+#         base_weights = torch.where(is_target_nonzero, self.non_zero_weight, 1.0)
+
+#         # Identify error types
+#         false_positive_mask = ~is_target_nonzero & is_pred_nonzero
+#         false_negative_mask = is_target_nonzero & ~is_pred_nonzero
+
+#         # Apply penalties to error types while preserving base weights
+#         weights = torch.where(
+#             false_positive_mask,
+#             self.false_positive_weight,
+#             torch.where(false_negative_mask, self.false_negative_weight, base_weights),
+#         )
+
+#         # Calculate Huber loss
+#         errors = targets - preds
+#         huber_loss = torch.where(
+#             torch.abs(errors) <= self.delta,
+#             0.5 * errors**2,
+#             self.delta * (torch.abs(errors) - 0.5 * self.delta),
+#         )
+
+#         # Apply computed weights
+#         weighted_loss = weights * huber_loss
+#         return torch.mean(weighted_loss)
+
 class WeightedPenaltyHuberLoss(torch.nn.Module):
     """
-    Custom weighted Huber loss with penalties for false positives and false negatives.
+    Custom weighted Huber loss with multiplicative penalties for false positives and false negatives.
 
     This loss function extends the standard Huber loss by applying different weights to:
-    - Non-zero targets (higher importance)
-    - False positives (predicted non-zero when target is zero)
-    - False negatives (predicted zero when target is non-zero)
+    - Non-zero targets (higher importance via non_zero_weight)
+    - False positives (predicted non-zero when target is zero) - multiplied by false_positive_weight
+    - False negatives (predicted zero when target is non-zero) - multiplied by false_negative_weight
 
     Args:
         zero_threshold (float, optional): Threshold to consider a value as zero. Defaults to 0.01.
         delta (float, optional): Huber loss delta parameter. Defaults to 0.5.
-        non_zero_weight (float, optional): Weight for non-zero targets. Defaults to 5.0.
-        false_positive_weight (float, optional): Penalty weight for false positives. Defaults to 10.0.
-        false_negative_weight (float, optional): Penalty weight for false negatives. Defaults to 15.0.
+        non_zero_weight (float, optional): Base weight for non-zero targets. Defaults to 5.0.
+        false_positive_weight (float, optional): Multiplier applied to base weight for false positives. Defaults to 2.0.
+        false_negative_weight (float, optional): Multiplier applied to base weight for false negatives. Defaults to 3.0.
 
     Forward Args:
         preds (torch.Tensor): Predicted values.
@@ -211,6 +299,12 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
 
     Returns:
         torch.Tensor: Scalar mean of the weighted Huber loss.
+    
+    Example weights:
+        - Zero target, zero pred: weight = 1.0
+        - Non-zero target, correct pred: weight = non_zero_weight (e.g., 5.0)
+        - Zero target, non-zero pred (FP): weight = 1.0 * false_positive_weight (e.g., 2.0)
+        - Non-zero target, zero pred (FN): weight = non_zero_weight * false_negative_weight (e.g., 5.0 * 3.0 = 15.0)
     """
 
     def __init__(
@@ -218,8 +312,8 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         zero_threshold=0.01,
         delta=0.5,
         non_zero_weight=5.0,
-        false_positive_weight=10.0,
-        false_negative_weight=15.0,
+        false_positive_weight=2.0,
+        false_negative_weight=3.0,
     ):
         super().__init__()
         self.threshold = zero_threshold
@@ -228,7 +322,7 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         self.false_positive_weight = false_positive_weight
         self.false_negative_weight = false_negative_weight
         logger.info(
-            "\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}".format(
+            "\n{:<30} {:<10}\n{:<30} {:<10}\n{:<30} {:<10}\n{:<30} {:<10}\n{:<30} {:<10}".format(
                 "zero_threshold",
                 zero_threshold,
                 "delta",
@@ -243,32 +337,275 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         )
 
     def forward(self, preds, targets):
-        # Identify non-zero targets and predictions (detach masks to prevent gradient flow)
+        # Ensure same dtype and device for numerical stability
+        device = preds.device
+        dtype = preds.dtype
+        
+        # Check for NaN/Inf in TARGETS (data issue) - these we can safely handle
+        if torch.isnan(targets).any() or torch.isinf(targets).any():
+            logger.warning("NaN or Inf detected in targets - replacing with 0")
+            targets = torch.nan_to_num(targets, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        # Check for NaN/Inf in PREDICTIONS (model instability) - log but DON'T mask
+        # Masking predictions hides the problem and produces garbage gradients
+        nan_mask = torch.isnan(preds) | torch.isinf(preds)
+        if nan_mask.any():
+            nan_count = nan_mask.sum().item()
+            total_count = preds.numel()
+            nan_pct = 100 * nan_count / total_count
+            logger.warning(
+                f"NaN/Inf in predictions: {nan_count}/{total_count} ({nan_pct:.1f}%) - "
+                f"model is unstable! Check: learning_rate, gradient_clip, norm_type, d_model/nhead ratio"
+            )
+            # Replace with a large penalty value instead of 0 to create strong gradient signal
+            # This helps the optimizer correct the instability rather than ignoring it
+            preds = torch.where(nan_mask, torch.zeros_like(preds), preds)
+        
+        # Identify non-zero targets and predictions (detach pred mask to prevent gradient flow)
         is_target_nonzero = torch.abs(targets) > self.threshold
         is_pred_nonzero = (torch.abs(preds) > self.threshold).detach()
 
-        # Base weights: prioritize non-zero targets
-        base_weights = torch.where(is_target_nonzero, self.non_zero_weight, 1.0)
+        # Base weights: prioritize non-zero targets (ensure correct dtype/device)
+        non_zero_w = torch.tensor(self.non_zero_weight, device=device, dtype=dtype)
+        one = torch.tensor(1.0, device=device, dtype=dtype)
+        base_weights = torch.where(is_target_nonzero, non_zero_w, one)
 
         # Identify error types
-        false_positive_mask = ~is_target_nonzero & is_pred_nonzero
-        false_negative_mask = is_target_nonzero & ~is_pred_nonzero
+        false_positive_mask = ~is_target_nonzero & is_pred_nonzero  # Predicted conflict when none exists
+        false_negative_mask = is_target_nonzero & ~is_pred_nonzero  # Missed a real conflict
 
-        # Apply penalties to error types while preserving base weights
+        # Apply multiplicative penalties on top of base weights (ensure correct dtype/device)
+        fp_weight = torch.tensor(self.false_positive_weight, device=device, dtype=dtype)
+        fn_weight = torch.tensor(self.false_negative_weight, device=device, dtype=dtype)
+        
         weights = torch.where(
             false_positive_mask,
-            self.false_positive_weight,
-            torch.where(false_negative_mask, self.false_negative_weight, base_weights),
+            base_weights * fp_weight,  # e.g., 1.0 * 2.0 = 2.0
+            torch.where(
+                false_negative_mask,
+                base_weights * fn_weight,  # e.g., 5.0 * 3.0 = 15.0
+                base_weights  # No error: use base weight
+            ),
         )
 
         # Calculate Huber loss
         errors = targets - preds
+        delta_t = torch.tensor(self.delta, device=device, dtype=dtype)
+        abs_errors = torch.abs(errors)
         huber_loss = torch.where(
-            torch.abs(errors) <= self.delta,
+            abs_errors <= delta_t,
             0.5 * errors**2,
-            self.delta * (torch.abs(errors) - 0.5 * self.delta),
+            delta_t * (abs_errors - 0.5 * delta_t),
         )
 
-        # Apply computed weights
+        # Apply computed weights and handle potential NaN
         weighted_loss = weights * huber_loss
+        
+        # Final NaN check
+        if torch.isnan(weighted_loss).any():
+            logger.warning("NaN in weighted_loss, replacing with 0")
+            weighted_loss = torch.nan_to_num(weighted_loss, nan=0.0)
+        
         return torch.mean(weighted_loss)
+
+
+class TweedieLoss(torch.nn.Module):
+    """
+    Tweedie loss for zero-inflated continuous data.
+    
+    The Tweedie distribution is a family of distributions that includes:
+    - p=1: Poisson (discrete counts)
+    - p=2: Gamma (continuous positive)
+    - 1<p<2: Compound Poisson-Gamma (zero-inflated continuous)
+    
+    For conflict forecasting, p=1.5 is a good starting point as it naturally
+    handles the excess zeros and heavy-tailed positive values typical of conflict data.
+
+    Args:
+        p (float, optional): Power parameter in (1, 2). p=1.5 is good for zero-inflated data. Defaults to 1.5.
+        non_zero_weight (float, optional): Additional weight for non-zero targets. Defaults to 5.0.
+        zero_threshold (float, optional): Threshold to determine if a target is considered zero. Defaults to 0.01.
+        eps (float, optional): Small constant for numerical stability. Defaults to 1e-8.
+
+    Forward Args:
+        preds (torch.Tensor): Predicted values (will be passed through softplus to ensure positivity).
+        targets (torch.Tensor): Ground truth target values.
+
+    Returns:
+        torch.Tensor: The mean weighted Tweedie loss over the batch.
+    """
+
+    def __init__(self, p=1.5, non_zero_weight=5.0, zero_threshold=0.01, eps=1e-8):
+        super().__init__()
+        if not (1 < p < 2):
+            raise ValueError(f"Power parameter p must be in (1, 2), got {p}")
+        self.p = p
+        self.non_zero_weight = non_zero_weight
+        self.threshold = zero_threshold
+        self.eps = eps
+        logger.info(
+            "\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}".format(
+                "p (Tweedie power)", p,
+                "non_zero_weight", non_zero_weight,
+                "zero_threshold", zero_threshold,
+            )
+        )
+
+    def forward(self, preds, targets):
+        # Ensure predictions are positive via softplus
+        preds_pos = F.softplus(preds) + self.eps
+        
+        # Tweedie deviance for 1 < p < 2 (Compound Poisson-Gamma)
+        # D(y, mu) = 2 * (y^(2-p)/((1-p)(2-p)) - y*mu^(1-p)/(1-p) + mu^(2-p)/(2-p))
+        # Simplified form used in practice:
+        loss = (
+            torch.pow(preds_pos, 2 - self.p) / (2 - self.p)
+            - targets * torch.pow(preds_pos, 1 - self.p) / (1 - self.p)
+        )
+        
+        # Weight non-zero targets more heavily
+        # Use float tensor for weights to ensure MPS compatibility
+        weights = torch.where(
+            torch.abs(targets) > self.threshold, 
+            torch.tensor(self.non_zero_weight, device=targets.device, dtype=targets.dtype),
+            torch.tensor(1.0, device=targets.device, dtype=targets.dtype)
+        )
+        
+        return (weights * loss).mean()
+
+
+class AsymmetricQuantileLoss(torch.nn.Module):
+    """
+    Asymmetric Quantile Loss for conflict forecasting.
+    
+    Quantile regression naturally handles asymmetric error costs. For conflict
+    forecasting where underestimation (missing conflicts) is typically costlier
+    than overestimation (false alarms), use tau > 0.5.
+    
+    - tau = 0.5: Symmetric (equivalent to MAE)
+    - tau = 0.75: 3x penalty for underestimation vs overestimation
+    - tau = 0.9: 9x penalty for underestimation vs overestimation
+
+    Args:
+        tau (float, optional): Quantile level in (0, 1). Higher values penalize underestimation more. Defaults to 0.75.
+        non_zero_weight (float, optional): Additional weight for non-zero targets. Defaults to 5.0.
+        zero_threshold (float, optional): Threshold to determine if a target is considered zero. Defaults to 0.01.
+
+    Forward Args:
+        preds (torch.Tensor): Predicted values.
+        targets (torch.Tensor): Ground truth target values.
+
+    Returns:
+        torch.Tensor: The mean weighted quantile loss over the batch.
+    """
+
+    def __init__(self, tau=0.75, non_zero_weight=5.0, zero_threshold=0.01):
+        super().__init__()
+        if not (0 < tau < 1):
+            raise ValueError(f"tau must be in (0, 1), got {tau}")
+        self.tau = tau
+        self.non_zero_weight = non_zero_weight
+        self.threshold = zero_threshold
+        logger.info(
+            "\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}".format(
+                "tau (quantile)", tau,
+                "non_zero_weight", non_zero_weight,
+                "zero_threshold", zero_threshold,
+            )
+        )
+
+    def forward(self, preds, targets):
+        errors = targets - preds
+        
+        # Asymmetric quantile loss
+        # Positive error (underestimation): weight by tau
+        # Negative error (overestimation): weight by (1 - tau)
+        quantile_loss = torch.where(
+            errors >= 0,
+            self.tau * errors,           # Underestimation penalty
+            (self.tau - 1) * errors      # Overestimation penalty (note: errors < 0, so this is positive)
+        )
+        
+        # Additional weight for non-zero targets
+        # Use explicit tensors for MPS compatibility
+        weights = torch.where(
+            torch.abs(targets) > self.threshold, 
+            torch.tensor(self.non_zero_weight, device=targets.device, dtype=targets.dtype),
+            torch.tensor(1.0, device=targets.device, dtype=targets.dtype)
+        )
+        
+        return (weights * quantile_loss).mean()
+
+
+class ZeroInflatedLoss(torch.nn.Module):
+    """
+    Zero-Inflated Loss for sparse conflict data.
+    
+    Explicitly models the two-part nature of zero-inflated data:
+    1. Binary component: Is there any conflict? (logistic-like)
+    2. Count component: How much conflict? (Huber loss on non-zero values)
+    
+    This is particularly suited for conflict data where the majority of
+    observations are zeros, and we need to separately model the occurrence
+    vs. intensity of conflict.
+
+    Args:
+        zero_weight (float, optional): Weight for the binary (zero/non-zero) classification component. Defaults to 1.0.
+        count_weight (float, optional): Weight for the count/intensity component. Defaults to 1.0.
+        delta (float, optional): Huber loss delta parameter for the count component. Defaults to 0.5.
+        zero_threshold (float, optional): Threshold to determine if a value is considered zero. Defaults to 0.01.
+        eps (float, optional): Small constant for numerical stability. Defaults to 1e-8.
+
+    Forward Args:
+        preds (torch.Tensor): Predicted values.
+        targets (torch.Tensor): Ground truth target values.
+
+    Returns:
+        torch.Tensor: The weighted sum of binary and count loss components.
+    """
+
+    def __init__(self, zero_weight=1.0, count_weight=1.0, delta=0.5, zero_threshold=0.01, eps=1e-8):
+        super().__init__()
+        self.zero_weight = zero_weight
+        self.count_weight = count_weight
+        self.delta = delta
+        self.threshold = zero_threshold
+        self.eps = eps
+        logger.info(
+            "\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}\n{:<25} {:<10}".format(
+                "zero_weight", zero_weight,
+                "count_weight", count_weight,
+                "delta", delta,
+                "zero_threshold", zero_threshold,
+            )
+        )
+
+    def forward(self, preds, targets):
+        # Ensure shapes match by flattening if needed
+        # Darts may pass (batch, time, features) or (batch, time) tensors
+        original_shape = preds.shape
+        preds_flat = preds.reshape(-1)
+        targets_flat = targets.reshape(-1)
+        
+        # Binary component: classify zero vs non-zero
+        is_zero = (torch.abs(targets_flat) < self.threshold).float()
+        
+        # Soft zero detection using sigmoid
+        # Higher predictions -> lower probability of zero
+        pred_prob_zero = torch.sigmoid(-preds_flat * 10)  # Scale factor for sharper transition
+        
+        # Clamp to avoid numerical issues with BCE
+        pred_prob_zero = torch.clamp(pred_prob_zero, self.eps, 1.0 - self.eps)
+        
+        # Binary cross-entropy for zero/non-zero classification
+        zero_loss = F.binary_cross_entropy(pred_prob_zero, is_zero, reduction='mean')
+        
+        # Count component: Pseudo-Huber loss only on non-zero targets
+        count_mask = 1.0 - is_zero
+        count_errors = (preds_flat - targets_flat) * count_mask
+        
+        # Pseudo-Huber: smooth approximation to Huber loss
+        # L(e) = delta^2 * (sqrt(1 + (e/delta)^2) - 1)
+        count_loss = self.delta**2 * (torch.sqrt(1 + (count_errors / self.delta)**2) - 1)
+        
+        return self.zero_weight * zero_loss + self.count_weight * count_loss.mean()

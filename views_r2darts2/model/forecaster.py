@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Union
@@ -520,9 +521,17 @@ class DartsForecaster:
             ]
 
         # Train the model
+        # Auto-detect num_workers: use half of available CPUs, capped at 8, minimum 0
+        num_workers = min(max((os.cpu_count() or 1) // 2, 0), 8)
+        dataloader_kwargs = (
+            {"num_workers": num_workers, "persistent_workers": True}
+            if num_workers > 0
+            else {}
+        )
         self.model.fit(
             series=target_series,
             past_covariates=past_covariates,
+            dataloader_kwargs=dataloader_kwargs,
             verbose=True,
         )
 

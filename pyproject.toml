@@ -12,7 +12,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = ">=3.11,<3.15"
 views-pipeline-core = ">=2.0.0,<3.0.0"
-darts = "=0.35.0"
+darts = "=0.40.0"
 pytorch-lightning-bolts = ">=0.3.2.post1"
 lightning-bolts = ">=0.7.0"
 

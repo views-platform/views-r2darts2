@@ -213,8 +213,8 @@ class ModelCatalog:
             n_epochs=self.config.get("n_epochs", 2),
             random_state=self.config.get("random_state", 42),
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", True
-            ),  # https://openreview.net/forum?id=cGDAkQo1C0p - good for non-stationary conflict data
+                "use_reversible_instance_norm", False
+            ),
             # Training controls
             pl_trainer_kwargs={
                 "accelerator": "gpu",
@@ -304,8 +304,8 @@ class ModelCatalog:
             n_epochs=self.config.get("n_epochs", 2),
             loss_fn=self.loss_fn,
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", True
-            ),  # https://openreview.net/forum?id=cGDAkQo1C0p - good for non-stationary conflict data
+                "use_reversible_instance_norm", False
+            ),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
@@ -364,8 +364,8 @@ class ModelCatalog:
                 ),  # L2 regularization
             },
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", True
-            ),  # Config-based, default True for non-stationary conflict data
+                "use_reversible_instance_norm", False
+            ),
             model_name=self.config.get("name", "BlockRNNModel"),  # Model name
             random_state=self.config.get(
                 "random_state", 42
@@ -420,8 +420,8 @@ class ModelCatalog:
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", True
-            ),  # Good for non-stationary conflict data
+                "use_reversible_instance_norm", False
+            ),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
@@ -474,8 +474,8 @@ class ModelCatalog:
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", True
-            ),  # Good for non-stationary conflict data
+                "use_reversible_instance_norm", False
+            ),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
@@ -526,8 +526,8 @@ class ModelCatalog:
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", True
-            ),  # Good for non-stationary conflict data
+                "use_reversible_instance_norm", False
+            ),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
@@ -601,8 +601,8 @@ class ModelCatalog:
             ),  # Random seed for reproducibility
             force_reset=True,  # Reset the model if it already exists
             use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", True
-            ),  # Good for non-stationary conflict data
+                "use_reversible_instance_norm", False
+            ),
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),

@@ -217,6 +217,9 @@ class ModelCatalog:
             use_reversible_instance_norm=self.config.get(
                 "use_reversible_instance_norm", False
             ),
+            skip_interpolation=self.config.get("skip_interpolation", False),
+            hidden_continuous_size=self.config.get("hidden_continuous_size", 16),
+
             # Training controls
             pl_trainer_kwargs={
                 "accelerator": "gpu",

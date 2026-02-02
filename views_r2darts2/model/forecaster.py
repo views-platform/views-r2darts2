@@ -475,13 +475,14 @@ class DartsForecaster:
         """
         # Process predictions into list format
         results = []
+        eps = 1e-8
         for pred in timeseries_pred:
             entity_id = int(pred.static_covariates.iat[0, 0])
             pred_values = pred.all_values(copy=False)
             if pred_values.ndim == 2:
                 pred_values = pred_values[..., np.newaxis]
             pred_values = np.nan_to_num(pred_values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-            pred_values = np.clip(pred_values, a_min=0, a_max=None).astype(np.float32)
+            pred_values = np.clip(pred_values, a_min=eps, a_max=None).astype(np.float32)
             for time_idx in range(pred_values.shape[0]):
                 time_stamp = pred.start_time() + time_idx * pred.freq
                 row_data = {

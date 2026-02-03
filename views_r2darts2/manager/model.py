@@ -229,9 +229,9 @@ class DartsForecastingModelManager(ForecastingModelManager):
             result = forecaster.predict(
                 sequence_number,
                 max(self.configs["steps"]),
-                num_samples=self.configs.get("num_samples", 1),
+                num_samples=self.configs.get("num_samples"),
                 n_jobs=self.configs.get("n_jobs", 1),
-                mc_dropout=self.configs.get("mc_dropout", False),
+                mc_dropout=self.configs.get("mc_dropout"),
             )
             logger.info(f"✓ Completed prediction for sequence {sequence_number + 1}/{total_sequence_number}")
             return result

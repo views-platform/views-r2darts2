@@ -95,22 +95,22 @@ class ModelCatalog:
         self.config = config
         self.device = DartsForecaster.get_device()
 
-        self.loss_name = self.config.get("loss_function", "WeightedPenaltyHuberLoss")
+        self.loss_name = self.config["loss_function"]
 
         # Prepare loss arguments from config parameters
         self.loss_args = {
-            "zero_threshold": self.config.get("zero_threshold", 0.01),
-            "delta": self.config.get("delta", 0.5),
-            "non_zero_weight": self.config.get("non_zero_weight", 5.0),
-            "false_negative_weight": self.config.get("false_negative_weight", 15.0),
-            "false_positive_weight": self.config.get("false_positive_weight", 10.0),
+            "zero_threshold": self.config["zero_threshold"],
+            "delta": self.config["delta"],
+            "non_zero_weight": self.config["non_zero_weight"],
+            "false_negative_weight": self.config["false_negative_weight"],
+            "false_positive_weight": self.config["false_positive_weight"],
         }
         self.loss_fn = LossSelector.get_loss_function(self.loss_name, **self.loss_args)
         self.lr_scheduler_args = {
             "mode": "min",
-            "factor": self.config.get("lr_scheduler_factor", 0.1),
-            "patience": self.config.get("lr_scheduler_patience", 3),
-            "min_lr": self.config.get("lr_scheduler_min_lr", 1e-6),
+            "factor": self.config["lr_scheduler_factor"],
+            "patience": self.config["lr_scheduler_patience"],
+            "min_lr": self.config["lr_scheduler_min_lr"],
             "monitor": "train_loss",
         }
 
@@ -138,34 +138,32 @@ class ModelCatalog:
     def _get_tsmixer_model(self):
         torch.serialization.add_safe_globals([TSMixerModel, LossSelector])
         return TSMixerModel(
-            input_chunk_length=self.config.get("input_chunk_length", 12 * 4),
+            input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=len(self.config["steps"]),
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),
-            num_blocks=self.config.get("num_blocks", 2),
-            ff_size=self.config.get("ff_size", 64),
-            hidden_size=self.config.get("hidden_size", 64),
-            activation=self.config.get("activation", "ReLU"),
-            dropout=self.config.get("dropout", 0.1),
-            norm_type=self.config.get("norm_type", "LayerNorm"),
-            normalize_before=self.config.get("normalize_before", False),
-            batch_size=self.config.get("batch_size", 64),
-            n_epochs=self.config.get("n_epochs", 2),
+            output_chunk_shift=self.config["output_chunk_shift"],
+            num_blocks=self.config["num_blocks"],
+            ff_size=self.config["ff_size"],
+            hidden_size=self.config["hidden_size"],
+            activation=self.config["activation"],
+            dropout=self.config["dropout"],
+            norm_type=self.config["norm_type"],
+            normalize_before=self.config["normalize_before"],
+            batch_size=self.config["batch_size"],
+            n_epochs=self.config["n_epochs"],
             loss_fn=self.loss_fn,
-            model_name=self.config.get("name", "TSMixerModel"),
-            random_state=self.config.get("random_state", 42),
+            model_name=self.config["name"],
+            random_state=self.config["random_state"],
             force_reset=True,
-            use_static_covariates=self.config.get(
-                "use_static_covariates", True
-            ),  # Default: True
+            use_static_covariates=self.config["use_static_covariates"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 5),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
@@ -173,8 +171,8 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),
-                "weight_decay": self.config.get("weight_decay", 1e-3),
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -183,53 +181,36 @@ class ModelCatalog:
     def _get_tft_model(self):
         torch.serialization.add_safe_globals([TFTModel, LossSelector])
 
-        # Revised training parameters
-        batch_size = 256  # Reduced from 512 for better gradient variety
-        training_samples = 180000
-        steps_per_epoch = int(np.ceil(training_samples / batch_size))
-
         return TFTModel(
-            # Keep temporal configuration unchanged
-            input_chunk_length=self.config.get("input_chunk_length", 12 * 4),
+            input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=len(self.config["steps"]),
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            feed_forward=self.config.get(
-                "feed_forward", "GatedResidualNetwork"
-            ),  # Default: True
-            add_relative_index=self.config.get(
-                "add_relative_index", True
-            ),  # Default: True
-            use_static_covariates=self.config.get(
-                "use_static_covariates", True
-            ),  # Default: True
-            full_attention=self.config.get("full_attention", False),  # Default: False
-            lstm_layers=self.config.get("lstm_layers", 1),  # Default: 1
-            num_attention_heads=self.config.get("num_attention_heads", 4),  # Default: 4
-            hidden_size=self.config.get("hidden_size", 256),  # Default: 256
-            dropout=self.config.get("dropout", 0.3),  # Default: 0.3
-            # Critical training modifications
-            batch_size=self.config.get("batch_size", batch_size),  # Default: 256
+            output_chunk_shift=self.config["output_chunk_shift"],
+            feed_forward=self.config["feed_forward"],
+            add_relative_index=self.config["add_relative_index"],
+            use_static_covariates=self.config["use_static_covariates"],
+            full_attention=self.config["full_attention"],
+            lstm_layers=self.config["lstm_layers"],
+            num_attention_heads=self.config["num_attention_heads"],
+            hidden_size=self.config["hidden_size"],
+            dropout=self.config["dropout"],
+            batch_size=self.config["batch_size"],
             loss_fn=self.loss_fn,
-            model_name="TFTModel",
-            norm_type="RMSNorm",  # Better for scaled outputs
-            n_epochs=self.config.get("n_epochs", 2),
-            random_state=self.config.get("random_state", 42),
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),
-            skip_interpolation=self.config.get("skip_interpolation", False),
-            hidden_continuous_size=self.config.get("hidden_continuous_size", 16),
-
-            # Training controls
+            model_name=self.config["name"],
+            norm_type=self.config.get("norm_type", "RMSNorm"),
+            n_epochs=self.config["n_epochs"],
+            random_state=self.config["random_state"],
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
+            skip_interpolation=self.config["skip_interpolation"],
+            hidden_continuous_size=self.config["hidden_continuous_size"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 3),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
@@ -237,10 +218,8 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),  # Default learning rate
-                "weight_decay": self.config.get(
-                    "weight_decay", 1e-3
-                ),  # Default L2 regularization
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -249,31 +228,31 @@ class ModelCatalog:
     def _get_nbeats(self):
         torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
         return NBEATSModel(
-            input_chunk_length=self.config.get("input_chunk_length", 12 * 2),
+            input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=len(self.config["steps"]),
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            generic_architecture=self.config.get("generic_architecture", True),
-            num_stacks=self.config.get("num_stacks", 4),
-            num_blocks=self.config.get("num_blocks", 2),
-            num_layers=self.config.get("num_layers", 2),
-            layer_widths=self.config.get("layer_width", 128),
-            activation=self.config.get("activation", "ReLU"),
-            dropout=self.config.get("dropout", 0.2),
-            random_state=self.config.get("random_state", 42),
-            n_epochs=self.config.get("n_epochs", 2),
-            batch_size=self.config.get("batch_size", 128),
+            output_chunk_shift=self.config["output_chunk_shift"],
+            generic_architecture=self.config["generic_architecture"],
+            num_stacks=self.config["num_stacks"],
+            num_blocks=self.config["num_blocks"],
+            num_layers=self.config["num_layers"],
+            layer_widths=self.config["layer_width"],
+            activation=self.config["activation"],
+            dropout=self.config["dropout"],
+            random_state=self.config["random_state"],
+            n_epochs=self.config["n_epochs"],
+            batch_size=self.config["batch_size"],
             loss_fn=self.loss_fn,
-            model_name=self.config.get("name", "NBEATSModel"),
-            force_reset=self.config.get("force_reset", True),
+            model_name=self.config["name"],
+            force_reset=self.config["force_reset"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 5),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
@@ -281,8 +260,8 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),
-                "weight_decay": self.config.get("weight_decay", 1e-3),
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,
@@ -297,36 +276,34 @@ class ModelCatalog:
         """
         torch.serialization.add_safe_globals([NHiTSModel, LossSelector])
         return NHiTSModel(
-            input_chunk_length=self.config.get("input_chunk_length", 12 * 2),
+            input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=len(self.config["steps"]),
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),
-            num_stacks=self.config.get("num_stacks", 3),  # Default: 3
-            num_blocks=self.config.get("num_blocks", 1),  # Default: 1
-            num_layers=self.config.get("num_layers", 2),  # Default: 2
-            layer_widths=self.config.get("layer_width", 512),  # Default: 512
-            pooling_kernel_sizes=self.config.get("pooling_kernel_sizes", None),  # Auto-configured
-            n_freq_downsample=self.config.get("n_freq_downsample", None),  # Auto-configured
-            activation=self.config.get("activation", "ReLU"),
-            MaxPool1d=self.config.get("max_pool_1d", True),  # Use MaxPool (vs AvgPool)
-            dropout=self.config.get("dropout", 0.1),
-            random_state=self.config.get("random_state", 42),
-            n_epochs=self.config.get("n_epochs", 2),
-            batch_size=self.config.get("batch_size", 128),
+            output_chunk_shift=self.config["output_chunk_shift"],
+            num_stacks=self.config["num_stacks"],
+            num_blocks=self.config["num_blocks"],
+            num_layers=self.config["num_layers"],
+            layer_widths=self.config["layer_width"],
+            pooling_kernel_sizes=self.config["pooling_kernel_sizes"],
+            n_freq_downsample=self.config["n_freq_downsample"],
+            activation=self.config["activation"],
+            MaxPool1d=self.config["max_pool_1d"],
+            dropout=self.config["dropout"],
+            random_state=self.config["random_state"],
+            n_epochs=self.config["n_epochs"],
+            batch_size=self.config["batch_size"],
             loss_fn=self.loss_fn,
-            model_name=self.config.get("name", "NHiTSModel"),
-            force_reset=self.config.get("force_reset", True),
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),
+            model_name=self.config["name"],
+            force_reset=self.config["force_reset"],
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 5),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
@@ -334,8 +311,8 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),
-                "weight_decay": self.config.get("weight_decay", 1e-3),
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,
@@ -344,42 +321,37 @@ class ModelCatalog:
     def _get_tcn_model(self):
         torch.serialization.add_safe_globals([TCNModel, LossSelector])
         return TCNModel(
-            input_chunk_length=self.config.get("input_chunk_length", 12 * 6),
+            input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=len(self.config["steps"]),
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            kernel_size=self.config.get("kernel_size", 3),  # Default: 3
-            num_filters=self.config.get("num_filters", 64),  # Default: 64
-            dilation_base=self.config.get("dilation_base", 2),  # Default: 2
-            # weight_norm=True, #BUG!
-            dropout=self.config.get("dropout", 0.2),  # Default: 0.2
-            force_reset=self.config.get(
-                "force_reset", True
-            ),  # Reset the model if it already exists
+            output_chunk_shift=self.config["output_chunk_shift"],
+            kernel_size=self.config["kernel_size"],
+            num_filters=self.config["num_filters"],
+            dilation_base=self.config["dilation_base"],
+            dropout=self.config["dropout"],
+            force_reset=self.config["force_reset"],
             save_checkpoints=True,
-            batch_size=self.config.get("batch_size", 64),
-            model_name=self.config.get("name", "TCNModel"),
-            random_state=self.config.get("random_state", 42),
-            n_epochs=self.config.get("n_epochs", 2),
+            batch_size=self.config["batch_size"],
+            model_name=self.config["name"],
+            random_state=self.config["random_state"],
+            n_epochs=self.config["n_epochs"],
             loss_fn=self.loss_fn,
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 5),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                 ],
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),
-                "weight_decay": self.config.get("weight_decay", 1e-3),
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -388,47 +360,39 @@ class ModelCatalog:
     def _get_rnn_model(self):
         torch.serialization.add_safe_globals([BlockRNNModel, LossSelector])
         return BlockRNNModel(
-            input_chunk_length=self.config.get("input_chunk_length", 12 * 6),
+            input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=len(self.config["steps"]),
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            model=self.config.get(
-                "rnn_type", "LSTM"
-            ),  # Choose between 'LSTM', 'GRU', or 'RNN'
-            hidden_dim=self.config.get("hidden_dim", 5),  # Size of the hidden layers
-            activation=self.config.get("activation", "ReLU"),
-            n_rnn_layers=self.config.get("n_rnn_layers", 2),  # Number of RNN layers
-            dropout=self.config.get("dropout", 0.4),  # Dropout rate for regularization
-            batch_size=self.config.get("batch_size", 256),  # Batch size for training
-            n_epochs=self.config.get("n_epochs", 7),  # Number of training epochs
+            output_chunk_shift=self.config["output_chunk_shift"],
+            model=self.config["rnn_type"],
+            hidden_dim=self.config["hidden_dim"],
+            activation=self.config["activation"],
+            n_rnn_layers=self.config["n_rnn_layers"],
+            dropout=self.config["dropout"],
+            batch_size=self.config["batch_size"],
+            n_epochs=self.config["n_epochs"],
             loss_fn=self.loss_fn,
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 5),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                 ],
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 1e-4),  # Learning rate
-                "weight_decay": self.config.get(
-                    "weight_decay", 1e-4
-                ),  # L2 regularization
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),
-            model_name=self.config.get("name", "BlockRNNModel"),  # Model name
-            random_state=self.config.get(
-                "random_state", 42
-            ),  # Random seed for reproducibility
-            force_reset=True,  # Reset the model if it already exists
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
+            model_name=self.config["name"],
+            random_state=self.config["random_state"],
+            force_reset=True,
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
@@ -436,9 +400,8 @@ class ModelCatalog:
     def _get_transformer_model(self):
         torch.serialization.add_safe_globals([TransformerModel, LossSelector])
         
-        # Get d_model and nhead, ensure compatibility
-        d_model = self.config.get("d_model", 128)
-        nhead = self.config.get("nhead", self.config.get("num_attention_heads", 4))
+        d_model = self.config["d_model"]
+        nhead = self.config.get("nhead", self.config.get("num_attention_heads"))
         
         # Validate d_model is divisible by nhead
         if d_model % nhead != 0:
@@ -450,58 +413,44 @@ class ModelCatalog:
             nhead = max(1, d_model // 32)  # Ensure at least 32 dims per head
         
         return TransformerModel(
-            input_chunk_length=self.config.get(
-                "input_chunk_length", 12 * 6
-            ),  # Default: 72
-            output_chunk_length=len(
-                self.config["steps"]
-            ),  # Output chunk length based on steps
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
+            input_chunk_length=self.config["input_chunk_length"],
+            output_chunk_length=len(self.config["steps"]),
+            output_chunk_shift=self.config["output_chunk_shift"],
             d_model=d_model,
             nhead=nhead,
-            num_encoder_layers=self.config.get(
-                "num_encoder_layers", 3
-            ),  # Default: 3 encoder layers
-            num_decoder_layers=self.config.get(
-                "num_decoder_layers", 3
-            ),  # Default: 3 decoder layers
-            dim_feedforward=self.config.get("dim_feedforward", 512),  # Default: 512
-            dropout=self.config.get("dropout", 0.1),  # Default: 0.1
-            activation=self.config.get("activation", "gelu"),  # GELU more stable than ReLU
-            norm_type=self.config.get("norm_type", "LayerNorm"),  # LayerNorm CRITICAL for stability!
-            batch_size=self.config.get("batch_size", 256),  # Default: 256
-            n_epochs=self.config.get("n_epochs", 2),  # Default: 100
+            num_encoder_layers=self.config["num_encoder_layers"],
+            num_decoder_layers=self.config["num_decoder_layers"],
+            dim_feedforward=self.config["dim_feedforward"],
+            dropout=self.config["dropout"],
+            activation=self.config["activation"],
+            norm_type=self.config["norm_type"],
+            batch_size=self.config["batch_size"],
+            n_epochs=self.config["n_epochs"],
             loss_fn=self.loss_fn,
-            model_name=self.config.get("name", "TransformerModel"),  # Model name
-            random_state=self.config.get(
-                "random_state", 42
-            ),  # Random seed for reproducibility
-            force_reset=True,  # Reset the model if it already exists
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),
+            model_name=self.config["name"],
+            random_state=self.config["random_state"],
+            force_reset=True,
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 5),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
-                    NaNDetectionCallback(patience=5),  # Stop if 5 consecutive NaN batches
+                    NaNDetectionCallback(patience=5),
                 ],
                 "enable_progress_bar": True,
-                "detect_anomaly": self.config.get("detect_anomaly", False),  # Set True to debug NaN source
+                "detect_anomaly": self.config["detect_anomaly"],
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 1e-4),  # Lower default LR for transformers
-                "weight_decay": self.config.get(
-                    "weight_decay", 1e-3
-                ),  # Default L2 regularization
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -510,39 +459,29 @@ class ModelCatalog:
     def _get_nlinear_model(self):
         torch.serialization.add_safe_globals([NLinearModel, LossSelector])
         return NLinearModel(
-            input_chunk_length=self.config.get(
-                "input_chunk_length", 12 * 6
-            ),  # Default: 72
-            output_chunk_length=len(
-                self.config["steps"]
-            ),  # Output chunk length based on steps
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            shared_weights=self.config.get("shared_weights", False),  # Default: False
-            const_init=self.config.get("const_init", True),  # Default: True
-            normalize=self.config.get("normalize", False),  # Default: False
-            use_static_covariates=self.config.get(
-                "use_static_covariates", True
-            ),  # Default: True
-            batch_size=self.config.get("batch_size", 64),  # Default: 64
-            n_epochs=self.config.get("n_epochs", 2),  # Default: 2
-            loss_fn=self.loss_fn,  # Use configured loss function from LossSelector
-            model_name=self.config.get("name", "NLinearModel"),  # Model name
-            random_state=self.config.get(
-                "random_state", 42
-            ),  # Random seed for reproducibility
-            force_reset=True,  # Reset the model if it already exists
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),
+            input_chunk_length=self.config["input_chunk_length"],
+            output_chunk_length=len(self.config["steps"]),
+            output_chunk_shift=self.config["output_chunk_shift"],
+            shared_weights=self.config["shared_weights"],
+            const_init=self.config["const_init"],
+            normalize=self.config["normalize"],
+            use_static_covariates=self.config["use_static_covariates"],
+            batch_size=self.config["batch_size"],
+            n_epochs=self.config["n_epochs"],
+            loss_fn=self.loss_fn,
+            model_name=self.config["name"],
+            random_state=self.config["random_state"],
+            force_reset=True,
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 5),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
@@ -550,10 +489,8 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),  # Default learning rate
-                "weight_decay": self.config.get(
-                    "weight_decay", 1e-3
-                ),  # Default L2 regularization
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -562,39 +499,29 @@ class ModelCatalog:
     def _get_dlinear_model(self):
         torch.serialization.add_safe_globals([DLinearModel, LossSelector])
         return DLinearModel(
-            input_chunk_length=self.config.get(
-                "input_chunk_length", 12 * 6
-            ),  # Default: 72
-            output_chunk_length=len(
-                self.config["steps"]
-            ),  # Output chunk length based on steps
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            shared_weights=self.config.get("shared_weights", False),  # Default: False
-            kernel_size=self.config.get("kernel_size", 25),  # Default: 25
-            const_init=self.config.get("const_init", True),  # Default: True
-            use_static_covariates=self.config.get(
-                "use_static_covariates", True
-            ),  # Default: True
-            batch_size=self.config.get("batch_size", 64),  # Default: 64
-            n_epochs=self.config.get("n_epochs", 2),  # Default: 2
-            loss_fn=self.loss_fn,  # Use configured loss function from LossSelector
-            model_name=self.config.get("name", "DLinearModel"),  # Model name
-            random_state=self.config.get(
-                "random_state", 42
-            ),  # Random seed for reproducibility
-            force_reset=True,  # Reset the model if it already exists
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),
+            input_chunk_length=self.config["input_chunk_length"],
+            output_chunk_length=len(self.config["steps"]),
+            output_chunk_shift=self.config["output_chunk_shift"],
+            shared_weights=self.config["shared_weights"],
+            kernel_size=self.config["kernel_size"],
+            const_init=self.config["const_init"],
+            use_static_covariates=self.config["use_static_covariates"],
+            batch_size=self.config["batch_size"],
+            n_epochs=self.config["n_epochs"],
+            loss_fn=self.loss_fn,
+            model_name=self.config["name"],
+            random_state=self.config["random_state"],
+            force_reset=True,
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "logger": WandbLogger(log_model="all"),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 5),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
@@ -602,10 +529,8 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 3e-4),  # Default learning rate
-                "weight_decay": self.config.get(
-                    "weight_decay", 1e-3
-                ),  # Default L2 regularization
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -613,63 +538,38 @@ class ModelCatalog:
 
     def _get_tide_model(self):
         torch.serialization.add_safe_globals([TiDEModel, LossSelector])
-        batch_size = 64  # Reduced from 512 for better gradient variety
-        training_samples = 180000
-        steps_per_epoch = int(np.ceil(training_samples / batch_size))
         return TiDEModel(
-            input_chunk_length=self.config.get(
-                "input_chunk_length", 12 * 4
-            ),  # Default: 72
-            output_chunk_length=len(
-                self.config["steps"]
-            ),  # Output chunk length based on steps
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),  # Default: 0
-            num_encoder_layers=self.config.get(
-                "num_encoder_layers", 1
-            ),  # Default: 1 encoder layer
-            num_decoder_layers=self.config.get(
-                "num_decoder_layers", 1
-            ),  # Default: 1 decoder layer
-            decoder_output_dim=self.config.get("decoder_output_dim", 16),  # Default: 16
-            hidden_size=self.config.get("hidden_size", 128),  # Default: 128
-            temporal_width_past=self.config.get("temporal_width_past", 4),  # Default: 4
-            temporal_width_future=self.config.get(
-                "temporal_width_future", 4
-            ),  # Default: 4
-            temporal_hidden_size_past=self.config.get(
-                "temporal_hidden_size_past", None
-            ),  # Default: None
-            temporal_hidden_size_future=self.config.get(
-                "temporal_hidden_size_future", None
-            ),  # Default: None
-            temporal_decoder_hidden=self.config.get(
-                "temporal_decoder_hidden", 32
-            ),  # Default: 32
-            use_layer_norm=self.config.get("use_layer_norm", False),  # Default: False
-            dropout=self.config.get("dropout", 0.4),  # Default: 0.1
-            use_static_covariates=self.config.get(
-                "use_static_covariates", True
-            ),  # Default: True
-            batch_size=self.config.get("batch_size", batch_size),  # Default: 64
-            n_epochs=self.config.get("n_epochs", 2),  # Default: 2
+            input_chunk_length=self.config["input_chunk_length"],
+            output_chunk_length=len(self.config["steps"]),
+            output_chunk_shift=self.config["output_chunk_shift"],
+            num_encoder_layers=self.config["num_encoder_layers"],
+            num_decoder_layers=self.config["num_decoder_layers"],
+            decoder_output_dim=self.config["decoder_output_dim"],
+            hidden_size=self.config["hidden_size"],
+            temporal_width_past=self.config["temporal_width_past"],
+            temporal_width_future=self.config["temporal_width_future"],
+            temporal_hidden_size_past=self.config["temporal_hidden_size_past"],
+            temporal_hidden_size_future=self.config["temporal_hidden_size_future"],
+            temporal_decoder_hidden=self.config["temporal_decoder_hidden"],
+            use_layer_norm=self.config["use_layer_norm"],
+            dropout=self.config["dropout"],
+            use_static_covariates=self.config["use_static_covariates"],
+            batch_size=self.config["batch_size"],
+            n_epochs=self.config["n_epochs"],
             loss_fn=self.loss_fn,
-            model_name=self.config.get("name", "TiDEModel"),  # Model name
-            random_state=self.config.get(
-                "random_state", 42
-            ),  # Random seed for reproducibility
-            force_reset=True,  # Reset the model if it already exists
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm", False
-            ),
+            model_name=self.config["name"],
+            random_state=self.config["random_state"],
+            force_reset=True,
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
+                "gradient_clip_val": self.config["gradient_clip_val"],
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",
-                        patience=self.config.get("early_stopping_patience", 3),
-                        min_delta=self.config.get("early_stopping_min_delta", 0.001),
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
@@ -677,10 +577,8 @@ class ModelCatalog:
                 "enable_progress_bar": True,
             },
             optimizer_kwargs={
-                "lr": self.config.get("lr", 2e-3),  # Default learning rate was 3e-4
-                "weight_decay": self.config.get(
-                    "weight_decay", 1e-5
-                ),  # Default L2 regularization
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
             },
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  

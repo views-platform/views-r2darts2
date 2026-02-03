@@ -73,7 +73,7 @@ class WeightedHuberLoss(torch.nn.Module):
         torch.Tensor: The mean weighted Huber loss over the batch.
     """
 
-    def __init__(self, zero_threshold=0.01, delta=0.5, non_zero_weight=5.0):
+    def __init__(self, zero_threshold, delta, non_zero_weight):
         super().__init__()
         self.threshold = zero_threshold
         self.delta = delta
@@ -170,7 +170,7 @@ class SpikeFocalLoss(torch.nn.Module):
         - Returns the mean of the weighted loss values.
     """
 
-    def __init__(self, alpha=0.8, gamma=2.0, spike_threshold=3.0445):
+    def __init__(self, alpha, gamma, spike_threshold):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -309,11 +309,11 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
 
     def __init__(
         self,
-        zero_threshold=0.01,
-        delta=0.5,
-        non_zero_weight=5.0,
-        false_positive_weight=2.0,
-        false_negative_weight=3.0,
+        zero_threshold,
+        delta,
+        non_zero_weight,
+        false_positive_weight,
+        false_negative_weight,
     ):
         super().__init__()
         self.threshold = zero_threshold
@@ -435,7 +435,7 @@ class TweedieLoss(torch.nn.Module):
         torch.Tensor: The mean weighted Tweedie loss over the batch.
     """
 
-    def __init__(self, p=1.5, non_zero_weight=5.0, zero_threshold=0.01, eps=1e-8):
+    def __init__(self, p, non_zero_weight, zero_threshold, eps):
         super().__init__()
         if not (1 < p < 2):
             raise ValueError(f"Power parameter p must be in (1, 2), got {p}")
@@ -499,7 +499,7 @@ class AsymmetricQuantileLoss(torch.nn.Module):
         torch.Tensor: The mean weighted quantile loss over the batch.
     """
 
-    def __init__(self, tau=0.75, non_zero_weight=5.0, zero_threshold=0.01):
+    def __init__(self, tau, non_zero_weight, zero_threshold):
         super().__init__()
         if not (0 < tau < 1):
             raise ValueError(f"tau must be in (0, 1), got {tau}")
@@ -564,7 +564,7 @@ class ZeroInflatedLoss(torch.nn.Module):
         torch.Tensor: The weighted sum of binary and count loss components.
     """
 
-    def __init__(self, zero_weight=1.0, count_weight=1.0, delta=0.5, zero_threshold=0.01, eps=1e-8):
+    def __init__(self, zero_weight, count_weight, delta, zero_threshold, eps):
         super().__init__()
         self.zero_weight = zero_weight
         self.count_weight = count_weight

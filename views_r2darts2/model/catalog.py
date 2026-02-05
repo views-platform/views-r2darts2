@@ -139,7 +139,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([TSMixerModel, LossSelector])
         return TSMixerModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             num_blocks=self.config["num_blocks"],
             ff_size=self.config["ff_size"],
@@ -183,7 +183,7 @@ class ModelCatalog:
 
         return TFTModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             feed_forward=self.config["feed_forward"],
             add_relative_index=self.config["add_relative_index"],
@@ -229,7 +229,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
         return NBEATSModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             generic_architecture=self.config["generic_architecture"],
             num_stacks=self.config["num_stacks"],
@@ -277,7 +277,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([NHiTSModel, LossSelector])
         return NHiTSModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             num_stacks=self.config["num_stacks"],
             num_blocks=self.config["num_blocks"],
@@ -322,7 +322,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([TCNModel, LossSelector])
         return TCNModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             kernel_size=self.config["kernel_size"],
             num_filters=self.config["num_filters"],
@@ -361,7 +361,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([BlockRNNModel, LossSelector])
         return BlockRNNModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             model=self.config["rnn_type"],
             hidden_dim=self.config["hidden_dim"],
@@ -414,7 +414,7 @@ class ModelCatalog:
         
         return TransformerModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             d_model=d_model,
             nhead=nhead,
@@ -460,7 +460,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([NLinearModel, LossSelector])
         return NLinearModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             shared_weights=self.config["shared_weights"],
             const_init=self.config["const_init"],
@@ -500,7 +500,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([DLinearModel, LossSelector])
         return DLinearModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             shared_weights=self.config["shared_weights"],
             kernel_size=self.config["kernel_size"],
@@ -540,7 +540,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([TiDEModel, LossSelector])
         return TiDEModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=len(self.config["steps"]),
+            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
             output_chunk_shift=self.config["output_chunk_shift"],
             num_encoder_layers=self.config["num_encoder_layers"],
             num_decoder_layers=self.config["num_decoder_layers"],

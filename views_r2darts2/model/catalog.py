@@ -98,13 +98,22 @@ class ModelCatalog:
         self.loss_name = self.config["loss_function"]
 
         # Prepare loss arguments from config parameters
+        # Use .get() with None defaults so missing params don't crash
+        # LossSelector.get_loss_function filters to only valid params for each loss
         self.loss_args = {
-            "zero_threshold": self.config["zero_threshold"],
-            "delta": self.config["delta"],
-            "non_zero_weight": self.config["non_zero_weight"],
-            "false_negative_weight": self.config["false_negative_weight"],
-            "false_positive_weight": self.config["false_positive_weight"],
+            # Common to most losses
+            "zero_threshold": self.config.get("zero_threshold"),
+            "non_zero_weight": self.config.get("non_zero_weight"),
+            # Huber-specific
+            "delta": self.config.get("delta"),
+            "false_negative_weight": self.config.get("false_negative_weight"),
+            "false_positive_weight": self.config.get("false_positive_weight"),
+            # Tweedie-specific
+            "p": self.config.get("p"),
+            "eps": self.config.get("eps"),
         }
+        # Remove None values so LossSelector doesn't pass them
+        self.loss_args = {k: v for k, v in self.loss_args.items() if v is not None}
         self.loss_fn = LossSelector.get_loss_function(self.loss_name, **self.loss_args)
         self.lr_scheduler_args = {
             "mode": "min",

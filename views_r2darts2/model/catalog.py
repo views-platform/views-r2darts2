@@ -60,6 +60,87 @@ class NaNDetectionCallback(Callback):
             self.nan_count = 0  # Reset on valid loss
 
 
+class GradientHealthCallback(Callback):
+    """
+    Callback to monitor gradient health after each epoch.
+    
+    Logs statistics about gradients to help diagnose:
+    - Vanishing gradients (very small norms)
+    - Exploding gradients (very large norms)
+    - NaN/Inf gradients
+    """
+    
+    def __init__(self, log_every_n_epochs: int = 1, warn_threshold: float = 1e-7, explode_threshold: float = 100.0):
+        """
+        Args:
+            log_every_n_epochs: How often to log gradient stats (default: every epoch)
+            warn_threshold: Gradient norm below this triggers vanishing warning
+            explode_threshold: Gradient norm above this triggers exploding warning
+        """
+        super().__init__()
+        self.log_every_n_epochs = log_every_n_epochs
+        self.warn_threshold = warn_threshold
+        self.explode_threshold = explode_threshold
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+        
+        grad_norms = []
+        nan_count = 0
+        inf_count = 0
+        zero_count = 0
+        total_params = 0
+        
+        for name, param in pl_module.named_parameters():
+            if param.grad is not None:
+                total_params += 1
+                grad = param.grad.detach()
+                norm = grad.norm().item()
+                
+                if np.isnan(norm):
+                    nan_count += 1
+                elif np.isinf(norm):
+                    inf_count += 1
+                elif norm == 0:
+                    zero_count += 1
+                else:
+                    grad_norms.append(norm)
+        
+        if not grad_norms and total_params == 0:
+            return  # No gradients yet
+        
+        # Compute stats
+        if grad_norms:
+            grad_norms = np.array(grad_norms)
+            stats = {
+                "min": grad_norms.min(),
+                "max": grad_norms.max(),
+                "mean": grad_norms.mean(),
+                "median": np.median(grad_norms),
+            }
+        else:
+            stats = {"min": 0, "max": 0, "mean": 0, "median": 0}
+        
+        # Build status message
+        status = "✅ healthy"
+        if nan_count > 0:
+            status = f"🚨 {nan_count} NaN grads!"
+        elif inf_count > 0:
+            status = f"🚨 {inf_count} Inf grads!"
+        elif stats["max"] > self.explode_threshold:
+            status = f"🚨 exploding (max={stats['max']:.1f})"
+        elif stats["max"] < self.warn_threshold:
+            status = f"🚨 vanishing (max={stats['max']:.2e})"
+        
+        logger.info(
+            f"[Epoch {trainer.current_epoch}] Gradients {status} | "
+            f"norm: min={stats['min']:.2e}, max={stats['max']:.2e}, "
+            f"mean={stats['mean']:.2e}, median={stats['median']:.2e} | "
+            f"zero={zero_count}/{total_params}"
+        )
+
+
 # from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 from views_r2darts2.model.forecaster import DartsForecaster
 from views_r2darts2.utils.loss import LossSelector
@@ -176,6 +257,7 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
             },
@@ -223,6 +305,7 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
             },
@@ -265,6 +348,7 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
             },
@@ -316,6 +400,7 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
             },
@@ -356,6 +441,7 @@ class ModelCatalog:
                         min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
+                    GradientHealthCallback(),
                 ],
             },
             optimizer_kwargs={
@@ -391,6 +477,7 @@ class ModelCatalog:
                         min_delta=self.config["early_stopping_min_delta"],
                         mode="min",
                     ),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
             },
@@ -453,6 +540,7 @@ class ModelCatalog:
                     ),
                     LearningRateMonitor(log_momentum=True),
                     NaNDetectionCallback(patience=5),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
                 "detect_anomaly": self.config["detect_anomaly"],
@@ -494,6 +582,7 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
             },
@@ -534,6 +623,7 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
             },
@@ -582,6 +672,7 @@ class ModelCatalog:
                         mode="min",
                     ),
                     LearningRateMonitor(log_momentum=True),
+                    GradientHealthCallback(),
                 ],
                 "enable_progress_bar": True,
             },

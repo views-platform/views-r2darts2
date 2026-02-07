@@ -467,55 +467,76 @@ class FeatureScalerManager:
             for feat in unmapped_features:
                 self._feature_to_scaler[feat] = scaler_key
     
-    def _instantiate_scaler(self, scaler_cfg) -> Scaler:
+    def _instantiate_scaler(self, scaler_cfg):
         """
-        Create a Darts Scaler wrapper from config.
+        Create a Darts Scaler or Pipeline from config.
+        
+        Uses Darts Pipeline for chained scalers to properly preserve
+        the sample dimension during inverse_transform on probabilistic series.
         
         Supports:
         - String: "StandardScaler" or "AsinhTransform->StandardScaler" (chained)
         - List: ["AsinhTransform", "StandardScaler"] (chained)
         - Dict: {"name": "RobustScaler", "kwargs": {...}}
         - Dict with chain: {"chain": ["AsinhTransform", "StandardScaler"]}
+        
+        Returns:
+          Darts Scaler (single) or Pipeline (chained).
         """
+        from darts.dataprocessing import Pipeline
+
+        def _parse_chain_string(chain_str: str) -> list:
+            """Parse 'Scaler1->Scaler2' into ['Scaler1', 'Scaler2']."""
+            return [s.strip() for s in chain_str.split("->")]
+
+        def _is_chain_string(s: str) -> bool:
+            return "->" in s
+
+        def _make_pipeline(scaler_names: list):
+            """Create a Darts Pipeline from a list of scaler names."""
+            darts_scalers = [
+                Scaler(ScalerSelector.get_scaler(name)) for name in scaler_names
+            ]
+            return Pipeline(darts_scalers)
+
         if isinstance(scaler_cfg, str):
-            # Check if it's a chain specification
-            estimator = ScalerSelector.get_scaler_or_chain(scaler_cfg)
-            return Scaler(estimator)
+            if _is_chain_string(scaler_cfg):
+                scaler_names = _parse_chain_string(scaler_cfg)
+                return _make_pipeline(scaler_names)
+            else:
+                estimator = ScalerSelector.get_scaler(scaler_cfg)
+                return Scaler(estimator)
         
         if isinstance(scaler_cfg, list):
-            # List of scalers to chain: ["AsinhTransform", "StandardScaler"]
             if len(scaler_cfg) == 1:
                 estimator = ScalerSelector.get_scaler(scaler_cfg[0])
+                return Scaler(estimator)
             else:
-                scalers = [ScalerSelector.get_scaler(name) for name in scaler_cfg]
-                estimator = ChainedScaler(scalers)
-            return Scaler(estimator)
+                return _make_pipeline(scaler_cfg)
         
         if isinstance(scaler_cfg, dict):
-            # Check if it's a chain config
             if "chain" in scaler_cfg:
                 chain_list = scaler_cfg["chain"]
                 if isinstance(chain_list, str):
-                    # "chain": "AsinhTransform->StandardScaler"
-                    estimator = ScalerSelector.get_chained_scaler(chain_list)
+                    scaler_names = _parse_chain_string(chain_list)
+                    return _make_pipeline(scaler_names)
                 elif isinstance(chain_list, list):
-                    # "chain": ["AsinhTransform", "StandardScaler"]
-                    scalers = [ScalerSelector.get_scaler(name) for name in chain_list]
-                    estimator = ChainedScaler(scalers)
+                    return _make_pipeline(chain_list)
                 else:
                     raise TypeError(
                         f"'chain' must be a string or list, got {type(chain_list).__name__}"
                     )
-                return Scaler(estimator)
             
-            # Standard dict format with name and optional kwargs
             name = scaler_cfg.get("name")
             kwargs = scaler_cfg.get("kwargs", {})
             if name is None:
                 raise ValueError(
                     "Scaler config dict must have a 'name' key or a 'chain' key."
                 )
-            estimator = ScalerSelector.get_scaler_or_chain(name, **kwargs)
+            if _is_chain_string(name):
+                scaler_names = _parse_chain_string(name)
+                return _make_pipeline(scaler_names)
+            estimator = ScalerSelector.get_scaler(name, **kwargs)
             return Scaler(estimator)
         
         raise TypeError(
@@ -556,7 +577,13 @@ class FeatureScalerManager:
         
         This ensures that scalers like StandardScaler compute statistics
         (mean, std) over the entire dataset, not per-series.
+        
+        For Pipeline objects (chained scalers), we use the native fit_transform
+        since accessing internal sklearn scalers is complex.
+        For single Scaler objects, we access the sklearn transformer directly.
         """
+        from darts.dataprocessing import Pipeline
+        
         if not series_list:
             return
         
@@ -574,6 +601,43 @@ class FeatureScalerManager:
             if not feature_indices:
                 continue
             
+            # For Pipeline, use native Darts fit_transform (it handles chaining internally)
+            if isinstance(scaler, Pipeline):
+                # Build a combined series for fitting the pipeline
+                all_subsets = []
+                for ts in series_list:
+                    arr = ts.all_values(copy=False)
+                    if arr.ndim == 2:
+                        subset = arr[:, feature_indices]
+                    else:  # ndim == 3 (probabilistic)
+                        subset = arr[:, feature_indices, :]
+                    all_subsets.append(subset)
+                
+                # Stack all data
+                combined_data = np.concatenate(all_subsets, axis=0)
+                
+                # Create a dummy TimeSeries for fitting the pipeline
+                subset_names = [components[i] for i in feature_indices]
+                dummy_index = pd.RangeIndex(start=0, stop=combined_data.shape[0], step=1)
+                
+                if combined_data.ndim == 3:
+                    # For 3D, we need to flatten for fitting
+                    n_time, n_features, n_samples = combined_data.shape
+                    combined_2d = combined_data[:, :, 0]  # Use first sample for fitting
+                else:
+                    combined_2d = combined_data
+                
+                dummy_ts = TimeSeries.from_times_and_values(
+                    times=dummy_index,
+                    values=combined_2d.astype(np.float32),
+                    columns=subset_names,
+                )
+                
+                # Fit the pipeline using native Darts method
+                scaler.fit([dummy_ts])
+                continue
+            
+            # For single Scaler, use manual sklearn access (existing logic)
             # Collect data from all series for these features
             all_subsets = []
             for ts in series_list:
@@ -728,9 +792,12 @@ class FeatureScalerManager:
         return result
     
     def _inverse_transform_single_series(self, ts: TimeSeries) -> TimeSeries:
-        """Inverse transform a single TimeSeries."""
+        """Inverse transform a single TimeSeries, preserving samples for probabilistic series."""
+        from darts.dataprocessing import Pipeline
+        
         components = list(ts.components)
         arr = ts.all_values(copy=True)
+        is_probabilistic = arr.ndim == 3
         
         for scaler_key, scaler in self._scalers.items():
             feature_names = self._scaler_to_features.get(scaler_key, [])
@@ -743,12 +810,14 @@ class FeatureScalerManager:
             if not feature_indices:
                 continue
             
-            if arr.ndim == 2:
-                subset = arr[:, feature_indices]
-            else:
-                subset = arr[:, feature_indices, :]
-            
+            # Extract subset for this scaler
             subset_names = [components[i] for i in feature_indices]
+            if is_probabilistic:
+                subset = arr[:, feature_indices, :]
+            else:
+                subset = arr[:, feature_indices]
+            
+            # Create temporary TimeSeries for the subset
             temp_ts = TimeSeries.from_times_and_values(
                 times=ts.time_index,
                 values=subset.astype(np.float32),
@@ -756,13 +825,45 @@ class FeatureScalerManager:
                 freq=ts.freq,
             )
             
-            inv_subset = scaler.inverse_transform([temp_ts])[0]
-            inv_values = inv_subset.all_values(copy=False)
-            
-            if arr.ndim == 2:
-                arr[:, feature_indices] = inv_values
+            # For Pipeline objects, inverse_transform handles samples correctly
+            if isinstance(scaler, Pipeline):
+                inv_subset = scaler.inverse_transform([temp_ts])[0]
+                inv_values = inv_subset.all_values(copy=False)
+                if is_probabilistic:
+                    arr[:, feature_indices, :] = inv_values.astype(np.float32)
+                else:
+                    arr[:, feature_indices] = inv_values.astype(np.float32)
+            elif is_probabilistic:
+                # For single Scaler with 3D data, manually preserve samples
+                n_time, n_features, n_samples = subset.shape
+                
+                # Reshape to 2D for sklearn: (time * samples, features)
+                subset_2d = subset.transpose(0, 2, 1).reshape(-1, n_features)
+                
+                # Get the fitted sklearn scaler from the Darts Scaler wrapper
+                sklearn_scaler = None
+                if hasattr(scaler, '_fitted_params') and scaler._fitted_params:
+                    fitted_params = scaler._fitted_params
+                    if isinstance(fitted_params, (list, tuple)) and len(fitted_params) > 0:
+                        first_param = fitted_params[0]
+                        if isinstance(first_param, dict) and 'fitted' in first_param:
+                            sklearn_scaler = first_param['fitted']
+                        else:
+                            sklearn_scaler = first_param
+                
+                if sklearn_scaler is not None and hasattr(sklearn_scaler, 'inverse_transform'):
+                    inv_2d = sklearn_scaler.inverse_transform(subset_2d.astype(np.float64))
+                else:
+                    inv_2d = subset_2d
+                
+                # Reshape back to 3D: (time, features, samples)
+                inv_values = inv_2d.reshape(n_time, n_samples, n_features).transpose(0, 2, 1)
+                arr[:, feature_indices, :] = inv_values.astype(np.float32)
             else:
-                arr[:, feature_indices, :] = inv_values
+                # For 2D data with single Scaler: use Darts inverse_transform
+                inv_subset = scaler.inverse_transform([temp_ts])[0]
+                inv_values = inv_subset.all_values(copy=False)
+                arr[:, feature_indices] = inv_values
         
         new_ts = TimeSeries.from_times_and_values(
             times=ts.time_index,

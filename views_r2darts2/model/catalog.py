@@ -245,6 +245,7 @@ class ModelCatalog:
             random_state=self.config["random_state"],
             force_reset=True,
             use_static_covariates=self.config["use_static_covariates"],
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs={
                 "accelerator": "gpu",
                 "gradient_clip_val": self.config["gradient_clip_val"],

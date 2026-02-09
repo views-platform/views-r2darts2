@@ -612,8 +612,10 @@ class DartsForecaster:
         # Train the model
         # Auto-detect num_workers: use half of available CPUs, capped at 8, minimum 0
         num_workers = min(max((os.cpu_count() or 1) // 2, 0), 8)
+        # Note: persistent_workers=False to avoid file descriptor exhaustion in sweeps
+        # Set persistent_workers=True only for single long runs where performance matters
         dataloader_kwargs = (
-            {"num_workers": num_workers, "persistent_workers": True}
+            {"num_workers": num_workers, "persistent_workers": False}
             if num_workers > 0
             else {}
         )

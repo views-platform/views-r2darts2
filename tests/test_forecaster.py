@@ -151,6 +151,9 @@ class TestDartsForecaster:
         mock_ts.astype = Mock(return_value=mock_ts)
         mock_ts.slice = Mock(return_value=mock_ts)
         mock_ts.__getitem__ = Mock(return_value=mock_ts)
+        # Mock all_values to return a numpy array for _check_data_sanity
+        mock_ts.all_values = Mock(return_value=np.array([[1.0, 2.0], [3.0, 4.0]]))
+        mock_ts.components = pd.Index(['target1', 'target2'])
         
         timeseries = [mock_ts]
         
@@ -178,6 +181,9 @@ class TestDartsForecaster:
         mock_ts.astype = Mock(return_value=mock_ts)
         mock_ts.slice = Mock(return_value=mock_ts)
         mock_ts.__getitem__ = Mock(return_value=mock_ts)
+        # Mock all_values to return a numpy array for _check_data_sanity
+        mock_ts.all_values = Mock(return_value=np.array([[1.0, 2.0], [3.0, 4.0]]))
+        mock_ts.components = pd.Index(['target1', 'target2'])
         
         timeseries = [mock_ts]
         
@@ -251,9 +257,10 @@ class TestDartsForecaster:
         
         results = forecaster._process_predictions([mock_pred])
         
-        # Check that negative value was clipped to 0
+        # Check that negative value was clipped to eps (1e-8)
         # When there's 1 sample, it returns a list with 1 element
-        assert results[0]['pred_target1'] == [0.0]
+        eps = 1e-8
+        assert abs(results[0]['pred_target1'][0] - eps) < 1e-10
         assert results[0]['pred_target2'] == [2.0]
 
     def test_process_predictions_handles_nans(self, forecaster):
@@ -272,8 +279,10 @@ class TestDartsForecaster:
         
         results = forecaster._process_predictions([mock_pred])
         
+        # NaN replaced with 0.0, then clipped to eps (1e-8)
         # When there's 1 sample, it returns a list with 1 element
-        assert results[0]['pred_target1'] == [0.0]
+        eps = 1e-8
+        assert abs(results[0]['pred_target1'][0] - eps) < 1e-10
         assert results[0]['pred_target2'] == [2.0]
 
     def test_train(self, forecaster):
@@ -360,6 +369,8 @@ class TestDartsForecaster:
         forecaster_with_scalers._preprocess_timeseries = Mock(return_value=([mock_ts], [mock_ts]))
         forecaster_with_scalers.model.predict = Mock(return_value=[mock_pred])
         forecaster_with_scalers.target_scaler.inverse_transform = Mock(return_value=[mock_pred])
+        # Must set scaler_fitted=True for inverse transform to be applied
+        forecaster_with_scalers.scaler_fitted = True
         
         result = forecaster_with_scalers.predict(sequence_number=0, output_length=2)
         

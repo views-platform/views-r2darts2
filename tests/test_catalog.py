@@ -18,8 +18,80 @@ def basic_config():
     return {
         "steps": [1, 2, 3],
         "input_chunk_length": 48,
+        "output_chunk_shift": 0,
         "name": "test_model",
         "random_state": 42,
+        "batch_size": 64,
+        "n_epochs": 2,
+        "lr": 3e-4,
+        "weight_decay": 1e-3,
+        "dropout": 0.1,
+        "activation": "ReLU",
+        "gradient_clip_val": 0.8,
+        "early_stopping_patience": 5,
+        "early_stopping_min_delta": 0.001,
+        "loss_function": "WeightedPenaltyHuberLoss",
+        "zero_threshold": 0.01,
+        "delta": 0.5,
+        "non_zero_weight": 5.0,
+        "false_negative_weight": 15.0,
+        "false_positive_weight": 10.0,
+        "lr_scheduler_factor": 0.1,
+        "lr_scheduler_patience": 3,
+        "lr_scheduler_min_lr": 1e-6,
+        "use_reversible_instance_norm": False,
+        "use_static_covariates": True,
+        # Model-specific params with sensible defaults
+        "generic_architecture": True,
+        "num_stacks": 4,
+        "num_blocks": 2,
+        "num_layers": 2,
+        "layer_width": 128,
+        "force_reset": True,
+        # TFT params
+        "feed_forward": "GatedResidualNetwork",
+        "add_relative_index": True,
+        "full_attention": False,
+        "lstm_layers": 1,
+        "num_attention_heads": 4,
+        "hidden_size": 64,
+        "skip_interpolation": False,
+        "hidden_continuous_size": 16,
+        # TCN params
+        "kernel_size": 3,
+        "num_filters": 64,
+        "dilation_base": 2,
+        # RNN params
+        "rnn_type": "LSTM",
+        "hidden_dim": 5,
+        "n_rnn_layers": 2,
+        # Transformer params
+        "d_model": 128,
+        "nhead": 4,
+        "num_encoder_layers": 3,
+        "num_decoder_layers": 3,
+        "dim_feedforward": 512,
+        "norm_type": "LayerNorm",
+        "detect_anomaly": False,
+        # TSMixer params
+        "ff_size": 64,
+        "normalize_before": False,
+        # NLinear/DLinear params
+        "shared_weights": False,
+        "const_init": True,
+        "normalize": False,
+        # NHiTS params
+        "pooling_kernel_sizes": None,
+        "n_freq_downsample": None,
+        "max_pool_1d": True,
+        # TiDE params
+        "decoder_output_dim": 16,
+        "temporal_width_past": 4,
+        "temporal_width_future": 4,
+        "temporal_hidden_size_past": None,
+        "temporal_hidden_size_future": None,
+        "temporal_decoder_hidden": 32,
+        "use_layer_norm": False,
     }
 
 
@@ -37,6 +109,8 @@ def full_config():
         "lr": 1e-3,
         "weight_decay": 1e-4,
         "dropout": 0.2,
+        "activation": "ReLU",
+        "gradient_clip_val": 0.8,
         "early_stopping_patience": 5,
         "early_stopping_min_delta": 0.001,
         "loss_function": "WeightedPenaltyHuberLoss",
@@ -48,6 +122,59 @@ def full_config():
         "lr_scheduler_factor": 0.1,
         "lr_scheduler_patience": 3,
         "lr_scheduler_min_lr": 1e-6,
+        "use_reversible_instance_norm": False,
+        "use_static_covariates": True,
+        # Model-specific params
+        "generic_architecture": True,
+        "num_stacks": 4,
+        "num_blocks": 2,
+        "num_layers": 2,
+        "layer_width": 128,
+        "force_reset": True,
+        # TFT params
+        "feed_forward": "GatedResidualNetwork",
+        "add_relative_index": True,
+        "full_attention": False,
+        "lstm_layers": 1,
+        "num_attention_heads": 4,
+        "hidden_size": 64,
+        "skip_interpolation": False,
+        "hidden_continuous_size": 16,
+        # TCN params
+        "kernel_size": 3,
+        "num_filters": 64,
+        "dilation_base": 2,
+        # RNN params
+        "rnn_type": "LSTM",
+        "hidden_dim": 5,
+        "n_rnn_layers": 2,
+        # Transformer params
+        "d_model": 128,
+        "nhead": 4,
+        "num_encoder_layers": 3,
+        "num_decoder_layers": 3,
+        "dim_feedforward": 512,
+        "norm_type": "LayerNorm",
+        "detect_anomaly": False,
+        # TSMixer params
+        "ff_size": 64,
+        "normalize_before": False,
+        # NLinear/DLinear params
+        "shared_weights": False,
+        "const_init": True,
+        "normalize": False,
+        # NHiTS params
+        "pooling_kernel_sizes": None,
+        "n_freq_downsample": None,
+        "max_pool_1d": True,
+        # TiDE params
+        "decoder_output_dim": 16,
+        "temporal_width_past": 4,
+        "temporal_width_future": 4,
+        "temporal_hidden_size_past": None,
+        "temporal_hidden_size_future": None,
+        "temporal_decoder_hidden": 32,
+        "use_layer_norm": False,
     }
 
 
@@ -84,7 +211,7 @@ class TestModelCatalogInitialization:
         assert catalog.config == basic_config
         assert catalog.device == "cpu"
         assert catalog.loss_name == "WeightedPenaltyHuberLoss"
-        assert len(catalog.models) == 9
+        assert len(catalog.models) == 10
 
     def test_init_with_valid_loss_functions(self, basic_config):
         """Test initialization with valid loss function names."""
@@ -131,8 +258,9 @@ class TestModelCatalogMethods:
         catalog = ModelCatalog(basic_config)
         models = catalog.list_models()
         
-        assert len(models) == 9
+        assert len(models) == 10
         assert "NBEATSModel" in models
+        assert "NHiTSModel" in models
         assert "TFTModel" in models
         assert "TCNModel" in models
         assert "BlockRNNModel" in models
@@ -186,10 +314,10 @@ class TestNBEATSModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_nbeats_custom_params(self, mock_safe_globals):
+    def test_nbeats_custom_params(self, mock_safe_globals, basic_config):
         """Test N-BEATS model with custom parameters."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "input_chunk_length": 24,
             "num_stacks": 5,
             "num_blocks": 3,
@@ -225,10 +353,10 @@ class TestTFTModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_tft_custom_params(self, mock_safe_globals):
+    def test_tft_custom_params(self, mock_safe_globals, basic_config):
         """Test TFT model with custom parameters."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "input_chunk_length": 36,
             "hidden_size": 512,
             "num_attention_heads": 8,
@@ -253,10 +381,10 @@ class TestTCNModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_tcn_custom_kernel_size(self, mock_safe_globals):
+    def test_tcn_custom_kernel_size(self, mock_safe_globals, basic_config):
         """Test TCN model with custom kernel size."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "kernel_size": 5,
             "num_filters": 128,
         }
@@ -279,10 +407,10 @@ class TestBlockRNNModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_rnn_custom_type(self, mock_safe_globals):
+    def test_rnn_custom_type(self, mock_safe_globals, basic_config):
         """Test RNN model with custom RNN type."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "rnn_type": "GRU",
             "hidden_dim": 128,
             "n_rnn_layers": 3,
@@ -306,10 +434,10 @@ class TestTransformerModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_transformer_custom_layers(self, mock_safe_globals):
+    def test_transformer_custom_layers(self, mock_safe_globals, basic_config):
         """Test Transformer with custom encoder/decoder layers."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "num_encoder_layers": 6,
             "num_decoder_layers": 6,
             "d_model": 128,
@@ -333,10 +461,10 @@ class TestTSMixerModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_tsmixer_custom_blocks(self, mock_safe_globals):
+    def test_tsmixer_custom_blocks(self, mock_safe_globals, basic_config):
         """Test TSMixer with custom number of blocks."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "num_blocks": 4,
             "hidden_size": 128,
         }
@@ -359,10 +487,10 @@ class TestNLinearModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_nlinear_shared_weights(self, mock_safe_globals):
+    def test_nlinear_shared_weights(self, mock_safe_globals, basic_config):
         """Test NLinear with shared weights enabled."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "shared_weights": True,
         }
         catalog = ModelCatalog(config)
@@ -384,10 +512,10 @@ class TestDLinearModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_dlinear_custom_kernel(self, mock_safe_globals):
+    def test_dlinear_custom_kernel(self, mock_safe_globals, basic_config):
         """Test DLinear with custom kernel size."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "kernel_size": 50,
         }
         catalog = ModelCatalog(config)
@@ -409,10 +537,10 @@ class TestTiDEModel:
         assert model.output_chunk_length == len(basic_config["steps"])
 
     @patch("torch.serialization.add_safe_globals")
-    def test_tide_custom_params(self, mock_safe_globals):
+    def test_tide_custom_params(self, mock_safe_globals, basic_config):
         """Test TiDE model with custom parameters."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "input_chunk_length": 48,
             "num_encoder_layers": 2,
             "num_decoder_layers": 2,
@@ -428,28 +556,27 @@ class TestConfigurationHandling:
     """Test suite for configuration parameter handling."""
 
     @patch("torch.serialization.add_safe_globals")
-    def test_output_chunk_length_from_steps(self, mock_safe_globals):
+    def test_output_chunk_length_from_steps(self, mock_safe_globals, basic_config):
         """Test that output_chunk_length is correctly derived from steps."""
-        config = {"steps": [1, 2, 3, 6, 12, 24]}
+        config = {**basic_config, "steps": [1, 2, 3, 6, 12, 24]}
         catalog = ModelCatalog(config)
         model = catalog._get_nbeats()
         
         assert model.output_chunk_length == 6
 
     def test_default_values_applied(self, basic_config):
-        """Test that default values are applied when not in config."""
+        """Test that configured values are correctly applied."""
         catalog = ModelCatalog(basic_config)
+        
+        # Check loss function parameters from basic_config
+        assert catalog.loss_args["zero_threshold"] == 0.01
+        assert catalog.loss_args["delta"] == 0.5
+        assert catalog.loss_args["non_zero_weight"] == 5.0
 
-        # With the new, corrected implementation, if loss-specific parameters are
-        # not in the main config, the loss_args dictionary will be empty.
-        # This allows the specific loss function's constructor to handle its
-        # own default values, which is the desired behavior.
-        assert catalog.loss_args == {}
-
-    def test_custom_values_override_defaults(self):
-        """Test that custom values override defaults."""
+    def test_custom_values_override_defaults(self, basic_config):
+        """Test that custom values are correctly applied."""
         config = {
-            "steps": [1, 2, 3],
+            **basic_config,
             "zero_threshold": 0.5,
             "delta": 1.0,
             "non_zero_weight": 10.0,

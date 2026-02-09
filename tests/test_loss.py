@@ -60,7 +60,7 @@ class TestLossSelector:
 
     def test_filters_invalid_kwargs(self):
         loss = LossSelector.get_loss_function(
-            "WeightedHuberLoss", delta=1.0, invalid_param=999
+            "WeightedHuberLoss", zero_threshold=0.01, delta=1.0, non_zero_weight=5.0, invalid_param=999
         )
         assert isinstance(loss, WeightedHuberLoss)
         assert loss.delta == 1.0
@@ -387,12 +387,22 @@ class TestLossIntegration:
         preds = torch.randn(16, 10)
         targets = torch.randn(16, 10)
 
-        weighted_huber = WeightedHuberLoss()
+        weighted_huber = WeightedHuberLoss(
+            zero_threshold=0.01, delta=0.5, non_zero_weight=5.0
+        )
         time_aware = TimeAwareWeightedHuberLoss(
             zero_weight=1.0, non_zero_weight=5.0, decay_factor=0.95, delta=0.5
         )
-        spike_focal = SpikeFocalLoss()
-        weighted_penalty = WeightedPenaltyHuberLoss()
+        spike_focal = SpikeFocalLoss(
+            alpha=0.8, gamma=2.0, spike_threshold=3.0445
+        )
+        weighted_penalty = WeightedPenaltyHuberLoss(
+            zero_threshold=0.01,
+            delta=0.5,
+            non_zero_weight=5.0,
+            false_positive_weight=10.0,
+            false_negative_weight=15.0,
+        )
 
         loss1 = weighted_huber(preds, targets)
         # TimeAware expects shape (batch, seq_len, ...)
@@ -404,7 +414,9 @@ class TestLossIntegration:
 
     def test_loss_decreases_with_better_predictions(self):
         targets = torch.randn(32)
-        loss_fn = WeightedHuberLoss()
+        loss_fn = WeightedHuberLoss(
+            zero_threshold=0.01, delta=0.5, non_zero_weight=5.0
+        )
 
         # Bad predictions
         bad_preds = torch.randn(32) * 10

@@ -12,7 +12,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = ">=3.11,<3.15"
 views-pipeline-core = ">=2.0.0,<3.0.0"
-darts = "=0.38.0"
+darts = "=0.40.0"
 scikit-learn = "^1.8.0"
 
 [build-system]

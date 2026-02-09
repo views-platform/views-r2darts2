@@ -12,7 +12,7 @@ class TestQuantileLossVerification(unittest.TestCase):
         """Numerically prove correctness against hand-calculated 'golden' values."""
         
         # --- Test Case 1: Underprediction (error > 0) ---
-        loss_fn_75 = AsymmetricQuantileLoss(tau=0.75, non_zero_weight=1.0) # Disable weighting
+        loss_fn_75 = AsymmetricQuantileLoss(tau=0.75, non_zero_weight=1.0, zero_threshold=0.01) # Disable weighting
         preds = torch.tensor([1.0, 2.0])
         targets = torch.tensor([3.0, 3.0])
         # Expected loss: (0.75 * 2.0 + 0.75 * 1.0) / 2 = (1.5 + 0.75) / 2 = 1.125
@@ -31,7 +31,7 @@ class TestQuantileLossVerification(unittest.TestCase):
         self.assertAlmostEqual(loss_fn_75(preds, targets).item(), 0.0, places=6)
 
         # --- Test Case 4: tau=0.5 should be 0.5 * MAE ---
-        loss_fn_50 = AsymmetricQuantileLoss(tau=0.5, non_zero_weight=1.0)
+        loss_fn_50 = AsymmetricQuantileLoss(tau=0.5, non_zero_weight=1.0, zero_threshold=0.01)
         preds = torch.tensor([1.0, 4.0])
         targets = torch.tensor([3.0, 1.0])
         # Expected loss: 0.5 * MAE = 1.25
@@ -51,7 +51,7 @@ class TestQuantileLossVerification(unittest.TestCase):
         """Prove gradient correctness with torch.autograd.gradcheck."""
         
         # Use double precision for gradcheck
-        loss_fn = AsymmetricQuantileLoss(tau=0.8, non_zero_weight=10.0).double()
+        loss_fn = AsymmetricQuantileLoss(tau=0.8, non_zero_weight=10.0, zero_threshold=0.01).double()
         
         # Inputs must be double and require grad.
         # Ensure error is non-zero to avoid the non-differentiable point.

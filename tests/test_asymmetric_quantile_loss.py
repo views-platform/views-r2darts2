@@ -9,17 +9,17 @@ from views_r2darts2.utils.loss import AsymmetricQuantileLoss
 def test_asymmetric_quantile_loss_init():
     """Tests the initialization of AsymmetricQuantileLoss, including the tau constraint."""
     # Test valid initialization
-    loss_fn = AsymmetricQuantileLoss(tau=0.8, non_zero_weight=10.0)
+    loss_fn = AsymmetricQuantileLoss(tau=0.8, non_zero_weight=10.0, zero_threshold=0.01)
     assert loss_fn.tau == 0.8
     assert loss_fn.non_zero_weight == 10.0
 
     # Test invalid tau parameter
     with pytest.raises(ValueError, match="tau must be in"):
-        AsymmetricQuantileLoss(tau=0.0)
+        AsymmetricQuantileLoss(tau=0.0, non_zero_weight=5.0, zero_threshold=0.01)
     with pytest.raises(ValueError, match="tau must be in"):
-        AsymmetricQuantileLoss(tau=1.0)
+        AsymmetricQuantileLoss(tau=1.0, non_zero_weight=5.0, zero_threshold=0.01)
     with pytest.raises(ValueError, match="tau must be in"):
-        AsymmetricQuantileLoss(tau=-0.1)
+        AsymmetricQuantileLoss(tau=-0.1, non_zero_weight=5.0, zero_threshold=0.01)
 
 @pytest.mark.parametrize(
     "pred_val, target_val, tau, non_zero_weight, expected_loss",
@@ -57,7 +57,7 @@ def test_asymmetric_quantile_loss_invariant_mae():
     targets = torch.randn(10, 5)
     
     # Our implementation with tau=0.5 and no extra weighting
-    loss_fn_quantile = AsymmetricQuantileLoss(tau=0.5, non_zero_weight=1.0)
+    loss_fn_quantile = AsymmetricQuantileLoss(tau=0.5, non_zero_weight=1.0, zero_threshold=0.01)
     loss_quantile = loss_fn_quantile(preds, targets)
 
     # PyTorch L1Loss (MAE)
@@ -74,7 +74,7 @@ def test_asymmetric_quantile_loss_gradient_check():
     """
     from torch.autograd import gradcheck
 
-    loss_fn = AsymmetricQuantileLoss(tau=0.8, non_zero_weight=5.0)
+    loss_fn = AsymmetricQuantileLoss(tau=0.8, non_zero_weight=5.0, zero_threshold=0.01)
     
     # Use double precision for gradcheck
     # Test with errors > 0

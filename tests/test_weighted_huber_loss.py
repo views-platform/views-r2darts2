@@ -8,12 +8,6 @@ from views_r2darts2.utils.loss import WeightedHuberLoss
 
 def test_weighted_huber_loss_init():
     """Tests the initialization of WeightedHuberLoss with default and custom parameters."""
-    # Test default initialization
-    loss_fn_default = WeightedHuberLoss()
-    assert loss_fn_default.threshold == 0.01
-    assert loss_fn_default.delta == 0.5
-    assert loss_fn_default.non_zero_weight == 5.0
-
     # Test custom initialization
     loss_fn_custom = WeightedHuberLoss(zero_threshold=0.1, delta=1.5, non_zero_weight=20.0)
     assert loss_fn_custom.threshold == 0.1
@@ -67,7 +61,7 @@ def test_weighted_huber_loss_invariant_vs_torch():
     delta = 0.75
 
     # Our implementation
-    loss_fn_custom = WeightedHuberLoss(delta=delta, non_zero_weight=1.0)
+    loss_fn_custom = WeightedHuberLoss(zero_threshold=0.01, delta=delta, non_zero_weight=1.0)
     loss_custom = loss_fn_custom(preds, targets)
 
     # PyTorch reference implementation
@@ -84,7 +78,7 @@ def test_weighted_huber_loss_gradient_check():
 
     # Use double precision for gradcheck
     delta = 0.5
-    loss_fn = WeightedHuberLoss(delta=delta, non_zero_weight=10.0)
+    loss_fn = WeightedHuberLoss(zero_threshold=0.01, delta=delta, non_zero_weight=10.0)
     
     # Test away from the delta threshold
     preds = torch.randn(2, 2, dtype=torch.double, requires_grad=True)

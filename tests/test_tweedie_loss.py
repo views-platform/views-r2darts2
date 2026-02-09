@@ -11,15 +11,15 @@ from views_r2darts2.utils.loss import LossSelector, TweedieLoss
 def test_tweedie_loss_init():
     """Tests the initialization of the corrected TweedieLoss."""
     # Test valid initialization
-    loss_fn = TweedieLoss(p=1.5, eps=1e-7)
+    loss_fn = TweedieLoss(p=1.5, non_zero_weight=5.0, zero_threshold=0.01, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-7)
     assert loss_fn.p == 1.5
     assert loss_fn.eps == 1e-7
 
     # Test invalid power parameter
     with pytest.raises(ValueError, match="Tweedie power parameter p must be in"):
-        TweedieLoss(p=0.9)
+        TweedieLoss(p=0.9, non_zero_weight=5.0, zero_threshold=0.01, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-8)
     with pytest.raises(ValueError, match="Tweedie power parameter p must be in"):
-        TweedieLoss(p=2.0)
+        TweedieLoss(p=2.0, non_zero_weight=5.0, zero_threshold=0.01, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-8)
 
 @pytest.mark.parametrize(
     "preds, targets, p, expected_loss",
@@ -52,14 +52,14 @@ def test_tweedie_loss_init():
 )
 def test_tweedie_loss_golden_values(preds, targets, p, expected_loss):
     """Tests the forward pass of the new TweedieLoss against manually calculated golden values."""
-    loss_fn = TweedieLoss(p=p, eps=1e-8)
+    loss_fn = TweedieLoss(p=p, non_zero_weight=1.0, zero_threshold=0.01, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-8)
     loss = loss_fn(preds, targets)
     assert torch.isclose(loss, torch.tensor(expected_loss), atol=1e-3) # Increased precision for atol
 
 
 def test_tweedie_loss_invariant_minimization():
     """Tests that for a given target, the loss is minimized when mu equals the target (using softplus)."""
-    loss_fn = TweedieLoss(p=1.5)
+    loss_fn = TweedieLoss(p=1.5, non_zero_weight=1.0, zero_threshold=0.01, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-8)
     target = torch.tensor([2.0])
     
     # For softplus link, pred_val_at_target should make softplus(pred_val_at_target) == target
@@ -78,7 +78,7 @@ def test_tweedie_loss_invariant_minimization():
 def test_tweedie_loss_gradient_check():
     """Performs a gradient check for the new TweedieLoss."""
     from torch.autograd import gradcheck
-    loss_fn = TweedieLoss(p=1.5, eps=1e-6) # Use larger eps for stability in gradcheck
+    loss_fn = TweedieLoss(p=1.5, non_zero_weight=1.0, zero_threshold=0.01, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-6) # Use larger eps for stability in gradcheck
     
     # Use double precision for gradcheck
     preds = torch.randn(2, 2, dtype=torch.double, requires_grad=True)
@@ -110,8 +110,16 @@ def test_tweedie_loss_with_darts_models(model_name, model_tuple, seed):
     model_cls, model_kwargs = model_tuple
     torch.manual_seed(seed)
     
-    # Using LossSelector to ensure it correctly passes the `p` parameter
-    loss_fn = LossSelector.get_loss_function("TweedieLoss", p=1.5)
+    # Using LossSelector to ensure it correctly passes the parameters
+    loss_fn = LossSelector.get_loss_function(
+        "TweedieLoss", 
+        p=1.5, 
+        non_zero_weight=5.0, 
+        zero_threshold=0.01, 
+        false_positive_weight=1.0, 
+        false_negative_weight=1.0, 
+        eps=1e-8
+    )
 
     model = model_cls(
         **model_kwargs,

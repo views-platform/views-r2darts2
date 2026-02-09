@@ -132,7 +132,7 @@ def test_spikefocal_threshold_reachability_across_pipelines(pipeline):
     # Define a threshold that is guaranteed to be unreachable
     unreachable_threshold = max_val + 1.0
     
-    loss = SpikeFocalLoss(spike_threshold=unreachable_threshold)
+    loss = SpikeFocalLoss(alpha=0.8, gamma=2.0, spike_threshold=unreachable_threshold)
     is_spike = torch.from_numpy(targets_np) > loss.spike_threshold
     proportion_spikes = is_spike.float().mean().item()
 
@@ -142,7 +142,7 @@ def test_spikefocal_threshold_reachability_across_pipelines(pipeline):
 
     # To make this a complete test, we also show a reachable threshold works.
     reachable_threshold = np.quantile(targets_np, 0.9) # 90th percentile
-    loss_functional = SpikeFocalLoss(spike_threshold=reachable_threshold)
+    loss_functional = SpikeFocalLoss(alpha=0.8, gamma=2.0, spike_threshold=reachable_threshold)
     is_spike_functional = torch.from_numpy(targets_np) > loss_functional.spike_threshold
     proportion_spikes_functional = is_spike_functional.float().mean().item()
 

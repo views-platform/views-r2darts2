@@ -189,6 +189,9 @@ class ModelCatalog:
             # ZeroInflated-family params
             "zero_weight": self.config.get("zero_weight"),
             "count_weight": self.config.get("count_weight"),
+            # Tweedie-family params
+            "p": self.config.get("p"),
+            "eps": self.config.get("eps"),
         }
         # Filter out None values, so that loss function defaults can apply
         self.loss_args = {k: v for k, v in self.loss_args.items() if v is not None}

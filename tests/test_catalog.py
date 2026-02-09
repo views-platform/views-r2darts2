@@ -47,7 +47,12 @@ def basic_config():
         "num_blocks": 2,
         "num_layers": 2,
         "layer_width": 128,
+        "layer_widths": 128,
         "force_reset": True,
+        # Loss params
+        "p": 1.5,
+        "eps": 1e-8,
+        "tau": 0.75,
         # TFT params
         "feed_forward": "GatedResidualNetwork",
         "add_relative_index": True,
@@ -130,7 +135,12 @@ def full_config():
         "num_blocks": 2,
         "num_layers": 2,
         "layer_width": 128,
+        "layer_widths": 128,
         "force_reset": True,
+        # Loss params
+        "p": 1.5,
+        "eps": 1e-8,
+        "tau": 0.75,
         # TFT params
         "feed_forward": "GatedResidualNetwork",
         "add_relative_index": True,

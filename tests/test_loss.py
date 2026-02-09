@@ -95,6 +95,7 @@ class TestWeightedHuberLoss:
         return WeightedHuberLoss(zero_threshold=0.01, delta=0.5, non_zero_weight=5.0)
 
     def test_initialization(self):
+        # Test custom initialization
         loss = WeightedHuberLoss(zero_threshold=0.02, delta=1.0, non_zero_weight=10.0)
         assert loss.threshold == 0.02
         assert loss.delta == 1.0
@@ -436,23 +437,16 @@ class TestTweedieLoss:
         return TweedieLoss(p=1.5, non_zero_weight=5.0, zero_threshold=0.01, eps=1e-8)
 
     def test_initialization(self):
-        # Test default initialization
-        loss_fn_default = TweedieLoss()
-        assert loss_fn_default.p == 1.5
-        assert loss_fn_default.non_zero_weight == 5.0
-        assert loss_fn_default.threshold == 0.01
-        assert loss_fn_default.eps == 1e-8
-
         # Test custom initialization
-        loss_fn_custom = TweedieLoss(p=1.9, non_zero_weight=10.0, zero_threshold=0.05, eps=1e-7)
+        loss_fn_custom = TweedieLoss(p=1.9, non_zero_weight=10.0, zero_threshold=0.05, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-7)
         assert loss_fn_custom.p == 1.9
         assert loss_fn_custom.non_zero_weight == 10.0
         assert loss_fn_custom.threshold == 0.05
         assert loss_fn_custom.eps == 1e-7
 
         # Test invalid p
-        with pytest.raises(ValueError, match="Power parameter p must be in \(1, 2\)"):
-            TweedieLoss(p=1.0)
+        with pytest.raises(ValueError, match="Tweedie power parameter p must be in"):
+            TweedieLoss(p=1.0, non_zero_weight=5.0, zero_threshold=0.01, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-8)
         with pytest.raises(ValueError, match="Power parameter p must be in \(1, 2\)"):
             TweedieLoss(p=2.0)
         with pytest.raises(ValueError, match="Power parameter p must be in \(1, 2\)"):
@@ -551,12 +545,6 @@ class TestAsymmetricQuantileLoss:
         return AsymmetricQuantileLoss(tau=0.75, non_zero_weight=5.0, zero_threshold=0.01)
 
     def test_initialization(self):
-        # Test default initialization
-        loss_fn_default = AsymmetricQuantileLoss()
-        assert loss_fn_default.tau == 0.75
-        assert loss_fn_default.non_zero_weight == 5.0
-        assert loss_fn_default.threshold == 0.01
-
         # Test custom initialization
         loss_fn_custom = AsymmetricQuantileLoss(tau=0.9, non_zero_weight=10.0, zero_threshold=0.05)
         assert loss_fn_custom.tau == 0.9
@@ -565,11 +553,11 @@ class TestAsymmetricQuantileLoss:
 
         # Test invalid tau
         with pytest.raises(ValueError, match="tau must be in \(0, 1\)"):
-            AsymmetricQuantileLoss(tau=0.0)
+            AsymmetricQuantileLoss(tau=0.0, non_zero_weight=5.0, zero_threshold=0.01)
         with pytest.raises(ValueError, match="tau must be in \(0, 1\)"):
-            AsymmetricQuantileLoss(tau=1.0)
+            AsymmetricQuantileLoss(tau=1.0, non_zero_weight=5.0, zero_threshold=0.01)
         with pytest.raises(ValueError, match="tau must be in \(0, 1\)"):
-            AsymmetricQuantileLoss(tau=-0.5)
+            AsymmetricQuantileLoss(tau=-0.5, non_zero_weight=5.0, zero_threshold=0.01)
 
     @pytest.mark.parametrize(
         "preds_val, targets_val, tau_val, non_zero_weight_val, zero_threshold_val, expected_loss_val",
@@ -674,17 +662,9 @@ class TestAsymmetricQuantileLoss:
 class TestZeroInflatedLoss:
     @pytest.fixture
     def loss_fn(self):
-        return ZeroInflatedLoss() # Uses default values
+        return ZeroInflatedLoss(zero_weight=1.0, count_weight=1.0, delta=0.5, zero_threshold=0.01, eps=1e-8)
 
     def test_initialization(self):
-        # Test default initialization
-        loss_fn_default = ZeroInflatedLoss()
-        assert loss_fn_default.zero_weight == 1.0
-        assert loss_fn_default.count_weight == 1.0
-        assert loss_fn_default.delta == 0.5
-        assert loss_fn_default.threshold == 0.01
-        assert loss_fn_default.eps == 1e-8
-
         # Test custom initialization
         loss_fn_custom = ZeroInflatedLoss(zero_weight=2.0, count_weight=0.5, delta=1.0, zero_threshold=0.05, eps=1e-7)
         assert loss_fn_custom.zero_weight == 2.0
@@ -714,7 +694,7 @@ class TestZeroInflatedLoss:
         """
         Tests the binary (zero/non-zero) classification component of ZeroInflatedLoss.
         """
-        loss_fn = ZeroInflatedLoss(zero_weight=1.0, count_weight=0.0, zero_threshold=zero_threshold, eps=eps)
+        loss_fn = ZeroInflatedLoss(zero_weight=1.0, count_weight=0.0, delta=0.5, zero_threshold=zero_threshold, eps=eps)
         preds = torch.tensor([preds_val], dtype=torch.float32)
         targets = torch.tensor([targets_val], dtype=torch.float32)
         
@@ -740,7 +720,7 @@ class TestZeroInflatedLoss:
         """
         Tests the count (Pseudo-Huber) component of ZeroInflatedLoss for non-zero targets.
         """
-        loss_fn = ZeroInflatedLoss(zero_weight=0.0, count_weight=1.0, delta=delta, zero_threshold=zero_threshold)
+        loss_fn = ZeroInflatedLoss(zero_weight=0.0, count_weight=1.0, delta=delta, zero_threshold=zero_threshold, eps=1e-8)
         preds = torch.tensor([preds_val], dtype=torch.float32)
         targets = torch.tensor([targets_val], dtype=torch.float32)
         

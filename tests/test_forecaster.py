@@ -369,6 +369,8 @@ class TestDartsForecaster:
         forecaster_with_scalers._preprocess_timeseries = Mock(return_value=([mock_ts], [mock_ts]))
         forecaster_with_scalers.model.predict = Mock(return_value=[mock_pred])
         forecaster_with_scalers.target_scaler.inverse_transform = Mock(return_value=[mock_pred])
+        # Must set scaler_fitted=True for inverse transform to be applied
+        forecaster_with_scalers.scaler_fitted = True
         
         result = forecaster_with_scalers.predict(sequence_number=0, output_length=2)
         

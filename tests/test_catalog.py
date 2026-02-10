@@ -18,6 +18,7 @@ def basic_config():
     return {
         "steps": [1, 2, 3],
         "input_chunk_length": 48,
+        "output_chunk_length": 3,
         "output_chunk_shift": 0,
         "name": "test_model",
         "random_state": 42,
@@ -106,6 +107,7 @@ def full_config():
     return {
         "steps": [1, 2, 3, 6, 12],
         "input_chunk_length": 48,
+        "output_chunk_length": 5,
         "output_chunk_shift": 0,
         "name": "full_test_model",
         "random_state": 42,
@@ -566,13 +568,26 @@ class TestConfigurationHandling:
     """Test suite for configuration parameter handling."""
 
     @patch("torch.serialization.add_safe_globals")
-    def test_output_chunk_length_from_steps(self, mock_safe_globals, basic_config):
-        """Test that output_chunk_length is correctly derived from steps."""
-        config = {**basic_config, "steps": [1, 2, 3, 6, 12, 24]}
-        catalog = ModelCatalog(config)
-        model = catalog._get_nbeats()
-        
-        assert model.output_chunk_length == 6
+    def test_output_chunk_length_validation(self, mock_safe_globals, basic_config):
+        """Test that output_chunk_length must be a divisor of forecast horizon (steps)."""
+        # Valid: steps=6, ocl=3
+        config_valid = {**basic_config, "steps": [1, 2, 3, 4, 5, 6], "output_chunk_length": 3}
+        catalog_valid = ModelCatalog(config_valid)
+        model = catalog_valid._get_nbeats()
+        assert model.output_chunk_length == 3
+
+        # Invalid: steps=5, ocl=3
+        config_invalid = {**basic_config, "steps": [1, 2, 3, 4, 5], "output_chunk_length": 3}
+        catalog_invalid = ModelCatalog(config_invalid)
+        with pytest.raises(ValueError, match="Architecture Mismatch"):
+            catalog_invalid._get_nbeats()
+
+        # Missing OCL
+        config_missing = {**basic_config, "steps": [1, 2, 3]}
+        del config_missing["output_chunk_length"]
+        catalog_missing = ModelCatalog(config_missing)
+        with pytest.raises(KeyError, match="output_chunk_length"):
+            catalog_missing._get_nbeats()
 
     def test_default_values_applied(self, basic_config):
         """Test that configured values are correctly applied."""

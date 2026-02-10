@@ -100,6 +100,50 @@ class DartsForecastingModelManager(ForecastingModelManager):
             f"Current model architecture: \033[92m{self.configs['algorithm']}\033[0m"
         )
 
+    def _resolve_active_partition_dict(self, config: dict) -> dict:
+        """
+        Explicitly resolves the partition dictionary for the current run.
+        
+        This avoids the 'Stale DataLoader' bug by re-calculating the 
+        temporal windows based on the actual 'steps' in the active config.
+        
+        Args:
+            config: Captured configuration snapshot.
+            
+        Returns:
+            Dictionary containing 'train' and 'test' time ranges.
+            
+        Raises:
+            KeyError: If run_type or steps are missing.
+            ValueError: If the partition type is unsupported.
+        """
+        run_type = config.get("run_type")
+        steps_list = config.get("steps")
+        
+        if not run_type or steps_list is None:
+            raise KeyError(f"Cannot resolve partition: Missing 'run_type' or 'steps' in config.")
+            
+        if not isinstance(steps_list, list):
+            raise TypeError(f"Config parameter 'steps' must be a list, got {type(steps_list).__name__}.")
+
+        steps = len(steps_list)
+        
+        # Get the master partition dict (defined in config_partitions.py)
+        # We access the underlying manager state to find it
+        master_partitions = getattr(self, "_partition_dict", {})
+        
+        if run_type in master_partitions:
+            return master_partitions[run_type]
+            
+        # Fallback to parent logic for dynamic partitions (like 'forecasting')
+        if hasattr(self._data_loader, "_get_partition_dict"):
+            # We temporarily set the partition type on the loader so its internal 
+            # match/case logic works, then immediately call the calculator.
+            self._data_loader.partition = run_type
+            return self._data_loader._get_partition_dict(steps=steps)
+            
+        raise ValueError(f"Unsupported run_type for partition resolution: {run_type}")
+
     def _train_model_artifact(self):
         """
         Trains a forecasting model using the specified configuration and dataset, and saves the trained model artifact.
@@ -114,35 +158,41 @@ class DartsForecastingModelManager(ForecastingModelManager):
         Returns:
             DartsForecaster: The trained forecaster object.
         """
+        # Capture stable config snapshot
+        active_config = self.configs
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
-        run_type = self.config["run_type"]
+        run_type = active_config["run_type"]
 
         df_viewser = read_dataframe(
             path_raw / f"{run_type}_viewser_df{PipelineConfig.dataframe_format}"
         )
         # Partitioner dict from ViewsDataLoader
-        model_object = ModelCatalog(config=self.config).get_model(
-            model_name=self.config["algorithm"]
+        model_object = ModelCatalog(config=active_config).get_model(
+            model_name=active_config["algorithm"]
         )
+
+        # Explicitly resolve the partition for THIS specific run
+        current_partition = self._resolve_active_partition_dict(active_config)
+        logger.info(f"Training on partition [{run_type}]: {current_partition}")
 
         forecaster = DartsForecaster(
             dataset=_ViewsDatasetDarts(
                 source=df_viewser,
-                targets=self.config.get("targets"),
+                targets=active_config.get("targets"),
                 broadcast_features=True,
             ),
-            log_features=self.config.get("log_features", []),
-            log_targets=self.config.get("log_targets", False),
+            log_features=active_config.get("log_features", []),
+            log_targets=active_config.get("log_targets", False),
             model=model_object,
-            partition_dict=self._data_loader.partition_dict,
-            feature_scaler=self.config.get("feature_scaler", None),
-            target_scaler=self.config.get("target_scaler", None),
-            feature_scaler_map=self.config.get("feature_scaler_map", None),
+            partition_dict=current_partition,
+            feature_scaler=active_config.get("feature_scaler", None),
+            target_scaler=active_config.get("target_scaler", None),
+            feature_scaler_map=active_config.get("feature_scaler_map", None),
         )
         forecaster.train()
 
-        if not self.config["sweep"]:  # If not using wandb sweep
+        if not active_config["sweep"]:  # If not using wandb sweep
             model_filename = generate_model_file_name(
                 run_type, file_extension=".pt"
             )  # Generate the model file name
@@ -178,10 +228,12 @@ class DartsForecastingModelManager(ForecastingModelManager):
         """
         import concurrent.futures
         
-        # eval_type can be "standard", "long", "complete", "live"
+        # Capture stable config snapshot
+        active_config = self.configs
+        run_type = active_config["run_type"]
+
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
-        run_type = self.configs["run_type"]
 
         if artifact_name:
             logger.info(f"Using (non-default) artifact: {artifact_name}")
@@ -195,32 +247,37 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 run_type
             )  # Path to the latest model artifact if it exists
 
-        self._config_manager.add_config({"timestamp": path_artifact.stem[-15:]})
+        # Persist timestamp to the underlying manager
+        timestamp = path_artifact.stem[-15:]
+        self._config_manager.add_config({"timestamp": timestamp})
+        # Refresh snapshot to include the timestamp
+        active_config = self.configs
 
         df_viewser = read_dataframe(
             path_raw / f"{run_type}_viewser_df{PipelineConfig.dataframe_format}"
         )
 
-        model_object = ModelCatalog(config=self.configs).get_model(
-            model_name=self.configs["algorithm"]
+        model_object = ModelCatalog(config=active_config).get_model(
+            model_name=active_config["algorithm"]
         )
         forecaster = DartsForecaster(
             dataset=_ViewsDatasetDarts(
                 source=df_viewser,
-                targets=self.configs.get("targets"),
+                targets=active_config.get("targets"),
                 broadcast_features=True,
             ),
             model=model_object,
-            partition_dict=self._data_loader.partition_dict,
-            feature_scaler=self.configs.get("feature_scaler", None),
-            target_scaler=self.configs.get("target_scaler", None),
-            log_targets=self.configs.get("log_targets", False),
-            log_features=self.configs.get("log_features", []),
-            feature_scaler_map=self.configs.get("feature_scaler_map", None),
+            partition_dict=self._resolve_active_partition_dict(active_config),
+            feature_scaler=active_config.get("feature_scaler", None),
+            target_scaler=active_config.get("target_scaler", None),
+            log_targets=active_config.get("log_targets", False),
+            log_features=active_config.get("log_features", []),
+            feature_scaler_map=active_config.get("feature_scaler_map", None),
         )
         forecaster.load_model(path=path_artifact)
 
         total_sequence_number = 12
+        predict_kwargs = self._get_predict_kwargs(active_config)
 
         # Parallel prediction with order preservation
         def predict_sequence(sequence_number):
@@ -228,16 +285,14 @@ class DartsForecastingModelManager(ForecastingModelManager):
             logger.info(f"Starting prediction for sequence {sequence_number + 1}/{total_sequence_number}")
             result = forecaster.predict(
                 sequence_number,
-                max(self.configs["steps"]),
-                num_samples=self.configs.get("num_samples"),
-                n_jobs=self.configs.get("n_jobs", 1),
-                mc_dropout=self.configs.get("mc_dropout"),
+                max(active_config["steps"]),
+                **predict_kwargs
             )
             logger.info(f"✓ Completed prediction for sequence {sequence_number + 1}/{total_sequence_number}")
             return result
 
         # Use ThreadPoolExecutor for I/O-bound tasks or ProcessPoolExecutor for CPU-bound
-        max_workers = self.configs.get("parallel_workers", None)
+        max_workers = active_config.get("parallel_workers", None)
         
         logger.info(f"Starting parallel prediction with {max_workers} workers for {total_sequence_number} sequences")
         
@@ -263,6 +318,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
                     raise
 
         logger.info(f"All {total_sequence_number} predictions completed successfully")
+
         return df_predictions
 
     def _forecast_model_artifact(self, artifact_name):
@@ -279,12 +335,15 @@ class DartsForecastingModelManager(ForecastingModelManager):
             Information about the artifact being used (default or specified).
 
         Side Effects:
-            Updates self.config["timestamp"] with the timestamp extracted from the artifact path.
+            Updates self.configs["timestamp"] with the timestamp extracted from the artifact path.
         """
+        # Capture stable config snapshot
+        active_config = self.configs
+        run_type = active_config["run_type"]
+
         # Commonly used paths
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
-        run_type = self.config["run_type"]
 
         if artifact_name:
             logger.info(f"Using (non-default) artifact: {artifact_name}")
@@ -296,39 +355,99 @@ class DartsForecastingModelManager(ForecastingModelManager):
             )
             path_artifact = self._model_path.get_latest_model_artifact_path(run_type)
 
-        self.config["timestamp"] = path_artifact.stem[-15:]
+        # Update the underlying manager's state
+        timestamp = path_artifact.stem[-15:]
+        self._config_manager.add_config({"timestamp": timestamp})
+        # Refresh snapshot
+        active_config = self.configs
+
         df_viewser = read_dataframe(
             path_raw / f"{run_type}_viewser_df{PipelineConfig.dataframe_format}"
         )
 
-        model_object = ModelCatalog(config=self.config).get_model(
-            model_name=self.config["algorithm"]
+        model_object = ModelCatalog(config=active_config).get_model(
+            model_name=active_config["algorithm"]
         )
         forecaster = DartsForecaster(
             dataset=_ViewsDatasetDarts(
                 source=df_viewser,
-                targets=self.config.get("targets"),
+                targets=active_config.get("targets"),
                 broadcast_features=True,
             ),
             model=model_object,
-            partition_dict=self._data_loader.partition_dict,
-            feature_scaler=self.config.get("feature_scaler", None),
-            target_scaler=self.config.get("target_scaler", None),
-            log_targets=self.config.get("log_targets", False),
-            log_features=self.config.get("log_features", []),
-            feature_scaler_map=self.config.get("feature_scaler_map", None),
+            partition_dict=self._resolve_active_partition_dict(active_config),
+            feature_scaler=active_config.get("feature_scaler", None),
+            target_scaler=active_config.get("target_scaler", None),
+            log_targets=active_config.get("log_targets", False),
+            log_features=active_config.get("log_features", []),
+            feature_scaler_map=active_config.get("feature_scaler_map", None),
         )
         forecaster.load_model(path=path_artifact)
 
+        predict_kwargs = self._get_predict_kwargs(active_config)
+
         df_predictions = forecaster.predict(
             0,
-            max(self.config["steps"]),
-            num_samples=self.config.get("num_samples", 1),
-            n_jobs=self.config.get("n_jobs", 1),
-            mc_dropout=self.config.get("mc_dropout", False),
+            max(active_config["steps"]),
+            **predict_kwargs
         )
 
         return df_predictions
+
+    def _execute_model_sweeping(self) -> None:
+        """
+        Execute single sweep iteration.
+        """
+        import wandb
+        from views_pipeline_core.exceptions.exceptions import PipelineException
+
+        with self._wandb_module.initialize_run(
+            project=self._project,
+            config=None,  # Will be set by wandb.config
+            job_type="sweep",
+        ):
+            try:
+                # Update config for sweep run using config_manager
+                self._config_manager.update_for_sweep_run(
+                    wandb.config,
+                    self.args,
+                    wandb_module=self._wandb_module,
+                )
+                
+                active_config = self.configs
+
+                logger.info(f"Sweeping {self._model_path.target} {active_config['name']}...")
+                model = self._train_model_artifact()
+
+                self._wandb_module.send_alert(
+                    title=f"Training for {self._model_path.target} {active_config['name']} completed successfully.",
+                    text=f"```\nModel hyperparameters (Sweep: {self._sweep})\n\n{wandb.config}\n```",
+                    notifications_enabled=self._wandb_notifications,
+                )
+
+                logger.info(
+                    f"Evaluating {self._model_path.target} {active_config['name']}..."
+                )
+                df_predictions = self._evaluate_sweep(self._eval_type, model)
+
+                for i, df in enumerate(df_predictions):
+                    print(
+                        f"\nValidating evaluation dataframe of sequence {i+1}/{len(df_predictions)}"
+                    )
+                    from views_pipeline_core.modules.validation.model import (
+                        validate_prediction_dataframe,
+                    )
+
+                    validate_prediction_dataframe(
+                        dataframe=df, target=active_config["targets"]
+                    )
+
+                if active_config.get("metrics"):
+                    self._evaluate_prediction_dataframe(df_predictions, self._eval_type)
+                else:
+                    raise PipelineException("No evaluation metrics specified in config_meta.py")
+            finally:
+                self._wandb_module.finish_run()
 
     def _evaluate_sweep(self, eval_type: str, model: any):
         """
@@ -341,18 +460,51 @@ class DartsForecastingModelManager(ForecastingModelManager):
         Returns:
             list: A list of predictions generated by the model for each sequence number in the sweep.
         """
-
-        # total_sequence_number = (
-        #     ForecastingModelManager._resolve_evaluation_sequence_number(eval_type)
-        # )
+        # Snapshot the config once for the duration of evaluation
+        active_config = self.configs
+        
         logger.warning(
             "Using fixed total_sequence_number=12 for sweep evaluation eval_type will soon be deprecated."
         )
         total_sequence_number = 12
+        
+        # Explicitly extract kwargs to ensure reproducibility
+        predict_kwargs = self._get_predict_kwargs(active_config)
 
         df_predictions = [
-            model.predict(sequence_number, max(self.config["steps"]))
+            model.predict(
+                sequence_number, 
+                max(active_config["steps"]),
+                **predict_kwargs
+            )
             for sequence_number in range(total_sequence_number)
         ]
 
         return df_predictions
+
+    def _get_predict_kwargs(self, config: dict) -> dict:
+        """
+        Extracts and validates keyword arguments for the predict() method.
+        
+        Args:
+            config: Configuration dictionary snapshot.
+            
+        Returns:
+            Dictionary of keyword arguments for Darts predict().
+            
+        Raises:
+            ValueError: If mandatory parameters are missing.
+        """
+        mandatory = ["num_samples", "mc_dropout", "n_jobs"]
+        missing = [k for k in mandatory if k not in config]
+        if missing:
+            raise ValueError(
+                f"Missing mandatory prediction parameters in config: {missing}. "
+                "Explicit configuration is required for reproducibility."
+            )
+            
+        return {
+            "num_samples": config["num_samples"],
+            "mc_dropout": config["mc_dropout"],
+            "n_jobs": config["n_jobs"],
+        }

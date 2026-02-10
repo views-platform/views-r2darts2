@@ -17,6 +17,10 @@ import torch
 import numpy as np
 import logging
 
+from views_r2darts2.model.forecaster import DartsForecaster
+from views_r2darts2.utils.loss import LossSelector
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -141,10 +145,6 @@ class GradientHealthCallback(Callback):
         )
 
 
-from views_r2darts2.model.forecaster import DartsForecaster
-from views_r2darts2.utils.loss import LossSelector
-
-
 class ModelCatalog:
 
     def __init__(self, config: dict):
@@ -218,11 +218,41 @@ class ModelCatalog:
         """
         return list(self.models.keys())
 
+    def _validate_architecture(self, config: dict):
+        """
+        Ensures that the architecture parameters are explicitly defined and valid.
+        
+        Args:
+            config: Model configuration dictionary.
+            
+        Raises:
+            KeyError: If output_chunk_length or steps are missing.
+            ValueError: If len(steps) is not a multiple of output_chunk_length.
+        """
+        if "output_chunk_length" not in config:
+            raise KeyError(
+                "Missing required hyperparameter: 'output_chunk_length'. "
+                "The model architecture must be explicitly defined."
+            )
+        if "steps" not in config:
+            raise KeyError("Missing required hyperparameter: 'steps'.")
+            
+        steps_len = len(config["steps"])
+        ocl = config["output_chunk_length"]
+        
+        if steps_len % ocl != 0:
+            raise ValueError(
+                f"Architecture Mismatch: Forecast horizon 'steps' ({steps_len}) "
+                f"must be a multiple of 'output_chunk_length' ({ocl}). "
+                "Adjust either parameters to ensure alignment."
+            )
+
     def _get_tsmixer_model(self):
         torch.serialization.add_safe_globals([TSMixerModel, LossSelector])
+        self._validate_architecture(self.config)
         return TSMixerModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             num_blocks=self.config["num_blocks"],
             ff_size=self.config["ff_size"],
@@ -265,10 +295,11 @@ class ModelCatalog:
 
     def _get_tft_model(self):
         torch.serialization.add_safe_globals([TFTModel, LossSelector])
+        self._validate_architecture(self.config)
 
         return TFTModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             feed_forward=self.config["feed_forward"],
             add_relative_index=self.config["add_relative_index"],
@@ -314,10 +345,12 @@ class ModelCatalog:
     
     def _get_nbeats(self):
         torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
+        self._validate_architecture(self.config)
     
         # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
         required_hparams = [
             "input_chunk_length",
+            "output_chunk_length",
             "output_chunk_shift",
             "generic_architecture",
             "num_stacks",
@@ -345,13 +378,10 @@ class ModelCatalog:
                 f"Missing required N-BEATS hyperparameters in config: {missing}"
             )
     
-        # ---- 2. Derived parameters (allowed) ----
-        output_chunk_length = len(self.config["steps"])
-    
         # ---- 3. Model construction (STRICT access) ----
         return NBEATSModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=output_chunk_length,
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             generic_architecture=self.config["generic_architecture"],
             num_stacks=self.config["num_stacks"],
@@ -398,9 +428,10 @@ class ModelCatalog:
         and multi-scale interpolation for outputs.
         """
         torch.serialization.add_safe_globals([NHiTSModel, LossSelector])
+        self._validate_architecture(self.config)
         return NHiTSModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             num_stacks=self.config["num_stacks"],
             num_blocks=self.config["num_blocks"],
@@ -444,9 +475,10 @@ class ModelCatalog:
 
     def _get_tcn_model(self):
         torch.serialization.add_safe_globals([TCNModel, LossSelector])
+        self._validate_architecture(self.config)
         return TCNModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             kernel_size=self.config["kernel_size"],
             num_filters=self.config["num_filters"],
@@ -484,9 +516,10 @@ class ModelCatalog:
 
     def _get_rnn_model(self):
         torch.serialization.add_safe_globals([BlockRNNModel, LossSelector])
+        self._validate_architecture(self.config)
         return BlockRNNModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             model=self.config["rnn_type"],
             hidden_dim=self.config["hidden_dim"],
@@ -538,9 +571,11 @@ class ModelCatalog:
             )
             nhead = max(1, d_model // 32)  # Ensure at least 32 dims per head
         
+        self._validate_architecture(self.config)
+        
         return TransformerModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             d_model=d_model,
             nhead=nhead,
@@ -585,9 +620,10 @@ class ModelCatalog:
 
     def _get_nlinear_model(self):
         torch.serialization.add_safe_globals([NLinearModel, LossSelector])
+        self._validate_architecture(self.config)
         return NLinearModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             shared_weights=self.config["shared_weights"],
             const_init=self.config["const_init"],
@@ -626,9 +662,10 @@ class ModelCatalog:
 
     def _get_dlinear_model(self):
         torch.serialization.add_safe_globals([DLinearModel, LossSelector])
+        self._validate_architecture(self.config)
         return DLinearModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config.get("output_chunk_length", len(self.config["steps"])),
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             shared_weights=self.config["shared_weights"],
             kernel_size=self.config["kernel_size"],
@@ -669,10 +706,12 @@ class ModelCatalog:
     
     def _get_tide_model(self):
         torch.serialization.add_safe_globals([TiDEModel, LossSelector])
+        self._validate_architecture(self.config)
     
         # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
         required_hparams = [
             "input_chunk_length",
+            "output_chunk_length",
             "output_chunk_shift",
             "num_encoder_layers",
             "num_decoder_layers",
@@ -703,13 +742,10 @@ class ModelCatalog:
                 f"Missing required TiDE hyperparameters in config: {missing}"
             )
     
-        # ---- 2. Derived parameters (allowed) ----
-        output_chunk_length = len(self.config["steps"])
-    
         # ---- 3. Model construction (STRICT access only) ----
         return TiDEModel(
             input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=output_chunk_length,
+            output_chunk_length=self.config["output_chunk_length"],
             output_chunk_shift=self.config["output_chunk_shift"],
             num_encoder_layers=self.config["num_encoder_layers"],
             num_decoder_layers=self.config["num_decoder_layers"],

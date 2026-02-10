@@ -21,33 +21,45 @@ class TestReproducibilityInfra:
                     manager._model_path = path_manager
                     manager._data_loader = MagicMock()
                     manager._config_manager = MagicMock()
-                    # Initialize missing attributes required by property access during __init__
                     manager._sweep = False
                     
                     return manager
 
-    def test_data_loader_sync_alignment(self, mock_manager):
-        """Proves that _sync_data_loader correctly updates the loader partitions."""
+    def test_partition_resolution_alignment(self, mock_manager):
+        """Proves that _resolve_active_partition_dict correctly calculates partitions for any steps."""
         config = {
             "steps": [1, 2, 3, 4, 5, 6],
             "run_type": "calibration"
         }
         
-        # Setup mock behavior for the parent data loader's partition calculator
-        mock_manager._data_loader._get_partition_dict.return_value = {"train": (1, 10), "test": (11, 17)}
+        # Mock the master partitions
+        mock_manager._partition_dict = {
+            "calibration": {"train": (100, 200), "test": (201, 210)}
+        }
         
-        mock_manager._sync_data_loader(config)
+        partition = mock_manager._resolve_active_partition_dict(config)
+        assert partition["train"] == (100, 200)
         
-        assert mock_manager._data_loader.steps == 6
-        assert mock_manager._data_loader.partition == "calibration"
-        # Ensure it actually called the recalculation logic
-        mock_manager._data_loader._get_partition_dict.assert_called_with(steps=6)
+        # Test dynamic forecasting partition
+        config_forecasting = {
+            "steps": list(range(1, 13)), # 12 steps
+            "run_type": "forecasting"
+        }
+        
+        # The manager should fallback to the data loader's internal calculator
+        mock_manager._data_loader._get_partition_dict.return_value = {"train": (100, 500), "test": (501, 512)}
+        
+        partition_fc = mock_manager._resolve_active_partition_dict(config_forecasting)
+        
+        assert mock_manager._data_loader.partition == "forecasting"
+        mock_manager._data_loader._get_partition_dict.assert_called_with(steps=12)
+        assert partition_fc["test"] == (501, 512)
 
     def test_predict_kwargs_validation(self, mock_manager):
         """Ensures the manager raises an error if mandatory prediction params are missing."""
         
-        # Case 1: Missing mc_dropout
-        config_missing = {"num_samples": 100}
+        # Case 1: Missing n_jobs (new strict requirement)
+        config_missing = {"num_samples": 100, "mc_dropout": True}
         with pytest.raises(ValueError, match="Missing mandatory prediction parameters"):
             mock_manager._get_predict_kwargs(config_missing)
             

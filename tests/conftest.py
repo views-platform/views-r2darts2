@@ -2,6 +2,11 @@ import os
 import pytest
 import views_r2darts2
 import logging
+import torch
+
+# Capture the absolutely clean torch.load before any tests or mocks run
+# This is used by DartsForecastingModelManager to avoid 'Mock-in-the-Middle' bugs.
+CLEAN_TORCH_LOAD = torch.load
 
 logger = logging.getLogger(__name__)
 

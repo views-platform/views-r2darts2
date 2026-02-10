@@ -10,14 +10,27 @@ from views_pipeline_core.files.utils import (
 )
 
 from views_r2darts2.model.catalog import ModelCatalog
+from views_r2darts2.utils.gates import ReproducibilityGate, ReproducibilityError
 
 logger = logging.getLogger(__name__)
 
+# Save the original torch.load function ONLY once to avoid recursion or mock-poisoning.
+# If it's already patched (e.g. during tests), we don't want to re-save the patch.
+if not hasattr(torch, "__original_load__"):
+    # Priority 1: Check session-captured CLEAN_TORCH_LOAD (for tests)
+    try:
+        from tests.conftest import CLEAN_TORCH_LOAD
+        torch.__original_load__ = CLEAN_TORCH_LOAD
+    except (ImportError, ModuleNotFoundError):
+        # Priority 2: Use current torch.load if it's not a Mock
+        orig = torch.load
+        if "Mock" not in str(type(orig)):
+            torch.__original_load__ = orig
+        else:
+            # Last resort: we are in a mock-contaminated environment and conftest didn't help
+            torch.__original_load__ = orig
+
 # https://github.com/suno-ai/bark/pull/619#issuecomment-2726747073
-# Save the original torch.load function
-_original_torch_load = torch.load
-
-
 # Function that forces weights_only=False
 def custom_torch_load(*args, **kwargs):
     """
@@ -33,7 +46,11 @@ def custom_torch_load(*args, **kwargs):
     """
     if "weights_only" not in kwargs:
         kwargs["weights_only"] = False
-    return _original_torch_load(*args, **kwargs)
+    
+    # Use the saved original
+    return torch.__original_load__(*args, **kwargs)
+
+custom_torch_load.monkeypatched = True
 
 
 class DartsForecastingModelManager(ForecastingModelManager):
@@ -95,6 +112,8 @@ class DartsForecastingModelManager(ForecastingModelManager):
             use_prediction_store=use_prediction_store,
         )
         # Override torch.load globally
+        if not hasattr(torch, "__original_load__"):
+            torch.__original_load__ = torch.load
         torch.load = custom_torch_load
         logger.info(
             f"Current model architecture: \033[92m{self.configs['algorithm']}\033[0m"
@@ -115,7 +134,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             
         Raises:
             KeyError: If run_type or steps are missing.
-            ValueError: If the partition type is unsupported.
+            ValueError: If the partition type is unsupported or discontinuous.
         """
         run_type = config.get("run_type")
         steps_list = config.get("steps")
@@ -126,23 +145,26 @@ class DartsForecastingModelManager(ForecastingModelManager):
         if not isinstance(steps_list, list):
             raise TypeError(f"Config parameter 'steps' must be a list, got {type(steps_list).__name__}.")
 
-        steps = len(steps_list)
+        # SIREN: Horizon and Shift Checks
+        ReproducibilityGate.Config.audit_architecture(config)
         
         # Get the master partition dict (defined in config_partitions.py)
-        # We access the underlying manager state to find it
         master_partitions = getattr(self, "_partition_dict", {})
         
         if run_type in master_partitions:
-            return master_partitions[run_type]
-            
-        # Fallback to parent logic for dynamic partitions (like 'forecasting')
-        if hasattr(self._data_loader, "_get_partition_dict"):
-            # We temporarily set the partition type on the loader so its internal 
-            # match/case logic works, then immediately call the calculator.
-            self._data_loader.partition = run_type
-            return self._data_loader._get_partition_dict(steps=steps)
-            
-        raise ValueError(f"Unsupported run_type for partition resolution: {run_type}")
+            partition = master_partitions[run_type]
+        else:
+            # Fallback to parent logic for dynamic partitions (like 'forecasting')
+            if hasattr(self._data_loader, "_get_partition_dict"):
+                self._data_loader.partition = run_type
+                partition = self._data_loader._get_partition_dict(steps=len(steps_list))
+            else:
+                raise ValueError(f"Unsupported run_type for partition resolution: {run_type}")
+
+        # GUARDIAN: The Continuity Check (t+1)
+        ReproducibilityGate.Temporal.audit_continuity(partition)
+
+        return partition
 
     def _train_model_artifact(self):
         """
@@ -160,6 +182,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
         """
         # Capture stable config snapshot
         active_config = self.configs
+        
+        # DNA AUDIT: Verify mandatory hyperparameters
+        ReproducibilityGate.Config.audit_manifest(active_config)
+        ReproducibilityGate.Config.audit_architecture(active_config)
+        
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
         run_type = active_config["run_type"]
@@ -230,6 +257,10 @@ class DartsForecastingModelManager(ForecastingModelManager):
         
         # Capture stable config snapshot
         active_config = self.configs
+        
+        # DNA AUDIT: Verify mandatory hyperparameters
+        ReproducibilityGate.Config.audit_manifest(active_config)
+        
         run_type = active_config["run_type"]
 
         path_raw = self._model_path.data_raw
@@ -277,6 +308,17 @@ class DartsForecastingModelManager(ForecastingModelManager):
         forecaster.load_model(path=path_artifact)
 
         total_sequence_number = 12
+        
+        # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
+        partition = self._resolve_active_partition_dict(active_config)
+        ReproducibilityGate.Temporal.audit_prediction_horizon(
+            run_type=run_type,
+            train_end=partition["train"][1],
+            test_end=partition["test"][1],
+            max_steps=max(active_config["steps"]),
+            total_sequences=total_sequence_number
+        )
+
         predict_kwargs = self._get_predict_kwargs(active_config)
 
         # Parallel prediction with order preservation
@@ -324,21 +366,14 @@ class DartsForecastingModelManager(ForecastingModelManager):
     def _forecast_model_artifact(self, artifact_name):
         """
         Loads a model artifact and generates forecasts using the specified configuration.
-
-        Args:
-            artifact_name (str): The name of the model artifact to use. If None, uses the latest artifact based on run type.
-
-        Returns:
-            pd.DataFrame: DataFrame containing the forecasted predictions.
-
-        Logs:
-            Information about the artifact being used (default or specified).
-
-        Side Effects:
-            Updates self.configs["timestamp"] with the timestamp extracted from the artifact path.
         """
         # Capture stable config snapshot
         active_config = self.configs
+        
+        # DNA AUDIT: Verify mandatory hyperparameters
+        ReproducibilityGate.Config.audit_manifest(active_config)
+        ReproducibilityGate.Config.audit_architecture(active_config)
+        
         run_type = active_config["run_type"]
 
         # Commonly used paths
@@ -415,6 +450,10 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 )
                 
                 active_config = self.configs
+                
+                # DNA AUDIT: Verify mandatory hyperparameters
+                ReproducibilityGate.Config.audit_manifest(active_config)
+                ReproducibilityGate.Config.audit_architecture(active_config)
 
                 logger.info(f"Sweeping {self._model_path.target} {active_config['name']}...")
                 model = self._train_model_artifact()
@@ -428,6 +467,17 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 logger.info(
                     f"Evaluating {self._model_path.target} {active_config['name']}..."
                 )
+                
+                # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
+                partition = self._resolve_active_partition_dict(active_config)
+                ReproducibilityGate.Temporal.audit_prediction_horizon(
+                    run_type=active_config["run_type"],
+                    train_end=partition["train"][1],
+                    test_end=partition["test"][1],
+                    max_steps=max(active_config["steps"]),
+                    total_sequences=12
+                )
+                
                 df_predictions = self._evaluate_sweep(self._eval_type, model)
 
                 for i, df in enumerate(df_predictions):

@@ -127,7 +127,10 @@ class TestDartsForecasterLogFeatures:
         # 6. Sanity check: Assert that feature_B was NOT transformed
         feature_b_index = past_covariates[0].components.get_loc("feature_B")
         feature_b_values = processed_values[:, feature_b_index]
-        original_b_values = timeseries_list[0]["feature_B"].all_values(copy=False)
+        # Important: covariates were sliced during train_mode=True
+        start_idx = partition_dict["train"][0]
+        end_idx = partition_dict["train"][1]
+        original_b_values = timeseries_list[0][start_idx : end_idx + 1]["feature_B"].all_values(copy=False)
 
         np.testing.assert_allclose(
             feature_b_values.flatten(),

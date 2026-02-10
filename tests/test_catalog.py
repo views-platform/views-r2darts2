@@ -579,7 +579,8 @@ class TestConfigurationHandling:
         # Invalid: steps=5, ocl=3
         config_invalid = {**basic_config, "steps": [1, 2, 3, 4, 5], "output_chunk_length": 3}
         catalog_invalid = ModelCatalog(config_invalid)
-        with pytest.raises(ValueError, match="Architecture Mismatch"):
+        from views_r2darts2.utils.gates import ArchitectureMismatchError
+        with pytest.raises(ArchitectureMismatchError, match="Architecture Mismatch"):
             catalog_invalid._get_nbeats()
 
         # Missing OCL

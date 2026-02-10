@@ -466,9 +466,6 @@ class TestFeatureScalerManager:
             all_features=list(sample_timeseries_list[0].components),
         )
         
-        # Get original values
-        orig_values = [ts.all_values(copy=True) for ts in sample_timeseries_list]
-        
         # Transform and inverse transform
         transformed = manager.fit_transform(sample_timeseries_list)
         recovered = manager.inverse_transform(transformed)
@@ -788,7 +785,7 @@ class TestFeatureScalerManagerChaining:
             all_features=list(sample_timeseries_list[0].components),
         )
         
-        transformed = manager.fit_transform(sample_timeseries_list)
+        manager.fit_transform(sample_timeseries_list)
         assert manager.is_fitted
     
     def test_chained_inverse_transform(self, sample_timeseries_list):

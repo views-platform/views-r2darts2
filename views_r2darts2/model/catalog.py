@@ -19,6 +19,7 @@ import logging
 
 from views_r2darts2.model.forecaster import DartsForecaster
 from views_r2darts2.utils.loss import LossSelector
+from views_r2darts2.utils.gates import ReproducibilityGate
 
 
 logger = logging.getLogger(__name__)
@@ -218,38 +219,9 @@ class ModelCatalog:
         """
         return list(self.models.keys())
 
-    def _validate_architecture(self, config: dict):
-        """
-        Ensures that the architecture parameters are explicitly defined and valid.
-        
-        Args:
-            config: Model configuration dictionary.
-            
-        Raises:
-            KeyError: If output_chunk_length or steps are missing.
-            ValueError: If len(steps) is not a multiple of output_chunk_length.
-        """
-        if "output_chunk_length" not in config:
-            raise KeyError(
-                "Missing required hyperparameter: 'output_chunk_length'. "
-                "The model architecture must be explicitly defined."
-            )
-        if "steps" not in config:
-            raise KeyError("Missing required hyperparameter: 'steps'.")
-            
-        steps_len = len(config["steps"])
-        ocl = config["output_chunk_length"]
-        
-        if steps_len % ocl != 0:
-            raise ValueError(
-                f"Architecture Mismatch: Forecast horizon 'steps' ({steps_len}) "
-                f"must be a multiple of 'output_chunk_length' ({ocl}). "
-                "Adjust either parameters to ensure alignment."
-            )
-
     def _get_tsmixer_model(self):
         torch.serialization.add_safe_globals([TSMixerModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
         return TSMixerModel(
             input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=self.config["output_chunk_length"],
@@ -295,7 +267,7 @@ class ModelCatalog:
 
     def _get_tft_model(self):
         torch.serialization.add_safe_globals([TFTModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
 
         return TFTModel(
             input_chunk_length=self.config["input_chunk_length"],
@@ -345,7 +317,7 @@ class ModelCatalog:
     
     def _get_nbeats(self):
         torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
     
         # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
         required_hparams = [
@@ -428,7 +400,7 @@ class ModelCatalog:
         and multi-scale interpolation for outputs.
         """
         torch.serialization.add_safe_globals([NHiTSModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
         return NHiTSModel(
             input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=self.config["output_chunk_length"],
@@ -475,7 +447,7 @@ class ModelCatalog:
 
     def _get_tcn_model(self):
         torch.serialization.add_safe_globals([TCNModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
         return TCNModel(
             input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=self.config["output_chunk_length"],
@@ -516,7 +488,7 @@ class ModelCatalog:
 
     def _get_rnn_model(self):
         torch.serialization.add_safe_globals([BlockRNNModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
         return BlockRNNModel(
             input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=self.config["output_chunk_length"],
@@ -571,7 +543,7 @@ class ModelCatalog:
             )
             nhead = max(1, d_model // 32)  # Ensure at least 32 dims per head
         
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
         
         return TransformerModel(
             input_chunk_length=self.config["input_chunk_length"],
@@ -620,7 +592,7 @@ class ModelCatalog:
 
     def _get_nlinear_model(self):
         torch.serialization.add_safe_globals([NLinearModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
         return NLinearModel(
             input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=self.config["output_chunk_length"],
@@ -662,7 +634,7 @@ class ModelCatalog:
 
     def _get_dlinear_model(self):
         torch.serialization.add_safe_globals([DLinearModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
         return DLinearModel(
             input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=self.config["output_chunk_length"],
@@ -706,7 +678,87 @@ class ModelCatalog:
     
     def _get_tide_model(self):
         torch.serialization.add_safe_globals([TiDEModel, LossSelector])
-        self._validate_architecture(self.config)
+        ReproducibilityGate.Config.audit_architecture(self.config)
+    
+        # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
+        required_hparams = [
+            "input_chunk_length",
+            "output_chunk_length",
+            "output_chunk_shift",
+            "num_encoder_layers",
+            "num_decoder_layers",
+            "decoder_output_dim",
+            "hidden_size",
+            "temporal_width_past",
+            "temporal_width_future",
+            "temporal_decoder_hidden",
+            "use_layer_norm",
+            "dropout",
+            "use_static_covariates",
+            "batch_size",
+            "n_epochs",
+            "steps",
+            "name",
+            "random_state",
+            "use_reversible_instance_norm",
+            "gradient_clip_val",
+            "early_stopping_patience",
+            "early_stopping_min_delta",
+            "lr",
+            "weight_decay",
+        ]
+    
+        missing = [k for k in required_hparams if k not in self.config]
+        if missing:
+            raise ValueError(
+                f"Missing required TiDE hyperparameters in config: {missing}"
+            )
+    
+        # ---- 3. Model construction (STRICT access only) ----
+        return TiDEModel(
+            input_chunk_length=self.config["input_chunk_length"],
+            output_chunk_length=self.config["output_chunk_length"],
+            output_chunk_shift=self.config["output_chunk_shift"],
+            num_encoder_layers=self.config["num_encoder_layers"],
+            num_decoder_layers=self.config["num_decoder_layers"],
+            decoder_output_dim=self.config["decoder_output_dim"],
+            hidden_size=self.config["hidden_size"],
+            temporal_width_past=self.config["temporal_width_past"],
+            temporal_width_future=self.config["temporal_width_future"],
+            temporal_decoder_hidden=self.config["temporal_decoder_hidden"],
+            use_layer_norm=self.config["use_layer_norm"],
+            dropout=self.config["dropout"],
+            use_static_covariates=self.config["use_static_covariates"],
+            batch_size=self.config["batch_size"],
+            n_epochs=self.config["n_epochs"],
+            loss_fn=self.loss_fn,
+            model_name=self.config["name"],
+            random_state=self.config["random_state"],
+            force_reset=True,
+            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
+            pl_trainer_kwargs={
+                "accelerator": "gpu",
+                "logger": WandbLogger(log_model="all"),
+                "gradient_clip_val": self.config["gradient_clip_val"],
+                "callbacks": [
+                    EarlyStopping(
+                        monitor="train_loss",
+                        patience=self.config["early_stopping_patience"],
+                        min_delta=self.config["early_stopping_min_delta"],
+                        mode="min",
+                    ),
+                    LearningRateMonitor(log_momentum=True),
+                    GradientHealthCallback(),
+                ],
+                "enable_progress_bar": True,
+            },
+            optimizer_kwargs={
+                "lr": self.config["lr"],
+                "weight_decay": self.config["weight_decay"],
+            },
+            lr_scheduler_cls=ReduceLROnPlateau,
+            lr_scheduler_kwargs=self.lr_scheduler_args,
+        )
     
         # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
         required_hparams = [

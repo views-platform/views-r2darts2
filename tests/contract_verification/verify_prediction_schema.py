@@ -1,8 +1,6 @@
 
 import pandas as pd
 import numpy as np
-import torch
-from darts import TimeSeries
 from darts.models.forecasting.tft_model import TFTModel
 
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
@@ -10,7 +8,6 @@ from views_r2darts2.model.forecaster import DartsForecaster
 
 def create_mock_dataset() -> _ViewsDatasetDarts:
     """Creates a minimal but valid _ViewsDatasetDarts object."""
-    time_stamps = pd.to_datetime(pd.date_range(start="2020-01-01", periods=50, freq="MS"))
     df = pd.DataFrame({
         'month_id': range(1, 51),
         'country_id': 1,

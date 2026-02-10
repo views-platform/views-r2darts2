@@ -7,6 +7,7 @@ from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
 from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
+from views_r2darts2.utils.gates import ReproducibilityGate
 from darts.dataprocessing.transformers import Scaler
 
 import logging
@@ -262,68 +263,6 @@ class DartsForecaster:
             out.append(ts.map(lambda arr: np.log1p(np.maximum(arr, 0)).astype(np.float32)))
         return out
     
-    def _check_data_sanity(self, series_list: List[TimeSeries], name: str, max_abs_val: float = 100.0):
-        """
-        Check for NaN, Inf, or extreme values in time series data.
-        
-        Extreme values in attention-based models can cause numerical instability:
-        - Attention scores: softmax(Q @ K.T / sqrt(d)) can overflow with large inputs
-        - LayerNorm: can produce NaN if input variance is near-zero or extreme
-        
-        Args:
-            series_list: List of TimeSeries to check
-            name: Name of the data (for logging)
-            max_abs_val: Values beyond this threshold are flagged as extreme (default 100)
-        """
-        total_nan = 0
-        total_inf = 0
-        total_extreme = 0
-        total_values = 0
-        extreme_features = set()
-        
-        for ts in series_list:
-            arr = ts.all_values(copy=False)
-            total_values += arr.size
-            
-            nan_count = np.isnan(arr).sum()
-            inf_count = np.isinf(arr).sum()
-            extreme_mask = np.abs(arr) > max_abs_val
-            extreme_count = extreme_mask.sum()
-            
-            total_nan += nan_count
-            total_inf += inf_count
-            total_extreme += extreme_count
-            
-            # Find which features have extreme values
-            if extreme_count > 0 and hasattr(ts, 'components'):
-                components = list(ts.components)
-                if arr.ndim == 2:
-                    for feat_idx in range(arr.shape[1]):
-                        if np.any(extreme_mask[:, feat_idx]):
-                            max_val = np.max(np.abs(arr[:, feat_idx]))
-                            extreme_features.add((components[feat_idx], float(max_val)))
-                elif arr.ndim == 3:
-                    for feat_idx in range(arr.shape[1]):
-                        if np.any(extreme_mask[:, feat_idx, :]):
-                            max_val = np.max(np.abs(arr[:, feat_idx, :]))
-                            extreme_features.add((components[feat_idx], float(max_val)))
-        
-        if total_nan > 0:
-            logger.error(f"🚨 DATA SANITY FAILED [{name}]: {total_nan} NaN values found!")
-        if total_inf > 0:
-            logger.error(f"🚨 DATA SANITY FAILED [{name}]: {total_inf} Inf values found!")
-        if total_extreme > 0:
-            logger.warning(
-                f"⚠️ DATA SANITY WARNING [{name}]: {total_extreme}/{total_values} values "
-                f"({100*total_extreme/total_values:.2f}%) exceed ±{max_abs_val}. "
-                f"This may cause NaN in attention layers."
-            )
-            if extreme_features:
-                sorted_features = sorted(extreme_features, key=lambda x: -x[1])[:10]
-                logger.warning(
-                    f"⚠️ Top extreme features: {[(f, f'{v:.1f}') for f, v in sorted_features]}"
-                )
-
     def _inverse_log_on_predictions(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
         """
         Inverse of _apply_log_to_targets.
@@ -493,21 +432,25 @@ class DartsForecaster:
 
         self.min_length = self.model.input_chunk_length + self.model.output_chunk_length
         if train_mode:
+            # We slice targets up to 'end + 1' because Darts slice is exclusive for integer indices.
+            # This ensures month 'end' (t) is included.
             targets = [
-                s.slice(start_ts=start, end_ts=end - self.model.output_chunk_length)[
-                    self.dataset.targets
-                ]
+                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
                 for s in timeseries_float
                 if len(s) >= self.min_length
             ]
-            past_cov = [s[self.dataset.features].astype(np.float32) for s in timeseries_float]
+            # We MUST slice past_cov up to 'end + 1' to prevent feature leakage.
+            past_cov = [
+                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(np.float32) 
+                for s in timeseries_float
+            ]
         else:
             targets = [
-                s.slice(start_ts=start, end_ts=end)[self.dataset.targets]
+                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
                 for s in timeseries_float
             ]
             past_cov = [
-                s.slice(start_ts=start, end_ts=end)[self.dataset.features].astype(np.float32)
+                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(np.float32)
                 for s in timeseries_float
             ]
 
@@ -519,6 +462,16 @@ class DartsForecaster:
         targets = self._apply_log_to_targets(targets)
 
         if train_mode:
+            # GATE 3, 4, 5: The Fortress Firewall
+            
+            # Check Boundary Integrity (Peeking and Starvation)
+            # This ensures we use all data up to 'end' and not a month more.
+            ReproducibilityGate.Temporal.audit_boundary_integrity(targets, end)
+            
+            # Check Sequence Contiguity (No Holes)
+            for ts in targets:
+                ReproducibilityGate.Temporal.audit_sequence_contiguity(ts.time_index.values.astype(int))
+
             logger.info("Fitting scalers for training data...")
             if self.target_scaler:
                 targets = self.target_scaler.fit_transform(targets)
@@ -536,9 +489,9 @@ class DartsForecaster:
         targets = [ts.astype(np.float32) for ts in targets]
         past_cov = [pc.astype(np.float32) for pc in past_cov]
         
-        # Data sanity check: detect extreme values that could cause NaN in attention
-        self._check_data_sanity(targets, "targets")
-        self._check_data_sanity(past_cov, "past_covariates")
+        # Data sanity check: detect extreme values, NaNs, Infs
+        ReproducibilityGate.Data.audit_numerical_sanity(targets, "targets")
+        ReproducibilityGate.Data.audit_numerical_sanity(past_cov, "past_covariates")
 
         return targets, past_cov
 

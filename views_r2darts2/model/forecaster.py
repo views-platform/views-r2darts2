@@ -193,7 +193,7 @@ class DartsForecaster:
         def _make_pipeline(scaler_names: list):
             """Create a Darts Pipeline from a list of scaler names."""
             darts_scalers = [
-                Scaler(ScalerSelector.get_scaler(name)) for name in scaler_names
+                Scaler(ScalerSelector.get_scaler(name), global_fit=True) for name in scaler_names
             ]
             return Pipeline(darts_scalers)
 
@@ -205,13 +205,13 @@ class DartsForecaster:
             else:
                 # Single scaler
                 estimator = ScalerSelector.get_scaler(scaler_cfg)
-                return Scaler(estimator)
+                return Scaler(estimator, global_fit=True)
         
         if isinstance(scaler_cfg, list):
             # List of scalers to chain: ["AsinhTransform", "StandardScaler"]
             if len(scaler_cfg) == 1:
                 estimator = ScalerSelector.get_scaler(scaler_cfg[0])
-                return Scaler(estimator)
+                return Scaler(estimator, global_fit=True)
             else:
                 return _make_pipeline(scaler_cfg)
         
@@ -240,7 +240,7 @@ class DartsForecaster:
                 scaler_names = _parse_chain_string(name)
                 return _make_pipeline(scaler_names)
             estimator = ScalerSelector.get_scaler(name, **kwargs)
-            return Scaler(estimator)
+            return Scaler(estimator, global_fit=True)
         
         raise TypeError(
             f"Scaler config must be None, str, list, or dict. Got {type(scaler_cfg).__name__}."
@@ -296,7 +296,7 @@ class DartsForecaster:
         
         # For single Scaler, we need to manually handle probabilistic series
         result = []
-        for ts in timeseries_pred:
+        for i, ts in enumerate(timeseries_pred):
             arr = ts.all_values(copy=True)
             is_probabilistic = arr.ndim == 3
             
@@ -307,21 +307,25 @@ class DartsForecaster:
                 arr_2d = arr.transpose(0, 2, 1).reshape(-1, n_features)
                 
                 # Get the fitted sklearn scaler from the Darts Scaler wrapper
-                # Darts stores fitted params as a list of dicts with "fitted" key
+                # Darts stores fitted params as a list/tuple of parameters.
+                # If global_fit=True, the list has length 1. 
+                # If global_fit=False, the list length matches the number of series.
                 sklearn_scaler = None
                 if hasattr(self.target_scaler, '_fitted_params') and self.target_scaler._fitted_params:
                     fitted_params = self.target_scaler._fitted_params
-                    if isinstance(fitted_params, (list, tuple)) and len(fitted_params) > 0:
-                        first_param = fitted_params[0]
-                        if isinstance(first_param, dict) and 'fitted' in first_param:
-                            sklearn_scaler = first_param['fitted']
+                    # Use index 'i' if per-series, or index '0' if global
+                    param_idx = i if len(fitted_params) > 1 else 0
+                    if param_idx < len(fitted_params):
+                        param = fitted_params[param_idx]
+                        if isinstance(param, dict) and 'fitted' in param:
+                            sklearn_scaler = param['fitted']
                         else:
-                            sklearn_scaler = first_param
+                            sklearn_scaler = param
                 
                 if sklearn_scaler is not None and hasattr(sklearn_scaler, 'inverse_transform'):
                     inv_2d = sklearn_scaler.inverse_transform(arr_2d.astype(np.float64))
                 else:
-                    logger.warning("Target scaler fitted params not found or invalid, skipping inverse transform")
+                    logger.warning(f"Target scaler fitted params not found for series {i}, skipping inverse transform")
                     inv_2d = arr_2d
                 
                 # Reshape back to 3D: (time, features, samples)
@@ -336,6 +340,8 @@ class DartsForecaster:
                 )
             else:
                 # For deterministic, use standard Darts inverse_transform
+                # Standard Darts inverse_transform handles multiple series correctly 
+                # by internally matching the series index to the fitted params.
                 new_ts = self.target_scaler.inverse_transform([ts])[0]
             
             result.append(new_ts)

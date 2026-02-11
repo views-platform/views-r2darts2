@@ -616,16 +616,25 @@ class DartsForecaster:
             + sequence_number,  # self._test_start + sequence_number is exclusive
         )
 
-        # Fail-Loud: Verify model device state before prediction
-        # Darts models sometimes silently shift back to CPU in teardown()
+        # Resilient Device Management: Ensure model is on the correct device
+        # Darts models often shift to CPU in teardown(); we restore them if needed.
         current_device = next(self.model.model.parameters()).device
-        if self.device == "cuda" and current_device.type == "cpu":
-            error_msg = (
-                f"DEVICE MISMATCH DETECTED: Forecaster initialized for {self.device} "
-                f"but model weights found on {current_device}. Prediction halted to prevent race conditions."
-            )
-            logger.critical(error_msg)
-            raise RuntimeError(error_msg)
+        if self.device != "cpu" and current_device.type == "cpu":
+            logger.info(f"Restoring model to {self.device} before prediction...")
+            if hasattr(self.model, "to_device"):
+                self.model.to_device(self.device)
+            elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
+                self.model.model.to(self.device)
+            
+            # Final verification after restoration attempt
+            current_device = next(self.model.model.parameters()).device
+            if current_device.type == "cpu":
+                error_msg = (
+                    f"CRITICAL DEVICE FAILURE: Failed to move model from CPU to {self.device}. "
+                    "Prediction aborted to prevent inconsistent results."
+                )
+                logger.critical(error_msg)
+                raise RuntimeError(error_msg)
 
         # Generate forecasts
         try:

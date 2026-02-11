@@ -3,8 +3,8 @@ import pandas as pd
 from copy import deepcopy
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils.validation import check_array, check_is_fitted
-from typing import Dict, List, Optional, Union, Any
+from sklearn.utils.validation import check_is_fitted
+from typing import Dict, List, Optional, Any
 from darts import TimeSeries
 from darts.dataprocessing.transformers import Scaler
 
@@ -398,9 +398,9 @@ class FeatureScalerManager:
             self._parse_simple_format()
         else:
             raise ValueError(
-                f"Unrecognized feature_scaler_map format. Expected either:\n"
-                f"  1. Named groups: {{'group_name': {{'scaler': 'ScalerName', 'features': [...]}}}}\n"
-                f"  2. Simple mapping: {{'ScalerName': ['feat1', 'feat2']}}"
+                "Unrecognized feature_scaler_map format. Expected either:\n"
+                "  1. Named groups: {'group_name': {'scaler': 'ScalerName', 'features': [...]}}\n"
+                "  2. Simple mapping: {'ScalerName': ['feat1', 'feat2']}"
             )
         
         # Assign default scaler to unmapped features

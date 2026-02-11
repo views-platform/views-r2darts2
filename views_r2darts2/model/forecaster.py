@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 import torch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
@@ -180,7 +180,6 @@ class DartsForecaster:
         """
         if scaler_cfg is None:
             return None
-        from darts.dataprocessing.transformers import Scaler
         from darts.dataprocessing import Pipeline
 
         def _parse_chain_string(chain_str: str) -> list:

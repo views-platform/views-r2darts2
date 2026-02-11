@@ -9,7 +9,6 @@ from darts.models.forecasting.nlinear import NLinearModel
 from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
 from pytorch_lightning.callbacks import EarlyStopping, Callback
-from views_r2darts2.utils.loss import WeightedHuberLoss
 from pytorch_lightning.callbacks import LearningRateMonitor
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from pytorch_lightning.loggers import WandbLogger
@@ -654,7 +653,6 @@ class ModelCatalog:
                 "accelerator": "gpu",
                 "gradient_clip_val": self.config["gradient_clip_val"],
                 "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config.get("gradient_clip_val", 0.8),
                 "callbacks": [
                     EarlyStopping(
                         monitor="train_loss",

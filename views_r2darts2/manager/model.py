@@ -10,7 +10,7 @@ from views_pipeline_core.files.utils import (
 )
 
 from views_r2darts2.model.catalog import ModelCatalog
-from views_r2darts2.utils.gates import ReproducibilityGate, ReproducibilityError
+from views_r2darts2.utils.gates import ReproducibilityGate
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
         steps_list = config.get("steps")
         
         if not run_type or steps_list is None:
-            raise KeyError(f"Cannot resolve partition: Missing 'run_type' or 'steps' in config.")
+            raise KeyError("Cannot resolve partition: Missing 'run_type' or 'steps' in config.")
             
         if not isinstance(steps_list, list):
             raise TypeError(f"Config parameter 'steps' must be a list, got {type(steps_list).__name__}.")

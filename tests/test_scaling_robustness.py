@@ -6,7 +6,6 @@ from views_r2darts2.model.forecaster import DartsForecaster
 from views_r2darts2.model.catalog import ModelCatalog
 from views_r2darts2.utils.scaling import ScalerSelector
 from darts.dataprocessing.transformers import Scaler
-import logging
 
 class TestScalingRobustness:
     """

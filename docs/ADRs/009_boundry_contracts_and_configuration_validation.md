@@ -1,170 +1,66 @@
-
 # ADR-009: Boundary Contracts and Configuration Validation
 
-**Status:** --template--  
-**Date:** YYYY-MM-DD  
-**Deciders:** <roles / team>  
+**Status:** Accepted  
+**Date:** 2026-02-11  
+**Deciders:** Simon Polichinel von der Maase  
 
 ---
 
 ## Context
 
-Complex systems fail most often at boundaries:
+Complex forecasting systems fail most often at boundaries: between the researcher's configuration and the model catalog, or between raw dataframes and the training tensors. Hidden defaults and ambiguous schemas in these "handshakes" lead to silent semantic drift.
 
-- between modules,
-- between configuration and runtime,
-- between data producers and consumers,
-- between planning and execution.
-
-Ambiguous configuration, hidden defaults, and implicit contracts
-introduce silent semantic drift and runtime fragility.
-
-To preserve architectural integrity and fail-loud guarantees (ADR-003),
-all external and internal boundaries must be explicit and validated.
+To maintain the "Fortress" integrity, every boundary must be explicit and validated.
 
 ---
 
 ## Decision
 
-This repository adopts the following invariants:
+This repository adopts the invariant: **All architectural boundaries must declare explicit contracts and be validated at entry via the Handshake Principle.**
 
-> All architectural boundaries must declare explicit contracts.  
-> All configuration must be validated at entry.  
-> No semantic defaults may exist silently.
+### 1. The Core Handshakes in `views-r2darts2`
 
----
+#### `views_pipeline_core` (DNA) -> `ModelCatalog`
+- **Contract:** The merged manifest (sourced from `views_models`) must contain all keys in `MANDATORY_MANIFEST`.
+- **Validation:** `ReproducibilityGate.Config.audit_manifest` is called before model instantiation to verify the handshake from the orchestration layer.
+- **Fail-Loud:** Missing or `None` values raise `MissingHyperparameterError`.
 
-## 1. Boundary Contracts
+#### Raw VIEWS DF -> `DataHandler`
+- **Contract:** Data must be non-empty, have the correct entity/time index, and match the DNA's `targets` list.
+- **Validation:** Type checking and index integrity checks during `_ViewsDatasetDarts` initialization.
 
-Every boundary between components must define:
+#### `DartsForecaster` -> Prediction DF
+- **Contract:** Predictions must be non-negative (clipped if necessary) and contain all target components.
+- **Validation:** `_process_predictions` ensures shape and numerical sanity before returning to the manager.
 
-- Explicit input schema
-- Explicit output schema
-- Declared invariants
-- Failure semantics
+### 2. The Handshake Principle
+Validation must occur **before** execution begins. We do not "try and see." We audit the requirements, and if the handshake fails, the run terminates immediately.
 
-Boundaries include:
-
-- Configuration → runtime
-- Data ingestion → processing
-- Planning → execution
-- Internal modules → external interfaces
-
-Implicit contracts are prohibited.
-
-If a boundary assumption cannot be declared clearly,
-the boundary is ill-defined and must be redesigned.
+### 3. Forbidden Semantic Defaults
+No parameter that affects the mathematical identity of a model (loss choice, scaling method, stochastic seed) may have a silent default in the core pipeline. If the researcher doesn't declare it, the system doesn't guess it.
 
 ---
 
-## 2. Configuration as First-Class Artifact
+## Configuration as a First-Class Artifact
 
-Configuration is not a convenience layer.
-It is an architectural artifact.
-
-Configuration must:
-
-- Be explicit
-- Be versionable
-- Be externally inspectable
-- Be validated before execution
-- Not rely on hidden defaults
-
-Changing configuration must not silently alter system meaning.
-
----
-
-## 3. Validation at Entry (Handshake Principle)
-
-All configuration and external inputs must be validated at the system boundary.
-
-Validation must occur:
-
-- Before state mutation
-- Before execution begins
-- Before orchestration proceeds
-
-The system must fail early if:
-
-- Required fields are missing
-- Types are incorrect
-- Redundant parameters disagree
-- Declared invariants are violated
-
-Borrowed or assumed state is prohibited.
-
----
-
-## 4. Separation of Configuration Domains
-
-Configuration domains must be separated conceptually.
-
-Examples (illustrative, not prescriptive):
-
-- Operational parameters (affect computation)
-- Behavioral parameters (affect runtime behavior)
-- Metadata or documentation parameters (informational only)
-
-Cross-domain coupling must be explicit.
-
-Configuration that affects behavior must not be disguised as documentation.
-
----
-
-## 5. Redundancy and Consistency Checks
-
-Where ambiguity risk is high, explicit redundancy is preferred.
-
-Examples:
-
-- Declaring both dimensionality and shape
-- Declaring both type and interpretation
-- Declaring both mode and permitted operations
-
-Redundant declarations must be validated for consistency.
-
-Silent derivation is discouraged where semantic meaning is involved.
-
----
-
-## 6. Failure Semantics
-
-Configuration validation failures must:
-
-- Be logged (ADR-008)
-- Be raised explicitly (ADR-008)
-- Halt execution
-
-Warnings are insufficient for structural configuration errors.
+- **Traceability:** The configuration used for a training run must be saved alongside the model weights.
+- **Immutability:** Once the handshake is complete and training starts, the configuration must be treated as read-only.
 
 ---
 
 ## Consequences
 
 ### Positive
-
-- Eliminates hidden configuration drift
-- Reduces boundary fragility
-- Strengthens fail-loud guarantees
-- Improves reproducibility and traceability
+- **Eliminates Configuration Drift:** You always know exactly what parameters were used.
+- **Boundary Robustness:** Errors are caught at the point of entry, not deep inside PyTorch Lightning.
+- **Reproducibility:** Forces researchers to be explicit about every choice.
 
 ### Negative
-
-- Requires explicit schemas
-- Adds validation boilerplate
-- Increases up-front configuration clarity requirements
-
-These costs are accepted.
+- Increases "boilerplate" in `sweep_configs`.
+- Requires rigorous maintenance of the `ReproducibilityGate` as the system evolves.
 
 ---
 
 ## Notes
 
-This ADR does not prescribe:
-
-- Specific file layouts
-- Specific configuration libraries
-- Specific schema frameworks
-
-Operational configuration structures may vary by project,
-provided they comply with the invariants defined here.
+This ADR operationalizes the "Authority of Declarations" (ADR-003). It defines *where* and *how* we verify that those declarations are valid.

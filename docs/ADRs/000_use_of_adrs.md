@@ -1,28 +1,23 @@
-
 # ADR-000: Use of Architecture Decision Records (ADRs)
 
 **Status:** Accepted  
-**Date:** YYYY-MM-DD  
-**Deciders:** Project maintainers  
+**Date:** 2026-02-11  
+**Deciders:** Simon Polichinel von der Maase  
 **Informed:** All contributors  
 
 ---
 
 ## Context
 
-This project involves long-lived code, evolving research ideas, operational constraints, and multiple contributors with different roles and time horizons.
+The `views-r2darts2` repository supports long-lived research development in conflict forecasting under high uncertainty. It involves multiple contributors, evolving deep learning architectures, and strict operational constraints regarding temporal integrity and reproducibility.
 
-Many important decisions in such systems are:
-- Made under uncertainty
-- Revised over time
-- Obvious to those present at the time, but opaque later
-- Revisited implicitly, often leading to regressions or duplicated debate
+Many important decisions in this system (e.g., how we handle zero-inflation in loss functions, how we enforce temporal boundaries, or how we manage scalers for probabilistic forecasts) are:
+- Made under research uncertainty
+- Revised as new models or data become available
+- Obvious to those present during a "sprint," but opaque months later
+- Revisited implicitly, often leading to regressions in reproducibility or duplicated debate
 
-Without a shared record of *why* decisions were made, the project risks:
-- Re-litigating settled questions
-- Accidental reversals of critical design choices
-- Accumulating invisible technical and conceptual debt
-- Losing institutional memory as contributors change
+Without a shared record of *why* decisions were made, the project risks re-litigating settled questions, accidentally reversing critical design choices (like the "Fortress" firewall gates), and losing institutional memory as research focus shifts.
 
 We therefore need a lightweight but rigorous mechanism to document **significant decisions**, their **rationale**, and their **consequences**.
 
@@ -34,9 +29,9 @@ We will use **Architecture Decision Records (ADRs)** to document significant tec
 
 ADRs are:
 - Written in Markdown
-- Stored in the repository under `docs/adr/`
+- Stored in the repository under `docs/ADRs/`
 - Numbered sequentially
-- Treated as first-class project artifacts
+- Treated as first-class project artifacts, subject to code review
 
 An ADR records **a decision**, not a discussion or a design proposal.
 
@@ -46,122 +41,70 @@ An ADR records **a decision**, not a discussion or a design proposal.
 
 An ADR is a short, structured document that captures:
 - The context in which a decision was made
-- The decision itself
+- The decision itself (the "new law")
 - The rationale behind it
-- The alternatives that were considered
+- The alternatives considered
 - The consequences (positive and negative)
 
-An ADR answers the question:
-
-> *“Why is the system the way it is?”*
-
-—not just *“How does it work?”*
+An ADR answers the question: *“Why is the system the way it is?”* (e.g., "Why do we force sequential prediction on GPUs?").
 
 ---
 
 ## When to Write an ADR
 
 Write an ADR when making a decision that:
-- Affects system architecture or data layout
-- Constrains future design choices
-- Changes assumptions or invariants
-- Introduces or accepts technical debt
-- Is likely to be questioned or revisited later
+- Affects system architecture or data layout (e.g., introducing a new data handler layer)
+- Constrains future design choices (e.g., standardizing on `layer_widths`)
+- Changes assumptions or invariants (e.g., temporal continuity requirements)
+- Introduces or accepts technical debt for research speed
 - Has non-obvious trade-offs
 
 Examples include:
 - Data representations or schemas
-- Model interfaces or abstractions
-- Evaluation or validation strategies
+- Model interfaces or abstractions (e.g., `ModelCatalog` vs manual instantiation)
+- Evaluation or validation strategies (e.g., standardizing on 36-month horizons)
 - Handling of uncertainty, scaling, or transformations
-- Decisions that explicitly reject a seemingly reasonable alternative
 
 Do **not** write ADRs for:
 - Routine refactors
 - Purely local implementation details
-- Temporary experiments (unless they become permanent)
-
----
-
-## What an ADR Is *Not*
-
-An ADR is **not**:
-- A full design document
-- A tutorial or user guide
-- A speculative roadmap
-- A substitute for code comments
-- A place to argue indefinitely
-
-The goal is clarity and finality, not exhaustiveness.
-
----
-
-## Structure and Template
-
-All ADRs must follow the standard ADR template defined in this repository.
-
-The template enforces:
-- Clear separation between context, decision, and rationale
-- Explicit consideration of alternatives
-- Honest accounting of consequences
-- Traceability to code and discussions
-
-Consistency matters more than perfection.
+- Temporary experiments (unless they become part of the "production" pipeline)
 
 ---
 
 ## Lifecycle of an ADR
 
-ADRs have a status that reflects their lifecycle:
-
 - **Proposed** — decision under consideration
 - **Accepted** — decision is active and authoritative
-- **Superseded** — replaced by a newer ADR
+- **Superseded** — replaced by a newer ADR (e.g., a better loss function strategy)
 - **Deprecated** — decision remains but should no longer be used
 
-Decisions are never deleted.  
-If a decision changes, it is **superseded**, not erased.
+Decisions are never deleted. If a decision changes, it is **superseded**, not erased.
 
 ---
 
 ## Relationship to Code
 
 ADRs and code must agree.
-
 - Code should implement the decision described in the ADR
 - Significant deviations require a new ADR or an update
-- ADRs should be referenced from code, issues, or PRs when relevant
+- ADRs must be referenced from code comments when implementing non-trivial logic
 
-If code and ADRs disagree, the ADR is the source of truth — or a new ADR is required.
-
----
-
-## Why We Use ADRs
-
-We use ADRs to:
-- Preserve institutional memory
-- Reduce cognitive load for maintainers
-- Make trade-offs explicit
-- Enable principled disagreement
-- Support onboarding and handover
-- Prevent silent erosion of core design principles
-
-ADRs are a tool for **engineering discipline under uncertainty**.
+If code and ADRs disagree, the ADR is the source of truth until the code is fixed or the ADR is superseded.
 
 ---
 
 ## Consequences
 
 ### Positive
-- Clearer decision-making
-- Fewer repeated debates
-- Easier onboarding
-- Better long-term coherence
+- Clearer decision-making under research pressure
+- Fewer repeated debates on architecture
+- Easier onboarding for new researchers/engineers
+- Better long-term coherence of the "Fortress" infrastructure
 
 ### Negative
 - Small upfront cost in writing
-- Requires discipline to maintain
-- Forces explicitness where ambiguity may feel easier
+- Requires discipline to maintain during fast-paced research cycles
 
 These costs are accepted intentionally.
 
@@ -169,5 +112,5 @@ These costs are accepted intentionally.
 
 ## References
 
-- `docs/adr/ADR_TEMPLATE.md`
-- Project contribution guidelines
+- `docs/ADRs/adr_template.md`
+- `REPRODUCIBILITY_MANIFEST.md`

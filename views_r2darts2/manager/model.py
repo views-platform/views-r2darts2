@@ -334,11 +334,17 @@ class DartsForecastingModelManager(ForecastingModelManager):
             return result
 
         # Use ThreadPoolExecutor for I/O-bound tasks or ProcessPoolExecutor for CPU-bound
-        max_workers = active_config.get("parallel_workers", None)
+        # FORCE SEQUENTIAL FOR GPU: Darts moves models to CPU in teardown(), which causes
+        # race conditions in multi-threaded GPU inference.
+        if forecaster.device == "cpu":
+            max_workers = active_config.get("parallel_workers", 1)
+        else:
+            logger.info("GPU detected: forcing sequential prediction to avoid device-shifting race conditions.")
+            max_workers = 1
         
         logger.info(f"Starting parallel prediction with {max_workers} workers for {total_sequence_number} sequences")
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks and maintain order
             futures = {
                 executor.submit(predict_sequence, seq_num): seq_num

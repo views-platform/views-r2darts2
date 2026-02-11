@@ -1,28 +1,16 @@
-
 # ADR-003: Authority of Declarations Over Inference
 
-**Status:** --template--  
-**Date:** YYYY-MM-DD  
-**Deciders:** <roles / team>  
+**Status:** Accepted  
+**Date:** 2026-02-11  
+**Deciders:** Simon Polichinel von der Maase  
 
 ---
 
 ## Context
 
-In complex systems, the same concept often appears in multiple representations:
-- raw vs transformed data
-- configuration vs artifact metadata
-- intended vs observed behavior
+Reproducibility in conflict forecasting is often compromised by "magic" behavior — logic that depends on filenames, folder structures, or implicit defaults buried in library code. In such systems, two identical-looking runs can produce different results because a hidden state was inferred from the environment.
 
-When these representations diverge, systems often attempt to **infer intent** after the fact.
-
-Such inference leads to:
-- silent errors,
-- irreproducible results,
-- post-hoc rationalization,
-- and ambiguity about what the system actually believes.
-
-A clear rule is required to define **where semantic authority lives**, and how ambiguity is resolved.
+We need a system where the behavior of any component is explicitly declared, not guessed.
 
 ---
 
@@ -30,91 +18,53 @@ A clear rule is required to define **where semantic authority lives**, and how a
 
 In this repository:
 
-> **All meaningful semantics must be explicitly declared.  
-> Inference of semantics across component boundaries is forbidden.**
+> **All meaningful semantics must be explicitly declared in the Configuration Manifest (DNA). Inference of semantics across component boundaries is forbidden.**
 
-When multiple representations of the same concept exist, **a single source of truth must be designated**.
-
-If required semantics are missing, ambiguous, or contradictory, the system **must not guess**.
+The DNA manifest—delivered by `views_pipeline_core` from upstream `views_models` definitions—is the absolute authority for system behavior. If a required declaration is missing, ambiguous, or contradictory, the system **must fail loudly and immediately.**
 
 ---
 
-## Global Invariant: Fail Loud on Semantic Ambiguity
+## Global Invariant: Fail Loud on Ambiguity
 
-In this repository, **silent failure is considered a bug**.
+Silent failure is considered a bug. Warning-only behavior, implicit fallbacks, or "best-effort" inference are **forbidden** for any decision-relevant semantics.
 
-Whenever required semantics are:
-- missing,
-- ambiguous,
-- contradictory,
-- or inconsistent across representations,
-
-the system **must fail loudly and immediately**.
-
-This includes, but is not limited to:
-- raising explicit runtime errors,
-- failing validation or consistency checks,
-- refusing to proceed without explicit declaration.
-
-Warning-only behavior, implicit fallbacks, or “best-effort” inference are **forbidden**
-for any decision-relevant semantics.
-
-This rule applies regardless of environment:
-development, experimentation, evaluation, or production.
+This includes:
+- Raising explicit runtime errors during initialization if DNA is incomplete.
+- Refusing to load a model if its manifest is missing or altered.
+- Failing a run if temporal boundaries in the data don't match the declared partition.
 
 ---
 
 ## Rules of Semantic Authority
 
-The following rules apply throughout the repository:
-
-- Semantics must be **declared**, not inferred.
-- Transformations are owned by the component that performs them.
-- Metadata overrides naming conventions.
-- Evaluation consumes **declared semantics only**.
-- No component may guess another component’s intent.
-
-Inference is permitted **only within a component’s internal logic**, never across component boundaries.
+- **Explicit over Magic:** If a parameter matters, it must be declared. No logic may be triggered by naming patterns or directory nesting.
+- **Authority of the DNA:** If a manifest says a model uses `AsymmetricQuantileLoss`, it *uses* that loss, regardless of where the script is located or what the model name suggests.
+- **No Implicit Fallbacks:** "Sensible defaults" are forbidden for parameters affecting model identity (stochastic seeds, loss hyperparameters, feature sets).
 
 ---
 
 ## Examples of Forbidden Behavior
 
-> These examples must be adapted per project.
-
-- Inferring scaling from variable names or prefixes
-- Inferring task type from output shape
-- Inferring uncertainty from sample count or container type
-- Reconstructing model assumptions during evaluation
-- Proceeding after emitting warnings when required semantics are unknown
-
-If behavior matters, it must be declared.
+- **Naming-based logic:** "If the model name contains 'log', apply log scaling." -> **Forbidden.** The manifest must explicitly include `"log_targets": True`.
+- **Structural inference:** "If this feature is in the 'wdi' folder, use StandardScaler." -> **Forbidden.** The manifest must map the feature group to the scaler.
+- **Shape-based guessing:** Inferring whether a forecast is probabilistic based on the tensor shape. -> **Forbidden.** The manifest must declare `num_samples`.
 
 ---
 
 ## Consequences
 
 ### Positive
-- Eliminates silent semantic drift
-- Improves reproducibility and debuggability
-- Makes disagreements explicit and resolvable
-- Enables principled failure under uncertainty
+- **Guaranteed Reproducibility:** If the manifests match, the logic matches.
+- **Observability:** You can understand a model's full behavior just by looking at its configuration.
+- **Auditability:** Errors are caught at initialization time (via `ReproducibilityGate`).
 
 ### Negative
-- Requires more explicit configuration and metadata
-- Some convenience patterns are disallowed
-- Errors may surface earlier and more frequently
-
-These costs are accepted intentionally.
+- Manifests become large and verbose.
+- More upfront work is required to define feature mappings and scaling strategies.
 
 ---
 
 ## Notes
 
-This ADR does not define:
-- what concepts exist (ADR-001),
-- or how components depend on each other (ADR-002).
-
-It defines **who is allowed to say what something means**,  
-and mandates **loud failure over silent misinterpretation**.
+This ADR establishes *how* we know what to do. The specific contents of the manifest are defined in the `REPRODUCIBILITY_MANIFEST.md`. The validation logic is implemented in `views_r2darts2/utils/gates.py`.
 

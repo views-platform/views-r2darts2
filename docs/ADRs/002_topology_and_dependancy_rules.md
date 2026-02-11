@@ -1,21 +1,14 @@
 # ADR-002: Topology and Dependency Rules
 
-**Status:** --template--  
-**Date:** YYYY-MM-DD  
-**Deciders:** <roles / team>  
+**Status:** Accepted  
+**Date:** 2026-02-11  
+**Deciders:** Simon Polichinel von der Maase  
 
 ---
 
 ## Context
 
-In complex systems, architectural fragility often emerges not from incorrect
-logic, but from uncontrolled dependencies between components.
-
-Without explicit topology rules:
-
-- high-level modules begin depending on low-level implementation details,
-- circular dependencies emerge,
-- and system evolution becomes constrained by accidental coupling.
+In complex machine learning systems, fragility often emerges from uncontrolled dependencies. Without explicit topology rules, high-level orchestration code becomes coupled to low-level tensor operations, circular dependencies emerge (e.g., a model needing to know about its manager), and refactoring becomes impossible without breaking the entire system.
 
 A clear rule is required to define **who may depend on whom**.
 
@@ -23,86 +16,63 @@ A clear rule is required to define **who may depend on whom**.
 
 ## Decision
 
-This repository enforces a strict, directional dependency structure.
+This repository enforces a strict, **directional dependency structure**. Dependencies must follow the declared architectural direction. No component may depend on a layer above it.
 
-> Dependencies must follow declared architectural direction.
-> No component may depend on a layer above it.
-
-Dependency direction is part of the system’s structural integrity.
-
-Violations are architectural defects.
+Circular dependencies are forbidden. Cross-layer "shortcuts" are forbidden.
 
 ---
 
-## Layering Principle
+## The Layered Hierarchy
 
-Where layers exist, the following invariant applies:
+We define the following four layers (from lowest to highest):
 
-- Higher-level modules may depend on lower-level modules.
-- Lower-level modules must not depend on higher-level modules.
-- Cross-layer shortcuts are forbidden.
+### Layer 0: Core Utilities (`utils/`)
+- **Examples:** `loss.py`, `scaling.py`, `gates.py`.
+- **Constraint:** Must remain dependency-free (except for standard libraries and framework-agnostic torch/numpy). They must never import from layers above them.
 
-Dependency direction must remain acyclic.
+### Layer 1: Data Handlers (`data/`)
+- **Examples:** `handlers.py`.
+- **Constraint:** May depend on Layer 0 (for gates and scaling definitions). Must not depend on models or managers.
+
+### Layer 2: Model & Forecasting (`model/`)
+- **Examples:** `catalog.py`, `forecaster.py`, `nbeats_patch.py`.
+- **Constraint:** May depend on Layer 1 (for data handling) and Layer 0 (for loss and scaling). Must not depend on the Orchestration Layer.
+
+### Layer 3: Orchestration & Management (`manager/`)
+- **Examples:** `model.py` (DartsForecastingModelManager).
+- **Constraint:** The "highest" layer. May depend on all layers below it. This is the only layer allowed to coordinate the lifecycle of artifacts and data flows.
 
 ---
 
-## Architectural Boundaries
+## Topological Invariants
 
-Each component must:
-
-- Declare its responsibility zone (see ADR-001),
-- Respect dependency direction (this ADR),
-- Avoid implicit cross-layer coupling.
-
-This ADR governs **structural dependency direction only**.
-
-> The definition and validation of boundary contracts (schemas, configuration validation, handshake rules) are governed separately by ADR-009.
-
-Topology defines *who may depend on whom*.  
-ADR-009 defines *what must be true at the boundary*.
+1.  **Upward Imports are Forbidden:** `utils` must never import `model`. `data` must never import `manager`.
+2.  **Stateless Flow:** Information flows down (configurations, requirements) and results flow up (predictions, metrics).
+3.  **The "Ghost" Boundary:** The orchestration layer (`manager`) must interact with models via the `ModelCatalog` or `DartsForecaster` interface, never by reaching into the internal private methods of a PyTorch module.
 
 ---
 
 ## Forbidden Patterns
 
-Examples of architectural violations:
-
-- Business logic importing orchestration code
-- Evaluation layer mutating model state
-- Configuration logic depending on runtime artifacts
-- Cross-layer utility shortcuts that bypass declared structure
-
-If a dependency feels “convenient but wrong,” it probably is.
+- **Circular Logic:** A model calling a method in the `DartsForecastingModelManager`.
+- **Leakage:** Data handlers importing `ReproducibilityGate` is allowed, but `ReproducibilityGate` importing a specific `Forecaster` is a violation.
+- **Convenience shortcuts:** Importing `ModelCatalog` inside `loss.py` to get a parameter.
 
 ---
 
 ## Consequences
 
 ### Positive
-
-- Improved modularity
-- Easier reasoning about change impact
-- Safer refactoring
-- Reduced architectural entropy
+- **Modularity:** Layer 0 and 1 can be tested in isolation.
+- **Cognitive Load:** When working in `utils`, you don't need to understand the `manager`.
+- **Predictable Refactoring:** You can change the `manager` without any risk of affecting the math in `loss.py`.
 
 ### Negative
-
-- May require additional abstraction layers
-- Can introduce short-term friction during refactoring
-
-These costs are accepted intentionally.
+- Requires more careful placement of new code.
+- May require adding interfaces or "bridging" objects if two layers need to share a concept.
 
 ---
 
 ## Notes
 
-This ADR defines structural direction of dependencies.
-
-It does not define:
-
-- boundary contract validation (ADR-009),
-- semantic authority (ADR-003),
-- or testing obligations (ADR-005).
-
-Topology governs structure.  
-Contracts govern interaction.
+Topology governs *structure*. The specific handshake rules (what data looks like at the boundary) are governed by ADR-009 (Boundary Contracts).

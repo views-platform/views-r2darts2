@@ -206,6 +206,34 @@ class ModelCatalog:
             "monitor": "train_loss",
         }
 
+    def _get_common_pl_trainer_kwargs(self, extra_callbacks=None):
+        callbacks = [
+            EarlyStopping(
+                monitor="train_loss",
+                patience=self.config["early_stopping_patience"],
+                min_delta=self.config["early_stopping_min_delta"],
+                mode="min",
+            ),
+            LearningRateMonitor(log_momentum=True),
+            GradientHealthCallback(),
+        ]
+        if extra_callbacks:
+            callbacks.extend(extra_callbacks)
+
+        return {
+            "accelerator": "gpu",
+            "logger": WandbLogger(log_model="all"),
+            "gradient_clip_val": self.config["gradient_clip_val"],
+            "callbacks": callbacks,
+            "enable_progress_bar": True,
+        }
+
+    def _get_common_optimizer_kwargs(self):
+        return {
+            "lr": self.config["lr"],
+            "weight_decay": self.config["weight_decay"],
+        }
+
     def get_model(self, model_name: str):
         """
         Get a model class by its name.
@@ -240,26 +268,8 @@ class ModelCatalog:
             force_reset=True,
             use_static_covariates=self.config["use_static_covariates"],
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "logger": WandbLogger(log_model="all"),
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
@@ -289,26 +299,8 @@ class ModelCatalog:
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             skip_interpolation=self.config["skip_interpolation"],
             hidden_continuous_size=self.config["hidden_continuous_size"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
@@ -316,7 +308,6 @@ class ModelCatalog:
     
     def _get_nbeats(self):
         torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
-        ReproducibilityGate.Config.audit_architecture(self.config)
     
         # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
         required_hparams = [
@@ -349,6 +340,9 @@ class ModelCatalog:
                 f"Missing required N-BEATS hyperparameters in config: {missing}"
             )
     
+        # ---- 2. Audit architecture ----
+        ReproducibilityGate.Config.audit_architecture(self.config)
+    
         # ---- 3. Model construction (STRICT access) ----
         return NBEATSModel(
             input_chunk_length=self.config["input_chunk_length"],
@@ -367,26 +361,8 @@ class ModelCatalog:
             loss_fn=self.loss_fn,
             model_name=self.config["name"],
             force_reset=self.config["force_reset"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,
         )      
@@ -407,7 +383,7 @@ class ModelCatalog:
             num_stacks=self.config["num_stacks"],
             num_blocks=self.config["num_blocks"],
             num_layers=self.config["num_layers"],
-            layer_widths=self.config["layer_width"],
+            layer_widths=self.config["layer_widths"],
             pooling_kernel_sizes=self.config["pooling_kernel_sizes"],
             n_freq_downsample=self.config["n_freq_downsample"],
             activation=self.config["activation"],
@@ -420,26 +396,8 @@ class ModelCatalog:
             model_name=self.config["name"],
             force_reset=self.config["force_reset"],
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,
         )
@@ -463,24 +421,8 @@ class ModelCatalog:
             n_epochs=self.config["n_epochs"],
             loss_fn=self.loss_fn,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    GradientHealthCallback(),
-                ],
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
@@ -500,25 +442,8 @@ class ModelCatalog:
             batch_size=self.config["batch_size"],
             n_epochs=self.config["n_epochs"],
             loss_fn=self.loss_fn,
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             model_name=self.config["name"],
             random_state=self.config["random_state"],
@@ -564,27 +489,10 @@ class ModelCatalog:
             force_reset=True,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "logger": WandbLogger(log_model="all"),
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    NaNDetectionCallback(patience=5),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
+                **self._get_common_pl_trainer_kwargs(extra_callbacks=[NaNDetectionCallback(patience=5)]),
                 "detect_anomaly": self.config["detect_anomaly"],
             },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
@@ -607,26 +515,8 @@ class ModelCatalog:
             random_state=self.config["random_state"],
             force_reset=True,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
@@ -649,26 +539,8 @@ class ModelCatalog:
             random_state=self.config["random_state"],
             force_reset=True,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "logger": WandbLogger(log_model="all"),
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
         )
@@ -734,106 +606,9 @@ class ModelCatalog:
             random_state=self.config["random_state"],
             force_reset=True,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
+            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,
         )
-    
-        # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
-        required_hparams = [
-            "input_chunk_length",
-            "output_chunk_length",
-            "output_chunk_shift",
-            "num_encoder_layers",
-            "num_decoder_layers",
-            "decoder_output_dim",
-            "hidden_size",
-            "temporal_width_past",
-            "temporal_width_future",
-            "temporal_decoder_hidden",
-            "use_layer_norm",
-            "dropout",
-            "use_static_covariates",
-            "batch_size",
-            "n_epochs",
-            "steps",
-            "name",
-            "random_state",
-            "use_reversible_instance_norm",
-            "gradient_clip_val",
-            "early_stopping_patience",
-            "early_stopping_min_delta",
-            "lr",
-            "weight_decay",
-        ]
-    
-        missing = [k for k in required_hparams if k not in self.config]
-        if missing:
-            raise ValueError(
-                f"Missing required TiDE hyperparameters in config: {missing}"
-            )
-    
-        # ---- 3. Model construction (STRICT access only) ----
-        return TiDEModel(
-            input_chunk_length=self.config["input_chunk_length"],
-            output_chunk_length=self.config["output_chunk_length"],
-            output_chunk_shift=self.config["output_chunk_shift"],
-            num_encoder_layers=self.config["num_encoder_layers"],
-            num_decoder_layers=self.config["num_decoder_layers"],
-            decoder_output_dim=self.config["decoder_output_dim"],
-            hidden_size=self.config["hidden_size"],
-            temporal_width_past=self.config["temporal_width_past"],
-            temporal_width_future=self.config["temporal_width_future"],
-            temporal_decoder_hidden=self.config["temporal_decoder_hidden"],
-            use_layer_norm=self.config["use_layer_norm"],
-            dropout=self.config["dropout"],
-            use_static_covariates=self.config["use_static_covariates"],
-            batch_size=self.config["batch_size"],
-            n_epochs=self.config["n_epochs"],
-            loss_fn=self.loss_fn,
-            model_name=self.config["name"],
-            random_state=self.config["random_state"],
-            force_reset=True,
-            use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
-            pl_trainer_kwargs={
-                "accelerator": "gpu",
-                "logger": WandbLogger(log_model="all"),
-                "gradient_clip_val": self.config["gradient_clip_val"],
-                "callbacks": [
-                    EarlyStopping(
-                        monitor="train_loss",
-                        patience=self.config["early_stopping_patience"],
-                        min_delta=self.config["early_stopping_min_delta"],
-                        mode="min",
-                    ),
-                    LearningRateMonitor(log_momentum=True),
-                    GradientHealthCallback(),
-                ],
-                "enable_progress_bar": True,
-            },
-            optimizer_kwargs={
-                "lr": self.config["lr"],
-                "weight_decay": self.config["weight_decay"],
-            },
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
-        )
+

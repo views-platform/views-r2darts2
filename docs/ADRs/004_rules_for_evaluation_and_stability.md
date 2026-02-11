@@ -1,108 +1,62 @@
-
 # ADR-004: Rules for Evolution and Stability
 
-**Status:** --template-- 
-**Date:** YYYY-MM-DD  
-**Deciders:** —  
-**Informed:** All contributors  
+**Status:** Accepted  
+**Date:** 2026-02-11  
+**Deciders:** Simon Polichinel von der Maase  
 
 ---
 
 ## Context
 
-The preceding ADRs establish:
+A research repository in conflict forecasting must balance two opposing forces:
+1. **Stability:** The need for consistent, reproducible results over years.
+2. **Evolution:** The need to integrate new deep learning architectures and data sources rapidly.
 
-- **ADR-001:** the ontology of the repository (what exists)
-- **ADR-002:** the topology of the repository (how components may relate)
-- **ADR-003:** semantic authority (who owns meaning and how it is declared)
-
-Together, these decisions define the system’s structure and semantics at a point in time.
-
-What they do **not** yet define is how the system is allowed to **change over time**:
-- which components are expected to be stable
-- which components may evolve freely
-- what constitutes a breaking change
-- when compatibility guarantees apply
-- when a new ADR is required
-
-These questions are architectural, cross-cutting, and costly to reverse once external users or downstream dependencies exist.
+If everything is stable, research stagnates. If everything is experimental, results become untrustworthy. We need a tiered approach to stability.
 
 ---
 
 ## Decision
 
-No decision is made at this time.
+We define three **Stability Tiers** for the components of this repository. The stability of a component determines the "cost" of changing it.
 
-Rules governing stability, evolution, and backwards compatibility are **explicitly deferred**.
+### Tier 1: The Fortress (High Stability)
+- **Scope:** `utils/gates.py`, `utils/nbeats_patch.py`, and the mathematical definitions of standard losses in `utils/loss.py`.
+- **Guarantee:** These define the physical laws of the system (e.g., "thou shalt not peek into the future").
+- **Change Rule:** Changes require a new ADR or a superseding of an existing one. Breaking a "Gate" is considered a critical regression.
 
-This ADR exists to:
-- acknowledge the importance of this dimension
-- reserve a place for a future, explicit decision
-- prevent ad-hoc or implicit policies from emerging unnoticed
+### Tier 2: The DNA Schema (Medium Stability)
+- **Scope:** `REPRODUCIBILITY_MANIFEST.md` and the `MANDATORY_MANIFEST` list in `gates.py`.
+- **Guarantee:** Defines what an experiment *must* declare.
+- **Change Rule:** New parameters can be added (evolving the schema), but removing or renaming existing mandatory parameters requires updating all active `sweep_configs` and existing artifacts.
 
----
-
-## Rationale for Deferral
-
-At the time of writing:
-
-- Core abstractions are still being exercised and refined
-- The boundary between experimental and stable components may shift
-- Premature guarantees would either be ignored or constrain necessary exploration
-
-Deferring this decision preserves design freedom while maintaining architectural honesty.
+### Tier 3: Models & Managers (Research Stability)
+- **Scope:** `ModelCatalog`, `DartsForecaster`, `DartsForecastingModelManager`.
+- **Guarantee:** These are expected to evolve as we add new model types (e.g., TiDE, TSMixer) or optimization strategies.
+- **Change Rule:** Evolution is encouraged. Breaking changes are permitted during research sprints, provided that `Tier 1` and `Tier 2` invariants are maintained.
 
 ---
 
-## Trigger Conditions for Reconsideration
+## Backward Compatibility of Artifacts
 
-This ADR should be revisited when one or more of the following become true:
-
-- External users or downstream systems depend on this repository
-- Reproducibility across time becomes a contractual requirement
-- Breaking changes begin to incur real coordination or migration costs
-- Multiple versions of the same concept must be supported concurrently
-- Contributors express uncertainty about what is safe to change
-
-At that point, a new ADR should supersede this one.
-
----
-
-## Non-Decisions (Explicitly Out of Scope for Now)
-
-This ADR does **not** define:
-- Versioning schemes
-- Release processes
-- Migration tooling
-- Deprecation mechanics
-- API stability guarantees
-
-Those topics are intentionally postponed.
+- **The Golden Rule:** A trained model artifact must always be loadable and evaluatable by the version of the code that created it.
+- **Divergence:** If a code change makes older artifacts unreadable, the change must include a migration script or the old code must be preserved in a versioned submodule.
 
 ---
 
 ## Consequences
 
 ### Positive
-- Avoids premature or brittle guarantees
-- Preserves flexibility during early evolution
-- Makes the absence of rules explicit rather than accidental
+- **Trust:** Researchers can trust that the "Fortress" won't let them accidentally lie with data.
+- **Agility:** Engineers can refactor the `manager` layer without fearing they are violating "Core Laws."
+- **Clarity:** It's clear which PRs require high-level architectural review (Tier 1) vs. standard code review (Tier 3).
 
 ### Negative
-- Contributors must exercise judgment when making breaking changes
-- Some uncertainty remains about long-term guarantees
-
-These consequences are accepted intentionally.
+- Tier 1 changes become slower and more bureaucratic.
+- Requires maintaining a "Fortress" mindset even during fast research.
 
 ---
 
 ## Notes
 
-This ADR is a placeholder by design.
-
-Its purpose is to ensure that when rules for evolution and stability are introduced, they are:
-- explicit
-- deliberate
-- consistent with ADR-001 through ADR-003
-
-Until then, change is governed by those ADRs and by careful review.
+Stability is a design constraint, not a preference. This ADR ensures that we don't accidentally "innovate" away our reproducibility guarantees.

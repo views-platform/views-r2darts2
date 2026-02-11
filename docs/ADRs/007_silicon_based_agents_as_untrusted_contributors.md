@@ -1,124 +1,61 @@
-
 # ADR-007: Silicon-Based Agents as Untrusted Contributors
 
-**Status:** --template--  
-**Date:** YYYY-MM-DD  
-**Deciders:** <roles / team>  
+**Status:** Accepted  
+**Date:** 2026-02-11  
+**Deciders:** Simon Polichinel von der Maase  
 
 ---
 
 ## Context
 
-This repository may be modified with the assistance of **silicon-based agents**
-(e.g. large language models, coding assistants, refactoring tools).
+This repository is developed with the assistance of **silicon-based agents** (LLMs, coding assistants). While these agents are powerful accelerators, they differ from carbon-based agents in critical ways:
+- They prioritize local plausibility over global architectural correctness.
+- They lack a genuine understanding of "Temporal Integrity" and the "Fortress" mindset.
+- They are prone to **silent failures**, such as file truncation or "logical drift," where they replace complex logic with structurally valid but incorrect code.
 
-Silicon-based agents differ fundamentally from carbon-based agents:
-
-- They optimize for local plausibility, not global correctness
-- They lack understanding of system intent and architectural constraints
-- They may infer, invent, or collapse semantics silently
-- They may introduce partial or structurally valid failures (e.g. truncation)
-- They do not experience uncertainty, responsibility, or risk
-
-Without explicit guardrails, silicon-based agents introduce architectural,
-semantic, and safety risks that are difficult to detect post hoc.
+Without explicit guardrails, silicon agents introduce risks that are difficult to detect during standard code review.
 
 ---
 
 ## Decision
 
-Silicon-based agents are treated as **untrusted contributors**.
+Silicon-based agents are treated as **untrusted contributors**. They are permitted to assist in code modification only under explicit constraints and never as autonomous authorities.
 
-They are permitted to assist in code modification **only under explicit,
-documented constraints**, and **never as autonomous authorities**.
-
-All silicon-based agent activity is subject to the same (or stricter)
-architectural rules as carbon-based agents, including but not limited to:
-
-- declared ontology (ADR-001),
-- enforced topology (ADR-002),
-- explicit semantic authority and fail-loud behavior (ADR-003),
-- mandatory testing obligations (ADR-005),
-- intent contracts for non-trivial classes (ADR-006),
-- explicit failure and observability requirements (ADR-008).
-
-The concrete operational rules governing silicon-based agents are defined
-outside this ADR in a dedicated **Silicon-Based Agent Protocol**.
-
----
-
-## Scope
-
-This decision applies to:
-
-- LLM-based coding assistants
-- AI-powered refactoring tools
-- Code-generation, modification, or suggestion systems
-- Any non-carbon-based agent that proposes or applies code changes
-
-This ADR does **not** regulate:
-
-- carbon-based agents (see Carbon-Based Agent Protocol)
-- read-only analysis or explanation tools
-- tooling that does not modify repository state
+All silicon agent activity must comply with:
+1. **The Silicon-Based Agent Protocol:** Defined in `docs/contributor_protocols/silicon_based_agents.md`.
+2. **The Anti-Truncation Rule:** Full-file rewrites of existing files are forbidden to prevent "silent lobotomy" failures.
+3. **Mandatory Edit-In-Place:** Existing files must be modified using targeted, scoped replacements (like the `replace` tool) rather than `write_file`.
 
 ---
 
 ## Authority and Responsibility
 
-Silicon-based agents:
-
-- are not authoritative
-- do not own intent
-- do not establish semantics
-- do not override architectural decisions
-
-Carbon-based agents remain fully responsible for:
-
-- the correctness of changes,
-- adherence to ADRs and intent contracts,
-- and the consequences of merging silicon-assisted code.
-
-“No carbon-based agent reviewed it” is not an acceptable justification.
+- **Intent Ownership:** Silicon agents do not own intent. They cannot declare new ontology (ADR-001) or change topology (ADR-002) without a carbon-based agent's explicit, reviewed command.
+- **Responsibility:** Carbon-based agents remain 100% responsible for all code committed to the repository. "The AI did it" is not a valid defense for architectural violations.
+- **Review Posture:** Silicon-assisted changes require **heightened scrutiny**. Reviewers must check for "plausible hallucinations" in math and logic.
 
 ---
 
-## Enforcement
+## Scope
 
-- Silicon-based agent–assisted changes must comply with the Silicon-Based Agent Protocol
-- Violations of architectural ADRs by silicon-based agents are treated as violations by carbon-based agents
-- Reviewers are expected to apply **heightened scrutiny** to silicon-assisted changes
-
-The absence of declared guardrails is grounds for rejecting such changes.
+This ADR applies to any non-carbon-based system that proposes or applies code changes. It does not regulate read-only analysis tools or framework-internal generators.
 
 ---
 
 ## Consequences
 
 ### Positive
-
-- Prevents silent architectural erosion
-- Preserves semantic integrity under automation
-- Makes responsibility explicit and traceable
-- Aligns automated modification with fail-loud and observability guarantees
+- **Architectural Preservation:** Prevents the silent erosion of the "Fortress" gates.
+- **Reliability:** The Anti-Truncation Rule eliminates a major class of automation-induced bugs.
+- **Traceability:** Forces agents to explain *why* they are making a change relative to existing ADRs.
 
 ### Negative
-
-- Limits agent autonomy
-- Requires carbon-based agents to actively constrain and review agent output
-- Adds friction compared to unrestricted tool use
-
-These trade-offs are accepted intentionally.
+- Adds friction to the development workflow.
+- Requires carbon-based agents to maintain better "agent-steering" discipline.
 
 ---
 
 ## Notes
 
-This ADR establishes **that** silicon-based agents are constrained.
-
-It does not define **how** they are constrained.
-
-Operational rules, allowed actions, forbidden actions, and review requirements
-are defined in the **Silicon-Based Agent Protocol**, which may evolve
-independently as tools and risks change.
+This ADR establishes **that** agents are constrained. The specific operational rules (how to read files, how to apply diffs) are governed by the **Silicon-Based Agent Protocol**.
 

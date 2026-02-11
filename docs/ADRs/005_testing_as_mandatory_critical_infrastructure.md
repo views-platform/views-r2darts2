@@ -1,164 +1,77 @@
-
 # ADR-005: Testing as Mandatory Critical Infrastructure
 
-**Status:** --template--  
-**Date:** YYYY-MM-DD  
-**Deciders:** <roles / team>  
+**Status:** Accepted  
+**Date:** 2026-02-11  
+**Deciders:** Simon Polichinel von der Maase  
 
 ---
 
 ## Context
 
-This repository supports systems whose outputs may inform:
-- high-stakes decisions,
-- downstream automated processes,
-- or human judgment under uncertainty.
+In conflict forecasting, failure is not limited to crashes. The most dangerous failures are **silent lies**:
+- A model peeking into the future because a partition was sliced incorrectly.
+- A run that appears successful but used an implicit default for a critical hyperparameter.
+- A stochastic drift that makes results irreproducible across different machines.
 
-In such systems, failure is not limited to crashes or exceptions.
-Failures may also include:
-- silent semantic drift,
-- misuse by well-intentioned users,
-- over-trust or under-trust in outputs,
-- brittle behavior under realistic conditions.
-
-Given this, testing is not a convenience or a quality signal.
-It is **critical infrastructure**.
-
-The absence of rigorous, multi-perspective testing constitutes unacceptable risk.
+Testing is not a quality signal; it is **critical infrastructure** that protects the scientific integrity of the project.
 
 ---
 
 ## Decision
 
-This repository treats **testing as mandatory critical infrastructure**.
-
-All non-trivial functionality **must be covered by tests**.
-
-Testing is not limited to correctness under ideal conditions, but must explicitly address:
-- adversarial behavior,
-- realistic human use,
-- and system robustness under expected operation.
-
-To achieve this, tests are explicitly divided into **three complementary categories**:
-
-- 🟥 **Red team tests** (adversarial)
-- 🟫 **Beige team tests** (realistic, neutral misuse)
-- 🟩 **Green team tests** (supportive, resilience-oriented)
-
-Each category serves a distinct purpose and **none may substitute for another**.
+This repository treats **testing as mandatory critical infrastructure**. All non-trivial functionality must be covered by tests. We use a three-tiered taxonomy to ensure multi-perspective robustness.
 
 ---
 
 ## Test Taxonomy
 
-### 🟥 Red Team Tests — Adversarial Testing
+### 🟥 Red Team Tests (Adversarial)
+- **Goal:** Expose failure modes by deliberately trying to break the "Fortress" invariants.
+- **Mindset:** *“How can I make this model lie?”*
+- **Views-r2darts2 Examples:**
+  - **Temporal Injection:** Passing a dataset with a 1-month hole to see if `ReproducibilityGate` catches it.
+  - **Future Peeking:** Attempting to train on data that includes the test partition boundary.
+  - **Numerical Poisoning:** Injecting NaNs or Infs into the data stream to ensure the model fails loudly.
 
-Red team tests deliberately attempt to **break, exploit, or misuse the system** by assuming hostile or worst-case behavior.
+### 🟫 Beige Team Tests (Human Error / Realistic Usage)
+- **Goal:** Catch failures caused by common researcher mistakes or ambiguous configurations.
+- **Mindset:** *“What happens if a researcher forgets a parameter?”*
+- **Views-r2darts2 Examples:**
+  - **DNA Manifest Audit:** Verifying that a run is blocked if `random_state` is missing.
+  - **OCL/Step Mismatch:** Ensuring an error is raised if the forecast horizon isn't a multiple of the output chunk length.
+  - **Ghost Imports:** Verifying that the code fails if it tries to import from a temporary/stale folder.
 
-- **Goal:** expose failure modes, vulnerabilities, unsafe behaviors
-- **Mindset:** *“How could this go wrong?”*
-- **Typical focus:**
-  - Security exploits
-  - Model misuse or abuse
-  - Safety failures
-  - Stress-testing assumptions
-  - Boundary and out-of-distribution behavior
-
-In ML systems, this may include:
-- distribution shift attacks,
-- data poisoning,
-- prompt or input manipulation,
-- assumption violations.
-
-Red team tests are expected to fail the system until weaknesses are addressed.
-
----
-
-### 🟫 Beige Team Tests — Realistic, Neutral Usage
-
-Beige team tests focus on **boring, realistic, non-adversarial usage patterns** that are neither friendly nor hostile — but still dangerous if mishandled.
-
-- **Goal:** catch failures caused by normal human behavior
-- **Mindset:** *“What will regular users actually do?”*
-- **Typical focus:**
-  - Ambiguous inputs
-  - Misinterpretation of outputs
-  - Over-trust or under-trust
-  - Workflow and integration issues
-
-In decision-support systems, beige failures are often the most damaging.
-
-Examples include:
-- users confusing correlation with causation,
-- ignoring uncertainty intervals,
-- copy-pasting outputs into reports without context,
-- silently misusing probabilities or forecasts.
-
-Beige team tests are mandatory for any user-facing or decision-facing component.
-
----
-
-### 🟩 Green Team Tests — Supportive, Resilience-Oriented Testing
-
-Green team tests focus on **ensuring the system works as intended** under expected conditions and degrades safely.
-
-- **Goal:** ensure reliability, robustness, and trustworthiness
-- **Mindset:** *“How do we make this solid?”*
-- **Typical focus:**
-  - Correctness and performance validation
-  - Calibration and consistency checks
-  - Monitoring and observability
-  - Drift detection
-  - Guardrails and fallback behavior
-
-Green team tests are expected to pass continuously and form the backbone of CI.
-
----
-
-## Relationship to Other ADRs
-
-This ADR reinforces and operationalizes:
-
-- **ADR-001 (Ontology):** tests must respect declared concepts and stability expectations
-- **ADR-002 (Topology):** tests must not bypass architectural boundaries
-- **ADR-003 (Authority & Semantics):** tests must fail loudly on semantic ambiguity
-- **ADR-004 (Deferred):** future evolution rules must account for test coverage obligations
-
-Testing is a primary mechanism by which these ADRs are enforced.
+### 🟩 Green Team Tests (Resilience & Correctness)
+- **Goal:** Ensure the system works as intended and remains stable over time.
+- **Mindset:** *“Is the system solid and reproducible?”*
+- **Views-r2darts2 Examples:**
+  - **Stochastic Parity:** Verifying that saving and reloading a model produces bit-identical predictions.
+  - **Loss Landscape:** Ensuring that custom loss functions produce valid gradients across different data scales.
+  - **Scaling Integrity:** Verifying that `FeatureScalerManager` applies correct transforms to group-specific features.
 
 ---
 
 ## Enforcement Rules
 
-- Code that meaningfully affects behavior **must not be merged without tests**
-- Tests that only cover happy paths are insufficient
-- Warning-only behavior in tests is unacceptable for decision-relevant semantics
-- If a failure mode is known and untested, it is considered technical debt and must be tracked explicitly
-
-The absence of appropriate tests is valid grounds for blocking a change.
+- **Happy Paths are Insufficient:** A PR that only tests that a model "runs" will be rejected. It must include at least one "Red" or "Beige" test if it modifies the core pipeline.
+- **Fail-Loud in Tests:** Tests must verify that the system fails loudly when it should. Capturing an exception and doing nothing is forbidden.
+- **CI Obligations:** Green team tests form the backbone of our CI. Red and Beige tests ensure the boundaries of that backbone are respected.
 
 ---
 
 ## Consequences
 
 ### Positive
-- Reduced risk of silent failure
-- Earlier detection of misuse and misunderstanding
-- Increased trustworthiness of outputs
-- Clearer system boundaries and guarantees
+- **High Trust:** Results can be defended as mathematically and temporally sound.
+- **Safer Refactoring:** The "Fortress" gates are themselves guarded by tests.
+- **Scientific Rigor:** Reproducibility is verified continuously, not just at publication time.
 
 ### Negative
-- Higher upfront development cost
-- Slower iteration if tests are neglected
-- Requires cultural discipline and reviewer enforcement
-
-These costs are accepted intentionally.
+- Higher upfront development cost for new model integrations.
+- Requires researchers to think like "adversaries" against their own code.
 
 ---
 
 ## Notes
 
-Testing in this repository is not merely about correctness.
-
-It is about **preventing harm, misunderstanding, and overconfidence**  
-in systems that operate under uncertainty and pressure.
+Testing is the primary mechanism for enforcing ADR-001 (Ontology) and ADR-003 (Authority). If a rule isn't tested, it doesn't exist.

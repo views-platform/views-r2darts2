@@ -47,7 +47,6 @@ def basic_config():
         "num_stacks": 4,
         "num_blocks": 2,
         "num_layers": 2,
-        "layer_width": 128,
         "layer_widths": 128,
         "force_reset": True,
         # Loss params
@@ -136,7 +135,6 @@ def full_config():
         "num_stacks": 4,
         "num_blocks": 2,
         "num_layers": 2,
-        "layer_width": 128,
         "layer_widths": 128,
         "force_reset": True,
         # Loss params
@@ -333,7 +331,7 @@ class TestNBEATSModel:
             "input_chunk_length": 24,
             "num_stacks": 5,
             "num_blocks": 3,
-            "layer_width": 256,
+            "layer_widths": 256,
         }
         catalog = ModelCatalog(config)
         model = catalog._get_nbeats()
@@ -587,7 +585,7 @@ class TestConfigurationHandling:
         config_missing = {**basic_config, "steps": [1, 2, 3]}
         del config_missing["output_chunk_length"]
         catalog_missing = ModelCatalog(config_missing)
-        with pytest.raises(KeyError, match="output_chunk_length"):
+        with pytest.raises(ValueError, match="output_chunk_length"):
             catalog_missing._get_nbeats()
 
     def test_default_values_applied(self, basic_config):

@@ -1,28 +1,16 @@
-
 # ADR-006: Intent Contracts for Non-Trivial Classes
 
-**Status:** --template--  
-**Date:** YYYY-MM-DD  
-**Deciders:** <roles / team>  
+**Status:** Accepted  
+**Date:** 2026-02-11  
+**Deciders:** Simon Polichinel von der Maase  
 
 ---
 
 ## Context
 
-As this repository evolves, classes tend to accumulate:
-- implicit responsibilities,
-- undocumented assumptions,
-- and behavior that is clear only to their original author.
+In conflict forecasting, deep learning models often accumulate implicit responsibilities. For example, a "Forecaster" might silently start handling data cleaning or metric calculation. This leads to semantic drift, where a class no longer does what its name suggests, making refactoring dangerous and reproducibility fragile.
 
-This is especially dangerous in systems that:
-- support decision-making under uncertainty,
-- combine research and production code,
-- or must remain trustworthy over time.
-
-Tests alone are insufficient to preserve *intent*:
-they verify current behavior, not what the class is **meant** to do.
-
-To prevent semantic drift, non-trivial classes require an explicit, human-readable declaration of intent.
+Tests verify *how* a class works, but they don't capture *what* it is meant to do. We need explicit intent contracts to preserve scientific meaning.
 
 ---
 
@@ -30,96 +18,58 @@ To prevent semantic drift, non-trivial classes require an explicit, human-readab
 
 All **non-trivial and substantial classes** in this repository must have an explicit **intent contract**.
 
-An intent contract is a short, human-readable description of:
-- what the class is intended to do,
-- what it is explicitly *not* responsible for,
-- and the guarantees it provides to its callers.
-
-The intent contract does **not** need to be a full technical specification,
-but it must be:
-- unambiguous,
-- readable by humans,
-- and consistent with tests and implementation.
+An intent contract is a short, human-readable declaration of:
+- **Purpose:** What is the class meant to achieve?
+- **Non-Goals:** What is it explicitly *not* responsible for?
+- **Guarantees:** What invariants does it promise to maintain?
+- **Failure Behavior:** How does it fail when its assumptions are violated?
 
 ---
 
-## What Qualifies as a Non-Trivial Class
+## Non-Trivial Classes in `views-r2darts2`
 
-A class is considered **non-trivial** if it meets one or more of the following:
+The following are automatically considered non-trivial:
 
-- Encodes domain or decision-relevant logic
-- Orchestrates multiple components
-- Maintains internal state across operations
-- Enforces or assumes semantic invariants
-- Acts as a boundary between major subsystems
-- Could cause silent failure or misuse if misunderstood
-
-Whether a class is non-trivial is a **review decision**.
-
-When in doubt, treat the class as non-trivial.
+- **Managers (`DartsForecastingModelManager`):** Orchestrate the high-level lifecycle.
+- **Forecasters (`DartsForecaster`):** Manage the coupling of models and stateful preprocessing (scalers).
+- **Gates (`ReproducibilityGate`):** Enforce physical and temporal invariants.
+- **Catalogs (`ModelCatalog`):** Translate the merged DNA manifests from `views_pipeline_core` into concrete Darts Model instances.
+- **Data Handlers:** Manage the transformation of raw VIEWS data to Darts types.
 
 ---
 
-## Form of an Intent Contract
+## Form of the Contract
 
-An intent contract must include, at minimum:
+The contract must live in the class docstring or a linked Markdown file. It must be unambiguous and readable by both carbon and silicon agents.
 
-- **Purpose:** what the class is for
-- **Non-goals:** what the class explicitly does *not* do
-- **Inputs and assumptions:** what it expects to be true
-- **Outputs and guarantees:** what it promises in return
-- **Failure behavior:** how it fails when assumptions are violated
-
-The contract may live as:
-- a dedicated ADR (for especially central classes),
-- a standalone design note,
-- or a clearly marked docstring or markdown file referenced from the code.
-
-The format is flexible; clarity is not.
+### Example: `DartsForecaster`
+- **Purpose:** Coupling a Darts model with the exact scalers and log-transforms used during its training.
+- **Non-Goals:** Does not handle database connections or W&B logging.
+- **Guarantees:** Ensures that inverse transforms are applied in the correct order before returning predictions.
+- **Failure Behavior:** Raises `NotFittedError` if prediction is attempted before scalers are fit.
 
 ---
 
 ## Relationship to Tests
 
-Intent contracts and tests must agree.
-
-- Tests should reflect the declared intent
-- Changes to intent require updating the contract
-- Changes that violate the declared intent are bugs, not refactors
-
-If behavior changes but intent does not, tests must be updated.
-If intent changes, it must be made explicit.
-
----
-
-## Enforcement
-
-- Introducing a non-trivial class without an intent contract is grounds for blocking a change
-- Modifying a non-trivial class in ways that contradict its intent contract is not permitted
-- Reviewers are expected to reference intent contracts when evaluating changes
-
-This rule is enforced socially and through review.
+- **Tests must reflect intent:** A Green Team test should verify a "Guarantee." A Red Team test should verify a "Failure Behavior."
+- **Intent-First Refactoring:** If you need to change what a class *does*, you must update the contract first.
 
 ---
 
 ## Consequences
 
 ### Positive
-- Preserves architectural intent over time
-- Makes refactoring safer and more principled
-- Reduces cognitive load for reviewers and new contributors
-- Prevents classes from silently changing meaning
+- **Architectural Integrity:** Prevents "God Objects" from emerging silently.
+- **Safer Refactoring:** You can delete code with confidence if it doesn't serve the declared intent.
+- **Better AI Assistance:** Silicon agents (like LLMs) can respect the boundaries defined in the contracts.
 
 ### Negative
-- Requires additional upfront thought and writing
-- Some changes may require updating documentation alongside code
-
-These costs are accepted intentionally.
+- Requires more upfront thinking during the design phase.
+- Some "routine" changes now require updating docstrings.
 
 ---
 
 ## Notes
 
-Intent contracts are not bureaucracy.
-
-They are a mechanism for ensuring that **the system continues to mean what we think it means**, even as the code changes.
+Intent contracts are our defense against "Architectural Rot." They ensure the system continues to mean what we think it means, even as research requirements evolve.

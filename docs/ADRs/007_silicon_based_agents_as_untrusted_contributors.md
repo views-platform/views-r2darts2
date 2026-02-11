@@ -39,7 +39,8 @@ architectural rules as carbon-based agents, including but not limited to:
 - enforced topology (ADR-002),
 - explicit semantic authority and fail-loud behavior (ADR-003),
 - mandatory testing obligations (ADR-005),
-- intent contracts for non-trivial classes (ADR-006).
+- intent contracts for non-trivial classes (ADR-006),
+- explicit failure and observability requirements (ADR-008).
 
 The concrete operational rules governing silicon-based agents are defined
 outside this ADR in a dedicated **Silicon-Based Agent Protocol**.
@@ -95,12 +96,14 @@ The absence of declared guardrails is grounds for rejecting such changes.
 ## Consequences
 
 ### Positive
+
 - Prevents silent architectural erosion
 - Preserves semantic integrity under automation
 - Makes responsibility explicit and traceable
-- Enables safe use of powerful tools
+- Aligns automated modification with fail-loud and observability guarantees
 
 ### Negative
+
 - Limits agent autonomy
 - Requires carbon-based agents to actively constrain and review agent output
 - Adds friction compared to unrestricted tool use

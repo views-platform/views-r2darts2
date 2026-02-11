@@ -1,7 +1,6 @@
-
 # ADR-002: Topology and Dependency Rules
 
-**Status:** --template--
+**Status:** --template--  
 **Date:** YYYY-MM-DD  
 **Deciders:** <roles / team>  
 
@@ -9,82 +8,101 @@
 
 ## Context
 
-Once the ontology of the repository is defined, uncontrolled dependencies between concepts can still lead to architectural decay.
+In complex systems, architectural fragility often emerges not from incorrect
+logic, but from uncontrolled dependencies between components.
 
-In particular, ML and data-heavy systems tend to accumulate:
-- circular dependencies
-- “helpful” cross-layer access
-- post-hoc reconstruction of intent
+Without explicit topology rules:
 
-To prevent this, explicit rules are required governing **allowed and forbidden dependencies**.
+- high-level modules begin depending on low-level implementation details,
+- circular dependencies emerge,
+- and system evolution becomes constrained by accidental coupling.
+
+A clear rule is required to define **who may depend on whom**.
 
 ---
 
 ## Decision
 
-This repository enforces **explicit dependency rules** between ontological categories.
+This repository enforces a strict, directional dependency structure.
 
-These rules define:
-- which categories may depend on which others
-- which dependency directions are forbidden
-- where semantic boundaries must not be crossed
+> Dependencies must follow declared architectural direction.
+> No component may depend on a layer above it.
 
-The goal is not to prescribe every allowed interaction, but to **forbid known failure modes**.
+Dependency direction is part of the system’s structural integrity.
 
----
-
-## Dependency Principles
-
-The following principles apply globally:
-
-- Dependencies must flow in a single, intentional direction.
-- No component may infer semantics from another component’s internal implementation.
-- Higher-level concerns may depend on lower-level concerns, but not vice versa.
-- Infrastructure may depend on everything; nothing depends on infrastructure.
+Violations are architectural defects.
 
 ---
 
-## Forbidden Dependencies
+## Layering Principle
 
-> This section must be adapted per project.
+Where layers exist, the following invariant applies:
 
-Examples:
-- Evaluation may not infer model behavior.
-- Models may not reach into evaluation internals.
-- Configuration may not be reconstructed from runtime behavior.
-- Experimental code may not be depended upon by stable components.
+- Higher-level modules may depend on lower-level modules.
+- Lower-level modules must not depend on higher-level modules.
+- Cross-layer shortcuts are forbidden.
 
-Forbidden dependencies are enforced socially and through code review.
+Dependency direction must remain acyclic.
 
 ---
 
-## Allowed Flexibility
+## Architectural Boundaries
 
-This topology:
-- does **not** prescribe directory structure
-- does **not** forbid all cross-cutting concerns
-- does **not** constrain internal implementation details
+Each component must:
 
-It constrains **responsibility and authority**, not creativity.
+- Declare its responsibility zone (see ADR-001),
+- Respect dependency direction (this ADR),
+- Avoid implicit cross-layer coupling.
+
+This ADR governs **structural dependency direction only**.
+
+> The definition and validation of boundary contracts (schemas, configuration validation, handshake rules) are governed separately by ADR-009.
+
+Topology defines *who may depend on whom*.  
+ADR-009 defines *what must be true at the boundary*.
+
+---
+
+## Forbidden Patterns
+
+Examples of architectural violations:
+
+- Business logic importing orchestration code
+- Evaluation layer mutating model state
+- Configuration logic depending on runtime artifacts
+- Cross-layer utility shortcuts that bypass declared structure
+
+If a dependency feels “convenient but wrong,” it probably is.
 
 ---
 
 ## Consequences
 
 ### Positive
+
+- Improved modularity
+- Easier reasoning about change impact
+- Safer refactoring
 - Reduced architectural entropy
-- Easier reasoning about changes
-- Clearer boundaries for contributors
 
 ### Negative
-- Some shortcuts are disallowed
-- Requires reviewers to actively enforce rules
 
-These constraints are intentional.
+- May require additional abstraction layers
+- Can introduce short-term friction during refactoring
+
+These costs are accepted intentionally.
 
 ---
 
 ## Notes
 
-This ADR governs *relationships between concepts*, not their internal semantics.  
-Semantic authority is defined separately.
+This ADR defines structural direction of dependencies.
+
+It does not define:
+
+- boundary contract validation (ADR-009),
+- semantic authority (ADR-003),
+- or testing obligations (ADR-005).
+
+Topology governs structure.  
+Contracts govern interaction.

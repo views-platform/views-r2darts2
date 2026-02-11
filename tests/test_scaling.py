@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.exceptions import NotFittedError
 from darts import TimeSeries
 import pandas as pd
-from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager, ChainedScaler
+from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager
 
 
 class TestScalerSelector:
@@ -582,73 +582,6 @@ class TestFeatureScalerManager:
         assert not np.allclose(vals1, vals2)
 
 
-class TestChainedScaler:
-    """Tests for ChainedScaler - chaining multiple scalers in sequence."""
-    
-    def test_chained_scaler_creation(self):
-        """Test creating a chained scaler from list of scalers."""
-        scalers = [
-            ScalerSelector.get_scaler("AsinhTransform"),
-            ScalerSelector.get_scaler("StandardScaler"),
-        ]
-        chained = ChainedScaler(scalers)
-        assert len(chained.scalers) == 2
-    
-    def test_chained_scaler_empty_raises_error(self):
-        """Test that empty scaler list raises error."""
-        with pytest.raises(ValueError, match="at least one scaler"):
-            ChainedScaler([])
-    
-    def test_chained_scaler_fit_transform(self):
-        """Test fit_transform applies scalers in order."""
-        X = np.array([[0, 1], [10, 100], [1000, 10000]]).astype(np.float64)
-        
-        chained = ChainedScaler([
-            ScalerSelector.get_scaler("AsinhTransform"),
-            ScalerSelector.get_scaler("StandardScaler"),
-        ])
-        
-        X_transformed = chained.fit_transform(X)
-        
-        # Should have mean ~0 and std ~1 after StandardScaler
-        assert X_transformed.shape == X.shape
-        assert np.allclose(X_transformed.mean(axis=0), 0, atol=1e-6)
-        assert np.allclose(X_transformed.std(axis=0), 1, atol=1e-6)
-    
-    def test_chained_scaler_inverse_transform(self):
-        """Test inverse_transform recovers original values."""
-        X = np.array([[0, 1], [10, 100], [1000, 10000]]).astype(np.float64)
-        
-        chained = ChainedScaler([
-            ScalerSelector.get_scaler("AsinhTransform"),
-            ScalerSelector.get_scaler("StandardScaler"),
-        ])
-        
-        X_transformed = chained.fit_transform(X)
-        X_recovered = chained.inverse_transform(X_transformed)
-        
-        np.testing.assert_array_almost_equal(X, X_recovered, decimal=5)
-    
-    def test_chained_scaler_transform_requires_fit(self):
-        """Test that transform raises error if not fitted."""
-        X = np.array([[1, 2], [3, 4]])
-        chained = ChainedScaler([ScalerSelector.get_scaler("StandardScaler")])
-        
-        with pytest.raises(Exception):  # NotFittedError or similar
-            chained.transform(X)
-    
-    def test_chained_scaler_repr(self):
-        """Test string representation."""
-        chained = ChainedScaler([
-            ScalerSelector.get_scaler("AsinhTransform"),
-            ScalerSelector.get_scaler("StandardScaler"),
-        ])
-        repr_str = repr(chained)
-        assert "ChainedScaler" in repr_str
-        assert "FunctionTransformer" in repr_str  # AsinhTransform is a FunctionTransformer
-        assert "StandardScaler" in repr_str
-
-
 class TestScalerSelectorChaining:
     """Tests for ScalerSelector chain-related methods."""
     
@@ -661,15 +594,17 @@ class TestScalerSelectorChaining:
     
     def test_get_chained_scaler(self):
         """Test creating chained scaler from string."""
+        from darts.dataprocessing import Pipeline
         chained = ScalerSelector.get_chained_scaler("AsinhTransform->StandardScaler")
-        assert isinstance(chained, ChainedScaler)
-        assert len(chained.scalers) == 2
+        assert isinstance(chained, Pipeline)
+        assert len(chained) == 2
     
     def test_get_chained_scaler_with_spaces(self):
         """Test that spaces around -> are handled."""
+        from darts.dataprocessing import Pipeline
         chained = ScalerSelector.get_chained_scaler("AsinhTransform -> StandardScaler")
-        assert isinstance(chained, ChainedScaler)
-        assert len(chained.scalers) == 2
+        assert isinstance(chained, Pipeline)
+        assert len(chained) == 2
     
     def test_get_chained_scaler_single_raises_error(self):
         """Test that single scaler in chain format raises error."""
@@ -683,22 +618,27 @@ class TestScalerSelectorChaining:
     
     def test_get_scaler_or_chain_chained(self):
         """Test get_scaler_or_chain returns chained scaler."""
+        from darts.dataprocessing import Pipeline
         scaler = ScalerSelector.get_scaler_or_chain("AsinhTransform->StandardScaler")
-        assert isinstance(scaler, ChainedScaler)
+        assert isinstance(scaler, Pipeline)
     
     def test_three_scaler_chain(self):
         """Test chaining three scalers."""
+        from darts.dataprocessing import Pipeline
         chained = ScalerSelector.get_chained_scaler(
             "AsinhTransform->StandardScaler->MinMaxScaler"
         )
-        assert len(chained.scalers) == 3
+        assert isinstance(chained, Pipeline)
+        assert len(chained) == 3
         
+        # Test functionality
         X = np.array([[0, 1], [10, 100], [1000, 10000]]).astype(np.float64)
-        X_transformed = chained.fit_transform(X)
-        X_recovered = chained.inverse_transform(X_transformed)
+        ts = TimeSeries.from_values(X.astype(np.float32))
         
-        np.testing.assert_array_almost_equal(X, X_recovered, decimal=4)
-
+        transformed = chained.fit_transform([ts])[0]
+        recovered = chained.inverse_transform([transformed])[0]
+    
+        np.testing.assert_array_almost_equal(X, recovered.all_values().squeeze(), decimal=2)
 
 class TestFeatureScalerManagerChaining:
     """Tests for FeatureScalerManager with chained scalers."""

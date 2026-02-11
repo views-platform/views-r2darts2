@@ -1,6 +1,7 @@
 import pytest
 import pandas as pd
 import numpy as np
+import torch
 from unittest.mock import Mock, patch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
@@ -27,6 +28,14 @@ def mock_model():
     model.input_chunk_length = 12
     model.output_chunk_length = 6
     model.to_device = Mock()
+    
+    # Nested mock for the underlying PyTorch model
+    mock_torch_model = Mock()
+    mock_param = Mock()
+    mock_param.device = torch.device('cpu')
+    mock_torch_model.parameters.return_value = iter([mock_param])
+    model.model = mock_torch_model
+    
     return model
 
 
@@ -42,7 +51,13 @@ def partition_dict():
 @pytest.fixture
 def forecaster(mock_dataset, mock_model, partition_dict):
     """Create a DartsForecaster instance."""
-    with patch('views_r2darts2.model.forecaster.ScalerSelector'):
+    # Ensure weights match CPU device
+    mock_param = Mock()
+    mock_param.device = torch.device('cpu')
+    mock_model.model.parameters.return_value = iter([mock_param])
+
+    with patch('views_r2darts2.model.forecaster.ScalerSelector'), \
+         patch.object(DartsForecaster, 'get_device', return_value='cpu'):
         forecaster = DartsForecaster(
             dataset=mock_dataset,
             model=mock_model,
@@ -56,8 +71,14 @@ def forecaster_with_scalers(mock_dataset, mock_model, partition_dict):
     """Create a DartsForecaster with real, picklable scalers."""
     # Use a real scaler that can be pickled by torch.save
     
+    # Ensure weights match CPU device
+    mock_param = Mock()
+    mock_param.device = torch.device('cpu')
+    mock_model.model.parameters.return_value = iter([mock_param])
+
     # We patch the selector to return our real scaler instance
-    with patch('views_r2darts2.model.forecaster.ScalerSelector.get_scaler', return_value=StandardScaler()):
+    with patch('views_r2darts2.model.forecaster.ScalerSelector.get_scaler', return_value=StandardScaler()), \
+         patch.object(DartsForecaster, 'get_device', return_value='cpu'):
         forecaster = DartsForecaster(
             dataset=mock_dataset,
             model=mock_model,
@@ -127,6 +148,11 @@ class TestDartsForecaster:
 
     def test_device_assignment(self, mock_dataset, mock_model, partition_dict):
         """Test that model is moved to correct device."""
+        # Update the mock model weight to be on CUDA for this test
+        mock_param = Mock()
+        mock_param.device = torch.device('cuda:0')
+        mock_model.model.parameters.return_value = iter([mock_param])
+
         with patch('views_r2darts2.model.forecaster.ScalerSelector'), \
              patch.object(DartsForecaster, 'get_device', return_value='cuda'):
             forecaster = DartsForecaster(

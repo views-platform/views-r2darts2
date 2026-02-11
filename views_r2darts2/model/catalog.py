@@ -146,6 +146,20 @@ class GradientHealthCallback(Callback):
 
 
 class ModelCatalog:
+    """
+    Central repository for translating DNA manifests into concrete Darts Model instances.
+
+    Intent Contract:
+        - Purpose: Act as a factory for Darts forecasting models, ensuring they are initialized with 
+          the exact hyperparameters and loss functions declared in the upstream DNA manifest.
+        - Non-Goals: Does not handle data loading or model execution.
+        - Guarantees: 
+            - Ensures every model is audited for architectural compatibility with the forecast horizon.
+            - Ensures standard loss functions and custom Fortress losses are correctly instantiated.
+            - Guarantees that PyTorch Lightning trainers are configured with mandatory Fortress callbacks (NaNDetection, GradientHealth).
+        - Failure Behavior: Raises ValueError if a requested model or loss is unknown, and KeyError if 
+          mandatory hyperparameters for a specific architecture are missing.
+    """
 
     def __init__(self, config: dict):
         """

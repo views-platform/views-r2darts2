@@ -66,86 +66,6 @@ def _inverse_asinh_transform(x):
     return np.sinh(x)
 
 
-class ChainedScaler(BaseEstimator, TransformerMixin):
-    """
-    A scaler that chains multiple sklearn scalers/transformers in sequence.
-    
-    Applies transforms in order during fit_transform/transform, and applies
-    inverse transforms in reverse order during inverse_transform.
-    
-    Example:
-        # First apply asinh, then standardize
-        chained = ChainedScaler([
-            ScalerSelector.get_scaler("AsinhTransform"),
-            ScalerSelector.get_scaler("StandardScaler"),
-        ])
-        X_transformed = chained.fit_transform(X)
-        X_original = chained.inverse_transform(X_transformed)
-    
-    Config usage:
-        "feature_scaler_map": {
-            "AsinhTransform->StandardScaler": ["ged_sb", "ged_ns"],
-            "LogTransform->RobustScaler": ["wdi_ny_gdp_mktp_kd"],
-        }
-    """
-    
-    def __init__(self, scalers: List[BaseEstimator]):
-        """
-        Initialize the chained scaler.
-        
-        Args:
-            scalers: List of sklearn-compatible scalers/transformers to chain.
-                     Applied in order during transform, reversed during inverse.
-        """
-        if not scalers:
-            raise ValueError("ChainedScaler requires at least one scaler.")
-        self.scalers = scalers
-        self._is_fitted = False
-    
-    def fit(self, X, y=None):
-        """Fit all scalers in sequence."""
-        X_current = X
-        for scaler in self.scalers:
-            X_current = scaler.fit_transform(X_current)
-        self._is_fitted = True
-        return self
-    
-    def transform(self, X):
-        """Apply all transforms in order."""
-        check_is_fitted(self, '_is_fitted')
-        X_current = X
-        for scaler in self.scalers:
-            X_current = scaler.transform(X_current)
-        return X_current
-    
-    def fit_transform(self, X, y=None):
-        """Fit and transform in one step."""
-        X_current = X
-        for scaler in self.scalers:
-            X_current = scaler.fit_transform(X_current)
-        self._is_fitted = True
-        return X_current
-    
-    def inverse_transform(self, X):
-        """Apply inverse transforms in reverse order."""
-        check_is_fitted(self, '_is_fitted')
-        X_current = X
-        # Apply inverse transforms in reverse order
-        for scaler in reversed(self.scalers):
-            if hasattr(scaler, 'inverse_transform'):
-                X_current = scaler.inverse_transform(X_current)
-            else:
-                raise ValueError(
-                    f"Scaler {scaler.__class__.__name__} does not support inverse_transform. "
-                    f"Cannot use it in a chain that requires inversion."
-                )
-        return X_current
-    
-    def __repr__(self) -> str:
-        scaler_names = [s.__class__.__name__ for s in self.scalers]
-        return f"ChainedScaler({' -> '.join(scaler_names)})"
-
-
 class ScalerSelector:
     @staticmethod
     def get_scaler(scaler_name: str, **kwargs) -> BaseEstimator:
@@ -236,9 +156,9 @@ class ScalerSelector:
         return scalers[scaler_name](**kwargs)
 
     @staticmethod
-    def get_chained_scaler(scaler_chain: str) -> ChainedScaler:
+    def get_chained_scaler(scaler_chain: str) -> Any:
         """
-        Create a ChainedScaler from a chain specification string.
+        Create a Darts Pipeline from a chain specification string.
         
         Parameters
         ----------
@@ -248,14 +168,10 @@ class ScalerSelector:
             
         Returns
         -------
-        ChainedScaler
-            A ChainedScaler instance with the specified scalers.
-            
-        Example
-        -------
-        >>> chained = ScalerSelector.get_chained_scaler("AsinhTransform->StandardScaler")
-        >>> # Equivalent to: ChainedScaler([AsinhTransform(), StandardScaler()])
+        Pipeline
+            A Darts Pipeline instance with the specified scalers.
         """
+        from darts.dataprocessing import Pipeline
         scaler_names = [s.strip() for s in scaler_chain.split("->")]
         if len(scaler_names) < 2:
             raise ValueError(
@@ -263,8 +179,10 @@ class ScalerSelector:
                 f"separated by '->'. Got {len(scaler_names)} scaler(s)."
             )
         
-        scalers = [ScalerSelector.get_scaler(name) for name in scaler_names]
-        return ChainedScaler(scalers)
+        darts_scalers = [
+            Scaler(ScalerSelector.get_scaler(name), global_fit=True) for name in scaler_names
+        ]
+        return Pipeline(darts_scalers)
     
     @staticmethod
     def is_chain_spec(scaler_name: str) -> bool:
@@ -272,27 +190,20 @@ class ScalerSelector:
         return "->" in scaler_name
     
     @staticmethod
-    def get_scaler_or_chain(scaler_spec: str, **kwargs) -> BaseEstimator:
+    def get_scaler_or_chain(scaler_spec: str, **kwargs) -> Any:
         """
-        Get either a single scaler or a chained scaler based on the specification.
+        Get either a single sklearn scaler or a Darts Pipeline based on the specification.
         
         Parameters
         ----------
         scaler_spec : str
             Either a single scaler name or a chain specification.
-            Examples: "StandardScaler", "AsinhTransform->StandardScaler"
             
         Returns
         -------
-        BaseEstimator
-            Either a single scaler or a ChainedScaler instance.
+        BaseEstimator | Pipeline
         """
         if ScalerSelector.is_chain_spec(scaler_spec):
-            if kwargs:
-                raise ValueError(
-                    "kwargs are not supported for chained scalers. "
-                    "Use the named group format with individual scaler configs instead."
-                )
             return ScalerSelector.get_chained_scaler(scaler_spec)
         return ScalerSelector.get_scaler(scaler_spec, **kwargs)
 

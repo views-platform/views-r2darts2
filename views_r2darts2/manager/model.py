@@ -55,37 +55,18 @@ custom_torch_load.monkeypatched = True
 
 class DartsForecastingModelManager(ForecastingModelManager):
     """
-    DartsForecastingModelManager
-
     Manages the lifecycle of Darts-based forecasting models, including training, evaluation, and artifact management.
 
-    This class extends ForecastingModelManager to provide specialized functionality for time series forecasting using the Darts library. It handles model initialization, training, evaluation, and prediction workflows, as well as artifact saving and loading. The manager integrates with external tools such as Weights & Biases for notifications and supports advanced features like Monte Carlo dropout inference and partitioned dataset handling.
-
-    Attributes:
-        model_path (ModelPathManager): Manager for model file paths and artifact directories.
-        wandb_notifications (bool): Enables or disables Weights & Biases notifications.
-        use_prediction_store (bool): Enables or disables the prediction store for caching predictions.
-
-    Methods:
-        __init__(model_path, wandb_notifications=True, use_prediction_store=True):
-            Initializes the model manager, overrides torch.load globally, and logs the current model architecture.
-
-        _train_model_artifact():
-            Trains a forecasting model using the configured dataset and algorithm, saves the trained model artifact, and returns the trained forecaster.
-
-        _evaluate_model_artifact(eval_type, artifact_name=None):
-            Evaluates a model artifact for a specified evaluation type, optionally using a specific artifact. Returns a list of prediction DataFrames for each evaluation sequence.
-
-        _forecast_model_artifact(artifact_name):
-            Loads a model artifact and generates forecasts using the current configuration. Returns a DataFrame of forecasted predictions.
-
-        _evaluate_sweep(eval_type, model):
-            Evaluates the model over a sweep of sequence numbers and returns a list of predictions.
-
-    Notes:
-        - Supports automatic artifact selection based on run type and timestamp extraction.
-        - Integrates with custom dataset and model catalog classes for flexible configuration.
-        - Provides options for feature and target scaling, parallel prediction jobs, and Monte Carlo inference.
+    Intent Contract:
+        - Purpose: Orchestrate the transition from raw VIEWS dataframes to persistent model artifacts and 
+          validated evaluation results, acting as the primary entry point for experiment execution.
+        - Non-Goals: Does not define model architectures or implement core tensor math.
+        - Guarantees: 
+            - Ensures every execution context is audited against the DNA manifest before state mutation.
+            - Guarantees that temporal boundaries (t+1) are strictly enforced across train/test splits.
+            - Ensures model artifacts (weights + scalers) are saved coupled together.
+        - Failure Behavior: Fails loudly during the "Handshake" phase if configurations are incomplete 
+          or if predictions are attempted into the void beyond known ground truth.
     """
 
     def __init__(

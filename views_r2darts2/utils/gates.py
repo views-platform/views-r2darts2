@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from typing import List, Dict, Any, Union
 import logging
 from darts import TimeSeries
@@ -50,6 +51,16 @@ class ReproducibilityGate:
     
     This class centralizes all validation logic to ensure that models are built
     on a stable 'DNA' manifest and that temporal boundaries are strictly enforced.
+
+    Intent Contract:
+        - Purpose: Enforce physical, temporal, and configuration invariants to ensure 100% experiment reproducibility.
+        - Non-Goals: Does not perform data cleaning, model training, or metric calculation.
+        - Guarantees: 
+            - Ensures training data never leaks into the future relative to its partition.
+            - Ensures all mandatory DNA parameters are present and non-null before initialization.
+            - Ensures numerical stability (no NaNs/Infs) at the system boundaries.
+        - Failure Behavior: Raises specific ReproducibilityError subclasses (e.g., DataLeakageError, MissingHyperparameterError) 
+          immediately upon invariant violation, halting execution.
     """
 
     class Config:
@@ -255,6 +266,29 @@ class ReproducibilityGate:
                 )
                 logger.error(error_msg)
                 raise DataLeakageError(error_msg)
+
+        @staticmethod
+        def audit_dataframe_schema(df: pd.DataFrame, expected_targets: List[str], expected_features: List[str]) -> None:
+            """
+            Ensures that the input dataframe complies with the Handshake Contract (ADR-009).
+            Verifies presence of required multi-index levels and all declared columns.
+            """
+            import pandas as pd
+            if not isinstance(df.index, pd.MultiIndex):
+                raise NumericalSanityError("Dataframe must have a MultiIndex (time, entity).")
+            
+            if len(df.index.levels) < 2:
+                raise NumericalSanityError(f"MultiIndex must have at least 2 levels, got {len(df.index.levels)}.")
+
+            missing_cols = []
+            for col in expected_targets + expected_features:
+                if col not in df.columns:
+                    missing_cols.append(col)
+            
+            if missing_cols:
+                error_msg = f"Boundary Handshake Failed: Dataframe missing required columns: {missing_cols}"
+                logger.error(error_msg)
+                raise KeyError(error_msg)
 
         @staticmethod
         def audit_numerical_sanity(series_list: List[TimeSeries], name: str, max_abs_val: float = 1e9) -> None:

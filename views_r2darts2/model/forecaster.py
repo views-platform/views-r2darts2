@@ -19,17 +19,18 @@ class DartsForecaster:
     DartsForecaster is a wrapper class for time series forecasting using Darts models.
     This class manages the workflow for training and predicting with a TorchForecastingModel,
     including preprocessing, scaling, device management, and result formatting.
-        dataset (_ViewsDatasetDarts): The dataset containing time series, features, and targets.
-        model (TorchForecastingModel): The Darts forecasting model instance.
-        partition_dict (dict): Dictionary specifying 'train' and 'test' index ranges.
-    Methods:
-        get_device(): Returns the device type for model training (cpu, cuda, or mps).
-        _preprocess_timeseries(timeseries, start, end, train_mode): Preprocesses time series for training or prediction.
-        _process_predictions(timeseries_pred): Converts model predictions to structured list of dictionaries.
-        train(): Trains the forecasting model using the dataset.
-        predict(sequence_number, output_length, **predict_kwargs): Generates forecasts for a given sequence.
-        save_model(path): Saves the current model to the specified file path.
-        load_model(path): Loads a trained model from the specified file path.
+
+    Intent Contract:
+        - Purpose: Maintain the stateful coupling between a deep learning model and its required 
+          preprocessing pipeline (scalers, log-transforms) to ensure predictions are on the correct scale.
+        - Non-Goals: Does not manage Weights & Biases logging or experiment orchestration.
+        - Guarantees: 
+            - Ensures that data is downcast to float32 before entering the model.
+            - Guarantees that target scalers are fitted ONLY on training data and correctly applied 
+              in inverse during prediction (preserving sample dimensions for probabilistic forecasts).
+            - Ensures physical boundaries are respected during preprocessing via ReproducibilityGate.
+        - Failure Behavior: Raises RuntimeError if prediction is attempted before scalers are fitted or 
+          if numerical insanity is detected in the input tensors.
     """
 
     def __init__(
@@ -614,6 +615,17 @@ class DartsForecaster:
             end=self._test_start
             + sequence_number,  # self._test_start + sequence_number is exclusive
         )
+
+        # Fail-Loud: Verify model device state before prediction
+        # Darts models sometimes silently shift back to CPU in teardown()
+        current_device = next(self.model.model.parameters()).device
+        if self.device == "cuda" and current_device.type == "cpu":
+            error_msg = (
+                f"DEVICE MISMATCH DETECTED: Forecaster initialized for {self.device} "
+                f"but model weights found on {current_device}. Prediction halted to prevent race conditions."
+            )
+            logger.critical(error_msg)
+            raise RuntimeError(error_msg)
 
         # Generate forecasts
         try:

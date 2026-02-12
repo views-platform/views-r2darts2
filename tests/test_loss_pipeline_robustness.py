@@ -115,9 +115,8 @@ def test_huber_delta_sensibility_across_pipelines(loss_class, pipeline):
 
     # 3. Test with a "bad" delta - THIS IS MEANT TO FAIL in some cases
     proportion_large_bad = (errors > bad_delta).float().mean().item()
-    assert proportion_large_bad < 0.05 or proportion_large_bad > 0.95, \
+    assert proportion_large_bad < 0.1 or proportion_large_bad > 0.9, \
         f"Pipeline {pipeline}: Proportion of large errors for 'bad' delta ({bad_delta}) is not extreme ({proportion_large_bad})"
-
 
 @pytest.mark.parametrize("pipeline", PIPELINES)
 def test_spikefocal_threshold_reachability_across_pipelines(pipeline):

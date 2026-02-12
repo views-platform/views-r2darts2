@@ -248,6 +248,20 @@ class ModelCatalog:
             "weight_decay": self.config["weight_decay"],
         }
 
+    def _get_optimizer_cls(self):
+        opt_name = self.config.get("optimizer_cls")
+        if not opt_name:
+            from views_r2darts2.utils.gates import MissingHyperparameterError
+            raise MissingHyperparameterError(
+                "MANDATORY HYPERPARAMETER MISSING: 'optimizer_cls' must be explicitly declared in the DNA manifest."
+            )
+        try:
+            return getattr(torch.optim, opt_name)
+        except AttributeError:
+            raise ValueError(
+                f"INVALID HYPERPARAMETER: '{opt_name}' is not a valid torch.optim class name."
+            )
+
     def get_model(self, model_name: str):
         """
         Get a model class by its name.
@@ -283,6 +297,7 @@ class ModelCatalog:
             use_static_covariates=self.config["use_static_covariates"],
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -314,6 +329,7 @@ class ModelCatalog:
             skip_interpolation=self.config["skip_interpolation"],
             hidden_continuous_size=self.config["hidden_continuous_size"],
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -376,6 +392,7 @@ class ModelCatalog:
             model_name=self.config["name"],
             force_reset=self.config["force_reset"],
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,
@@ -411,6 +428,7 @@ class ModelCatalog:
             force_reset=self.config["force_reset"],
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,
@@ -436,6 +454,7 @@ class ModelCatalog:
             loss_fn=self.loss_fn,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -457,6 +476,7 @@ class ModelCatalog:
             n_epochs=self.config["n_epochs"],
             loss_fn=self.loss_fn,
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             model_name=self.config["name"],
@@ -506,6 +526,7 @@ class ModelCatalog:
                 **self._get_common_pl_trainer_kwargs(extra_callbacks=[NaNDetectionCallback(patience=5)]),
                 "detect_anomaly": self.config["detect_anomaly"],
             },
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -530,6 +551,7 @@ class ModelCatalog:
             force_reset=True,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -554,6 +576,7 @@ class ModelCatalog:
             force_reset=True,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,  
@@ -621,6 +644,7 @@ class ModelCatalog:
             force_reset=True,
             use_reversible_instance_norm=self.config["use_reversible_instance_norm"],
             pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
+            optimizer_cls=self._get_optimizer_cls(),
             optimizer_kwargs=self._get_common_optimizer_kwargs(),
             lr_scheduler_cls=ReduceLROnPlateau,
             lr_scheduler_kwargs=self.lr_scheduler_args,

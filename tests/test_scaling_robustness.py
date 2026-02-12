@@ -108,6 +108,7 @@ class TestScalingRobustness:
             "lr": 0.0003,
             "weight_decay": 0.0003,
             "loss_function": "WeightedPenaltyHuberLoss",
+            "optimizer_cls": "Adam",
             "delta": 0.025,
             "zero_threshold": 0.01,
             "non_zero_weight": 7.0,

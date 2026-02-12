@@ -27,7 +27,8 @@ These ADRs define system philosophy and governance:
 - **ADR-003** — Authority of Declarations Over Inference  
   Defines where semantic authority lives.
 
-- **ADR-004** — Rules for Evaluation and Stability (Deferred)
+- **ADR-004** — Rules for Evolution and Stability  
+  Defines Stability Tiers for the Fortress architecture.
 
 - **ADR-005** — Testing as Mandatory Critical Infrastructure  
   Defines red / beige / green test doctrine.
@@ -48,14 +49,18 @@ These ADRs form the architectural constitution of the repository.
 
 ---
 
-## Project-Specific ADRs
+## Operational & Domain ADRs
 
-ADRs numbered 010 and above define:
+ADRs numbered 010 and above define specific infrastructure, mathematical, and domain-level decisions:
 
-- Domain-specific evaluation strategy
-- Implementation details
-- Infrastructure decisions
-- Feature-level trade-offs
+- **ADR-010** — Numerical Precision and Semantic Thresholds  
+  Standardizes `float32` and prohibits hardcoded model floors.
+
+- **ADR-011** — Hardware Integrity and Parallelism  
+  Defines device self-healing and GPU prediction constraints.
+
+- **ADR-012** — Scaling Pipeline and Calibration Integrity  
+  Standardizes on Darts `Pipeline` and mandatory `global_fit`.
 
 These must comply with the constitutional ADRs above.
 
@@ -66,10 +71,14 @@ These must comply with the constitutional ADRs above.
 - **Ontology (001)** defines what exists.
 - **Topology (002)** defines structural direction.
 - **Authority (003)** defines who owns meaning.
+- **Evolution (004)** defines stability tiers.
 - **Boundary Contracts (009)** define interaction rules.
+- **Numerical Laws (010)** ensure precision and raw intentionality.
+- **Hardware Laws (011)** prevent race conditions and device drift.
+- **Mathematical Laws (012)** preserve probabilistic calibration.
 - **Observability (008)** enforces failure semantics.
 - **Testing (005)** verifies system integrity.
 - **Intent Contracts (006)** bind class-level behavior.
 - **Automation Governance (007)** constrains silicon-based agents.
 
-Together, these define the invariant layer of the system.
+Together, these define the invariant layer of the Fortress architecture.

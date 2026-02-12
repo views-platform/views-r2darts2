@@ -65,26 +65,33 @@ class TestReproducibilityInfra:
         config_missing = {"num_samples": 100, "mc_dropout": True}
         with pytest.raises(MissingHyperparameterError):
             ReproducibilityGate.Config.audit_manifest(config_missing)
-            
         # Case 2: Complete config
         config_complete = {
             "random_state": 42,
             "steps": [1],
             "run_type": "test",
+            "name": "test_model",
             "input_chunk_length": 1,
             "output_chunk_length": 1,
+            "output_chunk_shift": 0,
             "use_reversible_instance_norm": True,
+            "use_static_covariates": False,
             "optimizer_cls": "Adam",
             "lr": 0.01,
+            "weight_decay": 1e-5,
             "batch_size": 1,
             "n_epochs": 1,
+            "gradient_clip_val": 1.0,
+            "lr_scheduler_factor": 0.1,
+            "lr_scheduler_patience": 1,
+            "lr_scheduler_min_lr": 1e-6,
+            "early_stopping_patience": 1,
+            "early_stopping_min_delta": 0.01,
             "loss_function": "MSE",
-            "num_samples": 50, 
-            "mc_dropout": True, 
-            "n_jobs": 4
+            "num_samples": 50,
+            "mc_dropout": True
         }
         ReproducibilityGate.Config.audit_manifest(config_complete)
-
     def test_config_snapshot_stability(self, mock_manager):
         """
         [GREEN TEAM] Ensures that methods capture a snapshot of the config dictionary
@@ -279,11 +286,29 @@ class TestRedTeamAttacks:
         """[RED TEAM] Try to induce hidden defaults by passing None."""
         from views_r2darts2.utils.gates import MissingHyperparameterError
         config = {
-            "random_state": 42, "steps": [1], "run_type": "test",
-            "input_chunk_length": 1, "output_chunk_length": 1,
-            "use_reversible_instance_norm": True, "optimizer_cls": "Adam",
-            "lr": 0.01, "batch_size": 1, "n_epochs": 1,
-            "loss_function": "MSE", "num_samples": 1, "mc_dropout": False, "n_jobs": 1
+            "random_state": 42,
+            "steps": [1],
+            "run_type": "test",
+            "name": "test_model",
+            "input_chunk_length": 1,
+            "output_chunk_length": 1,
+            "output_chunk_shift": 0,
+            "use_reversible_instance_norm": True,
+            "use_static_covariates": False,
+            "optimizer_cls": "Adam",
+            "lr": 0.01,
+            "weight_decay": 1e-5,
+            "batch_size": 1,
+            "n_epochs": 1,
+            "gradient_clip_val": 1.0,
+            "lr_scheduler_factor": 0.1,
+            "lr_scheduler_patience": 1,
+            "lr_scheduler_min_lr": 1e-6,
+            "early_stopping_patience": 1,
+            "early_stopping_min_delta": 0.01,
+            "loss_function": "MSE",
+            "num_samples": 1,
+            "mc_dropout": False
         }
         config[poison_key] = poison_value
         with pytest.raises(MissingHyperparameterError, match="Implicit defaults are forbidden"):

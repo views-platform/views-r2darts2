@@ -67,20 +67,42 @@ class ReproducibilityGate:
         """Gates related to configuration and hyperparameter integrity."""
         
         MANDATORY_MANIFEST = [
+            # Global context
             "random_state",
             "steps",
             "run_type",
+            "name",
+            
+            # Structural DNA (General)
             "input_chunk_length",
             "output_chunk_length",
+            "output_chunk_shift",
             "use_reversible_instance_norm",
+            "use_static_covariates",
+            
+            # Optimization DNA
             "optimizer_cls",
             "lr",
+            "weight_decay",
             "batch_size",
             "n_epochs",
+            "gradient_clip_val",
+            
+            # Scheduler DNA
+            "lr_scheduler_factor",
+            "lr_scheduler_patience",
+            "lr_scheduler_min_lr",
+            
+            # Early Stopping DNA
+            "early_stopping_patience",
+            "early_stopping_min_delta",
+            
+            # Loss DNA
             "loss_function",
+            
+            # Inference DNA
             "num_samples",
-            "mc_dropout",
-            "n_jobs"
+            "mc_dropout"
         ]
 
         @staticmethod

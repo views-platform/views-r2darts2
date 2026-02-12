@@ -587,7 +587,7 @@ class TestConfigurationHandling:
         config_missing = {**basic_config, "steps": [1, 2, 3]}
         del config_missing["output_chunk_length"]
         catalog_missing = ModelCatalog(config_missing)
-        with pytest.raises(ValueError, match="output_chunk_length"):
+        with pytest.raises(KeyError, match="output_chunk_length"):
             catalog_missing._get_nbeats()
 
     def test_default_values_applied(self, basic_config):

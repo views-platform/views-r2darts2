@@ -214,9 +214,9 @@ class ModelCatalog:
 
         self.lr_scheduler_args = {
             "mode": "min",
-            "factor": self.config["lr_scheduler_factor"],
-            "patience": self.config["lr_scheduler_patience"],
-            "min_lr": self.config["lr_scheduler_min_lr"],
+            "factor": self.config.get("lr_scheduler_factor"),
+            "patience": self.config.get("lr_scheduler_patience"),
+            "min_lr": self.config.get("lr_scheduler_min_lr"),
             "monitor": "train_loss",
         }
 
@@ -224,8 +224,8 @@ class ModelCatalog:
         callbacks = [
             EarlyStopping(
                 monitor="train_loss",
-                patience=self.config["early_stopping_patience"],
-                min_delta=self.config["early_stopping_min_delta"],
+                patience=self.config.get("early_stopping_patience"),
+                min_delta=self.config.get("early_stopping_min_delta"),
                 mode="min",
             ),
             LearningRateMonitor(log_momentum=True),
@@ -237,15 +237,15 @@ class ModelCatalog:
         return {
             "accelerator": "gpu",
             "logger": WandbLogger(log_model="all"),
-            "gradient_clip_val": self.config["gradient_clip_val"],
+            "gradient_clip_val": self.config.get("gradient_clip_val"),
             "callbacks": callbacks,
             "enable_progress_bar": True,
         }
 
     def _get_common_optimizer_kwargs(self):
         return {
-            "lr": self.config["lr"],
-            "weight_decay": self.config["weight_decay"],
+            "lr": self.config.get("lr"),
+            "weight_decay": self.config.get("weight_decay"),
         }
 
     def _get_optimizer_cls(self):
@@ -339,41 +339,10 @@ class ModelCatalog:
     def _get_nbeats(self):
         torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
     
-        # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
-        required_hparams = [
-            "input_chunk_length",
-            "output_chunk_length",
-            "output_chunk_shift",
-            "generic_architecture",
-            "num_stacks",
-            "num_blocks",
-            "num_layers",
-            "layer_widths",
-            "activation",
-            "dropout",
-            "random_state",
-            "n_epochs",
-            "batch_size",
-            "name",
-            "force_reset",
-            "gradient_clip_val",
-            "early_stopping_patience",
-            "early_stopping_min_delta",
-            "lr",
-            "weight_decay",
-            "steps",
-        ]
-    
-        missing = [k for k in required_hparams if k not in self.config]
-        if missing:
-            raise ValueError(
-                f"Missing required N-BEATS hyperparameters in config: {missing}"
-            )
-    
-        # ---- 2. Audit architecture ----
+        # ---- 1. Audit architecture ----
         ReproducibilityGate.Config.audit_architecture(self.config)
     
-        # ---- 3. Model construction (STRICT access) ----
+        # ---- 2. Model construction (STRICT access) ----
         return NBEATSModel(
             input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=self.config["output_chunk_length"],
@@ -587,41 +556,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([TiDEModel, LossSelector])
         ReproducibilityGate.Config.audit_architecture(self.config)
     
-        # ---- 1. Explicit hyperparameter contract (NO DEFAULTS) ----
-        required_hparams = [
-            "input_chunk_length",
-            "output_chunk_length",
-            "output_chunk_shift",
-            "num_encoder_layers",
-            "num_decoder_layers",
-            "decoder_output_dim",
-            "hidden_size",
-            "temporal_width_past",
-            "temporal_width_future",
-            "temporal_decoder_hidden",
-            "use_layer_norm",
-            "dropout",
-            "use_static_covariates",
-            "batch_size",
-            "n_epochs",
-            "steps",
-            "name",
-            "random_state",
-            "use_reversible_instance_norm",
-            "gradient_clip_val",
-            "early_stopping_patience",
-            "early_stopping_min_delta",
-            "lr",
-            "weight_decay",
-        ]
-    
-        missing = [k for k in required_hparams if k not in self.config]
-        if missing:
-            raise ValueError(
-                f"Missing required TiDE hyperparameters in config: {missing}"
-            )
-    
-        # ---- 3. Model construction (STRICT access only) ----
+        # ---- 1. Model construction (STRICT access only) ----
         return TiDEModel(
             input_chunk_length=self.config["input_chunk_length"],
             output_chunk_length=self.config["output_chunk_length"],

@@ -466,8 +466,6 @@ class ReproducibilityGate:
             Ensures that the input dataframe complies with the Handshake Contract (ADR-009).
             Verifies presence of required multi-index levels and all declared columns.
             """
-            import pandas as pd
-
             if not isinstance(df.index, pd.MultiIndex):
                 raise NumericalSanityError(
                     "Dataframe must have a MultiIndex (time, entity)."

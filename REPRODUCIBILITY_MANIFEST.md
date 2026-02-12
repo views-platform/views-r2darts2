@@ -2,75 +2,61 @@
 
 This document defines the mandatory configuration standards and runtime safety gates for the `views-r2darts2` repository. Its purpose is to ensure that every experiment is 100% reproducible, temporally sound, and free from data leakage.
 
-## 1. The Mandatory Reproducibility Manifest
+## 1. The Mandatory Reproducibility Manifest (DNA)
 
-No model may be initialized, trained, or evaluated unless its configuration explicitly defines the following parameters. The system will **refuse to run** if any manifest key is missing or set to `None`.
+No model may be initialized, trained, or evaluated unless its configuration explicitly defines the following parameters. The DNA is **polymorphic**: the requirements are determined dynamically based on the chosen algorithm. The system will **refuse to run** if any manifest key is missing or set to `None`.
 
-### 1.1 Global Execution Context
+### 1.1 The Core Genome (Universal)
+Required by ALL experiments regardless of model.
+
 | Key | Purpose |
 | :--- | :--- |
 | `random_state` | Forces a fixed seed for weight initialization and stochastic operations. |
 | `steps` | Defines the explicit forecast horizon (list of month offsets). |
 | `run_type` | Defines the partition context (`calibration`, `validation`, `forecasting`). |
+| `algorithm` | The specific model architecture to instantiate. |
+| `loss_function` | The mathematical objective being minimized. |
+| `optimizer_cls` | Explicitly names the optimizer class (e.g., "Adam"). |
+| `lr`, `weight_decay` | Standard optimization hyperparameters. |
+| `batch_size`, `n_epochs` | Global training control. |
+| `num_samples`, `mc_dropout` | Inference behavior (probabilistic vs deterministic). |
 
-### 1.2 Structural DNA (Architecture)
-| Key | Purpose |
-| :--- | :--- |
-| `input_chunk_length` | Defines the number of past time steps the model sees. |
-| `output_chunk_length` | Defines the physical size of the model's output layer. |
-| `use_reversible_instance_norm` | Controls normalization behavior (critical for time-series scaling). |
-
-### 1.3 Optimization DNA (Training)
-| Key | Purpose |
-| :--- | :--- |
-| `optimizer_cls` | Explicitly names the optimizer (e.g., "Adam"). |
-| `lr` | The learning rate used for gradient descent. |
-| `batch_size` | Ensures consistent gradient calculation across runs. |
-| `n_epochs` | Fixes the training duration. |
-| `loss_function` | Defines the mathematical objective being minimized. |
-
-### 1.4 Inference DNA (Prediction)
-| Key | Purpose |
-| :--- | :--- |
-| `num_samples` | Explicitly sets the number of probabilistic samples (1 for deterministic). |
-| `mc_dropout` | Controls whether stochastic dropout is active during inference. |
-| `n_jobs` | Sets parallelization for prediction (reproducibility-critical for specific backends). |
+### 1.2 The Algorithm-Specific Genome
+Each architecture (N-BEATS, TFT, TiDE, etc.) defines its own mandatory "genes" (e.g., `num_stacks`, `use_static_covariates`). Parameters irrelevant to an architecture are forbidden in its manifest to prevent semantic bloat.
 
 ---
 
-## 2. Reproducibility Gates (Runtime Validators)
+## 2. Reproducibility Gates (The Fortress)
 
 The following gates are implemented in `views_r2darts2/utils/gates.py` and invoked at critical lifecycle points.
 
 ### 2.1 The Config Gate (`ConfigAudit`)
-*   **Audit Manifest**: Verifies the presence of all keys in Section 1.
-*   **Audit Architecture**: Verifies that `len(steps) % output_chunk_length == 0`.
+*   **Audit Manifest**: Performs a dynamic, model-aware audit of the DNA.
+*   **Audit Architecture**: Verifies that `len(steps) % output_chunk_length == 0` (ADR-009).
 *   **Failure Mode**: `MissingHyperparameterError` or `ArchitectureMismatchError`.
 
 ### 2.2 The Temporal Gate (`TemporalAudit`)
 *   **The Continuity Guardian ($t+1$)**: Verifies that the test set starts exactly one month after the training set ends.
 *   **The Horizon Siren**: Logs a high-visibility warning if `len(steps) != 36`.
-*   **The Sequence Auditor**: Scans raw training IDs to ensure a continuous range with **zero holes** (missing months).
-*   **Failure Mode**: `TemporalDiscontinuityError` or `ValueError`.
+*   **The Sequence Auditor**: Scans training IDs to ensure a continuous range with **zero holes**.
 
-### 2.3 The Data Gate (`DataAudit`)
-*   **The Leakage Firewall**: Performs a set-intersection check to guarantee that **zero** time IDs from the test set appear in the training tensors.
-*   **Numerical Sanity**: Detects `NaN`, `Inf`, and extreme adversarial outliers ($> 10^9$).
-*   **Failure Mode**: `DataLeakageError` or `NumericalSanityError`.
+### 2.3 The Hardware Gate (`HardwareAudit`)
+*   **Device Self-Healing**: Audits the model device before every prediction. If a Darts-induced CPU-drift is detected, the model is restored to its target device (ADR-011).
+*   **Parallelism Lockdown**: Forces `max_workers=1` for GPU prediction to prevent race conditions.
+
+### 2.4 The Data Gate (`DataAudit`)
+*   **Numerical Integrity**: Enforces `float32` standardization and detects `NaN`/`Inf` at the system boundaries (ADR-010).
+*   **The Leakage Firewall**: Set-intersection check between train and test partitions.
 
 ---
 
 ## 3. Implementation Patterns
 
 ### 3.1 Immutable Snapshots
-All manager methods (`_train`, `_evaluate`, `_sweep`) must capture a local snapshot of the configuration:
-```python
-active_config = self.configs  # Unified, merged dictionary
-```
-Internal logic must **never** mutate this dictionary.
+All manager methods must capture a local snapshot of the configuration: `active_config = self.configs`. Internal logic must **never** mutate this dictionary.
 
-### 3.2 Workspace Integrity
-The test suite and model entry points perform a path-check to ensure `views_r2darts2` is imported from the local project directory, preventing "Ghost Imports" from stale temporary folders.
+### 3.2 Global Calibration
+All target scalers must use `global_fit=True` to preserve cross-sectional signals and probabilistic calibration (ADR-012).
 
 ---
 
@@ -78,6 +64,6 @@ The test suite and model entry points perform a path-check to ensure `views_r2da
 
 | Team | Focus | Implementation |
 | :--- | :--- | :--- |
-| 🟩 **Green** | Resilience | Stochastic Parity tests verify bit-level identity between in-memory and reloaded models. |
-| 🟫 **Beige** | Human Error | Manifest audit prevents mundane transcription errors or missing keys in `config_sweep.py`. |
-| 🟥 **Red** | Adversarial | Injection tests verify that "Temporal Holes" and "Data Poisoning" (NaNs) are caught. |
+| 🟩 **Green** | Resilience | Stochastic Parity and Scaling Integrity tests. |
+| 🟫 **Beige** | Human Error | Polymorphic DNA audits and Mismatch detection. |
+| 🟥 **Red** | Adversarial | Temporal Injection and Numerical Poisoning. |

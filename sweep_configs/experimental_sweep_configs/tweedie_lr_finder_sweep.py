@@ -1,5 +1,6 @@
 # file: sweep_configs/tweedie_lr_finder_sweep.py
 
+
 def get_sweep_config():
     """
     This sweep is designed for Experiment 1 of the TweedieLoss diagnostic plan.
@@ -29,7 +30,7 @@ def get_sweep_config():
         "loss_function": {"value": "TweedieLoss"},
         "p": {"value": 1.5},
         # --- Trainer & Optimizer (lr is swept) ---
-        "n_epochs": {"value": 100}, # Shorter epochs for a faster search
+        "n_epochs": {"value": 100},  # Shorter epochs for a faster search
         "lr": {
             "distribution": "log_uniform_values",
             "min": 1e-6,
@@ -50,7 +51,7 @@ def get_sweep_config():
         "steps": {"value": [*range(1, 37)]},
         "mc_dropout": {"value": True},
         "force_reset": {"value": True},
-        "random_state": {"value": 42}, # Use a single random state for consistency
+        "random_state": {"value": 42},  # Use a single random state for consistency
     }
 
     sweep_config["parameters"] = parameters

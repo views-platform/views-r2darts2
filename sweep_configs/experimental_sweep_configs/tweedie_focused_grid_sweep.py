@@ -1,5 +1,6 @@
 # file: sweep_configs/tweedie_focused_grid_sweep.py
 
+
 def get_sweep_config():
     """
     This sweep is for Experiment 2 of the TweedieLoss diagnostic plan.
@@ -29,7 +30,7 @@ def get_sweep_config():
         "generic_architecture": {"value": True},
         # --- Loss Function (p is swept) ---
         "loss_function": {"value": "TweedieLoss"},
-        "p": {"values": [1.2, 1.4, 1.6, 1.8]}, # Finer grid for p
+        "p": {"values": [1.2, 1.4, 1.6, 1.8]},  # Finer grid for p
         # --- Trainer & Optimizer (lr is swept in a focused range) ---
         "n_epochs": {"value": 300},
         "lr": {

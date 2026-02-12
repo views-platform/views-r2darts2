@@ -6,7 +6,7 @@ from views_r2darts2.model.catalog import ModelCatalog
 
 __all__ = [
     "ScalerSelector",
-    "FeatureScalerManager", 
+    "FeatureScalerManager",
     "LossSelector",
     "DartsForecaster",
     "ModelCatalog",

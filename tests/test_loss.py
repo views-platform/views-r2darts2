@@ -60,7 +60,11 @@ class TestLossSelector:
 
     def test_filters_invalid_kwargs(self):
         loss = LossSelector.get_loss_function(
-            "WeightedHuberLoss", zero_threshold=0.01, delta=1.0, non_zero_weight=5.0, invalid_param=999
+            "WeightedHuberLoss",
+            zero_threshold=0.01,
+            delta=1.0,
+            non_zero_weight=5.0,
+            invalid_param=999,
         )
         assert isinstance(loss, WeightedHuberLoss)
         assert loss.delta == 1.0
@@ -336,36 +340,44 @@ class TestWeightedPenaltyHuberLoss:
             # Case 1: True Negative (target=0, pred=0) -> loss should be 0
             # weight = 1.0 (no target non-zero, no pred non-zero)
             (0.0, 0.0, 0.01, 0.5, 5.0, 2.0, 3.0, 0.0),
-
             # Case 2: True Positive (target>0, pred>0) -> uses non_zero_weight
             # target=0.1, pred=0.1. error=0.0. loss=0.0.
             (0.1, 0.1, 0.01, 0.5, 5.0, 2.0, 3.0, 0.0),
             # target=0.1, pred=0.2. error=0.1 (quad). weight=5.0. loss=0.5*0.1^2*5.0 = 0.025
             (0.2, 0.1, 0.01, 0.5, 5.0, 2.0, 3.0, 0.025),
-
             # Case 3: False Positive (target=0, pred>0) -> uses 1.0 * fp_weight
             # target=0.005 (below threshold), pred=0.1 (above threshold). error=0.1 (quad).
             # base_weight = 1.0. final_weight = 1.0 * 2.0 = 2.0
             # loss = 0.5 * 0.1^2 * 2.0 = 0.01
-            (0.1, 0.005, 0.01, 0.5, 5.0, 2.0, 3.0, 0.009025), # Corrected
+            (0.1, 0.005, 0.01, 0.5, 5.0, 2.0, 3.0, 0.009025),  # Corrected
             # Case 4: False Negative (target>0, pred=0) -> uses non_zero_weight * fn_weight
             # target=0.1 (above threshold), pred=0.005 (below threshold). error=0.1 (quad).
             # base_weight = 5.0. final_weight = 5.0 * 3.0 = 15.0
             # loss = 0.5 * 0.1^2 * 15.0 = 0.0676875
-            (0.005, 0.1, 0.01, 0.5, 5.0, 2.0, 3.0, 0.0676875), # Corrected
+            (0.005, 0.1, 0.01, 0.5, 5.0, 2.0, 3.0, 0.0676875),  # Corrected
             # Case 5: False Positive (linear region)
             # target=0.005, pred=1.0. error=1.0 (linear).
             # base_weight=1.0. final_weight=1.0 * 2.0 = 2.0
             # loss = (0.5 * (1.0 - 0.5 * 0.5)) * 2.0 = 0.745
-            (1.0, 0.005, 0.01, 0.5, 5.0, 2.0, 3.0, 0.745), # Corrected
+            (1.0, 0.005, 0.01, 0.5, 5.0, 2.0, 3.0, 0.745),  # Corrected
             # Case 6: False Negative (linear region)
             # target=1.0, pred=0.005. error=1.0 (linear).
             # base_weight=5.0. final_weight = 5.0 * 3.0 = 15.0
             # loss = (0.5 * (1.0 - 0.5 * 0.5)) * 15.0 = 5.5875
-            (0.005, 1.0, 0.01, 0.5, 5.0, 2.0, 3.0, 5.5875), # Corrected
-        ]
+            (0.005, 1.0, 0.01, 0.5, 5.0, 2.0, 3.0, 5.5875),  # Corrected
+        ],
     )
-    def test_penalty_huber_manual_calculation(self, preds_val, targets_val, zero_threshold, delta, non_zero_weight, fp_weight, fn_weight, expected_loss_val):
+    def test_penalty_huber_manual_calculation(
+        self,
+        preds_val,
+        targets_val,
+        zero_threshold,
+        delta,
+        non_zero_weight,
+        fp_weight,
+        fn_weight,
+        expected_loss_val,
+    ):
         """
         Tests the WeightedPenaltyHuberLoss against manually calculated values for various conditions.
         """
@@ -379,7 +391,9 @@ class TestWeightedPenaltyHuberLoss:
         preds = torch.tensor([preds_val], dtype=torch.float32)
         targets = torch.tensor([targets_val], dtype=torch.float32)
         loss = loss_fn(preds, targets)
-        assert torch.isclose(loss, torch.tensor(expected_loss_val), atol=1e-4) # atol changed to 1e-4
+        assert torch.isclose(
+            loss, torch.tensor(expected_loss_val), atol=1e-4
+        )  # atol changed to 1e-4
 
 
 # Integration tests
@@ -394,9 +408,7 @@ class TestLossIntegration:
         time_aware = TimeAwareWeightedHuberLoss(
             zero_weight=1.0, non_zero_weight=5.0, decay_factor=0.95, delta=0.5
         )
-        spike_focal = SpikeFocalLoss(
-            alpha=0.8, gamma=2.0, spike_threshold=3.0445
-        )
+        spike_focal = SpikeFocalLoss(alpha=0.8, gamma=2.0, spike_threshold=3.0445)
         weighted_penalty = WeightedPenaltyHuberLoss(
             zero_threshold=0.01,
             delta=0.5,
@@ -415,9 +427,7 @@ class TestLossIntegration:
 
     def test_loss_decreases_with_better_predictions(self):
         targets = torch.randn(32)
-        loss_fn = WeightedHuberLoss(
-            zero_threshold=0.01, delta=0.5, non_zero_weight=5.0
-        )
+        loss_fn = WeightedHuberLoss(zero_threshold=0.01, delta=0.5, non_zero_weight=5.0)
 
         # Bad predictions
         bad_preds = torch.randn(32) * 10
@@ -430,7 +440,9 @@ class TestLossIntegration:
         assert good_loss.item() < bad_loss.item()
 
 
-@pytest.mark.skip(reason="These tests are for the old TweedieLoss implementation and are now obsolete. New tests are in test_tweedie_loss.py.")
+@pytest.mark.skip(
+    reason="These tests are for the old TweedieLoss implementation and are now obsolete. New tests are in test_tweedie_loss.py."
+)
 class TestTweedieLoss:
     @pytest.fixture
     def loss_fn(self):
@@ -438,7 +450,14 @@ class TestTweedieLoss:
 
     def test_initialization(self):
         # Test custom initialization
-        loss_fn_custom = TweedieLoss(p=1.9, non_zero_weight=10.0, zero_threshold=0.05, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-7)
+        loss_fn_custom = TweedieLoss(
+            p=1.9,
+            non_zero_weight=10.0,
+            zero_threshold=0.05,
+            false_positive_weight=1.0,
+            false_negative_weight=1.0,
+            eps=1e-7,
+        )
         assert loss_fn_custom.p == 1.9
         assert loss_fn_custom.non_zero_weight == 10.0
         assert loss_fn_custom.threshold == 0.05
@@ -446,7 +465,14 @@ class TestTweedieLoss:
 
         # Test invalid p
         with pytest.raises(ValueError, match="Tweedie power parameter p must be in"):
-            TweedieLoss(p=1.0, non_zero_weight=5.0, zero_threshold=0.01, false_positive_weight=1.0, false_negative_weight=1.0, eps=1e-8)
+            TweedieLoss(
+                p=1.0,
+                non_zero_weight=5.0,
+                zero_threshold=0.01,
+                false_positive_weight=1.0,
+                false_negative_weight=1.0,
+                eps=1e-8,
+            )
         with pytest.raises(ValueError, match="Power parameter p must be in \(1, 2\)"):
             TweedieLoss(p=2.0)
         with pytest.raises(ValueError, match="Power parameter p must be in \(1, 2\)"):
@@ -470,7 +496,6 @@ class TestTweedieLoss:
             # weight = 5.0
             # expected_loss = 4.0003588 * 5.0 = 20.001794
             (0.5, 1.0, 1.5, 5.0, 0.01, 1e-8, 20.001794),
-
             # Case 2: Zero target, default p=1.5, weight=1.0
             # preds=0.1, targets=0.0, p=1.5
             # preds_pos = softplus(0.1) + 1e-8 = 0.5504269996
@@ -478,7 +503,7 @@ class TestTweedieLoss:
             #               = 2 * 0.741893 - 0 = 1.483786
             # weight = 1.0
             # expected_loss = 1.483786
-            (0.1, 0.0, 1.5, 5.0, 0.01, 1e-8, 1.72579996), # Corrected
+            (0.1, 0.0, 1.5, 5.0, 0.01, 1e-8, 1.72579996),  # Corrected
             # Case 3: Different p value (p=1.9), non-zero target, weight=5.0
             # preds=0.5, targets=1.0, p=1.9
             # preds_pos = 0.9740751995
@@ -488,14 +513,36 @@ class TestTweedieLoss:
             # loss_unweighted = 9.973809 - (-1.1405678) = 11.1143768
             # weight = 5.0
             # expected_loss = 11.1143768 * 5.0 = 55.571884
-            (0.5, 1.0, 1.9, 5.0, 0.01, 1e-8, 55.557289123535156), # Corrected to match PyTorch output
-        ]
+            (
+                0.5,
+                1.0,
+                1.9,
+                5.0,
+                0.01,
+                1e-8,
+                55.557289123535156,
+            ),  # Corrected to match PyTorch output
+        ],
     )
-    def test_tweedie_forward_manual_calculation(self, preds_val, targets_val, p_val, non_zero_weight_val, zero_threshold_val, eps_val, expected_loss_val):
+    def test_tweedie_forward_manual_calculation(
+        self,
+        preds_val,
+        targets_val,
+        p_val,
+        non_zero_weight_val,
+        zero_threshold_val,
+        eps_val,
+        expected_loss_val,
+    ):
         """
         Tests the forward pass of TweedieLoss against manually calculated values.
         """
-        loss_fn = TweedieLoss(p=p_val, non_zero_weight=non_zero_weight_val, zero_threshold=zero_threshold_val, eps=eps_val)
+        loss_fn = TweedieLoss(
+            p=p_val,
+            non_zero_weight=non_zero_weight_val,
+            zero_threshold=zero_threshold_val,
+            eps=eps_val,
+        )
         preds = torch.tensor([preds_val], dtype=torch.float32)
         targets = torch.tensor([targets_val], dtype=torch.float32)
         loss = loss_fn(preds, targets)
@@ -506,9 +553,9 @@ class TestTweedieLoss:
         Tests that preds are made positive and eps prevents division by zero.
         """
         loss_fn = TweedieLoss(p=1.5, eps=1e-8)
-        
+
         # Test near-zero prediction (should become positive by softplus+eps)
-        preds_near_zero = torch.tensor([-5.0]) # softplus(-5) is very close to 0
+        preds_near_zero = torch.tensor([-5.0])  # softplus(-5) is very close to 0
         targets_dummy = torch.tensor([1.0])
         loss = loss_fn(preds_near_zero, targets_dummy)
         assert not torch.isnan(loss)
@@ -516,14 +563,14 @@ class TestTweedieLoss:
 
         # Test zero prediction if softplus wasn't there
         # Without softplus, preds_pos could be zero leading to pow(0, negative_exponent)
-        
+
         # Ensure that with softplus, preds_pos is always > eps
         preds_neg_inf = torch.tensor([-1000.0])
         loss_fn_test = TweedieLoss(p=1.5, eps=1e-8)
         loss = loss_fn_test(preds_neg_inf, torch.tensor([1.0]))
         assert not torch.isnan(loss)
         assert not torch.isinf(loss)
-        
+
         # This test ensures no numerical errors are raised when preds_pos is very small
         # due to the addition of eps. The actual softplus(-1000) is ~0.
         # preds_pos should be 1e-8.
@@ -542,11 +589,15 @@ class TestTweedieLoss:
 class TestAsymmetricQuantileLoss:
     @pytest.fixture
     def loss_fn(self):
-        return AsymmetricQuantileLoss(tau=0.75, non_zero_weight=5.0, zero_threshold=0.01)
+        return AsymmetricQuantileLoss(
+            tau=0.75, non_zero_weight=5.0, zero_threshold=0.01
+        )
 
     def test_initialization(self):
         # Test custom initialization
-        loss_fn_custom = AsymmetricQuantileLoss(tau=0.9, non_zero_weight=10.0, zero_threshold=0.05)
+        loss_fn_custom = AsymmetricQuantileLoss(
+            tau=0.9, non_zero_weight=10.0, zero_threshold=0.05
+        )
         assert loss_fn_custom.tau == 0.9
         assert loss_fn_custom.non_zero_weight == 10.0
         assert loss_fn_custom.threshold == 0.05
@@ -566,37 +617,45 @@ class TestAsymmetricQuantileLoss:
             # error = 0.2. quantile_loss = 0.75 * 0.2 = 0.15
             # weight = 5.0. expected_loss = 0.15 * 5.0 = 0.75
             (0.8, 1.0, 0.75, 5.0, 0.01, 0.75),
-
             # Case 2: Overestimation (error < 0), target non-zero. tau=0.75, non_zero_weight=5.0
             # error = -0.2. quantile_loss = (0.75 - 1) * -0.2 = -0.25 * -0.2 = 0.05
             # weight = 5.0. expected_loss = 0.05 * 5.0 = 0.25
             (1.2, 1.0, 0.75, 5.0, 0.01, 0.25),
-
             # Case 3: Underestimation, target zero. tau=0.75, non_zero_weight=5.0 (but not applied)
             # error = 0.2. quantile_loss = 0.75 * 0.2 = 0.15
             # weight = 1.0. expected_loss = 0.15 * 1.0 = 0.15
-            (0.8, 0.005, 0.75, 5.0, 0.01, 0.19875), # Corrected
+            (0.8, 0.005, 0.75, 5.0, 0.01, 0.19875),  # Corrected
             # Case 4: Overestimation, target zero. tau=0.75, non_zero_weight=5.0 (but not applied)
             # error = -0.2. quantile_loss = -0.25 * -0.2 = 0.05
             # weight = 1.0. expected_loss = 0.05 * 1.0 = 0.05
-            (0.2, 0.005, 0.75, 5.0, 0.01, 0.04875), # Corrected
-
+            (0.2, 0.005, 0.75, 5.0, 0.01, 0.04875),  # Corrected
             # Case 5: Different tau (0.25), Underestimation, target non-zero, weight=5.0
             # error = 0.2. quantile_loss = 0.25 * 0.2 = 0.05
             # weight = 5.0. expected_loss = 0.05 * 5.0 = 0.25
             (0.8, 1.0, 0.25, 5.0, 0.01, 0.25),
-
             # Case 6: Different tau (0.25), Overestimation, target non-zero, weight=5.0
             # error = -0.2. quantile_loss = (0.25 - 1) * -0.2 = -0.75 * -0.2 = 0.15
             # weight = 5.0. expected_loss = 0.15 * 5.0 = 0.75
             (1.2, 1.0, 0.25, 5.0, 0.01, 0.75),
-        ]
+        ],
     )
-    def test_asymmetric_quantile_forward_manual_calculation(self, preds_val, targets_val, tau_val, non_zero_weight_val, zero_threshold_val, expected_loss_val):
+    def test_asymmetric_quantile_forward_manual_calculation(
+        self,
+        preds_val,
+        targets_val,
+        tau_val,
+        non_zero_weight_val,
+        zero_threshold_val,
+        expected_loss_val,
+    ):
         """
         Tests the forward pass of AsymmetricQuantileLoss against manually calculated values.
         """
-        loss_fn = AsymmetricQuantileLoss(tau=tau_val, non_zero_weight=non_zero_weight_val, zero_threshold=zero_threshold_val)
+        loss_fn = AsymmetricQuantileLoss(
+            tau=tau_val,
+            non_zero_weight=non_zero_weight_val,
+            zero_threshold=zero_threshold_val,
+        )
         preds = torch.tensor([preds_val], dtype=torch.float32)
         targets = torch.tensor([targets_val], dtype=torch.float32)
         loss = loss_fn(preds, targets)
@@ -606,16 +665,18 @@ class TestAsymmetricQuantileLoss:
         """
         Tests that non_zero_weight and zero_threshold are applied correctly.
         """
-        loss_fn_default = AsymmetricQuantileLoss(tau=0.75, non_zero_weight=10.0, zero_threshold=0.01)
+        loss_fn_default = AsymmetricQuantileLoss(
+            tau=0.75, non_zero_weight=10.0, zero_threshold=0.01
+        )
 
         # Target below threshold, error > 0
         preds_low_err = torch.tensor([0.003])
-        targets_low = torch.tensor([0.005]) # < 0.01
+        targets_low = torch.tensor([0.005])  # < 0.01
         loss_unweighted = loss_fn_default(preds_low_err, targets_low)
-        
+
         # Target above threshold, same error > 0
         preds_high_err = torch.tensor([0.08])
-        targets_high = torch.tensor([0.1]) # > 0.01
+        targets_high = torch.tensor([0.1])  # > 0.01
         loss_weighted = loss_fn_default(preds_high_err, targets_high)
 
         # The error (target - pred) is 0.002 for both.
@@ -641,17 +702,17 @@ class TestAsymmetricQuantileLoss:
         """
         preds = torch.randn(5, 10, requires_grad=True)
         targets = torch.randn(5, 10)
-        
+
         loss = loss_fn(preds, targets)
-        
+
         # Ensure loss is a scalar and not NaN/Inf
         assert loss.shape == torch.Size([])
         assert not torch.isnan(loss)
         assert not torch.isinf(loss)
-        
+
         loss.backward()
         grad = preds.grad
-        
+
         # Ensure gradients exist and are not NaN/Inf
         assert grad is not None
         assert grad.shape == preds.shape
@@ -662,11 +723,15 @@ class TestAsymmetricQuantileLoss:
 class TestZeroInflatedLoss:
     @pytest.fixture
     def loss_fn(self):
-        return ZeroInflatedLoss(zero_weight=1.0, count_weight=1.0, delta=0.5, zero_threshold=0.01, eps=1e-8)
+        return ZeroInflatedLoss(
+            zero_weight=1.0, count_weight=1.0, delta=0.5, zero_threshold=0.01, eps=1e-8
+        )
 
     def test_initialization(self):
         # Test custom initialization
-        loss_fn_custom = ZeroInflatedLoss(zero_weight=2.0, count_weight=0.5, delta=1.0, zero_threshold=0.05, eps=1e-7)
+        loss_fn_custom = ZeroInflatedLoss(
+            zero_weight=2.0, count_weight=0.5, delta=1.0, zero_threshold=0.05, eps=1e-7
+        )
         assert loss_fn_custom.zero_weight == 2.0
         assert loss_fn_custom.count_weight == 0.5
         assert loss_fn_custom.delta == 1.0
@@ -684,24 +749,33 @@ class TestZeroInflatedLoss:
             (0.0, 0.1, 0.01, 1e-8, 0.693147),
             # Case 3: False Non-Zero (target=0, pred>0)
             # is_zero = 1.0. pred_prob_zero = sigmoid(-0.1*10) = sigmoid(-1) = 0.26894. BCE(0.26894, 1) = -log(0.26894) = 1.3126
-            (0.1, 0.0, 0.01, 1e-8, 1.3133099), # Corrected
+            (0.1, 0.0, 0.01, 1e-8, 1.3133099),  # Corrected
             # Case 4: True Non-Zero (target>0, pred>0)
             # is_zero = 0.0. pred_prob_zero = sigmoid(-0.1*10) = 0.26894. BCE(0.26894, 0) = -log(1-0.26894) = -log(0.73106) = 0.3131
-            (0.1, 0.1, 0.01, 1e-8, 0.3133099), # Corrected
-        ]
+            (0.1, 0.1, 0.01, 1e-8, 0.3133099),  # Corrected
+        ],
     )
-    def test_zero_inflated_binary_component_manual_calculation(self, preds_val, targets_val, zero_threshold, eps, expected_zero_loss):
+    def test_zero_inflated_binary_component_manual_calculation(
+        self, preds_val, targets_val, zero_threshold, eps, expected_zero_loss
+    ):
         """
         Tests the binary (zero/non-zero) classification component of ZeroInflatedLoss.
         """
-        loss_fn = ZeroInflatedLoss(zero_weight=1.0, count_weight=0.0, delta=0.5, zero_threshold=zero_threshold, eps=eps)
+        loss_fn = ZeroInflatedLoss(
+            zero_weight=1.0,
+            count_weight=0.0,
+            delta=0.5,
+            zero_threshold=zero_threshold,
+            eps=eps,
+        )
         preds = torch.tensor([preds_val], dtype=torch.float32)
         targets = torch.tensor([targets_val], dtype=torch.float32)
-        
+
         # Binary component only
         zero_loss_result = loss_fn(preds, targets)
-        assert torch.isclose(zero_loss_result, torch.tensor(expected_zero_loss), atol=1e-4)
-
+        assert torch.isclose(
+            zero_loss_result, torch.tensor(expected_zero_loss), atol=1e-4
+        )
 
     @pytest.mark.parametrize(
         "preds_val, targets_val, delta, zero_threshold, expected_count_loss",
@@ -714,20 +788,29 @@ class TestZeroInflatedLoss:
             (0.3, 0.5, 0.5, 0.01, 0.01925),
             # Case 4: Zero target (should not contribute to count loss)
             (0.5, 0.005, 0.5, 0.01, 0.0),
-        ]
+        ],
     )
-    def test_zero_inflated_count_component_manual_calculation(self, preds_val, targets_val, delta, zero_threshold, expected_count_loss):
+    def test_zero_inflated_count_component_manual_calculation(
+        self, preds_val, targets_val, delta, zero_threshold, expected_count_loss
+    ):
         """
         Tests the count (Pseudo-Huber) component of ZeroInflatedLoss for non-zero targets.
         """
-        loss_fn = ZeroInflatedLoss(zero_weight=0.0, count_weight=1.0, delta=delta, zero_threshold=zero_threshold, eps=1e-8)
+        loss_fn = ZeroInflatedLoss(
+            zero_weight=0.0,
+            count_weight=1.0,
+            delta=delta,
+            zero_threshold=zero_threshold,
+            eps=1e-8,
+        )
         preds = torch.tensor([preds_val], dtype=torch.float32)
         targets = torch.tensor([targets_val], dtype=torch.float32)
-        
+
         # Count component only
         count_loss_result = loss_fn(preds, targets)
-        assert torch.isclose(count_loss_result, torch.tensor(expected_count_loss), atol=1e-4)
-
+        assert torch.isclose(
+            count_loss_result, torch.tensor(expected_count_loss), atol=1e-4
+        )
 
     @pytest.mark.parametrize(
         "preds_val, targets_val, zero_weight, count_weight, delta, zero_threshold, eps, expected_total_loss",
@@ -737,18 +820,36 @@ class TestZeroInflatedLoss:
             # Count: count_mask=1.0. error=0.1. Pseudo-Huber(0.1, delta=0.5) = 0.25*(sqrt(1+(0.1/0.5)^2)-1) = 0.25*(1.0198-1) = 0.25*0.0198 = 0.00495
             # Total = 1.0 * 0.693147 + 1.0 * 0.00495 = 0.698097
             (0.0, 0.1, 1.0, 1.0, 0.5, 0.01, 1e-8, 0.698097),
-        ]
+        ],
     )
-    def test_zero_inflated_combined_components_manual_calculation(self, preds_val, targets_val, zero_weight, count_weight, delta, zero_threshold, eps, expected_total_loss):
+    def test_zero_inflated_combined_components_manual_calculation(
+        self,
+        preds_val,
+        targets_val,
+        zero_weight,
+        count_weight,
+        delta,
+        zero_threshold,
+        eps,
+        expected_total_loss,
+    ):
         """
         Tests the combined weighted sum of both binary and count components of ZeroInflatedLoss.
         """
-        loss_fn = ZeroInflatedLoss(zero_weight=zero_weight, count_weight=count_weight, delta=delta, zero_threshold=zero_threshold, eps=eps)
+        loss_fn = ZeroInflatedLoss(
+            zero_weight=zero_weight,
+            count_weight=count_weight,
+            delta=delta,
+            zero_threshold=zero_threshold,
+            eps=eps,
+        )
         preds = torch.tensor([preds_val], dtype=torch.float32)
         targets = torch.tensor([targets_val], dtype=torch.float32)
-        
+
         total_loss_result = loss_fn(preds, targets)
-        assert torch.isclose(total_loss_result, torch.tensor(expected_total_loss), atol=1e-4)
+        assert torch.isclose(
+            total_loss_result, torch.tensor(expected_total_loss), atol=1e-4
+        )
 
     def test_zero_inflated_output_shape(self, loss_fn):
         """
@@ -765,17 +866,17 @@ class TestZeroInflatedLoss:
         """
         preds = torch.randn(5, 10, requires_grad=True)
         targets = torch.randn(5, 10)
-        
+
         loss = loss_fn(preds, targets)
-        
+
         # Ensure loss is a scalar and not NaN/Inf
         assert loss.shape == torch.Size([])
         assert not torch.isnan(loss)
         assert not torch.isinf(loss)
-        
+
         loss.backward()
         grad = preds.grad
-        
+
         # Ensure gradients exist and are not NaN/Inf
         assert grad is not None
         assert grad.shape == preds.shape

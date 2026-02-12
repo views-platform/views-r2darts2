@@ -10,6 +10,7 @@ CLEAN_TORCH_LOAD = torch.load
 
 logger = logging.getLogger(__name__)
 
+
 def pytest_sessionstart(session):
     """
     Workspace Integrity Check:
@@ -18,7 +19,7 @@ def pytest_sessionstart(session):
     """
     expected_path = os.path.abspath(os.path.join(os.getcwd(), "views_r2darts2"))
     actual_path = os.path.dirname(os.path.abspath(views_r2darts2.__file__))
-    
+
     if actual_path.lower() != expected_path.lower():
         error_msg = (
             "\n\n🚨 WORKSPACE INTEGRITY FAILURE 🚨\n"
@@ -33,5 +34,5 @@ def pytest_sessionstart(session):
             "Please run the 'Exorcism Protocol' to clear stale paths."
         )
         pytest.exit(error_msg)
-    
+
     print(f"\n✅ Workspace Integrity Verified: {actual_path}")

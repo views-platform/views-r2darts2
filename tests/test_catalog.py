@@ -219,7 +219,7 @@ class TestModelCatalogInitialization:
     def test_init_with_basic_config(self, basic_config):
         """Test initialization with minimal configuration."""
         catalog = ModelCatalog(basic_config)
-        
+
         assert catalog.config == basic_config
         assert catalog.device == "cpu"
         assert catalog.loss_name == "WeightedPenaltyHuberLoss"
@@ -228,7 +228,7 @@ class TestModelCatalogInitialization:
     def test_init_with_valid_loss_functions(self, basic_config):
         """Test initialization with valid loss function names."""
         valid_losses = ["WeightedPenaltyHuberLoss", "WeightedHuberLoss"]
-        
+
         for loss_name in valid_losses:
             config = {**basic_config, "loss_function": loss_name}
             catalog = ModelCatalog(config)
@@ -237,14 +237,14 @@ class TestModelCatalogInitialization:
     def test_init_with_invalid_loss_raises_error(self, basic_config):
         """Test that invalid loss function raises ValueError."""
         config = {**basic_config, "loss_function": "InvalidLoss"}
-        
+
         with pytest.raises(ValueError, match="Unknown loss function"):
             ModelCatalog(config)
 
     def test_loss_args_from_config(self, full_config):
         """Test that loss arguments are correctly extracted from config."""
         catalog = ModelCatalog(full_config)
-        
+
         assert catalog.loss_args["zero_threshold"] == 0.05
         assert catalog.loss_args["delta"] == 0.5
         assert catalog.loss_args["non_zero_weight"] == 5.0
@@ -254,7 +254,7 @@ class TestModelCatalogInitialization:
     def test_lr_scheduler_args(self, full_config):
         """Test that learning rate scheduler arguments are set correctly."""
         catalog = ModelCatalog(full_config)
-        
+
         assert catalog.lr_scheduler_args["mode"] == "min"
         assert catalog.lr_scheduler_args["factor"] == 0.1
         assert catalog.lr_scheduler_args["patience"] == 3
@@ -269,7 +269,7 @@ class TestModelCatalogMethods:
         """Test listing all available models."""
         catalog = ModelCatalog(basic_config)
         models = catalog.list_models()
-        
+
         assert len(models) == 10
         assert "NBEATSModel" in models
         assert "NHiTSModel" in models
@@ -287,14 +287,14 @@ class TestModelCatalogMethods:
         """Test getting a valid model."""
         catalog = ModelCatalog(basic_config)
         model = catalog.get_model("NBEATSModel")
-        
+
         assert isinstance(model, NBEATSModel)
         mock_safe_globals.assert_called()
 
     def test_get_model_invalid(self, basic_config):
         """Test getting an invalid model returns None."""
         catalog = ModelCatalog(basic_config)
-        
+
         # The models dict uses get() which returns None for invalid keys
         # But get_model() tries to call it, which will raise TypeError
         with pytest.raises(TypeError, match="'NoneType' object is not callable"):
@@ -304,10 +304,10 @@ class TestModelCatalogMethods:
     def test_get_model_case_sensitive(self, mock_safe_globals, basic_config):
         """Test that model names are case-sensitive."""
         catalog = ModelCatalog(basic_config)
-        
+
         # Correct case should work
         assert catalog.get_model("NBEATSModel") is not None
-        
+
         # Wrong case should raise TypeError (because None() is called)
         with pytest.raises(TypeError, match="'NoneType' object is not callable"):
             catalog.get_model("nbeatsmodel")
@@ -321,7 +321,7 @@ class TestNBEATSModel:
         """Test N-BEATS model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_nbeats()
-        
+
         assert isinstance(model, NBEATSModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -337,7 +337,7 @@ class TestNBEATSModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_nbeats()
-        
+
         assert model.input_chunk_length == 24
 
     @patch("torch.serialization.add_safe_globals")
@@ -345,7 +345,7 @@ class TestNBEATSModel:
         """Test that N-BEATS model is configured with loss function."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_nbeats()
-        
+
         # Verify the model was created successfully
         assert isinstance(model, NBEATSModel)
         # Verify loss function was passed during initialization
@@ -360,7 +360,7 @@ class TestTFTModel:
         """Test TFT model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_tft_model()
-        
+
         assert isinstance(model, TFTModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -376,7 +376,7 @@ class TestTFTModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_tft_model()
-        
+
         assert model.input_chunk_length == 36
 
 
@@ -388,7 +388,7 @@ class TestTCNModel:
         """Test TCN model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_tcn_model()
-        
+
         assert isinstance(model, TCNModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -402,7 +402,7 @@ class TestTCNModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_tcn_model()
-        
+
         assert isinstance(model, TCNModel)
 
 
@@ -414,7 +414,7 @@ class TestBlockRNNModel:
         """Test RNN model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_rnn_model()
-        
+
         assert isinstance(model, BlockRNNModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -429,7 +429,7 @@ class TestBlockRNNModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_rnn_model()
-        
+
         assert isinstance(model, BlockRNNModel)
 
 
@@ -441,7 +441,7 @@ class TestTransformerModel:
         """Test Transformer model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_transformer_model()
-        
+
         assert isinstance(model, TransformerModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -456,7 +456,7 @@ class TestTransformerModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_transformer_model()
-        
+
         assert isinstance(model, TransformerModel)
 
 
@@ -468,7 +468,7 @@ class TestTSMixerModel:
         """Test TSMixer model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_tsmixer_model()
-        
+
         assert isinstance(model, TSMixerModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -482,7 +482,7 @@ class TestTSMixerModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_tsmixer_model()
-        
+
         assert isinstance(model, TSMixerModel)
 
 
@@ -494,7 +494,7 @@ class TestNLinearModel:
         """Test NLinear model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_nlinear_model()
-        
+
         assert isinstance(model, NLinearModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -507,7 +507,7 @@ class TestNLinearModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_nlinear_model()
-        
+
         assert isinstance(model, NLinearModel)
 
 
@@ -519,7 +519,7 @@ class TestDLinearModel:
         """Test DLinear model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_dlinear_model()
-        
+
         assert isinstance(model, DLinearModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -532,7 +532,7 @@ class TestDLinearModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_dlinear_model()
-        
+
         assert isinstance(model, DLinearModel)
 
 
@@ -544,7 +544,7 @@ class TestTiDEModel:
         """Test TiDE model creation with default parameters."""
         catalog = ModelCatalog(basic_config)
         model = catalog._get_tide_model()
-        
+
         assert isinstance(model, TiDEModel)
         assert model.output_chunk_length == len(basic_config["steps"])
 
@@ -560,7 +560,7 @@ class TestTiDEModel:
         }
         catalog = ModelCatalog(config)
         model = catalog._get_tide_model()
-        
+
         assert isinstance(model, TiDEModel)
 
 
@@ -571,15 +571,24 @@ class TestConfigurationHandling:
     def test_output_chunk_length_validation(self, mock_safe_globals, basic_config):
         """Test that output_chunk_length must be a divisor of forecast horizon (steps)."""
         # Valid: steps=6, ocl=3
-        config_valid = {**basic_config, "steps": [1, 2, 3, 4, 5, 6], "output_chunk_length": 3}
+        config_valid = {
+            **basic_config,
+            "steps": [1, 2, 3, 4, 5, 6],
+            "output_chunk_length": 3,
+        }
         catalog_valid = ModelCatalog(config_valid)
         model = catalog_valid._get_nbeats()
         assert model.output_chunk_length == 3
 
         # Invalid: steps=5, ocl=3
-        config_invalid = {**basic_config, "steps": [1, 2, 3, 4, 5], "output_chunk_length": 3}
+        config_invalid = {
+            **basic_config,
+            "steps": [1, 2, 3, 4, 5],
+            "output_chunk_length": 3,
+        }
         catalog_invalid = ModelCatalog(config_invalid)
         from views_r2darts2.utils.gates import ArchitectureMismatchError
+
         with pytest.raises(ArchitectureMismatchError, match="Architecture Mismatch"):
             catalog_invalid._get_nbeats()
 
@@ -593,7 +602,7 @@ class TestConfigurationHandling:
     def test_default_values_applied(self, basic_config):
         """Test that configured values are correctly applied."""
         catalog = ModelCatalog(basic_config)
-        
+
         # Check loss function parameters from basic_config
         assert catalog.loss_args["zero_threshold"] == 0.01
         assert catalog.loss_args["delta"] == 0.5
@@ -608,7 +617,7 @@ class TestConfigurationHandling:
             "non_zero_weight": 10.0,
         }
         catalog = ModelCatalog(config)
-        
+
         assert catalog.loss_args["zero_threshold"] == 0.5
         assert catalog.loss_args["delta"] == 1.0
         assert catalog.loss_args["non_zero_weight"] == 10.0

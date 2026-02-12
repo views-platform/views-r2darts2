@@ -5,20 +5,26 @@ from views_r2darts2.utils.loss import TimeAwareWeightedHuberLoss
 
 # --- Unit Tests for TimeAwareWeightedHuberLoss ---
 
+
 def test_time_aware_weighted_huber_loss_init():
     """Tests the initialization of TimeAwareWeightedHuberLoss."""
-    loss_fn = TimeAwareWeightedHuberLoss(zero_weight=1.0, non_zero_weight=10.0, decay_factor=0.9, delta=0.5)
+    loss_fn = TimeAwareWeightedHuberLoss(
+        zero_weight=1.0, non_zero_weight=10.0, decay_factor=0.9, delta=0.5
+    )
     assert loss_fn.zero_weight == 1.0
     assert loss_fn.non_zero_weight == 10.0
     assert loss_fn.decay_factor == 0.9
     assert loss_fn.delta == 0.5
 
+
 def test_time_aware_weighted_huber_loss_golden_value():
     """
     Tests the forward pass of TimeAwareWeightedHuberLoss against a manually calculated golden value.
     """
-    loss_fn = TimeAwareWeightedHuberLoss(zero_weight=1.0, non_zero_weight=10.0, decay_factor=0.9, delta=1.0)
-    
+    loss_fn = TimeAwareWeightedHuberLoss(
+        zero_weight=1.0, non_zero_weight=10.0, decay_factor=0.9, delta=1.0
+    )
+
     # Shape: (batch_size=1, seq_len=3)
     preds = torch.tensor([[0.1, 0.6, 2.0]])
     targets = torch.tensor([[0.0, 0.5, 0.0]])
@@ -33,7 +39,7 @@ def test_time_aware_weighted_huber_loss_golden_value():
     # The LSS states: `decay_factor ** (seq_len - 1 - i)` seems more correct.
     # This would give weights [0.9^2, 0.9^1, 0.9^0] = [0.81, 0.9, 1.0].
     # Let's calculate with the implementation's logic first to see if it matches a failure.
-    
+
     # Calculation per implementation: time_weights = [0.729, 0.81, 0.9]
     # Step 1: pred=0.1, target=0.0. error=0.1. huber=0.005. event_w=1.0. time_w=0.729. loss=0.003645
     # Step 2: pred=0.6, target=0.5. error=0.1. huber=0.005. event_w=10.0. time_w=0.81. loss=0.0405
@@ -60,8 +66,9 @@ def test_time_aware_weighted_huber_loss_golden_value():
     # mean = (0.00405 + 0.045 + 1.5) / 3 = 1.54905 / 3 = 0.51635
 
     loss = loss_fn(preds, targets)
-    assert torch.isclose(loss, torch.tensor(0.51635), atol=1e-5), \
+    assert torch.isclose(loss, torch.tensor(0.51635), atol=1e-5), (
         "Golden value test failed. This may indicate the time decay is implemented incorrectly."
+    )
 
 
 def test_time_aware_huber_invariant_vs_torch():
@@ -75,15 +82,12 @@ def test_time_aware_huber_invariant_vs_torch():
 
     # Our implementation with neutral weights
     loss_fn_custom = TimeAwareWeightedHuberLoss(
-        delta=delta,
-        decay_factor=1.0,
-        zero_weight=1.0,
-        non_zero_weight=1.0
+        delta=delta, decay_factor=1.0, zero_weight=1.0, non_zero_weight=1.0
     )
     loss_custom = loss_fn_custom(preds, targets)
 
     # PyTorch reference implementation
-    loss_fn_torch = torch.nn.HuberLoss(delta=delta, reduction='mean')
+    loss_fn_torch = torch.nn.HuberLoss(delta=delta, reduction="mean")
     loss_torch = loss_fn_torch(preds, targets)
 
     assert torch.isclose(loss_custom, loss_torch, atol=1e-6)
@@ -97,12 +101,9 @@ def test_time_aware_huber_gradient_check():
 
     # Use double precision for gradcheck
     loss_fn = TimeAwareWeightedHuberLoss(
-        delta=0.5,
-        decay_factor=0.9,
-        zero_weight=1.0,
-        non_zero_weight=10.0
+        delta=0.5, decay_factor=0.9, zero_weight=1.0, non_zero_weight=10.0
     )
-    
+
     # Test with typical inputs
     preds = torch.randn(2, 3, dtype=torch.double, requires_grad=True)
     targets = torch.randn(2, 3, dtype=torch.double)

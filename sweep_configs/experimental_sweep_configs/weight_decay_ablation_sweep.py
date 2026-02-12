@@ -1,5 +1,6 @@
 # file: sweep_configs/weight_decay_ablation_sweep.py
 
+
 def get_sweep_config():
     """
     Configuration for an ablation study on weight_decay for ShrinkageLoss
@@ -24,12 +25,14 @@ def get_sweep_config():
         # --- Loss Function ---
         "loss_function": {"values": ["ShrinkageLoss"]},
         "a": {"values": [10.0]},  # Fixed to default used in local sweep
-        "c": {"values": [0.2]},   # Fixed to default used in local sweep
+        "c": {"values": [0.2]},  # Fixed to default used in local sweep
         # --- Trainer & Optimizer ---
         "n_epochs": {"values": [300]},
-        "lr": {"values": [0.001]}, # Optimized learning rate
+        "lr": {"values": [0.001]},  # Optimized learning rate
         "optimizer_cls": {"values": ["Adam"]},
-        "weight_decay": {"values": [0.0003, 0.0]}, # Ablation: with and without current weight_decay
+        "weight_decay": {
+            "values": [0.0003, 0.0]
+        },  # Ablation: with and without current weight_decay
         "gradient_clip_val": {"values": [0.64]},
         "early_stopping_patience": {"values": [20]},
         "early_stopping_min_delta": {"values": [0.001]},
@@ -40,12 +43,12 @@ def get_sweep_config():
         "batch_size": {"values": [8]},
         "target_scaler": {"values": ["MinMaxScaler"]},
         "feature_scaler": {"values": ["MinMaxScaler"]},
-        "log_targets": {"values": [True]}, # Corresponds to log1p transformation
+        "log_targets": {"values": [True]},  # Corresponds to log1p transformation
         "log_features": {"values": [None]},
         # --- Other ---
         "steps": {"values": [[*range(1, 37)]]},
         "force_reset": {"values": [True]},
-        "random_state": {"values": [42]}, # Fixed random state for reproducibility
+        "random_state": {"values": [42]},  # Fixed random state for reproducibility
     }
 
     sweep_config["parameters"] = parameters

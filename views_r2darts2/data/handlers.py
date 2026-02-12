@@ -9,10 +9,10 @@ class _ViewsDatasetDarts(_ViewsDataset):
     Handles the transformation of multi-index VIEWS dataframes into Darts-compatible TimeSeries collections.
 
     Intent Contract:
-        - Purpose: Act as the data boundary between the generic VIEWS pipeline and the Darts ecosystem, 
+        - Purpose: Act as the data boundary between the generic VIEWS pipeline and the Darts ecosystem,
           ensuring correct mapping of time and entity dimensions.
         - Non-Goals: Does not perform data cleaning or temporal slicing (slicing is handled by the forecaster).
-        - Guarantees: 
+        - Guarantees:
             - Ensures that feature and target columns are correctly grouped by entity.
             - Guarantees that the resulting TimeSeries collection preserves the multi-index semantic structure.
         - Failure Behavior: Raises KeyError if specified target or feature columns are missing from the source dataframe.
@@ -24,7 +24,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         ReproducibilityGate.Data.audit_dataframe_schema(
             df=self.get_subset_dataframe(),
             expected_targets=self.targets,
-            expected_features=self.features
+            expected_features=self.features,
         )
 
     def as_darts_timeseries(

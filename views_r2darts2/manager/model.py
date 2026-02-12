@@ -20,6 +20,7 @@ if not hasattr(torch, "__original_load__"):
     # Priority 1: Check session-captured CLEAN_TORCH_LOAD (for tests)
     try:
         from tests.conftest import CLEAN_TORCH_LOAD
+
         torch.__original_load__ = CLEAN_TORCH_LOAD
     except (ImportError, ModuleNotFoundError):
         # Priority 2: Use current torch.load if it's not a Mock
@@ -29,6 +30,7 @@ if not hasattr(torch, "__original_load__"):
         else:
             # Last resort: we are in a mock-contaminated environment and conftest didn't help
             torch.__original_load__ = orig
+
 
 # https://github.com/suno-ai/bark/pull/619#issuecomment-2726747073
 # Function that forces weights_only=False
@@ -46,9 +48,10 @@ def custom_torch_load(*args, **kwargs):
     """
     if "weights_only" not in kwargs:
         kwargs["weights_only"] = False
-    
+
     # Use the saved original
     return torch.__original_load__(*args, **kwargs)
+
 
 custom_torch_load.monkeypatched = True
 
@@ -58,14 +61,14 @@ class DartsForecastingModelManager(ForecastingModelManager):
     Manages the lifecycle of Darts-based forecasting models, including training, evaluation, and artifact management.
 
     Intent Contract:
-        - Purpose: Orchestrate the transition from raw VIEWS dataframes to persistent model artifacts and 
+        - Purpose: Orchestrate the transition from raw VIEWS dataframes to persistent model artifacts and
           validated evaluation results, acting as the primary entry point for experiment execution.
         - Non-Goals: Does not define model architectures or implement core tensor math.
-        - Guarantees: 
+        - Guarantees:
             - Ensures every execution context is audited against the DNA manifest before state mutation.
             - Guarantees that temporal boundaries (t+1) are strictly enforced across train/test splits.
             - Ensures model artifacts (weights + scalers) are saved coupled together.
-        - Failure Behavior: Fails loudly during the "Handshake" phase if configurations are incomplete 
+        - Failure Behavior: Fails loudly during the "Handshake" phase if configurations are incomplete
           or if predictions are attempted into the void beyond known ground truth.
     """
 
@@ -103,35 +106,39 @@ class DartsForecastingModelManager(ForecastingModelManager):
     def _resolve_active_partition_dict(self, config: dict) -> dict:
         """
         Explicitly resolves the partition dictionary for the current run.
-        
-        This avoids the 'Stale DataLoader' bug by re-calculating the 
+
+        This avoids the 'Stale DataLoader' bug by re-calculating the
         temporal windows based on the actual 'steps' in the active config.
-        
+
         Args:
             config: Captured configuration snapshot.
-            
+
         Returns:
             Dictionary containing 'train' and 'test' time ranges.
-            
+
         Raises:
             KeyError: If run_type or steps are missing.
             ValueError: If the partition type is unsupported or discontinuous.
         """
         run_type = config.get("run_type")
         steps_list = config.get("steps")
-        
+
         if not run_type or steps_list is None:
-            raise KeyError("Cannot resolve partition: Missing 'run_type' or 'steps' in config.")
-            
+            raise KeyError(
+                "Cannot resolve partition: Missing 'run_type' or 'steps' in config."
+            )
+
         if not isinstance(steps_list, list):
-            raise TypeError(f"Config parameter 'steps' must be a list, got {type(steps_list).__name__}.")
+            raise TypeError(
+                f"Config parameter 'steps' must be a list, got {type(steps_list).__name__}."
+            )
 
         # SIREN: Horizon and Shift Checks
         ReproducibilityGate.Config.audit_architecture(config)
-        
+
         # Get the master partition dict (defined in config_partitions.py)
         master_partitions = getattr(self, "_partition_dict", {})
-        
+
         if run_type in master_partitions:
             partition = master_partitions[run_type]
         else:
@@ -140,7 +147,9 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 self._data_loader.partition = run_type
                 partition = self._data_loader._get_partition_dict(steps=len(steps_list))
             else:
-                raise ValueError(f"Unsupported run_type for partition resolution: {run_type}")
+                raise ValueError(
+                    f"Unsupported run_type for partition resolution: {run_type}"
+                )
 
         # GUARDIAN: The Continuity Check (t+1)
         ReproducibilityGate.Temporal.audit_continuity(partition)
@@ -163,11 +172,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
         """
         # Capture stable config snapshot
         active_config = self.configs
-        
+
         # DNA AUDIT: Verify mandatory hyperparameters
         ReproducibilityGate.Config.audit_manifest(active_config)
         ReproducibilityGate.Config.audit_architecture(active_config)
-        
+
         path_raw = self._model_path.data_raw
         path_artifacts = self._model_path.artifacts
         run_type = active_config["run_type"]
@@ -235,13 +244,13 @@ class DartsForecastingModelManager(ForecastingModelManager):
         - Predictions are generated in parallel while maintaining sequence order.
         """
         import concurrent.futures
-        
+
         # Capture stable config snapshot
         active_config = self.configs
-        
+
         # DNA AUDIT: Verify mandatory hyperparameters
         ReproducibilityGate.Config.audit_manifest(active_config)
-        
+
         run_type = active_config["run_type"]
 
         path_raw = self._model_path.data_raw
@@ -289,7 +298,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
         forecaster.load_model(path=path_artifact)
 
         total_sequence_number = 12
-        
+
         # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
         partition = self._resolve_active_partition_dict(active_config)
         ReproducibilityGate.Temporal.audit_prediction_horizon(
@@ -297,7 +306,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             train_end=partition["train"][1],
             test_end=partition["test"][1],
             max_steps=max(active_config["steps"]),
-            total_sequences=total_sequence_number
+            total_sequences=total_sequence_number,
         )
 
         predict_kwargs = self._get_predict_kwargs(active_config)
@@ -305,13 +314,15 @@ class DartsForecastingModelManager(ForecastingModelManager):
         # Parallel prediction with order preservation
         def predict_sequence(sequence_number):
             """Helper function to predict a single sequence."""
-            logger.info(f"Starting prediction for sequence {sequence_number + 1}/{total_sequence_number}")
-            result = forecaster.predict(
-                sequence_number,
-                max(active_config["steps"]),
-                **predict_kwargs
+            logger.info(
+                f"Starting prediction for sequence {sequence_number + 1}/{total_sequence_number}"
             )
-            logger.info(f"✓ Completed prediction for sequence {sequence_number + 1}/{total_sequence_number}")
+            result = forecaster.predict(
+                sequence_number, max(active_config["steps"]), **predict_kwargs
+            )
+            logger.info(
+                f"✓ Completed prediction for sequence {sequence_number + 1}/{total_sequence_number}"
+            )
             return result
 
         # Use ThreadPoolExecutor for I/O-bound tasks or ProcessPoolExecutor for CPU-bound
@@ -320,28 +331,34 @@ class DartsForecastingModelManager(ForecastingModelManager):
         if forecaster.device == "cpu":
             max_workers = active_config.get("parallel_workers", 1)
         else:
-            logger.info("GPU detected: forcing sequential prediction to avoid device-shifting race conditions.")
+            logger.info(
+                "GPU detected: forcing sequential prediction to avoid device-shifting race conditions."
+            )
             max_workers = 1
-        
-        logger.info(f"Starting parallel prediction with {max_workers} workers for {total_sequence_number} sequences")
-        
+
+        logger.info(
+            f"Starting parallel prediction with {max_workers} workers for {total_sequence_number} sequences"
+        )
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks and maintain order
             futures = {
                 executor.submit(predict_sequence, seq_num): seq_num
                 for seq_num in range(total_sequence_number)
             }
-            
+
             # Track completed futures and maintain order
             df_predictions = [None] * total_sequence_number
             completed = 0
-            
+
             for future in concurrent.futures.as_completed(futures):
                 seq_num = futures[future]
                 try:
                     df_predictions[seq_num] = future.result()
                     completed += 1
-                    logger.info(f"Progress: {completed}/{total_sequence_number} sequences completed")
+                    logger.info(
+                        f"Progress: {completed}/{total_sequence_number} sequences completed"
+                    )
                 except Exception as e:
                     logger.error(f"Sequence {seq_num + 1} failed with error: {e}")
                     raise
@@ -356,11 +373,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
         """
         # Capture stable config snapshot
         active_config = self.configs
-        
+
         # DNA AUDIT: Verify mandatory hyperparameters
         ReproducibilityGate.Config.audit_manifest(active_config)
         ReproducibilityGate.Config.audit_architecture(active_config)
-        
+
         run_type = active_config["run_type"]
 
         # Commonly used paths
@@ -409,9 +426,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
         predict_kwargs = self._get_predict_kwargs(active_config)
 
         df_predictions = forecaster.predict(
-            0,
-            max(active_config["steps"]),
-            **predict_kwargs
+            0, max(active_config["steps"]), **predict_kwargs
         )
 
         return df_predictions
@@ -435,14 +450,16 @@ class DartsForecastingModelManager(ForecastingModelManager):
                     self.args,
                     wandb_module=self._wandb_module,
                 )
-                
+
                 active_config = self.configs
-                
+
                 # DNA AUDIT: Verify mandatory hyperparameters
                 ReproducibilityGate.Config.audit_manifest(active_config)
                 ReproducibilityGate.Config.audit_architecture(active_config)
 
-                logger.info(f"Sweeping {self._model_path.target} {active_config['name']}...")
+                logger.info(
+                    f"Sweeping {self._model_path.target} {active_config['name']}..."
+                )
                 model = self._train_model_artifact()
 
                 self._wandb_module.send_alert(
@@ -454,7 +471,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 logger.info(
                     f"Evaluating {self._model_path.target} {active_config['name']}..."
                 )
-                
+
                 # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
                 partition = self._resolve_active_partition_dict(active_config)
                 ReproducibilityGate.Temporal.audit_prediction_horizon(
@@ -462,14 +479,14 @@ class DartsForecastingModelManager(ForecastingModelManager):
                     train_end=partition["train"][1],
                     test_end=partition["test"][1],
                     max_steps=max(active_config["steps"]),
-                    total_sequences=12
+                    total_sequences=12,
                 )
-                
+
                 df_predictions = self._evaluate_sweep(self._eval_type, model)
 
                 for i, df in enumerate(df_predictions):
                     print(
-                        f"\nValidating evaluation dataframe of sequence {i+1}/{len(df_predictions)}"
+                        f"\nValidating evaluation dataframe of sequence {i + 1}/{len(df_predictions)}"
                     )
                     from views_pipeline_core.modules.validation.model import (
                         validate_prediction_dataframe,
@@ -482,7 +499,9 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 if active_config.get("metrics"):
                     self._evaluate_prediction_dataframe(df_predictions, self._eval_type)
                 else:
-                    raise PipelineException("No evaluation metrics specified in config_meta.py")
+                    raise PipelineException(
+                        "No evaluation metrics specified in config_meta.py"
+                    )
             finally:
                 self._wandb_module.finish_run()
 
@@ -499,20 +518,18 @@ class DartsForecastingModelManager(ForecastingModelManager):
         """
         # Snapshot the config once for the duration of evaluation
         active_config = self.configs
-        
+
         logger.warning(
             "Using fixed total_sequence_number=12 for sweep evaluation eval_type will soon be deprecated."
         )
         total_sequence_number = 12
-        
+
         # Explicitly extract kwargs to ensure reproducibility
         predict_kwargs = self._get_predict_kwargs(active_config)
 
         df_predictions = [
             model.predict(
-                sequence_number, 
-                max(active_config["steps"]),
-                **predict_kwargs
+                sequence_number, max(active_config["steps"]), **predict_kwargs
             )
             for sequence_number in range(total_sequence_number)
         ]
@@ -522,26 +539,25 @@ class DartsForecastingModelManager(ForecastingModelManager):
     def _get_predict_kwargs(self, config: dict) -> dict:
         """
         Extracts and validates keyword arguments for the predict() method.
-        
+
         Args:
             config: Configuration dictionary snapshot.
-            
+
         Returns:
             Dictionary of keyword arguments for Darts predict().
-            
+
         Raises:
             ValueError: If mandatory parameters are missing.
         """
-        mandatory = ["num_samples", "mc_dropout", "n_jobs"]
+        mandatory = ["num_samples", "mc_dropout"]
         missing = [k for k in mandatory if k not in config]
         if missing:
             raise ValueError(
                 f"Missing mandatory prediction parameters in config: {missing}. "
                 "Explicit configuration is required for reproducibility."
             )
-            
+
         return {
             "num_samples": config["num_samples"],
             "mc_dropout": config["mc_dropout"],
-            "n_jobs": config["n_jobs"],
         }

@@ -1,5 +1,6 @@
 # file: sweep_configs/verify_shrinkage_sweep.py
 
+
 def get_sweep_config():
     """
     Verification sweep for ShrinkageLoss.
@@ -15,14 +16,12 @@ def get_sweep_config():
     parameters = {
         # --- Verification Target ---
         "loss_function": {"values": ["ShrinkageLoss"]},
-        "a": {"values": [50.0]}, # Unique, non-default value
-
+        "a": {"values": [50.0]},  # Unique, non-default value
         # --- Fixed dummy parameters for a single, fast run ---
         "n_epochs": {"values": [1]},
         "lr": {"values": [0.001]},
         "log_targets": {"values": [True]},
         "target_scaler": {"values": ["MinMaxScaler"]},
-        
         # --- Minimal N-BEATS architecture ---
         "num_blocks": {"values": [1]},
         "num_stacks": {"values": [1]},

@@ -50,10 +50,21 @@ Contracts must be clear enough that:
 
 ## Active Contracts
 
-- `ModelRunner.md`
-- `VolumeHandler.md`
-- `BoundaryValidator.md`
-- (Add entries as they are created)
+### Orchestration & Management
+- `darts_forecasting_model_manager.md`
+
+### Modeling & Transformation
+- `model_catalog.md`
+- `darts_forecaster.md`
+- `feature_scaler_manager.md`
+- `loss_selector.md`
+
+### Data Infrastructure
+- `views_dataset_darts.md`
+
+### Governance & Observability
+- `reproducibility_gate.md`
+- `fortress_monitoring_callbacks.md`
 
 ---
 

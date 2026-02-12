@@ -67,5 +67,5 @@ This includes:
 
 ## Notes
 
-This ADR establishes *how* we know what to do. The specific contents of the manifest are defined in the `REPRODUCIBILITY_MANIFEST.md`. The validation logic is implemented in `views_r2darts2/utils/gates.py`.
+This ADR establishes *how* we know what to do. The specific contents of the manifest are defined in `docs/standards/REPRODUCIBILITY_MANIFEST.md`. The validation logic is implemented in `views_r2darts2/utils/gates.py`.
 

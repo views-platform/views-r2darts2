@@ -113,4 +113,4 @@ These costs are accepted intentionally.
 ## References
 
 - `docs/ADRs/adr_template.md`
-- `REPRODUCIBILITY_MANIFEST.md`
+- `docs/standards/REPRODUCIBILITY_MANIFEST.md`

@@ -201,6 +201,7 @@ cython_debug/
 # folders
 **/wandb/
 **/notebooks/
+**/darts_logs/
 
 # mac specific 
 .DS_Store

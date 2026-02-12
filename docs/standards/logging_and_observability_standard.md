@@ -125,7 +125,14 @@ The following must be logged:
 * Configuration summaries
 * All structural failures
 
-### 5.2 Optional Logging
+### 5.2 Hardware Observability (ADR-011)
+
+To prevent race conditions and detect device drift, the following hardware events must be logged:
+- Successful restoration of model weights from CPU to GPU (`INFO`).
+- Failure to restore device state (`CRITICAL`).
+- Concurrency adjustments (e.g., forcing `max_workers=1` on GPU) (`INFO`).
+
+### 5.3 Optional Logging
 
 * Intermediate tensor shapes (DEBUG)
 * Performance metrics during experimentation

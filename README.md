@@ -384,6 +384,19 @@ Explicitly models zero-inflated structure with two components:
 
 ---
 
+## 🛡️ Fortress Architecture & Governance
+
+This repository adheres to the **Fortress Architecture**, a set of strict engineering and mathematical standards designed to guarantee absolute scientific integrity and reproducibility in conflict forecasting.
+
+The repository is governed by:
+- **[Architectural Decision Records (ADRs)](docs/ADRs/README.md)**: Sequential, authoritative records of every major design choice (e.g., Numerical Precision, Hardware Integrity, Genomic Polymorphism).
+- **[Class Intent Contracts (CICs)](docs/CICs/README.md)**: Explicit, normative declarations of purpose and responsibility for every critical class.
+- **[Reproducibility Manifest](docs/standards/REPRODUCIBILITY_MANIFEST.md)**: The mandatory "DNA" genome that every experiment must declare before execution.
+
+> **In this repository, a crash is often a successful defense of scientific integrity.** The system is designed to fail loudly and immediately if any temporal, numerical, or configuration invariant is violated.
+
+---
+
 ## 🛠️ How It Works
 
 1. **Data Preparation**:

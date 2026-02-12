@@ -473,13 +473,23 @@ class ReproducibilityGate:
                     "Dataframe must have a MultiIndex (time, entity)."
                 )
 
+            # 1. Audit Levels (ADR-001)
             if len(df.index.levels) < 2:
                 raise NumericalSanityError(
                     f"MultiIndex must have at least 2 levels, got {len(df.index.levels)}."
                 )
 
+            level_names = list(df.index.names)
+            if "month_id" not in level_names or "country_id" not in level_names:
+                logger.warning(
+                    f"NON-STANDARD INDEX DETECTED: Expected [month_id, country_id], got {level_names}. "
+                    "Proceeding but mapping may be unstable."
+                )
+
+            # 2. Audit Presence (Handshake)
             missing_cols = []
-            for col in expected_targets + expected_features:
+            all_required = expected_targets + expected_features
+            for col in all_required:
                 if col not in df.columns:
                     missing_cols.append(col)
 
@@ -487,6 +497,19 @@ class ReproducibilityGate:
                 error_msg = f"Boundary Handshake Failed: Dataframe missing required columns: {missing_cols}"
                 logger.error(error_msg)
                 raise KeyError(error_msg)
+
+            # 3. Audit Precision Warning (ADR-010)
+            # We warn here, but the Dataset Airlock will fix it during conversion.
+            float64_cols = [
+                col
+                for col in all_required
+                if df[col].dtype == np.float64 or df[col].dtype == float
+            ]
+            if float64_cols:
+                logger.warning(
+                    f"PRECISION WARNING: Upstream provided float64 for columns {float64_cols}. "
+                    "Data Airlock will downcast to float32 to satisfy ADR-010."
+                )
 
         @staticmethod
         def audit_numerical_sanity(

@@ -1,5 +1,8 @@
 from views_pipeline_core.data.handlers import _ViewsDataset
+from views_pipeline_core.files.utils import read_dataframe
+from views_pipeline_core.configs.pipeline import PipelineConfig
 from typing import Optional, List, Union
+import numpy as np
 from darts import TimeSeries
 from views_r2darts2.utils.gates import ReproducibilityGate
 
@@ -27,6 +30,28 @@ class _ViewsDatasetDarts(_ViewsDataset):
             expected_features=self.features,
         )
 
+    @staticmethod
+    def from_views_path(path_raw: str, run_type: str, config: dict):
+        """
+        Factory method to load a VIEWS dataset from a raw path and configuration.
+        
+        Args:
+            path_raw (str): Path to the directory containing the raw dataframes.
+            run_type (str): The run type (e.g., 'validation', 'calibration').
+            config (dict): The DNA manifest for the experiment.
+            
+        Returns:
+            _ViewsDatasetDarts: Initialized dataset object.
+        """
+        file_path = f"{path_raw}/{run_type}_viewser_df{PipelineConfig.dataframe_format}"
+        df_viewser = read_dataframe(file_path)
+        
+        return _ViewsDatasetDarts(
+            source=df_viewser,
+            targets=config.get("targets"),
+            broadcast_features=True,
+        )
+
     def as_darts_timeseries(
         self,
         time_ids: Optional[Union[int, List[int]]] = None,
@@ -42,9 +67,13 @@ class _ViewsDatasetDarts(_ViewsDataset):
         Returns:
             TimeSeries: A Darts TimeSeries object constructed from the filtered dataframe, grouped by entity and containing the specified features and targets.
         """
-        df_reset = self.get_subset_dataframe(
-            time_ids=time_ids, entity_ids=entity_ids
-        ).reset_index(level=[1])
+        df_subset = self.get_subset_dataframe(time_ids=time_ids, entity_ids=entity_ids)
+
+        # Enforce float32 precision at the Data Airlock boundary (ADR-010)
+        cols_to_cast = self.features + self.targets
+        df_subset[cols_to_cast] = df_subset[cols_to_cast].astype(np.float32)
+
+        df_reset = df_subset.reset_index(level=[1])
         return TimeSeries.from_group_dataframe(
             df=df_reset,
             group_cols=self._entity_id,

@@ -548,6 +548,11 @@ class DartsForecaster:
         Returns:
             list: List of dictionaries, each containing time, entity ID, and predicted samples for each target.
         """
+        # HANDSHAKE: Audit model output for numerical sanity before processing
+        ReproducibilityGate.Data.audit_numerical_sanity(
+            timeseries_pred, name="Model Predictions"
+        )
+
         # Process predictions into list format
         results = []
         eps = 1e-8
@@ -556,9 +561,8 @@ class DartsForecaster:
             pred_values = pred.all_values(copy=False)
             if pred_values.ndim == 2:
                 pred_values = pred_values[..., np.newaxis]
-            pred_values = np.nan_to_num(
-                pred_values, nan=0.0, posinf=0.0, neginf=0.0
-            ).astype(np.float32)
+
+            # Enforce raw numerical stability (clipping only for epsilon floor)
             pred_values = np.clip(pred_values, a_min=eps, a_max=None).astype(np.float32)
             for time_idx in range(pred_values.shape[0]):
                 time_stamp = pred.start_time() + time_idx * pred.freq

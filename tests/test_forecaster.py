@@ -316,8 +316,10 @@ class TestDartsForecaster:
         assert abs(results[0]["pred_target1"][0] - eps) < 1e-10
         assert results[0]["pred_target2"] == [2.0]
 
-    def test_process_predictions_handles_nans(self, forecaster):
-        """Test that NaN values are replaced with zero."""
+    def test_process_predictions_raises_on_nans(self, forecaster):
+        """[RED TEAM] Test that NaN values trigger a NumericalSanityError."""
+        from views_r2darts2.utils.gates import NumericalSanityError
+
         times = pd.date_range("2020-01-01", periods=1, freq="M")
         # 1 timestep, 2 components, 1 sample each
         values = np.array(
@@ -332,13 +334,8 @@ class TestDartsForecaster:
         mock_pred.start_time = Mock(return_value=times[0])
         mock_pred.freq = pd.offsets.MonthEnd()
 
-        results = forecaster._process_predictions([mock_pred])
-
-        # NaN replaced with 0.0, then clipped to eps (1e-8)
-        # When there's 1 sample, it returns a list with 1 element
-        eps = 1e-8
-        assert abs(results[0]["pred_target1"][0] - eps) < 1e-10
-        assert results[0]["pred_target2"] == [2.0]
+        with pytest.raises(NumericalSanityError, match="NaN detected"):
+            forecaster._process_predictions([mock_pred])
 
     def test_train(self, forecaster):
         """Test model training."""
@@ -452,8 +449,10 @@ class TestDartsForecaster:
         with pytest.raises(Exception, match="Prediction failed"):
             forecaster.predict(sequence_number=0)
 
-    def test_predict_fillna(self, forecaster):
-        """Test that predictions fill NaN values with 0."""
+    def test_predict_raises_on_nans(self, forecaster):
+        """[RED TEAM] Test that predictions with NaN trigger a NumericalSanityError."""
+        from views_r2darts2.utils.gates import NumericalSanityError
+
         mock_ts = Mock(spec=TimeSeries)
         mock_ts.astype = Mock(return_value=mock_ts)
         mock_ts.slice = Mock(return_value=mock_ts)
@@ -472,10 +471,8 @@ class TestDartsForecaster:
         forecaster._preprocess_timeseries = Mock(return_value=([mock_ts], [mock_ts]))
         forecaster.model.predict = Mock(return_value=[mock_pred])
 
-        result = forecaster.predict(sequence_number=0, output_length=2)
-
-        # NaN should be converted to 0 by nan_to_num in _process_predictions
-        assert not result.isna().any().any()
+        with pytest.raises(NumericalSanityError, match="NaN detected"):
+            forecaster.predict(sequence_number=0, output_length=2)
 
     def test_save_model(self, forecaster_with_scalers, tmp_path):
         """Test saving model and scalers."""

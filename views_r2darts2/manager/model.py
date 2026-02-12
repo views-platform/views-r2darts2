@@ -1,13 +1,9 @@
 import logging
 import torch
-from views_pipeline_core.configs.pipeline import PipelineConfig
 from views_r2darts2.data.handlers import _ViewsDatasetDarts
 from views_r2darts2.model.forecaster import DartsForecaster
 from views_pipeline_core.files.utils import generate_model_file_name
 from views_pipeline_core.managers.model import ModelPathManager, ForecastingModelManager
-from views_pipeline_core.files.utils import (
-    read_dataframe,
-)
 
 from views_r2darts2.model.catalog import ModelCatalog
 from views_r2darts2.utils.gates import ReproducibilityGate
@@ -181,10 +177,10 @@ class DartsForecastingModelManager(ForecastingModelManager):
         path_artifacts = self._model_path.artifacts
         run_type = active_config["run_type"]
 
-        df_viewser = read_dataframe(
-            path_raw / f"{run_type}_viewser_df{PipelineConfig.dataframe_format}"
+        dataset = _ViewsDatasetDarts.from_views_path(
+            path_raw=path_raw, run_type=run_type, config=active_config
         )
-        # Partitioner dict from ViewsDataLoader
+
         model_object = ModelCatalog(config=active_config).get_model(
             model_name=active_config["algorithm"]
         )
@@ -194,11 +190,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
         logger.info(f"Training on partition [{run_type}]: {current_partition}")
 
         forecaster = DartsForecaster(
-            dataset=_ViewsDatasetDarts(
-                source=df_viewser,
-                targets=active_config.get("targets"),
-                broadcast_features=True,
-            ),
+            dataset=dataset,
             log_features=active_config.get("log_features", []),
             log_targets=active_config.get("log_targets", False),
             model=model_object,
@@ -274,19 +266,15 @@ class DartsForecastingModelManager(ForecastingModelManager):
         # Refresh snapshot to include the timestamp
         active_config = self.configs
 
-        df_viewser = read_dataframe(
-            path_raw / f"{run_type}_viewser_df{PipelineConfig.dataframe_format}"
+        dataset = _ViewsDatasetDarts.from_views_path(
+            path_raw=path_raw, run_type=run_type, config=active_config
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
             model_name=active_config["algorithm"]
         )
         forecaster = DartsForecaster(
-            dataset=_ViewsDatasetDarts(
-                source=df_viewser,
-                targets=active_config.get("targets"),
-                broadcast_features=True,
-            ),
+            dataset=dataset,
             model=model_object,
             partition_dict=self._resolve_active_partition_dict(active_config),
             feature_scaler=active_config.get("feature_scaler", None),
@@ -400,19 +388,15 @@ class DartsForecastingModelManager(ForecastingModelManager):
         # Refresh snapshot
         active_config = self.configs
 
-        df_viewser = read_dataframe(
-            path_raw / f"{run_type}_viewser_df{PipelineConfig.dataframe_format}"
+        dataset = _ViewsDatasetDarts.from_views_path(
+            path_raw=path_raw, run_type=run_type, config=active_config
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
             model_name=active_config["algorithm"]
         )
         forecaster = DartsForecaster(
-            dataset=_ViewsDatasetDarts(
-                source=df_viewser,
-                targets=active_config.get("targets"),
-                broadcast_features=True,
-            ),
+            dataset=dataset,
             model=model_object,
             partition_dict=self._resolve_active_partition_dict(active_config),
             feature_scaler=active_config.get("feature_scaler", None),

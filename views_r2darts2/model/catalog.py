@@ -253,6 +253,30 @@ class ModelCatalog:
             "weight_decay": self.config.get("weight_decay"),
         }
 
+    def _get_common_model_args(self):
+        """
+        Extracts common hyperparameters and training controls used by most Darts models.
+        
+        Returns:
+            dict: Mapping of parameter names to DNA values.
+        """
+        return {
+            "input_chunk_length": self.config.get("input_chunk_length"),
+            "output_chunk_length": self.config.get("output_chunk_length"),
+            "output_chunk_shift": self.config.get("output_chunk_shift"),
+            "batch_size": self.config.get("batch_size"),
+            "n_epochs": self.config.get("n_epochs"),
+            "loss_fn": self.loss_fn,
+            "model_name": self.config.get("name"),
+            "random_state": self.config.get("random_state"),
+            "force_reset": True,
+            "pl_trainer_kwargs": self._get_common_pl_trainer_kwargs(),
+            "optimizer_cls": self._get_optimizer_cls(),
+            "optimizer_kwargs": self._get_common_optimizer_kwargs(),
+            "lr_scheduler_cls": ReduceLROnPlateau,
+            "lr_scheduler_kwargs": self.lr_scheduler_args,
+        }
+
     def _get_optimizer_cls(self):
         opt_name = self.config.get("optimizer_cls")
         if not opt_name:
@@ -284,9 +308,7 @@ class ModelCatalog:
         torch.serialization.add_safe_globals([TSMixerModel, LossSelector])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return TSMixerModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             num_blocks=self.config.get("num_blocks"),
             ff_size=self.config.get("ff_size"),
             hidden_size=self.config.get("hidden_size"),
@@ -294,21 +316,8 @@ class ModelCatalog:
             dropout=self.config.get("dropout"),
             norm_type=self.config.get("norm_type"),
             normalize_before=self.config.get("normalize_before"),
-            batch_size=self.config.get("batch_size"),
-            n_epochs=self.config.get("n_epochs"),
-            loss_fn=self.loss_fn,
-            model_name=self.config.get("name"),
-            random_state=self.config.get("random_state"),
-            force_reset=True,
             use_static_covariates=self.config.get("use_static_covariates"),
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_tft_model(self):
@@ -316,9 +325,7 @@ class ModelCatalog:
         ReproducibilityGate.Config.audit_architecture(self.config)
 
         return TFTModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             feed_forward=self.config.get("feed_forward"),
             add_relative_index=self.config.get("add_relative_index"),
             use_static_covariates=self.config.get("use_static_covariates"),
@@ -327,35 +334,17 @@ class ModelCatalog:
             num_attention_heads=self.config.get("num_attention_heads"),
             hidden_size=self.config.get("hidden_size"),
             dropout=self.config.get("dropout"),
-            batch_size=self.config.get("batch_size"),
-            loss_fn=self.loss_fn,
-            model_name=self.config.get("name"),
             norm_type=self.config.get("norm_type", "RMSNorm"),
-            n_epochs=self.config.get("n_epochs"),
-            random_state=self.config.get("random_state"),
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
             skip_interpolation=self.config.get("skip_interpolation"),
             hidden_continuous_size=self.config.get("hidden_continuous_size"),
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_nbeats(self):
         torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
-
-        # ---- 1. Audit architecture ----
         ReproducibilityGate.Config.audit_architecture(self.config)
-
-        # ---- 2. Model construction (STRICT access) ----
         return NBEATSModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             generic_architecture=self.config.get("generic_architecture"),
             num_stacks=self.config.get("num_stacks"),
             num_blocks=self.config.get("num_blocks"),
@@ -363,32 +352,14 @@ class ModelCatalog:
             layer_widths=self.config.get("layer_widths"),
             activation=self.config.get("activation"),
             dropout=self.config.get("dropout"),
-            random_state=self.config.get("random_state"),
-            n_epochs=self.config.get("n_epochs"),
-            batch_size=self.config.get("batch_size"),
-            loss_fn=self.loss_fn,
-            model_name=self.config.get("name"),
-            force_reset=self.config.get("force_reset"),
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
         )
 
     def _get_nhits(self):
-        """N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting.
-
-        Similar to N-BEATS but with multi-rate sampling for better performance
-        at lower computational cost. Uses MaxPooling for input downsampling
-        and multi-scale interpolation for outputs.
-        """
+        """N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting."""
         torch.serialization.add_safe_globals([NHiTSModel, LossSelector])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return NHiTSModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             num_stacks=self.config.get("num_stacks"),
             num_blocks=self.config.get("num_blocks"),
             num_layers=self.config.get("num_layers"),
@@ -398,76 +369,32 @@ class ModelCatalog:
             activation=self.config.get("activation"),
             MaxPool1d=self.config.get("max_pool_1d"),
             dropout=self.config.get("dropout"),
-            random_state=self.config.get("random_state"),
-            n_epochs=self.config.get("n_epochs"),
-            batch_size=self.config.get("batch_size"),
-            loss_fn=self.loss_fn,
-            model_name=self.config.get("name"),
-            force_reset=self.config.get("force_reset"),
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_tcn_model(self):
         torch.serialization.add_safe_globals([TCNModel, LossSelector])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return TCNModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             kernel_size=self.config.get("kernel_size"),
             num_filters=self.config.get("num_filters"),
             dilation_base=self.config.get("dilation_base"),
             dropout=self.config.get("dropout"),
-            force_reset=self.config.get("force_reset"),
-            save_checkpoints=True,
-            batch_size=self.config.get("batch_size"),
-            model_name=self.config.get("name"),
-            random_state=self.config.get("random_state"),
-            n_epochs=self.config.get("n_epochs"),
-            loss_fn=self.loss_fn,
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_rnn_model(self):
         torch.serialization.add_safe_globals([BlockRNNModel, LossSelector])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return BlockRNNModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             model=self.config.get("rnn_type"),
             hidden_dim=self.config.get("hidden_dim"),
             activation=self.config.get("activation"),
             n_rnn_layers=self.config.get("n_rnn_layers"),
             dropout=self.config.get("dropout"),
-            batch_size=self.config.get("batch_size"),
-            n_epochs=self.config.get("n_epochs"),
-            loss_fn=self.loss_fn,
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
-            model_name=self.config.get("name"),
-            random_state=self.config.get("random_state"),
-            force_reset=True,
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_transformer_model(self):
@@ -488,10 +415,15 @@ class ModelCatalog:
 
         ReproducibilityGate.Config.audit_architecture(self.config)
 
+        # Merge common args with custom pl_trainer_kwargs for anomaly detection
+        common_args = self._get_common_model_args()
+        common_args["pl_trainer_kwargs"] = {
+            **common_args["pl_trainer_kwargs"],
+            "detect_anomaly": self.config.get("detect_anomaly"),
+        }
+
         return TransformerModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **common_args,
             d_model=d_model,
             nhead=nhead,
             num_encoder_layers=self.config.get("num_encoder_layers"),
@@ -500,79 +432,31 @@ class ModelCatalog:
             dropout=self.config.get("dropout"),
             activation=self.config.get("activation"),
             norm_type=self.config.get("norm_type"),
-            batch_size=self.config.get("batch_size"),
-            n_epochs=self.config.get("n_epochs"),
-            loss_fn=self.loss_fn,
-            model_name=self.config.get("name"),
-            random_state=self.config.get("random_state"),
-            force_reset=True,
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
-            pl_trainer_kwargs={
-                **self._get_common_pl_trainer_kwargs(
-                    extra_callbacks=[NaNDetectionCallback(patience=5)]
-                ),
-                "detect_anomaly": self.config.get("detect_anomaly"),
-            },
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_nlinear_model(self):
         torch.serialization.add_safe_globals([NLinearModel, LossSelector])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return NLinearModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             shared_weights=self.config.get("shared_weights"),
             const_init=self.config.get("const_init"),
             normalize=self.config.get("normalize"),
             use_static_covariates=self.config.get("use_static_covariates"),
-            batch_size=self.config.get("batch_size"),
-            n_epochs=self.config.get("n_epochs"),
-            loss_fn=self.loss_fn,
-            model_name=self.config.get("name"),
-            random_state=self.config.get("random_state"),
-            force_reset=True,
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_dlinear_model(self):
         torch.serialization.add_safe_globals([DLinearModel, LossSelector])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return DLinearModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             shared_weights=self.config.get("shared_weights"),
             kernel_size=self.config.get("kernel_size"),
             const_init=self.config.get("const_init"),
             use_static_covariates=self.config.get("use_static_covariates"),
-            batch_size=self.config.get("batch_size"),
-            n_epochs=self.config.get("n_epochs"),
-            loss_fn=self.loss_fn,
-            model_name=self.config.get("name"),
-            random_state=self.config.get("random_state"),
-            force_reset=True,
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_tide_model(self):
@@ -581,9 +465,7 @@ class ModelCatalog:
 
         # ---- 1. Model construction (STRICT access only) ----
         return TiDEModel(
-            input_chunk_length=self.config.get("input_chunk_length"),
-            output_chunk_length=self.config.get("output_chunk_length"),
-            output_chunk_shift=self.config.get("output_chunk_shift"),
+            **self._get_common_model_args(),
             num_encoder_layers=self.config.get("num_encoder_layers"),
             num_decoder_layers=self.config.get("num_decoder_layers"),
             decoder_output_dim=self.config.get("decoder_output_dim"),
@@ -594,18 +476,5 @@ class ModelCatalog:
             use_layer_norm=self.config.get("use_layer_norm"),
             dropout=self.config.get("dropout"),
             use_static_covariates=self.config.get("use_static_covariates"),
-            batch_size=self.config.get("batch_size"),
-            n_epochs=self.config.get("n_epochs"),
-            loss_fn=self.loss_fn,
-            model_name=self.config.get("name"),
-            random_state=self.config.get("random_state"),
-            force_reset=True,
-            use_reversible_instance_norm=self.config.get(
-                "use_reversible_instance_norm"
-            ),
-            pl_trainer_kwargs=self._get_common_pl_trainer_kwargs(),
-            optimizer_cls=self._get_optimizer_cls(),
-            optimizer_kwargs=self._get_common_optimizer_kwargs(),
-            lr_scheduler_cls=ReduceLROnPlateau,
-            lr_scheduler_kwargs=self.lr_scheduler_args,
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )

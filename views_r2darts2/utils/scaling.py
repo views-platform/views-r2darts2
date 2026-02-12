@@ -402,7 +402,8 @@ class FeatureScalerManager:
         def _make_pipeline(scaler_names: list):
             """Create a Darts Pipeline from a list of scaler names."""
             darts_scalers = [
-                Scaler(ScalerSelector.get_scaler(name)) for name in scaler_names
+                Scaler(ScalerSelector.get_scaler(name), global_fit=True)
+                for name in scaler_names
             ]
             return Pipeline(darts_scalers)
 
@@ -412,12 +413,12 @@ class FeatureScalerManager:
                 return _make_pipeline(scaler_names)
             else:
                 estimator = ScalerSelector.get_scaler(scaler_cfg)
-                return Scaler(estimator)
+                return Scaler(estimator, global_fit=True)
 
         if isinstance(scaler_cfg, list):
             if len(scaler_cfg) == 1:
                 estimator = ScalerSelector.get_scaler(scaler_cfg[0])
-                return Scaler(estimator)
+                return Scaler(estimator, global_fit=True)
             else:
                 return _make_pipeline(scaler_cfg)
 
@@ -444,7 +445,7 @@ class FeatureScalerManager:
                 scaler_names = _parse_chain_string(name)
                 return _make_pipeline(scaler_names)
             estimator = ScalerSelector.get_scaler(name, **kwargs)
-            return Scaler(estimator)
+            return Scaler(estimator, global_fit=True)
 
         raise TypeError(
             f"Scaler config must be str, list, or dict. Got {type(scaler_cfg).__name__}."

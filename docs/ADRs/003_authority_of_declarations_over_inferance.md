@@ -39,6 +39,7 @@ This includes:
 
 - **Explicit over Magic:** If a parameter matters, it must be declared. No logic may be triggered by naming patterns or directory nesting.
 - **Authority of the DNA:** If a manifest says a model uses `AsymmetricQuantileLoss`, it *uses* that loss, regardless of where the script is located or what the model name suggests.
+- **No Parameter Spillover:** Authority is limited to relevance. A declaration in the DNA only has authority if it corresponds to a recognized gene for the chosen algorithm. Forcing a model to declare a parameter it cannot consume (e.g., `use_static_covariates` for N-BEATS) is a violation of the principle of Intentionality.
 - **No Implicit Fallbacks:** "Sensible defaults" are forbidden for parameters affecting model identity (stochastic seeds, loss hyperparameters, feature sets).
 
 ---

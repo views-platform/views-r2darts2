@@ -21,8 +21,9 @@ This repository adopts the invariant: **All architectural boundaries must declar
 ### 1. The Core Handshakes in `views-r2darts2`
 
 #### `views_pipeline_core` (DNA) -> `ModelCatalog`
-- **Contract:** The merged manifest (sourced from `views_models`) must contain all keys in `MANDATORY_MANIFEST`.
-- **Validation:** `ReproducibilityGate.Config.audit_manifest` is called before model instantiation to verify the handshake from the orchestration layer.
+- **Contract:** The merged manifest (sourced from `views_models`) must contain all keys in the relevant Genome.
+- **Validation:** `ReproducibilityGate.Config.audit_manifest` is called before model instantiation. 
+- **Dynamic Handshake:** The validation contract is not a fixed list but a state machine: once the `algorithm` is identified, the corresponding genomic requirements are loaded and audited. This ensures the boundary is as tight as possible without being bloated.
 - **Fail-Loud:** Missing or `None` values raise `MissingHyperparameterError`.
 
 #### Raw VIEWS DF -> `DataHandler`

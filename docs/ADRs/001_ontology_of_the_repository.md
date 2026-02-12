@@ -25,6 +25,8 @@ This repository defines a **closed set of conceptual categories** ("entities"). 
 ### 1. The DNA (Configurations)
 - **Purpose:** Authoritative declarations of an experiment's identity (hyperparameters, temporal steps, loss choices).
 - **Origin:** Delivered via `views_pipeline_core` as a merger of model-specific configs declared in the upstream orchestration repo `views_models`.
+- **Genomic Polymorphism:** The DNA is not monolithic. It consists of a **Core Genome** (universal parameters like `random_state`) and an **Algorithm-Specific Genome**. The requirements for an experiment's DNA are determined dynamically by the `algorithm` key. 
+- **Constraint:** Parameters irrelevant to a specific architecture (e.g., `use_static_covariates` for N-BEATS) are not permitted in its manifest.
 - **Authority:** Authoritative.
 - **Stability:** Evolving (new research needs new genes in `views_models`), but once a run starts, the DNA is immutable within this library.
 - **Must not contain:** Runtime logic or data tensors.

@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import torch
 from typing import List, Dict, Any, Union
 import logging
 from darts import TimeSeries
@@ -536,3 +537,20 @@ class ReproducibilityGate:
                             f"ADVERSARIAL OUTLIER DETECTED in {name}: "
                             f"Magnitude {abs_max:.2e} exceeds threshold {max_abs_val:.2e}"
                         )
+
+        @staticmethod
+        def lock_entropy(seed: int) -> None:
+            """
+            The Entropy Guardian.
+            Force-resets all RNG seeds to guarantee bit-perfect identity in
+            probabilistic distributions (e.g., MC Dropout) across reloads.
+            """
+            import random
+
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            # Note: torch.manual_seed also seeds all CUDA devices and MPS.
+            logger.info(f"Entropy Locked: RNG seeds reset to {seed}")

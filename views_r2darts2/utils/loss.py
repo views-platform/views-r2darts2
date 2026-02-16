@@ -333,25 +333,19 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
         device = preds.device
         dtype = preds.dtype
 
-        # Check for NaN/Inf in TARGETS (data issue) - these we can safely handle
-        if torch.isnan(targets).any() or torch.isinf(targets).any():
-            logger.warning("NaN or Inf detected in targets - replacing with 0")
-            targets = torch.nan_to_num(targets, nan=0.0, posinf=1e6, neginf=-1e6)
+        from views_r2darts2.utils.gates import NumericalSanityError
 
-        # Check for NaN/Inf in PREDICTIONS (model instability) - log but DON'T mask
-        # Masking predictions hides the problem and produces garbage gradients
-        nan_mask = torch.isnan(preds) | torch.isinf(preds)
-        if nan_mask.any():
-            nan_count = nan_mask.sum().item()
-            total_count = preds.numel()
-            nan_pct = 100 * nan_count / total_count
-            logger.warning(
-                f"NaN/Inf in predictions: {nan_count}/{total_count} ({nan_pct:.1f}%) - "
-                f"model is unstable! Check: learning_rate, gradient_clip, norm_type, d_model/nhead ratio"
-            )
-            # Replace with a large penalty value instead of 0 to create strong gradient signal
-            # This helps the optimizer correct the instability rather than ignoring it
-            preds = torch.where(nan_mask, torch.zeros_like(preds), preds)
+        # Check for NaN/Inf in TARGETS (data issue)
+        if torch.isnan(targets).any() or torch.isinf(targets).any():
+            error_msg = "Numerical Sanity Violation: NaN or Inf detected in targets."
+            logger.critical(error_msg)
+            raise NumericalSanityError(error_msg)
+
+        # Check for NaN/Inf in PREDICTIONS (model instability)
+        if torch.isnan(preds).any() or torch.isinf(preds).any():
+            error_msg = "Numerical Sanity Violation: NaN or Inf detected in predictions (model instability)."
+            logger.critical(error_msg)
+            raise NumericalSanityError(error_msg)
 
         # Identify non-zero targets and predictions (detach pred mask to prevent gradient flow)
         is_target_nonzero = torch.abs(targets) > self.threshold
@@ -394,13 +388,14 @@ class WeightedPenaltyHuberLoss(torch.nn.Module):
             delta_t * (abs_errors - 0.5 * delta_t),
         )
 
-        # Apply computed weights and handle potential NaN
+        # Apply computed weights
         weighted_loss = weights * huber_loss
 
         # Final NaN check
         if torch.isnan(weighted_loss).any():
-            logger.warning("NaN in weighted_loss, replacing with 0")
-            weighted_loss = torch.nan_to_num(weighted_loss, nan=0.0)
+            error_msg = "Numerical Sanity Violation: NaN in weighted_loss."
+            logger.critical(error_msg)
+            raise NumericalSanityError(error_msg)
 
         return torch.mean(weighted_loss)
 
@@ -506,10 +501,13 @@ class TweedieLoss(torch.nn.Module):
         device = preds.device
         dtype = preds.dtype
 
+        from views_r2darts2.utils.gates import NumericalSanityError
+
         # Handle NaN/Inf in targets
         if torch.isnan(targets).any() or torch.isinf(targets).any():
-            logger.warning("NaN or Inf detected in targets - replacing with 0")
-            targets = torch.nan_to_num(targets, nan=0.0, posinf=1e6, neginf=0.0)
+            error_msg = "Numerical Sanity Violation: NaN or Inf detected in targets."
+            logger.critical(error_msg)
+            raise NumericalSanityError(error_msg)
 
         # Ensure targets are non-negative (Tweedie requires y >= 0)
         targets = torch.clamp(targets, min=0.0)
@@ -519,16 +517,10 @@ class TweedieLoss(torch.nn.Module):
         preds_pos = F.softplus(preds) + self.eps
 
         # Handle NaN/Inf in predictions
-        nan_mask = torch.isnan(preds_pos) | torch.isinf(preds_pos)
-        if nan_mask.any():
-            nan_count = nan_mask.sum().item()
-            total_count = preds_pos.numel()
-            logger.warning(
-                f"NaN/Inf in predictions: {nan_count}/{total_count} - model unstable"
-            )
-            preds_pos = torch.where(
-                nan_mask, torch.full_like(preds_pos, self.eps), preds_pos
-            )
+        if torch.isnan(preds_pos).any() or torch.isinf(preds_pos).any():
+            error_msg = "Numerical Sanity Violation: NaN or Inf detected in predictions (model instability)."
+            logger.critical(error_msg)
+            raise NumericalSanityError(error_msg)
 
         # Tweedie deviance (dropping constant term that doesn't depend on predictions)
         # D(y, μ) ∝ μ^(2-p)/(2-p) - y*μ^(1-p)/(1-p)
@@ -563,8 +555,9 @@ class TweedieLoss(torch.nn.Module):
 
         # Final NaN check
         if torch.isnan(weighted_loss).any():
-            logger.warning("NaN in Tweedie loss, replacing with 0")
-            weighted_loss = torch.nan_to_num(weighted_loss, nan=0.0)
+            error_msg = "Numerical Sanity Violation: NaN in Tweedie loss."
+            logger.critical(error_msg)
+            raise NumericalSanityError(error_msg)
 
         return torch.mean(weighted_loss)
 

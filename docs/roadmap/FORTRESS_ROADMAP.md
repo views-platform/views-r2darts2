@@ -1,31 +1,60 @@
-# Fortress Roadmap: Strengthening the Reproducibility Infrastructure
+# Fortress: End-of-the-Road Roadmap
 
-This document outlines the high-priority tasks remaining to finalize the **Fortress Architecture** and achieve absolute scientific integrity in the forecasting pipeline.
+**Status:** Final Hardening Phase  
+**Objective:** Finalize the "Fortress" architecture to guarantee absolute scientific integrity, numerical precision, and configuration authority before merging.
 
-## 1. Entropy Locking (The Reloading Gap)
-**Goal:** Guarantee bit-perfect identity in probabilistic distributions across save/load cycles.
+---
 
-*   **The Problem:** While we verify that model weights are identical after reloading, the global RNG state (Torch, Numpy, Python) continues to evolve. Two identical models will produce different MC Dropout distributions if prediction starts at different points in the entropy stream.
-*   **The Solution:** Implement `ReproducibilityGate.Data.lock_entropy(seed)` to be called inside `forecaster.predict()`.
-*   **Action:** Force-reset `torch.manual_seed`, `np.random.seed`, and `cuda.manual_seed` immediately before the first sample is generated.
+## Phase 1: Mathematical Hardening & Numerical Integrity
+*Focus: Ensuring core operations are robust, explicit, and noise-free.*
 
-## 2. The Automated Scribe (Beige Team Defense)
-**Goal:** Eliminate mundane human transcription errors during hyperparameter transfer.
+### 1.1 Entropy Locking (The Reloading Gap)
+*   **The Problem:** MC Dropout distributions drift across save/load cycles because the global RNG state (Torch, Numpy) evolves.
+*   **The Solution:** Implement `ReproducibilityGate.Data.lock_entropy(seed)` called inside `forecaster.predict()`.
+*   **Action:** Force-reset `torch.manual_seed`, `np.random.seed`, and `cuda.manual_seed` immediately before sampling.
 
-*   **The Problem:** Users must manually copy "best" hyperparameters from WandB into `config_hyperparameters.py`. A single typo (e.g., `lr: 0.003` vs `0.0003`) causes a silent, deadly deviation.
-*   **The Solution:** Create a synchronization utility: `python -m views_r2darts2.utils.sync_run <wandb_run_id>`.
-*   **Action:**
-    1.  Download the run configuration via the WandB API.
-    2.  Validate it against the **Mandatory DNA Manifest**.
-    3.  Automatically overwrite the local `config_hyperparameters.py` with the audited values.
+### 1.2 The Great Numerical Purge (Anti-Silent-Fix)
+*   **The Problem:** `nan_to_num` or silent clipping masks model instability and data corruption.
+*   **The Solution:** Remove all silent correction logic in `utils/loss.py` and `DartsForecaster`.
+*   **Action:** Replace "fixes" with explicit `NumericalSanityError` assertions. Fixes must only happen upstream, outside this package.
 
-## 3. The Executioner's Handbook (Standardization)
-**Goal:** Formalize the new "Loud Failure" standard for all contributors.
+### 1.3 Loss Function Refactor (Ontological Separation)
+*   **The Problem:** A monolithic `loss.py` is difficult to test and maintain.
+*   **The Solution:** Move to `views_r2darts2/utils/loss/` directory.
+*   **Action:** Split each loss into its own file and standardize the interface via a common base class.
 
-*   **The Problem:** New or external developers may see the strict "Kill Gates" as bugs rather than features.
-*   **The Solution:** Update `README.md` or create `docs/FORTRESS_PROTOCOL.md`.
-*   **Action:**
-    1.  Define the **"No Magic Defaults"** rule.
-    2.  Explain the **Firewall Gates** (Starvation, Peeking, Continuity).
-    3.  Document the **Reproduction Certificate** produced at the start of every run.
-    4.  Clearly state: *“In this repository, a crash is a successful defense of scientific integrity.”*
+---
+
+## Phase 2: Genomic Handshake (Validation & Alignment)
+*Focus: Hardening the ReproducibilityGate to prevent configuration drift.*
+
+### 2.1 Optimizer & Loss Genomes
+*   **The Problem:** Missing or unknown hyperparameters for losses and optimizers cause undefined behavior.
+*   **The Solution:** Define mandatory genomes for all supported optimizers and custom losses.
+*   **Action:** Update `ReproducibilityGate` to raise hard errors on missing OR unknown keys.
+
+### 2.2 Darts & Model Alignment Audit
+*   **The Problem:** Misaligned hyperparameters (ghost parameters) create "Silent Lies" about model identity.
+*   **The Solution:** Cross-reference `ModelCatalog` with Darts source/docs.
+*   **Action:** Verify all exposed HPs exist in Darts, are passed correctly, and that no declared HP remains unused.
+
+---
+
+## Phase 3: The Red Team Audit (Verification)
+*Focus: Verification of scientific integrity.*
+
+### 3.1 Loss Function Test Suite (Red Team)
+*   **Action:** Create comprehensive tests for each loss function:
+    *   Verify gradients on controlled inputs.
+    *   Test edge cases (all-zeros, extreme spikes).
+    *   Confirm behavior matches mathematical Intent Contracts.
+
+### 3.2 Contributor Protocol (The Final Law)
+*   **Action:** Formalize `docs/contributor_protocols/fortress_protocol.md`:
+    *   Define the "No Magic Defaults" standard.
+    *   Document the "Crash as Success" philosophy.
+    *   Incorporate Phase 2 & 3 of the original roadmap (Automated Scribe postponed).
+
+---
+
+🖖 **"In this repository, a crash is a successful defense of scientific integrity."**

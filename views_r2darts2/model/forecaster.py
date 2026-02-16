@@ -44,6 +44,7 @@ class DartsForecaster:
         log_targets: bool = False,
         log_features: list[str] | None = None,
         feature_scaler_map: Optional[Dict[str, Any]] = None,
+        random_state: int = None,
     ):
         """
         Initializes the forecaster with dataset, model, partition information, and optional scalers.
@@ -59,38 +60,8 @@ class DartsForecaster:
             log_features (list[str], optional): List of feature names to apply log1p transform. Defaults to None.
             feature_scaler_map (dict, optional): Mapping of scalers to specific feature groups.
                 When provided, this takes precedence over feature_scaler.
-
-                Supported formats:
-
-                1. Named group format:
-                ```python
-                {
-                    "conflict": {
-                        "scaler": "RobustScaler",
-                        "features": ["ged_sb", "ged_ns", "acled_sb"]
-                    },
-                    "wdi": {
-                        "scaler": "StandardScaler",
-                        "features": ["wdi_ny_gdp_mktp_kd"]
-                    },
-                    "vdem": {
-                        "scaler": "MinMaxScaler",
-                        "features": ["vdem_v2x_polyarchy"]
-                    }
-                }
-                ```
-
-                2. Simple format:
-                ```python
-                {
-                    "RobustScaler": ["ged_sb", "ged_ns", "acled_sb"],
-                    "StandardScaler": ["wdi_ny_gdp_mktp_kd"],
-                    "MinMaxScaler": ["vdem_v2x_polyarchy"]
-                }
-                ```
-
-                Features not listed in feature_scaler_map will use feature_scaler as default.
-
+            random_state (int): Random seed for reproducibility. Mandatory.
+...
         Attributes:
             dataset (_ViewsDatasetDarts): The provided dataset.
             model (TorchForecastingModel): The forecasting model.
@@ -104,6 +75,7 @@ class DartsForecaster:
             target_scaler (Scaler or None): Target scaler instance if provided.
             feature_scaler (Scaler, FeatureScalerManager, or None): Feature scaler instance.
             device (torch.device): Device used for model computation.
+            random_state (int): Captured random seed for entropy locking.
 
         Logs:
             Information about selected scalers and device.
@@ -112,6 +84,12 @@ class DartsForecaster:
         self.model = model
         self._train_start, self._train_end = partition_dict["train"]
         self._test_start, self._test_end = partition_dict["test"]
+
+        if random_state is None:
+            raise ValueError(
+                "MANDATORY PARAMETER MISSING: random_state must be provided to DartsForecaster."
+            )
+        self.random_state = random_state
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler
@@ -641,6 +619,9 @@ class DartsForecaster:
         Raises:
             Exception: If an error occurs during prediction.
         """
+        # LOCK ENTROPY: Guarantee bit-perfect identity for probabilistic samples
+        ReproducibilityGate.Data.lock_entropy(self.random_state)
+
         timeseries = self.dataset.as_darts_timeseries()
 
         # Get the input window for forecasting based on sequence_number
@@ -698,8 +679,15 @@ class DartsForecaster:
         df = pd.DataFrame(results)
         df = df.set_index([self.dataset._time_id, self.dataset._entity_id])
 
-        # Force nan to 0
-        df = df.fillna(0)
+        # Numerical Sanity Check: Ensure no NaNs leaked through the inverse pipeline
+        # (df.fillna(0) is forbidden by ADR-010 and ADR-008)
+        if df.isna().any().any():
+            from views_r2darts2.utils.gates import NumericalSanityError
+
+            error_msg = "Numerical Sanity Violation: NaNs detected in final prediction DataFrame."
+            logger.critical(error_msg)
+            raise NumericalSanityError(error_msg)
+
         return df.sort_index()
 
     def save_model(self, path: str) -> None:

@@ -198,6 +198,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             feature_scaler=active_config.get("feature_scaler", None),
             target_scaler=active_config.get("target_scaler", None),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
+            random_state=active_config["random_state"],
         )
         forecaster.train()
 
@@ -282,6 +283,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             log_targets=active_config.get("log_targets", False),
             log_features=active_config.get("log_features", []),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
+            random_state=active_config["random_state"],
         )
         forecaster.load_model(path=path_artifact)
 
@@ -404,6 +406,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             log_targets=active_config.get("log_targets", False),
             log_features=active_config.get("log_features", []),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
+            random_state=active_config["random_state"],
         )
         forecaster.load_model(path=path_artifact)
 

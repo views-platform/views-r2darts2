@@ -103,6 +103,9 @@ class TestScalingRobustness:
         """
         # Mock config similar to HP sweep
         config = {
+            "run_type": "test",
+            "num_samples": 1,
+            "mc_dropout": False,
             "algorithm": "NBEATSModel",
             "targets": ["target"],
             "steps": list(range(1, 37)),

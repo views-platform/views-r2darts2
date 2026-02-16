@@ -65,4 +65,21 @@
 
 ---
 
+## Phase 4: Deep Fortress Hardening (Post-Falsification)
+*Focus: Eliminating all remaining silent inferences identified by the Red Team Falsification Suite.*
+
+### 4.1 Strict Catalog Locking & Whitelisting
+*   **The Breach:** Catalogs currently allow unregistered optimizers (like Adagrad) and infer defaults for standard losses (HuberLoss delta=1.0).
+*   **The Solution:** 
+    *   `OptimizerCatalog` must reject any optimizer not in `OPTIMIZER_GENOMES`.
+    *   `LossCatalog` must remove all `.get(key, default)` logic.
+    *   Standard losses (MSE, L1) must have explicit empty genomes; `HuberLoss` must have a mandatory `delta`.
+
+### 4.2 ModelCatalog Genomic Firewall
+*   **The Breach:** Direct usage of `ModelCatalog` bypasses the Manager's audit, allowing models to be instantiated with missing genes until they crash deep in the framework.
+*   **The Solution:** Move `ReproducibilityGate.Config.audit_manifest` inside `ModelCatalog.__init__`.
+*   **Action:** Ensure the catalog itself is a gatekeeper, not just a factory.
+
+---
+
 🖖 **"In this repository, a crash is a successful defense of scientific integrity."**

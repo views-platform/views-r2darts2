@@ -171,6 +171,10 @@ class ModelCatalog:
         """
         Initializes the model catalog with configuration parameters.
         """
+        # GENOMIC FIREWALL: Audit the manifest immediately upon entry
+        # This protects against direct instantiation that bypasses the Manager
+        ReproducibilityGate.Config.audit_manifest(config)
+
         self.models = {
             "NBEATSModel": self._get_nbeats,
             "NHiTSModel": self._get_nhits,

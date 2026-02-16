@@ -38,7 +38,12 @@ class OptimizerCatalog:
         """
         from views_r2darts2.utils.gates import ReproducibilityGate
         
-        opt_genome = ReproducibilityGate.Config.OPTIMIZER_GENOMES.get(self.opt_name, ["lr", "weight_decay"])
+        if self.opt_name not in ReproducibilityGate.Config.OPTIMIZER_GENOMES:
+            error_msg = f"UNREGISTERED OPTIMIZER: '{self.opt_name}' is not in the Fortress whitelist. Please register its genome."
+            logger.critical(error_msg)
+            raise ValueError(error_msg)
+        
+        opt_genome = ReproducibilityGate.Config.OPTIMIZER_GENOMES[self.opt_name]
         valid_kwargs = {k: v for k, v in self._all_potential_args.items() if k in opt_genome}
         
         # Enforce No-Defaults Rule: All genes in the genome must be explicitly declared (not None)

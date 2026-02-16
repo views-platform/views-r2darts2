@@ -80,7 +80,10 @@ class LossCatalog:
         if cls.__module__.startswith("torch.nn"):
              # Filter recognized args for HuberLoss
              if self.loss_name == "HuberLoss":
-                 return cls(delta=self.config.get("delta", 1.0))
+                 delta = self.config.get("delta")
+                 if delta is None:
+                     raise ValueError("MANDATORY LOSS GENES MISSING for HuberLoss: ['delta']")
+                 return cls(delta=delta)
              return cls()
 
         # For custom Fortress losses, filter using the registered Genome in the Gate

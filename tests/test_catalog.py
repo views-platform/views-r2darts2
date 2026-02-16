@@ -17,6 +17,10 @@ from darts.models.forecasting.dlinear import DLinearModel
 def basic_config():
     """Fixture providing a basic configuration dictionary."""
     return {
+        "run_type": "test",
+        "num_samples": 1,
+        "mc_dropout": False,
+        "algorithm": "NLinearModel",
         "steps": [1, 2, 3],
         "input_chunk_length": 48,
         "output_chunk_length": 3,
@@ -106,6 +110,10 @@ def basic_config():
 def full_config():
     """Fixture providing a full configuration with all parameters."""
     return {
+        "run_type": "test",
+        "num_samples": 1,
+        "mc_dropout": False,
+        "algorithm": "NLinearModel",
         "steps": [1, 2, 3, 6, 12],
         "input_chunk_length": 48,
         "output_chunk_length": 5,
@@ -309,7 +317,8 @@ class TestNBEATSModel:
     @patch("torch.serialization.add_safe_globals")
     def test_nbeats_default_params(self, mock_safe_globals, basic_config):
         """Test N-BEATS model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "NBEATSModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_nbeats()
 
         assert isinstance(model, NBEATSModel)
@@ -320,6 +329,7 @@ class TestNBEATSModel:
         """Test N-BEATS model with custom parameters."""
         config = {
             **basic_config,
+            "algorithm": "NBEATSModel",
             "input_chunk_length": 24,
             "num_stacks": 5,
             "num_blocks": 3,
@@ -333,7 +343,8 @@ class TestNBEATSModel:
     @patch("torch.serialization.add_safe_globals")
     def test_nbeats_uses_config_loss(self, mock_safe_globals, basic_config):
         """Test that N-BEATS model is configured with loss function."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "NBEATSModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_nbeats()
 
         # Verify the model was created successfully
@@ -348,7 +359,8 @@ class TestTFTModel:
     @patch("torch.serialization.add_safe_globals")
     def test_tft_default_params(self, mock_safe_globals, basic_config):
         """Test TFT model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "TFTModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_tft_model()
 
         assert isinstance(model, TFTModel)
@@ -359,6 +371,7 @@ class TestTFTModel:
         """Test TFT model with custom parameters."""
         config = {
             **basic_config,
+            "algorithm": "TFTModel",
             "input_chunk_length": 36,
             "hidden_size": 512,
             "num_attention_heads": 8,
@@ -376,7 +389,8 @@ class TestTCNModel:
     @patch("torch.serialization.add_safe_globals")
     def test_tcn_default_params(self, mock_safe_globals, basic_config):
         """Test TCN model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "TCNModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_tcn_model()
 
         assert isinstance(model, TCNModel)
@@ -387,6 +401,7 @@ class TestTCNModel:
         """Test TCN model with custom kernel size."""
         config = {
             **basic_config,
+            "algorithm": "TCNModel",
             "kernel_size": 5,
             "num_filters": 128,
         }
@@ -402,7 +417,8 @@ class TestBlockRNNModel:
     @patch("torch.serialization.add_safe_globals")
     def test_rnn_default_params(self, mock_safe_globals, basic_config):
         """Test RNN model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "BlockRNNModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_rnn_model()
 
         assert isinstance(model, BlockRNNModel)
@@ -413,6 +429,7 @@ class TestBlockRNNModel:
         """Test RNN model with custom RNN type."""
         config = {
             **basic_config,
+            "algorithm": "BlockRNNModel",
             "rnn_type": "GRU",
             "hidden_dim": 128,
             "n_rnn_layers": 3,
@@ -429,7 +446,8 @@ class TestTransformerModel:
     @patch("torch.serialization.add_safe_globals")
     def test_transformer_default_params(self, mock_safe_globals, basic_config):
         """Test Transformer model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "TransformerModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_transformer_model()
 
         assert isinstance(model, TransformerModel)
@@ -440,6 +458,7 @@ class TestTransformerModel:
         """Test Transformer with custom encoder/decoder layers."""
         config = {
             **basic_config,
+            "algorithm": "TransformerModel",
             "num_encoder_layers": 6,
             "num_decoder_layers": 6,
             "d_model": 128,
@@ -456,7 +475,8 @@ class TestTSMixerModel:
     @patch("torch.serialization.add_safe_globals")
     def test_tsmixer_default_params(self, mock_safe_globals, basic_config):
         """Test TSMixer model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "TSMixerModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_tsmixer_model()
 
         assert isinstance(model, TSMixerModel)
@@ -467,6 +487,7 @@ class TestTSMixerModel:
         """Test TSMixer with custom number of blocks."""
         config = {
             **basic_config,
+            "algorithm": "TSMixerModel",
             "num_blocks": 4,
             "hidden_size": 128,
         }
@@ -482,7 +503,8 @@ class TestNLinearModel:
     @patch("torch.serialization.add_safe_globals")
     def test_nlinear_default_params(self, mock_safe_globals, basic_config):
         """Test NLinear model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "NLinearModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_nlinear_model()
 
         assert isinstance(model, NLinearModel)
@@ -493,6 +515,7 @@ class TestNLinearModel:
         """Test NLinear with shared weights enabled."""
         config = {
             **basic_config,
+            "algorithm": "NLinearModel",
             "shared_weights": True,
         }
         catalog = ModelCatalog(config)
@@ -507,7 +530,8 @@ class TestDLinearModel:
     @patch("torch.serialization.add_safe_globals")
     def test_dlinear_default_params(self, mock_safe_globals, basic_config):
         """Test DLinear model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "DLinearModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_dlinear_model()
 
         assert isinstance(model, DLinearModel)
@@ -518,6 +542,7 @@ class TestDLinearModel:
         """Test DLinear with custom kernel size."""
         config = {
             **basic_config,
+            "algorithm": "DLinearModel",
             "kernel_size": 50,
         }
         catalog = ModelCatalog(config)
@@ -532,7 +557,8 @@ class TestTiDEModel:
     @patch("torch.serialization.add_safe_globals")
     def test_tide_default_params(self, mock_safe_globals, basic_config):
         """Test TiDE model creation with default parameters."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "TiDEModel"}
+        catalog = ModelCatalog(config)
         model = catalog._get_tide_model()
 
         assert isinstance(model, TiDEModel)
@@ -543,6 +569,7 @@ class TestTiDEModel:
         """Test TiDE model with custom parameters."""
         config = {
             **basic_config,
+            "algorithm": "TiDEModel",
             "input_chunk_length": 48,
             "num_encoder_layers": 2,
             "num_decoder_layers": 2,
@@ -563,6 +590,10 @@ class TestConfigurationHandling:
         # Valid: steps=6, ocl=3
         config_valid = {
             **basic_config,
+            "run_type": "test",
+            "num_samples": 1,
+            "mc_dropout": False,
+            "algorithm": "NBEATSModel",
             "steps": [1, 2, 3, 4, 5, 6],
             "output_chunk_length": 3,
         }
@@ -573,6 +604,10 @@ class TestConfigurationHandling:
         # Invalid: steps=5, ocl=3
         config_invalid = {
             **basic_config,
+            "run_type": "test",
+            "num_samples": 1,
+            "mc_dropout": False,
+            "algorithm": "NBEATSModel",
             "steps": [1, 2, 3, 4, 5],
             "output_chunk_length": 3,
         }
@@ -583,15 +618,26 @@ class TestConfigurationHandling:
             catalog_invalid._get_nbeats()
 
         # Missing OCL
-        config_missing = {**basic_config, "steps": [1, 2, 3]}
-        del config_missing["output_chunk_length"]
-        catalog_missing = ModelCatalog(config_missing)
-        with pytest.raises(KeyError, match="output_chunk_length"):
-            catalog_missing._get_nbeats()
+        config_missing = {
+            **basic_config,
+            "run_type": "test",
+            "num_samples": 1,
+            "mc_dropout": False,
+            "algorithm": "NBEATSModel",
+            "steps": [1, 2, 3]
+        }
+        # output_chunk_length is already missing if not in basic_config or deleted
+        if "output_chunk_length" in config_missing:
+            del config_missing["output_chunk_length"]
+            
+        from views_r2darts2.utils.gates import MissingHyperparameterError
+        with pytest.raises(MissingHyperparameterError, match="REPRODUCIBILITY CONTRACT VIOLATED"):
+            ModelCatalog(config_missing)
 
     def test_optimizer_config_applied(self, basic_config):
         """Test that optimizer values are correctly applied."""
-        catalog = ModelCatalog(basic_config)
+        config = {**basic_config, "algorithm": "NLinearModel"}
+        catalog = ModelCatalog(config)
         kwargs = catalog.opt_catalog.get_optimizer_kwargs()
         assert kwargs["lr"] == 3e-4
         assert kwargs["weight_decay"] == 1e-3

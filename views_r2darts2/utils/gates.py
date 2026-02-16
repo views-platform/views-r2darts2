@@ -152,6 +152,7 @@ class ReproducibilityGate:
                 "use_static_covariates",
                 "full_attention",
                 "use_reversible_instance_norm",
+                "norm_type",
                 "skip_interpolation",
                 "hidden_continuous_size",
             ],

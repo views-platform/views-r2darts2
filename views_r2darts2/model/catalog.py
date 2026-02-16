@@ -286,7 +286,7 @@ class ModelCatalog:
             num_attention_heads=self.config.get("num_attention_heads"),
             hidden_size=self.config.get("hidden_size"),
             dropout=self.config.get("dropout"),
-            norm_type=self.config.get("norm_type", "RMSNorm"),
+            norm_type=self.config.get("norm_type"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
             skip_interpolation=self.config.get("skip_interpolation"),
             hidden_continuous_size=self.config.get("hidden_continuous_size"),
@@ -351,33 +351,12 @@ class ModelCatalog:
 
     def _get_transformer_model(self):
         torch.serialization.add_safe_globals([TransformerModel, LossCatalog])
-
-        d_model = self.config.get("d_model")
-        nhead = self.config.get("nhead", self.config.get("num_attention_heads"))
-
-        # Validate d_model is divisible by nhead
-        if d_model % nhead != 0:
-            import logging
-
-            logging.warning(
-                f"d_model ({d_model}) not divisible by nhead ({nhead}). "
-                f"Adjusting nhead to {d_model // (d_model // nhead)}."
-            )
-            nhead = max(1, d_model // 32)  # Ensure at least 32 dims per head
-
         ReproducibilityGate.Config.audit_architecture(self.config)
 
-        # Merge common args with custom pl_trainer_kwargs for anomaly detection
-        common_args = self._get_common_model_args()
-        common_args["pl_trainer_kwargs"] = {
-            **common_args["pl_trainer_kwargs"],
-            "detect_anomaly": self.config.get("detect_anomaly"),
-        }
-
         return TransformerModel(
-            **common_args,
-            d_model=d_model,
-            nhead=nhead,
+            **self._get_common_model_args(),
+            d_model=self.config.get("d_model"),
+            nhead=self.config.get("nhead"),
             num_encoder_layers=self.config.get("num_encoder_layers"),
             num_decoder_layers=self.config.get("num_decoder_layers"),
             dim_feedforward=self.config.get("dim_feedforward"),

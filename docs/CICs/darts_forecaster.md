@@ -64,6 +64,7 @@ The `DartsForecaster` is a stateful wrapper that manages the tight coupling betw
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Managed by `DartsForecastingModelManager`.
+- **Physical Zen:** Lives in `views_r2darts2/model/darts_forecaster.py`.
 - **Downstream:** Orchestrates `FeatureScalerManager` and specific Darts `TorchForecastingModel` instances.
 - **Validator:** Deeply coupled with `ReproducibilityGate` for boundary auditing.
 

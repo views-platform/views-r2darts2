@@ -64,6 +64,7 @@ The Monitoring Callbacks (`NaNDetectionCallback` and `GradientHealthCallback`) p
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Orchestrated by `ModelCatalog` which attaches them to the Trainer.
+- **Physical Zen:** Lives in `views_r2darts2/utils/callbacks.py`.
 - **Downstream:** Closely monitors the model weights and training loop outputs.
 - **Abstractions:** Treat the Darts/Lightning training loop as an opaque source of tensors.
 

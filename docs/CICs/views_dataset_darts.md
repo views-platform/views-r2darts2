@@ -59,6 +59,7 @@ The `_ViewsDatasetDarts` class acts as the **Data Airlock** for the repository. 
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Consumes dataframes from `views_pipeline_core`.
+- **Physical Zen:** Lives in `views_r2darts2/data/views_dataset_darts.py`.
 - **Downstream:** Provides data to `DartsForecaster`.
 - **Gatekeeper:** Invokes `ReproducibilityGate.Data` during initialization to verify the "Handshake" (ADR-009).
 

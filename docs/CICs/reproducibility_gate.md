@@ -62,6 +62,7 @@ The `ReproducibilityGate` is "The Law" of the repository. It is a stateless util
 
 - **Universal Utility:** Accessible and consumed by all layers (Data, Model, and Manager).
 - **Independent:** Must remain stateless and dependency-free (ADR-002 Layer 0).
+- **Physical Zen:** Lives in `views_r2darts2/utils/reproducibility_gate.py`.
 - **Master Auditor:** Validates the handshake between `views_pipeline_core` and the local codebase.
 
 ---

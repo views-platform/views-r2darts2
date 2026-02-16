@@ -62,6 +62,7 @@ The `FeatureScalerManager` is a specialized orchestrator responsible for applyin
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Orchestrated by `DartsForecaster`.
+- **Physical Zen:** Lives in `views_r2darts2/utils/feature_scaler_manager.py`.
 - **Factory:** Depends on `ScalerSelector` for individual estimator instantiation.
 - **Framework:** Tight coupling with `darts.dataprocessing.transformers.Scaler` and `Pipeline`.
 

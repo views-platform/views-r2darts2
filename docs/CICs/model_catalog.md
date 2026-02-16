@@ -28,42 +28,36 @@ The `ModelCatalog` acts as the central factory for translating abstract DNA mani
 
 - **Guarantees Architectural Alignment:** Validates that the model's `output_chunk_length` is mathematically compatible with the forecast `steps` (ADR-009).
 - **Ensures Fail-Loud Initialization:** Guarantees that models are never initialized with "magic defaults." Every architecture-defining parameter must come from the DNA.
-- **Translates Optimization DNA:** Correctly maps string identifiers (e.g., "Adam") to concrete PyTorch classes (`torch.optim.Adam`) and injects scheduler configurations.
-- **Configures Fortress Callbacks:** Automatically attaches mandatory monitoring callbacks (`NaNDetection`, `GradientHealth`) to every PyTorch Lightning trainer.
-- **Manages Loss Selection:** Orchestrates the `LossSelector` to instantiate complex, custom loss functions with the correct hyperparameter injection.
+- **Delegates Configuration Auditing:** Orchestrates `LossCatalog` and `OptimizerCatalog` to ensure total genomic compliance for optimization and objective functions.
+- **Configures Fortress Callbacks:** Automatically attaches mandatory monitoring callbacks (e.g., `GradientHealth`) to every PyTorch Lightning trainer.
 
 ---
 
 ## 4. Inputs and Assumptions
 
-- **Polymorphic Config:** Assumes a configuration dictionary that has already passed the `ReproducibilityGate.Config` audit.
-- **Darts API:** Assumes the underlying Darts model constructors are compatible with the provided hyperparameter mappings.
+- **Polymorphic Config:** Assumes a configuration dictionary that has already passed the `ReproducibilityGate.Config.audit_manifest` check (The Genomic Firewall).
 
 ---
 
 ## 5. Outputs and Side Effects
 
 - **Instantiated Models:** Produces a concrete subclass of `TorchForecastingModel` (e.g., `NBEATSModel`).
-- **Loss Objects:** Instantiates `torch.nn.Module` objects for the objective function.
-- **Side Effects:** Configures the global `torch.serialization.add_safe_globals` to ensure custom modules can be pickled.
+- **Side Effects:** None. This is a pure factory.
 
 ---
 
 ## 6. Failure Modes and Loudness
 
-- **Unknown Algorithm:** Raises `ValueError` if the requested model name is not in the registry.
-- **Missing Genome:** Raises `KeyError` (via gate or direct access) if a required algorithm-specific hyperparameter is missing.
+- **Unknown Algorithm:** Raises `ValueError` if the requested model name is not in the whitelist.
 - **Mathematical Mismatch:** Raises `ArchitectureMismatchError` if `steps % output_chunk_length != 0`.
-- **Invalid Optimizer:** Raises `ValueError` if the requested `optimizer_cls` is not a valid `torch.optim` attribute.
 
 ---
 
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Managed by `DartsForecastingModelManager`.
-- **Downstream:** Produces models consumed by `DartsForecaster`.
-- **Validator:** Consults `ReproducibilityGate` for architectural audits.
-- **Specialized Factory:** Depends on `LossSelector` for objective function instantiation.
+- **Physical Zen:** Lives in `views_r2darts2/model/model_catalog.py`.
+- **Specialized Factories:** Depends on `LossCatalog` and `OptimizerCatalog`.
 
 ---
 

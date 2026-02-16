@@ -35,7 +35,7 @@ class OptimizerCatalog:
         """
         Extracts and validates optimizer hyperparameters using the registered Genome.
         """
-        from views_r2darts2.utils.gates import ReproducibilityGate
+        from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
         
         if self.opt_name not in ReproducibilityGate.Config.OPTIMIZER_GENOMES:
             available_opts = list(ReproducibilityGate.Config.OPTIMIZER_GENOMES.keys())

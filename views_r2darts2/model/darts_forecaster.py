@@ -5,9 +5,10 @@ from typing import List, Dict, Any, Optional
 import torch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
-from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager
-from views_r2darts2.data.handlers import _ViewsDatasetDarts
-from views_r2darts2.utils.gates import ReproducibilityGate
+from views_r2darts2.utils.scaler_selector import ScalerSelector
+from views_r2darts2.utils.feature_scaler_manager import FeatureScalerManager
+from views_r2darts2.data.views_dataset_darts import _ViewsDatasetDarts
+from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
 from darts.dataprocessing.transformers import Scaler
 
 import logging
@@ -682,7 +683,7 @@ class DartsForecaster:
         # Numerical Sanity Check: Ensure no NaNs leaked through the inverse pipeline
         # (df.fillna(0) is forbidden by ADR-010 and ADR-008)
         if df.isna().any().any():
-            from views_r2darts2.utils.gates import NumericalSanityError
+            from views_r2darts2.utils.exceptions import NumericalSanityError
 
             error_msg = "Numerical Sanity Violation: NaNs detected in final prediction DataFrame."
             logger.critical(error_msg)

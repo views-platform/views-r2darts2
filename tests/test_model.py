@@ -3,10 +3,10 @@
 # import torch
 # from pathlib import Path
 # from unittest.mock import Mock, MagicMock, patch, call, mock_open
-# from views_r2darts2.manager.model import DartsForecastingModelManager, custom_torch_load
+# from views_r2darts2.manager.darts_forecasting_model_manager import DartsForecastingModelManager, apply_torch_load_patch
 # from views_pipeline_core.managers.model import ModelPathManager
 # from views_r2darts2.model.forecaster import DartsForecaster
-# from views_r2darts2.data.handlers import _ViewsDatasetDarts
+# from views_r2darts2.data.views_dataset_darts import _ViewsDatasetDarts
 # from views_r2darts2.model.catalog import ModelCatalog
 
 
@@ -53,9 +53,9 @@
 # @pytest.fixture
 # def model_manager(mock_model_path, mock_config, mock_data_loader):
 #     """Create a DartsForecastingModelManager instance."""
-#     with patch('views_r2darts2.manager.model.ForecastingModelManager.__init__', return_value=None) as mock_init, \
-#          patch('views_r2darts2.manager.model.torch.load'), \
-#          patch('views_r2darts2.manager.model.logger'):
+#     with patch('views_r2darts2.manager.darts_forecasting_model_manager.ForecastingModelManager.__init__', return_value=None) as mock_init, \
+#          patch('views_r2darts2.manager.darts_forecasting_model_manager.torch.load'), \
+#          patch('views_r2darts2.manager.darts_forecasting_model_manager.logger'):
 #         # Manually set configs after mocking __init__
 #         manager = DartsForecastingModelManager.__new__(DartsForecastingModelManager)
 #         # Set the private attribute that backs the configs property
@@ -75,35 +75,35 @@
 
 
 # class TestCustomTorchLoad:
-#     """Tests for custom_torch_load function."""
+#     """Tests for apply_torch_load_patch function."""
 
-#     def test_custom_torch_load_sets_weights_only_false(self):
-#         """Test that custom_torch_load sets weights_only=False by default."""
+#     def test_apply_torch_load_patch_sets_weights_only_false(self):
+#         """Test that apply_torch_load_patch sets weights_only=False by default."""
 #         mock_original = Mock()
 
-#         with patch('views_r2darts2.manager.model._original_torch_load', mock_original):
-#             custom_torch_load("model.pt")
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager._original_torch_load', mock_original):
+#             apply_torch_load_patch("model.pt")
 
 #             mock_original.assert_called_once()
 #             call_kwargs = mock_original.call_args[1]
 #             assert call_kwargs['weights_only'] is False
 
-#     def test_custom_torch_load_respects_explicit_weights_only(self):
-#         """Test that custom_torch_load respects explicitly set weights_only parameter."""
+#     def test_apply_torch_load_patch_respects_explicit_weights_only(self):
+#         """Test that apply_torch_load_patch respects explicitly set weights_only parameter."""
 #         mock_original = Mock()
 
-#         with patch('views_r2darts2.manager.model._original_torch_load', mock_original):
-#             custom_torch_load("model.pt", weights_only=True)
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager._original_torch_load', mock_original):
+#             apply_torch_load_patch("model.pt", weights_only=True)
 
 #             call_kwargs = mock_original.call_args[1]
 #             assert call_kwargs['weights_only'] is True
 
-#     def test_custom_torch_load_passes_all_args(self):
-#         """Test that custom_torch_load passes all arguments correctly."""
+#     def test_apply_torch_load_patch_passes_all_args(self):
+#         """Test that apply_torch_load_patch passes all arguments correctly."""
 #         mock_original = Mock()
 
-#         with patch('views_r2darts2.manager.model._original_torch_load', mock_original):
-#             custom_torch_load("model.pt", map_location="cpu", pickle_module=None)
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager._original_torch_load', mock_original):
+#             apply_torch_load_patch("model.pt", map_location="cpu", pickle_module=None)
 
 #             mock_original.assert_called_once_with(
 #                 "model.pt",
@@ -112,13 +112,13 @@
 #                 weights_only=False
 #             )
 
-#     def test_custom_torch_load_returns_result(self):
-#         """Test that custom_torch_load returns the result from original function."""
+#     def test_apply_torch_load_patch_returns_result(self):
+#         """Test that apply_torch_load_patch returns the result from original function."""
 #         mock_result = {"state": "data"}
 #         mock_original = Mock(return_value=mock_result)
 
-#         with patch('views_r2darts2.manager.model._original_torch_load', mock_original):
-#             result = custom_torch_load("model.pt")
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager._original_torch_load', mock_original):
+#             result = apply_torch_load_patch("model.pt")
 
 #             assert result == mock_result
 
@@ -128,9 +128,9 @@
 
 #     def test_initialization(self, mock_model_path):
 #         """Test model manager initialization."""
-#         with patch('views_r2darts2.manager.model.ForecastingModelManager.__init__', return_value=None) as mock_super_init, \
-#              patch('views_r2darts2.manager.model.torch') as mock_torch, \
-#              patch('views_r2darts2.manager.model.logger') as mock_logger:
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.ForecastingModelManager.__init__', return_value=None) as mock_super_init, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.torch') as mock_torch, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.logger') as mock_logger:
 
 #             # Create instance and manually set configs before __init__
 #             manager = DartsForecastingModelManager.__new__(DartsForecastingModelManager)
@@ -151,16 +151,16 @@
 #             )
 
 #             # Verify torch.load was overridden
-#             assert mock_torch.load == custom_torch_load
+#             assert mock_torch.load == apply_torch_load_patch
 
 #             # Verify logger was called
 #             mock_logger.info.assert_called_once()
 
 #     def test_initialization_logs_algorithm(self, mock_model_path):
 #         """Test that initialization logs the algorithm."""
-#         with patch('views_r2darts2.manager.model.ForecastingModelManager.__init__', return_value=None), \
-#              patch('views_r2darts2.manager.model.torch'), \
-#              patch('views_r2darts2.manager.model.logger') as mock_logger:
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.ForecastingModelManager.__init__', return_value=None), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.torch'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.logger') as mock_logger:
 
 #             # Create instance and manually set configs
 #             manager = DartsForecastingModelManager.__new__(DartsForecastingModelManager)
@@ -174,9 +174,9 @@
 
 #     def test_initialization_with_default_parameters(self, mock_model_path):
 #         """Test initialization with default parameters."""
-#         with patch('views_r2darts2.manager.model.ForecastingModelManager.__init__', return_value=None) as mock_super_init, \
-#              patch('views_r2darts2.manager.model.torch'), \
-#              patch('views_r2darts2.manager.model.logger'):
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.ForecastingModelManager.__init__', return_value=None) as mock_super_init, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.torch'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.logger'):
 
 #             # Create instance and manually set configs
 #             manager = DartsForecastingModelManager.__new__(DartsForecastingModelManager)
@@ -195,11 +195,11 @@
 #         mock_model = Mock()
 #         mock_forecaster = Mock(spec=DartsForecaster)
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts') as mock_dataset, \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster) as mock_forecaster_class, \
-#              patch('views_r2darts2.manager.model.generate_model_file_name', return_value='model_test.pt'):
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts') as mock_dataset, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster) as mock_forecaster_class, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.generate_model_file_name', return_value='model_test.pt'):
 
 #             mock_catalog_instance = Mock()
 #             mock_catalog_instance.get_model.return_value = mock_model
@@ -235,10 +235,10 @@
 #         mock_model = Mock()
 #         mock_forecaster = Mock(spec=DartsForecaster)
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster):
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster):
 
 #             mock_catalog_instance = Mock()
 #             mock_catalog_instance.get_model.return_value = mock_model
@@ -258,10 +258,10 @@
 #         mock_model = Mock()
 #         mock_forecaster = Mock(spec=DartsForecaster)
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster) as mock_forecaster_class:
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster) as mock_forecaster_class:
 
 #             mock_catalog_instance = Mock()
 #             mock_catalog_instance.get_model.return_value = mock_model
@@ -281,10 +281,10 @@
 #         mock_prediction = pd.DataFrame({'pred': [1, 2, 3]})
 #         mock_forecaster.predict.return_value = mock_prediction
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster), \
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster), \
 #              patch.object(
 #                  DartsForecastingModelManager,
 #                  '_resolve_evaluation_sequence_number',
@@ -316,10 +316,10 @@
 #         mock_prediction = pd.DataFrame({'pred': [1, 2, 3]})
 #         mock_forecaster.predict.return_value = mock_prediction
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster), \
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster), \
 #              patch.object(
 #                  DartsForecastingModelManager,
 #                  '_resolve_evaluation_sequence_number',
@@ -348,10 +348,10 @@
 #         mock_prediction = pd.DataFrame({'pred': [1, 2, 3]})
 #         mock_forecaster.predict.return_value = mock_prediction
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster), \
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster), \
 #              patch.object(
 #                  DartsForecastingModelManager,
 #                  '_resolve_evaluation_sequence_number',
@@ -376,10 +376,10 @@
 #         mock_model = Mock()
 #         mock_forecaster = Mock(spec=DartsForecaster)
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster), \
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster), \
 #              patch.object(
 #                  DartsForecastingModelManager,
 #                  '_resolve_evaluation_sequence_number',
@@ -406,10 +406,10 @@
 #         mock_prediction = pd.DataFrame({'pred': [1, 2, 3]})
 #         mock_forecaster.predict.return_value = mock_prediction
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster):
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster):
 
 #             mock_catalog_instance = Mock()
 #             mock_catalog_instance.get_model.return_value = mock_model
@@ -431,10 +431,10 @@
 #         mock_model = Mock()
 #         mock_forecaster = Mock(spec=DartsForecaster)
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster):
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster):
 
 #             mock_catalog_instance = Mock()
 #             mock_catalog_instance.get_model.return_value = mock_model
@@ -494,11 +494,11 @@
 #         mock_prediction = pd.DataFrame({'pred': [1, 2, 3]})
 #         mock_forecaster.predict.return_value = mock_prediction
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster), \
-#              patch('views_r2darts2.manager.model.generate_model_file_name', return_value='model.pt'), \
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.generate_model_file_name', return_value='model.pt'), \
 #              patch.object(
 #                  DartsForecastingModelManager,
 #                  '_resolve_evaluation_sequence_number',
@@ -526,11 +526,11 @@
 #             model_manager.config['run_type'] = run_type
 #             mock_df = pd.DataFrame({'col1': [1, 2, 3]})
 
-#             with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df) as mock_read:
-#                 with patch('views_r2darts2.manager.model.ModelCatalog'), \
-#                      patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#                      patch('views_r2darts2.manager.model.DartsForecaster'), \
-#                      patch('views_r2darts2.manager.model.generate_model_file_name', return_value='model.pt'):
+#             with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df) as mock_read:
+#                 with patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog'), \
+#                      patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#                      patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster'), \
+#                      patch('views_r2darts2.manager.darts_forecasting_model_manager.generate_model_file_name', return_value='model.pt'):
 
 #                     model_manager._train_model_artifact()
 
@@ -546,10 +546,10 @@
 #         mock_model = Mock()
 #         mock_forecaster = Mock(spec=DartsForecaster)
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster), \
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster), \
 #              patch.object(
 #                  DartsForecastingModelManager,
 #                  '_resolve_evaluation_sequence_number',
@@ -572,11 +572,11 @@
 #         mock_model = Mock()
 #         mock_forecaster = Mock(spec=DartsForecaster)
 
-#         with patch('views_r2darts2.manager.model.read_dataframe', return_value=mock_df), \
-#              patch('views_r2darts2.manager.model.ModelCatalog') as mock_catalog, \
-#              patch('views_r2darts2.manager.model._ViewsDatasetDarts'), \
-#              patch('views_r2darts2.manager.model.DartsForecaster', return_value=mock_forecaster), \
-#              patch('views_r2darts2.manager.model.generate_model_file_name', return_value='model.pt'):
+#         with patch('views_r2darts2.manager.darts_forecasting_model_manager.read_dataframe', return_value=mock_df), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.ModelCatalog') as mock_catalog, \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager._ViewsDatasetDarts'), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.DartsForecaster', return_value=mock_forecaster), \
+#              patch('views_r2darts2.manager.darts_forecasting_model_manager.generate_model_file_name', return_value='model.pt'):
 
 #             mock_catalog_instance = Mock()
 #             mock_catalog_instance.get_model.return_value = mock_model

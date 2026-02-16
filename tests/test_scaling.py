@@ -3,7 +3,8 @@ import numpy as np
 from sklearn.exceptions import NotFittedError
 from darts import TimeSeries
 import pandas as pd
-from views_r2darts2.utils.scaling import ScalerSelector, FeatureScalerManager
+from views_r2darts2.utils.scaler_selector import ScalerSelector
+from views_r2darts2.utils.feature_scaler_manager import FeatureScalerManager
 
 
 class TestScalerSelector:
@@ -450,7 +451,7 @@ class TestFeatureScalerManager:
         config = {"RobustScaler": ["ged_sb"]}
         manager = FeatureScalerManager(feature_scaler_map=config)
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(RuntimeError, match="Scalers not fitted"):
             manager.transform(sample_timeseries_list)
 
     def test_inverse_transform(self, sample_timeseries_list):

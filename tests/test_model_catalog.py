@@ -306,7 +306,7 @@ class TestModelCatalogInitialization:
 
 
 
-            from views_r2darts2.utils.gates import MissingHyperparameterError
+            from views_r2darts2.utils.exceptions import MissingHyperparameterError
 
 
 
@@ -712,7 +712,7 @@ class TestConfigurationHandling:
             "output_chunk_length": 3,
         }
         catalog_invalid = ModelCatalog(config_invalid)
-        from views_r2darts2.utils.gates import ArchitectureMismatchError
+        from views_r2darts2.utils.exceptions import ArchitectureMismatchError
 
         with pytest.raises(ArchitectureMismatchError, match="Architecture Mismatch"):
             catalog_invalid._get_nbeats()
@@ -730,7 +730,7 @@ class TestConfigurationHandling:
         if "output_chunk_length" in config_missing:
             del config_missing["output_chunk_length"]
             
-        from views_r2darts2.utils.gates import MissingHyperparameterError
+        from views_r2darts2.utils.exceptions import MissingHyperparameterError
         with pytest.raises(MissingHyperparameterError, match="REPRODUCIBILITY CONTRACT VIOLATED"):
             ModelCatalog(config_missing)
 

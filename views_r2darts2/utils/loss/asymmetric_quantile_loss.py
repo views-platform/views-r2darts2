@@ -34,7 +34,7 @@ class AsymmetricQuantileLoss(torch.nn.Module):
         )
 
     def forward(self, preds, targets):
-        from views_r2darts2.utils.gates import NumericalSanityError
+        from views_r2darts2.utils.exceptions import NumericalSanityError
         
         if torch.isnan(preds).any() or torch.isinf(preds).any():
             raise NumericalSanityError("Numerical Sanity Violation: NaN or Inf detected in predictions.")

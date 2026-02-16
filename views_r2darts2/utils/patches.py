@@ -1,4 +1,6 @@
+import torch
 import torch.nn as nn
+import logging
 from darts.logging import raise_if_not, raise_log, get_logger
 from darts.models.forecasting.nbeats import (
     _GType,
@@ -9,8 +11,41 @@ from darts.models.forecasting.nbeats import (
 )
 from darts.utils.torch import MonteCarloDropout
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
+darts_logger = get_logger(__name__)
 
+# --- 1. PyTorch Load Patch (weights_only safety) ---
+
+def apply_torch_load_patch():
+    """
+    Overrides torch.load to ensure weights_only=False by default.
+    Necessary for loading full model artifacts in many environments.
+    """
+    if hasattr(torch, "load") and not getattr(torch.load, "monkeypatched", False):
+        # Save original if not already saved
+        if not hasattr(torch, "__original_load__"):
+            # Try to get clean version from conftest if in test session
+            try:
+                from tests.conftest import CLEAN_TORCH_LOAD
+                torch.__original_load__ = CLEAN_TORCH_LOAD
+            except (ImportError, ModuleNotFoundError):
+                orig = torch.load
+                # Avoid capturing a Mock during testing
+                if "Mock" not in str(type(orig)):
+                    torch.__original_load__ = orig
+                else:
+                    return # Already contaminated, skip
+
+        def custom_torch_load(*args, **kwargs):
+            if "weights_only" not in kwargs:
+                kwargs["weights_only"] = False
+            return torch.__original_load__(*args, **kwargs)
+
+        custom_torch_load.monkeypatched = True
+        torch.load = custom_torch_load
+        logger.info("Successfully patched torch.load (weights_only=False default).")
+
+# --- 2. N-BEATS Dropout Patch ---
 
 def _patched_block_init(
     self,
@@ -71,7 +106,7 @@ def _patched_block_init(
         self.backcast_g = _SeasonalityGenerator(input_chunk_length)
         self.forecast_g = _SeasonalityGenerator(target_length)
     else:
-        raise_log(ValueError("g_type not supported"), logger)
+        raise_log(ValueError("g_type not supported"), darts_logger)
 
 
 def _patched_block_forward(self, x):
@@ -92,18 +127,19 @@ def _patched_block_forward(self, x):
     return x_hat, y_hat
 
 
-def patch_nbeats_dropout_issue():
+def apply_nbeats_patch():
+    """
+    Patches Darts NBEATSModel to correctly use MonteCarloDropout in its blocks.
+    """
     try:
         _Block.__init__ = _patched_block_init
-
         _Block.forward = _patched_block_forward
-
         logger.info("Successfully patched Darts NBEATSModel.")
-
     except Exception as e:
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
+# --- Initialize All Patches ---
 
-# Apply the monkey-patch on import
-
-patch_nbeats_dropout_issue()
+def apply_all_patches():
+    apply_torch_load_patch()
+    apply_nbeats_patch()

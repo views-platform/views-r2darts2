@@ -3,8 +3,8 @@ import pandas as pd
 import numpy as np
 from darts.models.forecasting.tcn_model import TCNModel
 
-from views_r2darts2.data.handlers import _ViewsDatasetDarts
-from views_r2darts2.model.forecaster import DartsForecaster
+from views_r2darts2.data.views_dataset_darts import _ViewsDatasetDarts
+from views_r2darts2.model.darts_forecaster import DartsForecaster
 
 
 @pytest.fixture

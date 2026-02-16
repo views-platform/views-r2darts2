@@ -1,7 +1,7 @@
 # file: tests/test_time_aware_weighted_huber_loss.py
 
 import torch
-from views_r2darts2.utils.loss.time_aware_huber import TimeAwareWeightedHuberLoss
+from views_r2darts2.utils.loss.time_aware_weighted_huber_loss import TimeAwareWeightedHuberLoss
 
 # --- Unit Tests for TimeAwareWeightedHuberLoss ---
 

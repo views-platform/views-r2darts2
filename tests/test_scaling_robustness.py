@@ -2,9 +2,9 @@ import pytest
 import numpy as np
 import pandas as pd
 from darts import TimeSeries
-from views_r2darts2.model.forecaster import DartsForecaster
+from views_r2darts2.model.darts_forecaster import DartsForecaster
 from views_r2darts2.model.model_catalog import ModelCatalog
-from views_r2darts2.utils.scaling import ScalerSelector
+from views_r2darts2.utils.scaler_selector import ScalerSelector
 from darts.dataprocessing.transformers import Scaler
 
 
@@ -144,7 +144,7 @@ class TestScalingRobustness:
         }
 
         # Instantiate a forecaster (which calls _instantiate_scaler)
-        from views_r2darts2.data.handlers import _ViewsDatasetDarts
+        from views_r2darts2.data.views_dataset_darts import _ViewsDatasetDarts
         from unittest.mock import MagicMock
 
         dataset = MagicMock(spec=_ViewsDatasetDarts)

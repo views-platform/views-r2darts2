@@ -1,13 +1,13 @@
 import torch
 import logging
-from .shrinkage import ShrinkageLoss
-from .weighted_huber import WeightedHuberLoss
-from .time_aware_huber import TimeAwareWeightedHuberLoss
-from .spike_focal import SpikeFocalLoss
-from .weighted_penalty_huber import WeightedPenaltyHuberLoss
-from .tweedie import TweedieLoss
-from .quantile import AsymmetricQuantileLoss
-from .zero_inflated import ZeroInflatedLoss
+from .shrinkage_loss import ShrinkageLoss
+from .weighted_huber_loss import WeightedHuberLoss
+from .time_aware_weighted_huber_loss import TimeAwareWeightedHuberLoss
+from .spike_focal_loss import SpikeFocalLoss
+from .weighted_penalty_huber_loss import WeightedPenaltyHuberLoss
+from .tweedie_loss import TweedieLoss
+from .asymmetric_quantile_loss import AsymmetricQuantileLoss
+from .zero_inflated_loss import ZeroInflatedLoss
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class LossCatalog:
         }
 
     def get_loss(self) -> torch.nn.Module:
-        from views_r2darts2.utils.gates import ReproducibilityGate
+        from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
         
         loss_classes = {
             "WeightedHuberLoss": WeightedHuberLoss,

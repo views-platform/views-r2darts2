@@ -5,7 +5,7 @@ import sys
 
 # Ensure the path is correct to import from the parent directory's module
 sys.path.append("..")
-from views_r2darts2.utils.loss.quantile import AsymmetricQuantileLoss
+from views_r2darts2.utils.loss.asymmetric_quantile_loss import AsymmetricQuantileLoss
 
 
 class TestQuantileLossVerification(unittest.TestCase):

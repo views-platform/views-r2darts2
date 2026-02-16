@@ -1,55 +1,15 @@
 import logging
-import torch
-from views_r2darts2.data.handlers import _ViewsDatasetDarts
-from views_r2darts2.model.forecaster import DartsForecaster
+import torch  # noqa: F401
+from views_r2darts2.data.views_dataset_darts import _ViewsDatasetDarts
+from views_r2darts2.model.darts_forecaster import DartsForecaster
 from views_pipeline_core.files.utils import generate_model_file_name
 from views_pipeline_core.managers.model import ModelPathManager, ForecastingModelManager
 
 from views_r2darts2.model.model_catalog import ModelCatalog
-from views_r2darts2.utils.gates import ReproducibilityGate
+from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.utils.patches import apply_all_patches
 
 logger = logging.getLogger(__name__)
-
-# Save the original torch.load function ONLY once to avoid recursion or mock-poisoning.
-# If it's already patched (e.g. during tests), we don't want to re-save the patch.
-if not hasattr(torch, "__original_load__"):
-    # Priority 1: Check session-captured CLEAN_TORCH_LOAD (for tests)
-    try:
-        from tests.conftest import CLEAN_TORCH_LOAD
-
-        torch.__original_load__ = CLEAN_TORCH_LOAD
-    except (ImportError, ModuleNotFoundError):
-        # Priority 2: Use current torch.load if it's not a Mock
-        orig = torch.load
-        if "Mock" not in str(type(orig)):
-            torch.__original_load__ = orig
-        else:
-            # Last resort: we are in a mock-contaminated environment and conftest didn't help
-            torch.__original_load__ = orig
-
-
-# https://github.com/suno-ai/bark/pull/619#issuecomment-2726747073
-# Function that forces weights_only=False
-def custom_torch_load(*args, **kwargs):
-    """
-    Loads a PyTorch model using the original torch load function, ensuring the 'weights_only' argument is set.
-
-    Args:
-        *args: Positional arguments to pass to the original torch load function.
-        **kwargs: Keyword arguments to pass to the original torch load function. If 'weights_only' is not provided, it defaults to False.
-
-    Returns:
-        The result of the original torch load function with the specified arguments.
-
-    """
-    if "weights_only" not in kwargs:
-        kwargs["weights_only"] = False
-
-    # Use the saved original
-    return torch.__original_load__(*args, **kwargs)
-
-
-custom_torch_load.monkeypatched = True
 
 
 class DartsForecastingModelManager(ForecastingModelManager):
@@ -91,10 +51,8 @@ class DartsForecastingModelManager(ForecastingModelManager):
             wandb_notifications=wandb_notifications,
             use_prediction_store=use_prediction_store,
         )
-        # Override torch.load globally
-        if not hasattr(torch, "__original_load__"):
-            torch.__original_load__ = torch.load
-        torch.load = custom_torch_load
+        # Initialize all required monkey-patches
+        apply_all_patches()
         logger.info(
             f"Current model architecture: \033[92m{self.configs['algorithm']}\033[0m"
         )

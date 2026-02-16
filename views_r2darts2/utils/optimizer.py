@@ -39,7 +39,11 @@ class OptimizerCatalog:
         from views_r2darts2.utils.gates import ReproducibilityGate
         
         if self.opt_name not in ReproducibilityGate.Config.OPTIMIZER_GENOMES:
-            error_msg = f"UNREGISTERED OPTIMIZER: '{self.opt_name}' is not in the Fortress whitelist. Please register its genome."
+            available_opts = list(ReproducibilityGate.Config.OPTIMIZER_GENOMES.keys())
+            error_msg = (
+                f"UNREGISTERED OPTIMIZER: '{self.opt_name}' is not in the Fortress whitelist.\n"
+                f"Registered optimizers: {available_opts}"
+            )
             logger.critical(error_msg)
             raise ValueError(error_msg)
         

@@ -72,7 +72,13 @@ class LossCatalog:
         }
 
         if self.loss_name not in loss_classes:
-            raise ValueError(f"Unknown loss function: {self.loss_name}")
+            available_losses = list(loss_classes.keys())
+            error_msg = (
+                f"Unknown loss function: {self.loss_name}.\n"
+                f"Available loss functions: {available_losses}"
+            )
+            logger.critical(error_msg)
+            raise ValueError(error_msg)
 
         cls = loss_classes[self.loss_name]
         

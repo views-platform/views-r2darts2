@@ -308,9 +308,11 @@ class ReproducibilityGate:
 
             # 2. Identify Algorithm & Audit Architecture Genome
             algo = config.get("algorithm")
+            available_algos = list(ReproducibilityGate.Config.ALGORITHM_GENOMES.keys())
             if algo not in ReproducibilityGate.Config.ALGORITHM_GENOMES:
                 error_msg = (
-                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown algorithm '{algo}'."
+                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown algorithm '{algo}'.\n"
+                    f"Available algorithms: {available_algos}"
                 )
                 logger.error(error_msg)
                 raise MissingHyperparameterError(error_msg)
@@ -327,6 +329,7 @@ class ReproducibilityGate:
 
             # 3. Identify Optimizer & Audit Optimizer Genome
             opt = config.get("optimizer_cls")
+            available_opts = list(ReproducibilityGate.Config.OPTIMIZER_GENOMES.keys())
             if opt in ReproducibilityGate.Config.OPTIMIZER_GENOMES:
                 opt_genome = ReproducibilityGate.Config.OPTIMIZER_GENOMES[opt]
                 missing_opt = [k for k in opt_genome if k not in config]
@@ -338,12 +341,16 @@ class ReproducibilityGate:
                     logger.error(error_msg)
                     raise MissingHyperparameterError(error_msg)
             else:
-                logger.warning(
-                    f"Optimizer '{opt}' is not registered in OPTIMIZER_GENOMES. Skipping specific audit."
+                error_msg = (
+                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown or unregistered optimizer '{opt}'.\n"
+                    f"Registered optimizers: {available_opts}"
                 )
+                logger.error(error_msg)
+                raise MissingHyperparameterError(error_msg)
 
             # 4. Identify Loss & Audit Loss Genome
             loss = config.get("loss_function")
+            available_losses = list(ReproducibilityGate.Config.LOSS_GENOMES.keys())
             if loss in ReproducibilityGate.Config.LOSS_GENOMES:
                 loss_genome = ReproducibilityGate.Config.LOSS_GENOMES[loss]
                 missing_loss = [k for k in loss_genome if k not in config]
@@ -355,9 +362,12 @@ class ReproducibilityGate:
                     logger.error(error_msg)
                     raise MissingHyperparameterError(error_msg)
             else:
-                logger.warning(
-                    f"Loss '{loss}' is not registered in LOSS_GENOMES. Skipping specific audit."
+                error_msg = (
+                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown or unregistered loss '{loss}'.\n"
+                    f"Registered losses: {available_losses}"
                 )
+                logger.error(error_msg)
+                raise MissingHyperparameterError(error_msg)
 
             # 5. Check for None values in ALL required keys (Core + Algo + Opt + Loss)
             all_required = (

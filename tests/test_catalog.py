@@ -223,41 +223,141 @@ def mock_all_external_deps(mock_device, mock_wandb):
 
 
 class TestModelCatalogInitialization:
+
+
     """Test suite for ModelCatalog initialization."""
 
+
+
+
+
     def test_init_with_basic_config(self, basic_config):
+
+
         """Test initialization with minimal configuration."""
+
+
         catalog = ModelCatalog(basic_config)
 
+
+
+
+
         assert catalog.config == basic_config
+
+
         assert catalog.device == "cpu"
+
+
         assert len(catalog.models) == 10
 
+
+
+
+
     def test_init_with_valid_loss_functions(self, basic_config):
+
+
         """Test initialization with valid loss function names."""
+
+
         valid_losses = ["WeightedPenaltyHuberLoss", "WeightedHuberLoss"]
 
+
+
+
+
         for loss_name in valid_losses:
+
+
             config = {**basic_config, "loss_function": loss_name}
+
+
             catalog = ModelCatalog(config)
+
+
             assert isinstance(catalog.loss_fn, torch.nn.Module)
 
-    def test_init_with_invalid_loss_raises_error(self, basic_config):
-        """Test that invalid loss function raises ValueError."""
-        config = {**basic_config, "loss_function": "InvalidLoss"}
 
-        with pytest.raises(ValueError, match="Unknown loss function"):
-            ModelCatalog(config)
+
+
+
+        def test_init_with_invalid_loss_raises_error(self, basic_config):
+
+
+
+
+
+            """Test that invalid loss function raises ValueError."""
+
+
+
+
+
+            config = {**basic_config, "loss_function": "InvalidLoss"}
+
+
+
+
+
+        
+
+
+
+
+
+            from views_r2darts2.utils.gates import MissingHyperparameterError
+
+
+
+
+
+            with pytest.raises(MissingHyperparameterError, match="Unknown or unregistered loss"):
+
+
+
+
+
+                ModelCatalog(config)
+
+
+
+
+
+    
+
+
+
+
 
     def test_lr_scheduler_args(self, full_config):
+
+
         """Test that learning rate scheduler arguments are set correctly."""
+
+
         catalog = ModelCatalog(full_config)
 
+
+
+
+
         assert catalog.lr_scheduler_args["mode"] == "min"
+
+
         assert catalog.lr_scheduler_args["factor"] == 0.1
+
+
         assert catalog.lr_scheduler_args["patience"] == 3
+
+
         assert catalog.lr_scheduler_args["min_lr"] == 1e-6
+
+
         assert catalog.lr_scheduler_args["monitor"] == "train_loss"
+
+
+
 
 
 class TestModelCatalogMethods:

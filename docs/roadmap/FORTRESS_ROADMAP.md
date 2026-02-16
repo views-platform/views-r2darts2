@@ -82,4 +82,47 @@
 
 ---
 
-🖖 **"In this repository, a crash is a successful defense of scientific integrity."**
+## Phase 5: Loss Function Integrity & Behavioral Audit
+*Focus: Guaranteeing mathematical validity, numerical stability, and scientific integrity of the objective functions.*
+
+### 5.0 The Integrity Harness (Infrastructure)
+*   **Goal:** Create a standardized environment for testing losses under realistic modeling conditions.
+*   **Action:** Implement `tests/losses/harness.py` capable of:
+    *   Generating `(B, T, K)` batches matching model outputs.
+    *   Replicating the scaling pipeline (Asinh, Log, MinMax) to test loss/scaler interactions.
+    *   Inverse-transforming predictions for original-unit diagnostics.
+
+### 5.1 Static Audit & Boundary Handshake
+*   **Goal:** Identify implementation smells and domain misalignments.
+*   **Action:** 
+    *   Audit for non-differentiable ops (`.detach()`, hard masks) and magic numbers.
+    *   Verify unit coherence (e.g., Tweedie/Poisson MUST receive count-scale data, not MinMax).
+    *   Check broadcasting correctness for per-sample weights.
+
+### 5.2 Forward, Gradient & Stability Stress-Tests
+*   **Goal:** Ensure signal propagation and prevent numerical explosions.
+*   **Action:**
+    *   **Forward Pass:** Verify scalar, finite, and non-negative outputs on edge cases (all-zeros, extreme spikes).
+    *   **Gradient Flow:** Run `gradcheck` on `float64` to verify backprop signal, especially near `zero_threshold` boundaries.
+    *   **Numerical Envelope:** Probe limits with huge targets/preds and negative inputs (pre-softplus).
+
+### 5.3 Behavioral Audit: The Cowardice Profile
+*   **Goal:** Detect incentives for "Cowardly" behavior (under-prediction / mass collapse).
+*   **Action:** 
+    *   Measure the directional incentive: Does increasing a prediction on a non-zero target actually reduce loss?
+    *   Track `y_hat_bar` (mean prediction) over early training epochs to detect immediate collapse.
+
+### 5.4 Seed Sensitivity & Basin Research
+*   **Goal:** Determine if a loss amplifies the "two attractors" (basin bifurcation) problem.
+*   **Action:** Run N-seed trials (e.g., 20 seeds) on fixed data and track the distribution of predictions. Identify if the loss induces bimodality in the result space.
+
+### 5.5 Governance: Scientific Loss Cards
+*   **Goal:** Formalize scientific understanding for future contributors.
+*   **Action:** Create "Loss Cards" in `docs/` detailing:
+    *   Mathematical assumptions and input domain requirements.
+    *   Known failure modes and "Cowardice" tendencies.
+    *   Safe parameter ranges (delta, epsilon, etc.).
+
+---
+
+🖖 **"In this repository, we value bit-perfect reproducibility and scientific bravery over convenient convergence."**

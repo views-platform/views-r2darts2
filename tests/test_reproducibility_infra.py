@@ -101,7 +101,7 @@ class TestReproducibilityInfra:
             "lr_scheduler_min_lr": 1e-6,
             "early_stopping_patience": 1,
             "early_stopping_min_delta": 0.01,
-            "loss_function": "MSE",
+            "loss_function": "MSELoss",
             "num_samples": 50,
             "mc_dropout": True,
         }
@@ -345,7 +345,7 @@ class TestRedTeamAttacks:
             "lr_scheduler_min_lr": 1e-6,
             "early_stopping_patience": 1,
             "early_stopping_min_delta": 0.01,
-            "loss_function": "MSE",
+            "loss_function": "MSELoss",
             "num_samples": 1,
             "mc_dropout": False,
         }

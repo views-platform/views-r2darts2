@@ -1,7 +1,7 @@
 import pytest
 import torch
 from tests.losses.harness import LossSpec, LossIntegrityHarness, make_fake_views_batch
-from views_r2darts2.utils.loss import LossCatalog
+from views_r2darts2.utils.loss.loss_catalog import LossCatalog
 from views_r2darts2.utils.gates import NumericalSanityError
 
 # 1. Decision: Deciding on Canonical Test Configuration

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from darts import TimeSeries
 from views_r2darts2.model.forecaster import DartsForecaster
-from views_r2darts2.model.catalog import ModelCatalog
+from views_r2darts2.model.model_catalog import ModelCatalog
 from views_r2darts2.utils.scaling import ScalerSelector
 from darts.dataprocessing.transformers import Scaler
 

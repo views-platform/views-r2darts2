@@ -6,7 +6,7 @@ import pandas as pd
 from unittest.mock import MagicMock
 from views_r2darts2.utils.gates import ReproducibilityGate, NumericalSanityError
 from views_r2darts2.model.forecaster import DartsForecaster
-from views_r2darts2.utils.loss import LossCatalog
+from views_r2darts2.utils.loss.loss_catalog import LossCatalog
 
 def test_entropy_locking_parity():
     """Green Team: Verify entropy locking parity."""

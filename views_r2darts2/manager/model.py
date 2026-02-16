@@ -5,7 +5,7 @@ from views_r2darts2.model.forecaster import DartsForecaster
 from views_pipeline_core.files.utils import generate_model_file_name
 from views_pipeline_core.managers.model import ModelPathManager, ForecastingModelManager
 
-from views_r2darts2.model.catalog import ModelCatalog
+from views_r2darts2.model.model_catalog import ModelCatalog
 from views_r2darts2.utils.gates import ReproducibilityGate
 
 logger = logging.getLogger(__name__)

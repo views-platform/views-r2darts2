@@ -1,15 +1,13 @@
 import pytest
 import torch
-from views_r2darts2.utils.loss import (
-    LossCatalog,
-    WeightedHuberLoss,
-    TimeAwareWeightedHuberLoss,
-    SpikeFocalLoss,
-    WeightedPenaltyHuberLoss,
-    TweedieLoss,
-    AsymmetricQuantileLoss,
-    ZeroInflatedLoss,
-)
+from views_r2darts2.utils.loss.loss_catalog import LossCatalog
+from views_r2darts2.utils.loss.weighted_huber import WeightedHuberLoss
+from views_r2darts2.utils.loss.time_aware_huber import TimeAwareWeightedHuberLoss
+from views_r2darts2.utils.loss.spike_focal import SpikeFocalLoss
+from views_r2darts2.utils.loss.weighted_penalty_huber import WeightedPenaltyHuberLoss
+from views_r2darts2.utils.loss.tweedie import TweedieLoss
+from views_r2darts2.utils.loss.quantile import AsymmetricQuantileLoss
+from views_r2darts2.utils.loss.zero_inflated import ZeroInflatedLoss
 
 
 class TestLossCatalog:

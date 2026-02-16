@@ -11,7 +11,7 @@ from darts.models import (
     NLinearModel,
     TiDEModel,
 )
-from views_r2darts2.utils.loss import LossCatalog
+from views_r2darts2.utils.loss.loss_catalog import LossCatalog
 
 # Define a small, consistent dataset for all integration tests
 # Ensure values are non-negative for Poisson loss

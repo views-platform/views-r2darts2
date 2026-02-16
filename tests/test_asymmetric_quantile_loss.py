@@ -2,7 +2,7 @@
 
 import torch
 import pytest
-from views_r2darts2.utils.loss import AsymmetricQuantileLoss
+from views_r2darts2.utils.loss.quantile import AsymmetricQuantileLoss
 
 # --- Unit Tests for AsymmetricQuantileLoss ---
 

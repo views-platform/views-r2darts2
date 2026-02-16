@@ -1,5 +1,4 @@
-import torch
-import logging
+from .loss_catalog import LossCatalog
 from .shrinkage import ShrinkageLoss
 from .weighted_huber import WeightedHuberLoss
 from .time_aware_huber import TimeAwareWeightedHuberLoss
@@ -9,98 +8,14 @@ from .tweedie import TweedieLoss
 from .quantile import AsymmetricQuantileLoss
 from .zero_inflated import ZeroInflatedLoss
 
-logger = logging.getLogger(__name__)
-
-class LossCatalog:
-    """
-    Genome Translator for mathematical loss functions.
-    
-    This class is responsible for mapping configuration DNA to concrete torch.nn.Module 
-    instances, ensuring that all mandatory loss hyperparameters are present and valid.
-    """
-    def __init__(self, config: dict):
-        self.config = config
-        self.loss_name = self.config["loss_function"]
-        
-        # Dictionary of all potential loss genes recognized by the Fortress
-        self._all_potential_args = {
-            # Huber-family
-            "zero_threshold": self.config.get("zero_threshold"),
-            "delta": self.config.get("delta"),
-            "non_zero_weight": self.config.get("non_zero_weight"),
-            "false_negative_weight": self.config.get("false_negative_weight"),
-            "false_positive_weight": self.config.get("false_positive_weight"),
-            # Quantile-family
-            "tau": self.config.get("tau"),
-            # Shrinkage-family
-            "a": self.config.get("a"),
-            "c": self.config.get("c"),
-            # SpikeFocal-family
-            "alpha": self.config.get("alpha"),
-            "gamma": self.config.get("gamma"),
-            "spike_threshold": self.config.get("spike_threshold"),
-            # ZeroInflated-family
-            "zero_weight": self.config.get("zero_weight"),
-            "count_weight": self.config.get("count_weight"),
-            # Tweedie-family
-            "p": self.config.get("p"),
-            "eps": self.config.get("eps"),
-            # Time-Aware family
-            "decay_factor": self.config.get("decay_factor"),
-        }
-
-    def get_loss(self) -> torch.nn.Module:
-        """
-        Instantiates and returns the loss function module based on the DNA.
-        """
-        from views_r2darts2.utils.gates import ReproducibilityGate
-        
-        loss_classes = {
-            "WeightedHuberLoss": WeightedHuberLoss,
-            "TimeAwareWeightedHuberLoss": TimeAwareWeightedHuberLoss,
-            "SpikeFocalLoss": SpikeFocalLoss,
-            "WeightedPenaltyHuberLoss": WeightedPenaltyHuberLoss,
-            "TweedieLoss": TweedieLoss,
-            "AsymmetricQuantileLoss": AsymmetricQuantileLoss,
-            "ZeroInflatedLoss": ZeroInflatedLoss,
-            "ShrinkageLoss": ShrinkageLoss,
-            "MSELoss": torch.nn.MSELoss,
-            "L1Loss": torch.nn.L1Loss,
-            "HuberLoss": torch.nn.HuberLoss,
-            "SmoothL1Loss": torch.nn.SmoothL1Loss,
-            "PoissonNLLLoss": torch.nn.PoissonNLLLoss,
-        }
-
-        if self.loss_name not in loss_classes:
-            available_losses = list(loss_classes.keys())
-            error_msg = (
-                f"Unknown loss function: {self.loss_name}.\n"
-                f"Available loss functions: {available_losses}"
-            )
-            logger.critical(error_msg)
-            raise ValueError(error_msg)
-
-        cls = loss_classes[self.loss_name]
-        
-        # Standard PyTorch losses (no filtering needed)
-        if cls.__module__.startswith("torch.nn"):
-             # Filter recognized args for HuberLoss
-             if self.loss_name == "HuberLoss":
-                 delta = self.config.get("delta")
-                 if delta is None:
-                     raise ValueError("MANDATORY LOSS GENES MISSING for HuberLoss: ['delta']")
-                 return cls(delta=delta)
-             return cls()
-
-        # For custom Fortress losses, filter using the registered Genome in the Gate
-        loss_genome = ReproducibilityGate.Config.LOSS_GENOMES.get(self.loss_name, [])
-        valid_kwargs = {k: v for k, v in self._all_potential_args.items() if k in loss_genome}
-        
-        # Ensure no mandatory parameters are None (enforcing No-Defaults Rule)
-        missing = [k for k in loss_genome if valid_kwargs.get(k) is None]
-        if missing:
-            error_msg = f"MANDATORY LOSS GENES MISSING for {self.loss_name}: {missing}"
-            logger.critical(error_msg)
-            raise ValueError(error_msg)
-
-        return cls(**valid_kwargs)
+__all__ = [
+    "LossCatalog",
+    "ShrinkageLoss",
+    "WeightedHuberLoss",
+    "TimeAwareWeightedHuberLoss",
+    "SpikeFocalLoss",
+    "WeightedPenaltyHuberLoss",
+    "TweedieLoss",
+    "AsymmetricQuantileLoss",
+    "ZeroInflatedLoss",
+]

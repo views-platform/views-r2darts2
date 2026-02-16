@@ -2,7 +2,8 @@
 
 import torch
 import pytest
-from views_r2darts2.utils.loss import WeightedPenaltyHuberLoss, WeightedHuberLoss
+from views_r2darts2.utils.loss.weighted_penalty_huber import WeightedPenaltyHuberLoss
+from views_r2darts2.utils.loss.weighted_huber import WeightedHuberLoss
 
 # --- Unit Tests for WeightedPenaltyHuberLoss ---
 

@@ -1,7 +1,7 @@
 import pytest
 import torch
 from unittest.mock import patch, MagicMock
-from views_r2darts2.model.catalog import ModelCatalog
+from views_r2darts2.model.model_catalog import ModelCatalog
 from darts.models.forecasting.nbeats import NBEATSModel
 from darts.models.forecasting.tft_model import TFTModel
 from darts.models.forecasting.tcn_model import TCNModel
@@ -202,7 +202,7 @@ def full_config():
 @pytest.fixture
 def mock_device():
     """Mock the device detection."""
-    with patch("views_r2darts2.model.catalog.DartsForecaster.get_device") as mock:
+    with patch("views_r2darts2.model.model_catalog.DartsForecaster.get_device") as mock:
         mock.return_value = "cpu"
         yield mock
 
@@ -210,7 +210,7 @@ def mock_device():
 @pytest.fixture
 def mock_wandb():
     """Mock WandB logger to prevent actual logging."""
-    with patch("views_r2darts2.model.catalog.WandbLogger") as mock:
+    with patch("views_r2darts2.model.model_catalog.WandbLogger") as mock:
         mock_instance = MagicMock()
         mock.return_value = mock_instance
         yield mock

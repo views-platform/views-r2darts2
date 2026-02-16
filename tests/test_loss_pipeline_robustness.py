@@ -5,14 +5,12 @@ import torch
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
-from views_r2darts2.utils.loss import (
-    WeightedHuberLoss,
-    TimeAwareWeightedHuberLoss,
-    WeightedPenaltyHuberLoss,
-    ZeroInflatedLoss,
-    SpikeFocalLoss,
-    ShrinkageLoss,
-)
+from views_r2darts2.utils.loss.weighted_huber import WeightedHuberLoss
+from views_r2darts2.utils.loss.time_aware_huber import TimeAwareWeightedHuberLoss
+from views_r2darts2.utils.loss.weighted_penalty_huber import WeightedPenaltyHuberLoss
+from views_r2darts2.utils.loss.zero_inflated import ZeroInflatedLoss
+from views_r2darts2.utils.loss.spike_focal import SpikeFocalLoss
+from views_r2darts2.utils.loss.shrinkage import ShrinkageLoss
 
 # --- Test Setup: Define All 8 Data Pipelines ---
 

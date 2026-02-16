@@ -125,4 +125,22 @@
 
 ---
 
-🖖 **"In this repository, we value bit-perfect reproducibility and scientific bravery over convenient convergence."**
+## Phase 6: Physical Alignment & Symmetrical Architecture
+*Focus: Eliminating organizational entropy by aligning file names with class names.*
+
+### 6.1 The 1-Class-1-File Standard
+*   **The Problem:** Catalogs are currently scattered across generically named files (`catalog.py`, `optimizer.py`) or hidden in `__init__.py`. This makes the codebase harder to navigate and violates the principle of "Predictable Discovery."
+*   **The Solution:** Rename and relocate all catalogs to match their class names exactly.
+*   **Action:** 
+    *   Move `LossCatalog` to `utils/loss/loss_catalog.py`.
+    *   Rename `optimizer.py` to `optimizer_catalog.py`.
+    *   Rename `model/catalog.py` to `model/model_catalog.py`.
+
+### 6.2 Infrastructure Extraction
+*   **The Problem:** `NaNDetectionCallback` and `GradientHealthCallback` are bundled with `ModelCatalog`.
+*   **The Solution:** Move training infrastructure to `utils/callbacks.py`.
+*   **Action:** Purge the catalogs of all non-factory logic.
+
+---
+
+🖖 **"In this repository, the structure of the files is as rigorous as the logic of the code."**

@@ -1,8 +1,8 @@
 import pytest
 import torch
-from views_r2darts2.utils.loss import LossCatalog
-from views_r2darts2.utils.optimizer import OptimizerCatalog
-from views_r2darts2.model.catalog import ModelCatalog
+from views_r2darts2.utils.loss.loss_catalog import LossCatalog
+from views_r2darts2.utils.optimizer_catalog import OptimizerCatalog
+from views_r2darts2.model.model_catalog import ModelCatalog
 
 def test_optimizer_catalog_genome_enforcement():
     """Beige Team: Verify OptimizerCatalog genome enforcement."""

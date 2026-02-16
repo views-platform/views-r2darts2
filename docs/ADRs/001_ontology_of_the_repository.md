@@ -33,48 +33,48 @@ This repository defines a **closed set of conceptual categories** ("entities"). 
 
 ### 2. The Fortress (Gates)
 - **Purpose:** Stateless runtime validators (`ReproducibilityGate`) that enforce physical invariants (temporal continuity, numerical sanity, DNA completeness).
+- **Physical Standard:** Must live in `reproducibility_gate.py`. Definitions of exceptions must be moved to `exceptions.py`.
 - **Authority:** Authoritative (The "Law").
-- **Stability:** Stable. Changes are high-impact and require ADR updates.
-- **Must not contain:** Model weights or business logic.
 
-### 3. Data Handlers
+### 3. Data Handlers (`_ViewsDatasetDarts`)
 - **Purpose:** Manage the transition from raw VIEWS dataframes to Darts-compatible `TimeSeries`.
-- **Authority:** Derived (from raw data and configuration).
-- **Stability:** Stable.
-- **Must not contain:** Model training logic.
+- **Physical Standard:** Must live in `views_dataset_darts.py`.
+- **Authority:** Derived.
 
 ### 4. Forecasters (`DartsForecaster`)
 - **Purpose:** Stateful wrappers that manage the coupling of a Model, its Scalers, and its Preprocessing state.
+- **Physical Standard:** Must live in `darts_forecaster.py`.
 - **Authority:** Operational.
-- **Stability:** Evolving.
-- **Must not contain:** Orchestration logic (like W&B sweep management).
 
 ### 5. Artifacts
 - **Purpose:** Immutable persistence of a trained Forecaster (weights + scaler states).
-- **Authority:** Derived (output of a training run).
-- **Stability:** Permanent. Once created, an artifact must never be modified.
-- **Must not contain:** Code logic (only state).
+- **Authority:** Derived.
 
 ### 6. The Manager (`DartsForecastingModelManager`)
 - **Purpose:** Orchestration of the lifecycle (Train -> Save -> Evaluate -> Forecast).
+- **Physical Standard:** Must live in `darts_forecasting_model_manager.py`.
 - **Authority:** Execution.
-- **Stability:** Evolving.
-- **Must not contain:** Model-specific math or low-level tensor operations.
+
+### 7. Catalogs (The Triple Catalog Architecture)
+- **Purpose:** Genome Translators that map DNA to concrete instances.
+    - **ModelCatalog:** Orchestrates algorithms.
+    - **LossCatalog:** Orchestrates mathematical objectives.
+    - **OptimizerCatalog:** Orchestrates PyTorch optimizers.
+- **Physical Standard:** Each must live in its own file matching the class name.
+- **Authority:** Translation.
 
 ---
 
 ## Stability Rules
 
-- **The Fortress** and **DNA Schemas** are the most stable layers.
-- **Artifacts** are strictly permanent.
-- **Forecasters** and **Managers** are allowed to evolve to support new models.
+- **The Fortress**, **DNA Schemas**, and **Catalogs** are the most stable layers.
 
 ---
 
 ## Explicit Non-Entities
 
 - **Implicit Semantics:** Behavior inferred from filenames or folder structures is forbidden.
-- **Mixed-Role Scripts:** A single file must not act as both a "Gate" and a "Model."
+- **Mixed-Role Scripts:** A single file must not act as both a "Gate" and a "Model." (See ADR-013: Physical Symmetry).
 - **Ghost Imports:** Importing from outside the local `views_r2darts2` package is a violation of ontology.
 
 ---

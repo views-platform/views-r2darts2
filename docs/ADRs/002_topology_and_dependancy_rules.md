@@ -27,19 +27,19 @@ Circular dependencies are forbidden. Cross-layer "shortcuts" are forbidden.
 We define the following four layers (from lowest to highest):
 
 ### Layer 0: Core Utilities (`utils/`)
-- **Examples:** `loss.py`, `scaling.py`, `gates.py`.
+- **Examples:** `loss_catalog.py`, `scaler_selector.py`, `reproducibility_gate.py`, `exceptions.py`.
 - **Constraint:** Must remain dependency-free (except for standard libraries and framework-agnostic torch/numpy). They must never import from layers above them.
 
-### Layer 1: Data Handlers (`data/`)
-- **Examples:** `handlers.py`.
+### Layer 1: Data Handling (`data/`)
+- **Examples:** `views_dataset_darts.py`.
 - **Constraint:** May depend on Layer 0 (for gates and scaling definitions). Must not depend on models or managers.
 
 ### Layer 2: Model & Forecasting (`model/`)
-- **Examples:** `catalog.py`, `forecaster.py`, `nbeats_patch.py`.
+- **Examples:** `model_catalog.py`, `darts_forecaster.py`.
 - **Constraint:** May depend on Layer 1 (for data handling) and Layer 0 (for loss and scaling). Must not depend on the Orchestration Layer.
 
 ### Layer 3: Orchestration & Management (`manager/`)
-- **Examples:** `model.py` (DartsForecastingModelManager).
+- **Examples:** `darts_forecasting_model_manager.py`.
 - **Constraint:** The "highest" layer. May depend on all layers below it. This is the only layer allowed to coordinate the lifecycle of artifacts and data flows.
 
 ---

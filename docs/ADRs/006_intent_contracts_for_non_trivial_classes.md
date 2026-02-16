@@ -28,13 +28,13 @@ An intent contract is a short, human-readable declaration of:
 
 ## Non-Trivial Classes in `views-r2darts2`
 
-The following are automatically considered non-trivial:
+The following are automatically considered non-trivial and must maintain an intent contract:
 
 - **Managers (`DartsForecastingModelManager`):** Orchestrate the high-level lifecycle.
 - **Forecasters (`DartsForecaster`):** Manage the coupling of models and stateful preprocessing (scalers).
 - **Gates (`ReproducibilityGate`):** Enforce physical and temporal invariants.
-- **Catalogs (`ModelCatalog`):** Translate the merged DNA manifests from `views_pipeline_core` into concrete Darts Model instances.
-- **Data Handlers:** Manage the transformation of raw VIEWS data to Darts types.
+- **Catalogs (`ModelCatalog`, `LossCatalog`, `OptimizerCatalog`):** Translate the DNA manifests into concrete instances and enforce the Genomic Firewall.
+- **Data Handlers (`_ViewsDatasetDarts`):** Manage the transformation of raw VIEWS data to Darts types.
 
 ---
 

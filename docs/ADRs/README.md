@@ -62,6 +62,9 @@ ADRs numbered 010 and above define specific infrastructure, mathematical, and do
 - **ADR-012** — Scaling Pipeline and Calibration Integrity  
   Standardizes on Darts `Pipeline` and mandatory `global_fit`.
 
+- **ADR-013** — Physical Symmetrical Architecture  
+  Mandates the 1-Class-1-File Zen standard for file organization.
+
 These must comply with the constitutional ADRs above.
 
 ---
@@ -76,6 +79,7 @@ These must comply with the constitutional ADRs above.
 - **Numerical Laws (010)** ensure precision and raw intentionality.
 - **Hardware Laws (011)** prevent race conditions and device drift.
 - **Mathematical Laws (012)** preserve probabilistic calibration.
+- **Physical Zen (013)** ensures predictable class-to-file discovery.
 - **Observability (008)** enforces failure semantics.
 - **Testing (005)** verifies system integrity.
 - **Intent Contracts (006)** bind class-level behavior.

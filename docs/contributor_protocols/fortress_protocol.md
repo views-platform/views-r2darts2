@@ -23,20 +23,26 @@ All data entering the system must pass through a numerical airlock.
 - **Requirement:** Downcast all input to `float32` immediately.
 - **Requirement:** Detect and raise errors on NaNs or Infs at every boundary (Data entry, Loss calculation, Prediction output).
 
+### D. Physical Symmetrical Architecture (ADR-013)
+**"1 Class, 1 File, 1 Name."**
+Organizational Zen is a requirement for maintainability.
+- **Requirement:** Every non-trivial class must live in its own file named after the class in `snake_case`.
+- **Requirement:** Heterogeneous logic (callbacks, patches, exceptions) must be consolidated into pre-defined symmetrical hubs (`utils/callbacks.py`, `utils/patches.py`).
+
 ---
 
 ## 2. Contributor Requirements
 
 ### Adding a New Model
-1.  **Define the Genome:** Register the mandatory hyperparameters in `ReproducibilityGate.Config.ALGORITHM_GENOMES`.
-2.  **Register in Catalog:** Add the instantiation logic to `ModelCatalog`.
-3.  **Audit Alignment:** Ensure all DNA parameters are passed correctly to the underlying framework (Darts/Torch).
+1.  **Define the Genome:** Register mandatory hyperparameters in `ReproducibilityGate.Config.ALGORITHM_GENOMES`.
+2.  **Symmetrical Entry:** Create `views_r2darts2/model/my_new_model.py`.
+3.  **Register in Catalog:** Add instantiation logic to `ModelCatalog`.
 
 ### Adding a New Loss Function
-1.  **Modularize:** Create a dedicated file in `views_r2darts2/utils/loss/`.
+1.  **Symmetrical Entry:** Create `views_r2darts2/utils/loss/my_new_loss.py`.
 2.  **Enforce Sanity:** Implement explicit NaN/Inf checks in the `forward()` method.
 3.  **Register Genome:** Add mandatory hyperparameters to `ReproducibilityGate.Config.LOSS_GENOMES`.
-4.  **Update Factory:** Add the class to `LossCatalog`.
+4.  **Update Catalog:** Add the class to `LossCatalog`.
 
 ---
 

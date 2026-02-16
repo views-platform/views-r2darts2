@@ -55,9 +55,11 @@ Contracts must be clear enough that:
 
 ### Modeling & Transformation
 - `model_catalog.md`
+- `loss_catalog.md`
+- `optimizer_catalog.md`
 - `darts_forecaster.md`
 - `feature_scaler_manager.md`
-- `loss_selector.md`
+- `scaler_selector.md`
 
 ### Data Infrastructure
 - `views_dataset_darts.md`

@@ -28,11 +28,14 @@ Each architecture (N-BEATS, TFT, TiDE, etc.) defines its own mandatory "genes" (
 
 ## 2. Reproducibility Gates (The Fortress)
 
-The following gates are implemented in `views_r2darts2/utils/gates.py` and invoked at critical lifecycle points.
+The following gates are implemented in `views_r2darts2/utils/reproducibility_gate.py` and invoked at critical lifecycle points.
 
 ### 2.1 The Config Gate (`ConfigAudit`)
 *   **Audit Manifest**: Performs a dynamic, model-aware audit of the DNA.
 *   **Audit Architecture**: Verifies that `len(steps) % output_chunk_length == 0` (ADR-009).
+*   **Triple Catalog Firewall**: 
+    - `ModelCatalog`, `LossCatalog`, and `OptimizerCatalog` perform secondary audits during instantiation.
+    - **Refuse-to-Guess Invariant**: Catalogs will raise `MissingHyperparameterError` if any mandatory DNA key is missing or `None`.
 *   **Failure Mode**: `MissingHyperparameterError` or `ArchitectureMismatchError`.
 
 ### 2.2 The Temporal Gate (`TemporalAudit`)

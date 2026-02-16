@@ -65,5 +65,5 @@ To enforce this, all Catalogs (Model, Loss, Optimizer) implement a **Genomic Fir
 
 ## Notes
 
-This ADR establishes *how* we know what to do. The specific contents of the manifest are defined in `docs/standards/REPRODUCIBILITY_MANIFEST.md`. The validation logic is implemented in `views_r2darts2/utils/gates.py`.
+This ADR establishes *how* we know what to do. The specific contents of the manifest are defined in `docs/standards/REPRODUCIBILITY_MANIFEST.md`. The validation logic is implemented in `views_r2darts2/utils/reproducibility_gate.py`.
 

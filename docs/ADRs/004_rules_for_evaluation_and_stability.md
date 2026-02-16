@@ -21,7 +21,7 @@ If everything is stable, research stagnates. If everything is experimental, resu
 We define three **Stability Tiers** for the components of this repository. The stability of a component determines the "cost" of changing it.
 
 ### Tier 1: The Fortress (High Stability)
-- **Scope:** `utils/gates.py`, `utils/nbeats_patch.py`, and the mathematical definitions of standard losses in `utils/loss.py`.
+- **Scope:** `utils/reproducibility_gate.py`, `utils/patches.py`, and the mathematical definitions of standard losses in `utils/loss/loss_catalog.py`.
 - **Guarantee:** These define the physical laws of the system (e.g., "thou shalt not peek into the future").
 - **Change Rule:** Changes require a new ADR or a superseding of an existing one. Breaking a "Gate" is considered a critical regression.
 

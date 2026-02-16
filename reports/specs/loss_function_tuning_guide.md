@@ -8,6 +8,13 @@ Several custom loss functions in this repository contain hyperparameters that ar
 
 A parameter value that is optimal for data scaled to `[0, 1]` will be ineffective or cause numerical instability for raw count data, and vice-versa. **It is critical to tune these parameters based on the specific data transformation pipeline being used.**
 
+Detailed behavioral profiles for each custom loss can be found in the **[Loss Cards](../../docs/loss_cards/README.md)**.
+
+---
+
+## 2. Standard Symmetrical Paths
+For reference, all custom objective functions live in `views_r2darts2/utils/loss/` and follow the 1-Class-1-File Zen standard (e.g., `tweedie_loss.py`).
+
 ## 2. Common Data Transformation Pipelines
 
 The following table defines common pipelines and the typical data range they produce.

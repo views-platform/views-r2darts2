@@ -389,185 +389,54 @@ Explicitly models zero-inflated structure with two components:
 This repository adheres to the **Fortress Architecture**, a set of strict engineering and mathematical standards designed to guarantee absolute scientific integrity and reproducibility in conflict forecasting.
 
 The repository is governed by:
-- **[Architectural Decision Records (ADRs)](docs/ADRs/README.md)**: Sequential, authoritative records of every major design choice (e.g., Numerical Precision, Hardware Integrity, Genomic Polymorphism).
+- **[Architectural Decision Records (ADRs)](docs/ADRs/README.md)**: Sequential, authoritative records of every major design choice (e.g., Physical Symmetry, Hardware Integrity, Genomic Firewall).
 - **[Class Intent Contracts (CICs)](docs/CICs/README.md)**: Explicit, normative declarations of purpose and responsibility for every critical class.
 - **[Reproducibility Manifest](docs/standards/REPRODUCIBILITY_MANIFEST.md)**: The mandatory "DNA" genome that every experiment must declare before execution.
 
-> **In this repository, a crash is often a successful defense of scientific integrity.** The system is designed to fail loudly and immediately if any temporal, numerical, or configuration invariant is violated.
-
 ---
 
-## 🛠️ How It Works
+## 🔧 API Reference (Symmetrical Access)
 
-1. **Data Preparation**:
-   - Handles VIEWS-formatted spatiotemporal data, supporting both CSV and DataFrame inputs.
-   - Integrates with the `_ViewsDatasetDarts` class, which converts raw data into Darts-compatible `TimeSeries` objects, manages static and dynamic covariates, and ensures correct alignment of time and entity indices.
-   - Supports broadcasting of features and targets, enabling flexible handling of multi-entity and multi-feature datasets.
-
-2. **Model Training**:
-   - Models are instantiated via the centralized `ModelCatalog`, which selects and configures the appropriate Darts model based on the provided configuration dictionary.
-   - Loss functions are selected and parameterized using the `LossSelector` utility, allowing for advanced weighting and penalty schemes tailored to zero-inflated and imbalanced data.
-   - Training leverages PyTorch Lightning under the hood, enabling features such as:
-     - Learning rate scheduling (OneCycle, Cosine Annealing, etc.)
-     - Early stopping based on monitored metrics (e.g., train loss)
-     - Gradient clipping to stabilize training
-     - Callbacks for logging, monitoring, and checkpointing
-   - Models are trained on GPU (if available), with automatic device selection (`cuda`, `mps`, or `cpu`).
-
-3. **Forecasting**:
-   - The `DartsForecaster` class manages the workflow for generating forecasts, including preprocessing, scaling, and device management.
-   - Supports probabilistic forecasting by generating multiple samples per prediction (Monte Carlo dropout, ensemble methods).
-   - Handles variable-length input sequences and flexible output horizons, allowing for both rolling and fixed-window predictions.
-   - Maintains temporal alignment of predictions, ensuring that forecasted values are correctly indexed by time and entity.
-   - Predictions are post-processed to ensure non-negativity and proper formatting, with support for inverse scaling.
-
-4. **Evaluation**:
-   - Evaluation routines automatically select the appropriate model artifact and partition the data for assessment.
-   - Outputs predictions as DataFrames indexed by time and entity, with support for multiple samples and uncertainty quantification.
-   - Includes automatic model versioning and artifact management, saving trained models and scalers for reproducibility and future inference.
-
-5. **Model Management & Saving**:
-   - The `DartsForecastingModelManager` class orchestrates the full lifecycle of model training, evaluation, and artifact management.
-   - Models and associated scalers are saved and loaded together, ensuring consistent preprocessing during inference.
-   - Supports partitioned dataset handling, parallel prediction jobs, and Monte Carlo inference for uncertainty estimation.
-
----
-
-## 🧩 Troubleshooting & FAQ
-
-- **CUDA Errors:** Ensure correct PyTorch and CUDA versions.
-- **Data Shape Mismatches:** Check input dimensions and required columns.
-- **Scaling Issues:** Verify scalers are fitted before prediction.
-- **Getting Help:** Open an issue on GitHub or contact maintainers.
-
----
-
-## 🎯 Configuration Examples
-
-### Basic Sweep Configuration
-
-```python
-def get_sweep_config():
-    sweep_config = {
-        'method': 'bayes',
-        'metric': {'name': 'time_series_wise_msle_mean_sb', 'goal': 'minimize'},
-        'early_terminate': {'type': 'hyperband', 'min_iter': 12, 'eta': 2},
-    }
-    
-    parameters = {
-        # Temporal
-        'steps': {'values': [[*range(1, 36 + 1)]]},
-        'input_chunk_length': {'values': [36, 48, 60]},
-        'output_chunk_length': {'values': [36]},
-        
-        # Training
-        'batch_size': {'values': [64, 128, 256]},
-        'n_epochs': {'values': [300]},
-        'early_stopping_patience': {'values': [10, 12]},
-        
-        # Optimizer
-        'lr': {'distribution': 'log_uniform_values', 'min': 1e-5, 'max': 5e-4},
-        'weight_decay': {'distribution': 'log_uniform_values', 'min': 1e-5, 'max': 1e-3},
-        
-        # Scaling (feature_scaler_map takes precedence)
-        'feature_scaler': {'values': [None]},
-        'target_scaler': {'values': ['AsinhTransform']},
-        'feature_scaler_map': {
-            'values': [{
-                "AsinhTransform": ["ged_sb", "ged_ns", "ged_os", "acled_sb"],
-                "MinMaxScaler": ["vdem_v2x_polyarchy", "wdi_sp_urb_totl_in_zs"],
-                "StandardScaler": ["wdi_sp_pop_grow"]
-            }]
-        },
-        
-        # Loss
-        'loss_function': {'values': ['WeightedPenaltyHuberLoss']},
-        'zero_threshold': {'distribution': 'uniform', 'min': 0.01, 'max': 0.1},
-        'delta': {'distribution': 'log_uniform_values', 'min': 0.1, 'max': 1.0},
-        'non_zero_weight': {'distribution': 'uniform', 'min': 3.0, 'max': 8.0},
-        'false_positive_weight': {'distribution': 'uniform', 'min': 1.5, 'max': 3.0},
-        'false_negative_weight': {'distribution': 'uniform', 'min': 2.0, 'max': 5.0},
-        
-        # Architecture (model-specific)
-        'use_reversible_instance_norm': {'values': [True]},
-        'dropout': {'values': [0.2, 0.3, 0.4]},
-    }
-    
-    sweep_config['parameters'] = parameters
-    return sweep_config
-```
-
----
-
-## 📐 Mathematical Reference
-
-### Huber Loss
-$$L_\delta(y, \hat{y}) = \begin{cases} \frac{1}{2}(y - \hat{y})^2 & \text{if } |y - \hat{y}| \leq \delta \\ \delta(|y - \hat{y}| - \frac{1}{2}\delta) & \text{otherwise} \end{cases}$$
-
-### Tweedie Deviance (1 < p < 2)
-$$D(y, \mu) = \frac{\mu^{2-p}}{2-p} - \frac{y \cdot \mu^{1-p}}{1-p}$$
-
-### Quantile Loss
-$$L_\tau(y, \hat{y}) = \begin{cases} \tau(y - \hat{y}) & \text{if } y \geq \hat{y} \\ (1-\tau)(\hat{y} - y) & \text{otherwise} \end{cases}$$
-
-### Asinh Transform
-$$y = \text{asinh}(x) = \ln(x + \sqrt{x^2 + 1})$$
-
-For large $x$: $\text{asinh}(x) \approx \ln(2x)$
-
----
-
-## 🔧 API Reference
+Every core class in the Fortress follows the **1-Class-1-File** Zen standard.
 
 ### ScalerSelector
-
 ```python
-from views_r2darts2.utils.scaling import ScalerSelector
+from views_r2darts2.utils.scaler_selector import ScalerSelector
 
 # Get a scaler by name
 scaler = ScalerSelector.get_scaler("AsinhTransform")
-scaler = ScalerSelector.get_scaler("RobustScaler")
-scaler = ScalerSelector.get_scaler("QuantileNormal", n_quantiles=500)
-```
-
-### LossSelector
-
-```python
-from views_r2darts2.utils.loss import LossSelector
-
-# Get a loss function by name with parameters
-loss = LossSelector.get_loss_function(
-    "WeightedPenaltyHuberLoss",
-    zero_threshold=0.05,
-    delta=0.5,
-    non_zero_weight=5.0,
-    false_positive_weight=2.0,
-    false_negative_weight=3.0
-)
+# Get a chained pipeline
+pipeline = ScalerSelector.get_chained_scaler("AsinhTransform->StandardScaler")
 ```
 
 ### FeatureScalerManager
-
 ```python
-from views_r2darts2.utils.scaling import FeatureScalerManager
+from views_r2darts2.utils.feature_scaler_manager import FeatureScalerManager
 
 manager = FeatureScalerManager(
-    feature_scaler_map={
-        "AsinhTransform": ["ged_sb", "ged_ns"],
-        "MinMaxScaler": ["vdem_v2x_polyarchy"]
-    },
-    default_scaler="RobustScaler",
-    all_features=["ged_sb", "ged_ns", "vdem_v2x_polyarchy", "other_feature"]
+    feature_scaler_map={"AsinhTransform": ["ged_sb"]},
+    default_scaler="RobustScaler"
 )
+```
 
-# Fit and transform
-transformed = manager.fit_transform(series_list)
+### Triple Catalogs (The Genomic Firewall)
+```python
+from views_r2darts2.model.model_catalog import ModelCatalog
+from views_r2darts2.utils.loss.loss_catalog import LossCatalog
+from views_r2darts2.utils.optimizer_catalog import OptimizerCatalog
 
-# Transform new data
-transformed_new = manager.transform(new_series_list)
+# Catalogs automatically enforce DNA completeness at initialization.
+loss_fn = LossCatalog(config).get_loss()
+model = ModelCatalog(config).get_model("NBEATSModel")
+```
 
-# Inverse transform predictions
-original_scale = manager.inverse_transform(predictions)
+### ReproducibilityGate (The Law)
+```python
+from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
+
+# Centralized validation of physical and temporal invariants.
+ReproducibilityGate.Config.audit_manifest(config)
+ReproducibilityGate.Temporal.audit_continuity(partition)
 ```
 
 ---

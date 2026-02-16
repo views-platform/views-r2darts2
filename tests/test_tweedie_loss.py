@@ -11,7 +11,7 @@ from darts.models import (
     NLinearModel,
     TiDEModel,
 )
-from views_r2darts2.utils.loss import LossSelector, TweedieLoss
+from views_r2darts2.utils.loss import LossCatalog, TweedieLoss
 
 # --- Unit Tests for the new TweedieLoss (with softplus link) ---
 
@@ -201,16 +201,17 @@ def test_tweedie_loss_with_darts_models(model_name, model_tuple, seed):
     model_cls, model_kwargs = model_tuple
     torch.manual_seed(seed)
 
-    # Using LossSelector to ensure it correctly passes the parameters
-    loss_fn = LossSelector.get_loss_function(
-        "TweedieLoss",
-        p=1.5,
-        non_zero_weight=5.0,
-        zero_threshold=0.01,
-        false_positive_weight=1.0,
-        false_negative_weight=1.0,
-        eps=1e-8,
-    )
+    # Using LossCatalog to ensure it correctly passes the parameters
+    config = {
+        "loss_function": "TweedieLoss",
+        "p": 1.5,
+        "non_zero_weight": 5.0,
+        "zero_threshold": 0.01,
+        "false_positive_weight": 1.0,
+        "false_negative_weight": 1.0,
+        "eps": 1e-8
+    }
+    loss_fn = LossCatalog(config).get_loss()
 
     model = model_cls(
         **model_kwargs,

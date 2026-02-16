@@ -17,7 +17,8 @@ import numpy as np
 import logging
 
 from views_r2darts2.model.forecaster import DartsForecaster
-from views_r2darts2.utils.loss import LossSelector
+from views_r2darts2.utils.loss import LossCatalog
+from views_r2darts2.utils.optimizer import OptimizerCatalog
 from views_r2darts2.utils.gates import ReproducibilityGate
 
 
@@ -185,37 +186,9 @@ class ModelCatalog:
         self.config = config
         self.device = DartsForecaster.get_device()
 
-        self.loss_name = self.config["loss_function"]
-
-        # Prepare loss arguments from config parameters by dynamically grabbing all
-        # potential loss-related keys from the config.
-        self.loss_args = {
-            # Huber-family params
-            "zero_threshold": self.config.get("zero_threshold"),
-            "delta": self.config.get("delta"),
-            "non_zero_weight": self.config.get("non_zero_weight"),
-            "false_negative_weight": self.config.get("false_negative_weight"),
-            "false_positive_weight": self.config.get("false_positive_weight"),
-            # Quantile-family params
-            "tau": self.config.get("tau"),
-            # Shrinkage-family params
-            "a": self.config.get("a"),
-            "c": self.config.get("c"),
-            # SpikeFocal-family params
-            "alpha": self.config.get("alpha"),
-            "gamma": self.config.get("gamma"),
-            "spike_threshold": self.config.get("spike_threshold"),
-            # ZeroInflated-family params
-            "zero_weight": self.config.get("zero_weight"),
-            "count_weight": self.config.get("count_weight"),
-            # Tweedie-family params
-            "p": self.config.get("p"),
-            "eps": self.config.get("eps"),
-        }
-        # Filter out None values, so that loss function defaults can apply
-        self.loss_args = {k: v for k, v in self.loss_args.items() if v is not None}
-
-        self.loss_fn = LossSelector.get_loss_function(self.loss_name, **self.loss_args)
+        # DELEGATION: Specialized catalogs handle genomic translation
+        self.loss_fn = LossCatalog(self.config).get_loss()
+        self.opt_catalog = OptimizerCatalog(self.config)
 
         self.lr_scheduler_args = {
             "mode": "min",
@@ -247,12 +220,6 @@ class ModelCatalog:
             "enable_progress_bar": True,
         }
 
-    def _get_common_optimizer_kwargs(self):
-        return {
-            "lr": self.config.get("lr"),
-            "weight_decay": self.config.get("weight_decay"),
-        }
-
     def _get_common_model_args(self):
         """
         Extracts common hyperparameters and training controls used by most Darts models.
@@ -271,26 +238,11 @@ class ModelCatalog:
             "random_state": self.config.get("random_state"),
             "force_reset": True,
             "pl_trainer_kwargs": self._get_common_pl_trainer_kwargs(),
-            "optimizer_cls": self._get_optimizer_cls(),
-            "optimizer_kwargs": self._get_common_optimizer_kwargs(),
+            "optimizer_cls": self.opt_catalog.get_optimizer_cls(),
+            "optimizer_kwargs": self.opt_catalog.get_optimizer_kwargs(),
             "lr_scheduler_cls": ReduceLROnPlateau,
             "lr_scheduler_kwargs": self.lr_scheduler_args,
         }
-
-    def _get_optimizer_cls(self):
-        opt_name = self.config.get("optimizer_cls")
-        if not opt_name:
-            from views_r2darts2.utils.gates import MissingHyperparameterError
-
-            raise MissingHyperparameterError(
-                "MANDATORY HYPERPARAMETER MISSING: 'optimizer_cls' must be explicitly declared in the DNA manifest."
-            )
-        try:
-            return getattr(torch.optim, opt_name)
-        except AttributeError:
-            raise ValueError(
-                f"INVALID HYPERPARAMETER: '{opt_name}' is not a valid torch.optim class name."
-            )
 
     def get_model(self, model_name: str):
         """
@@ -305,7 +257,7 @@ class ModelCatalog:
         return list(self.models.keys())
 
     def _get_tsmixer_model(self):
-        torch.serialization.add_safe_globals([TSMixerModel, LossSelector])
+        torch.serialization.add_safe_globals([TSMixerModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return TSMixerModel(
             **self._get_common_model_args(),
@@ -321,7 +273,7 @@ class ModelCatalog:
         )
 
     def _get_tft_model(self):
-        torch.serialization.add_safe_globals([TFTModel, LossSelector])
+        torch.serialization.add_safe_globals([TFTModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
 
         return TFTModel(
@@ -341,7 +293,7 @@ class ModelCatalog:
         )
 
     def _get_nbeats(self):
-        torch.serialization.add_safe_globals([NBEATSModel, LossSelector])
+        torch.serialization.add_safe_globals([NBEATSModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return NBEATSModel(
             **self._get_common_model_args(),
@@ -356,7 +308,7 @@ class ModelCatalog:
 
     def _get_nhits(self):
         """N-HiTS: Neural Hierarchical Interpolation for Time Series Forecasting."""
-        torch.serialization.add_safe_globals([NHiTSModel, LossSelector])
+        torch.serialization.add_safe_globals([NHiTSModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return NHiTSModel(
             **self._get_common_model_args(),
@@ -373,7 +325,7 @@ class ModelCatalog:
         )
 
     def _get_tcn_model(self):
-        torch.serialization.add_safe_globals([TCNModel, LossSelector])
+        torch.serialization.add_safe_globals([TCNModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return TCNModel(
             **self._get_common_model_args(),
@@ -385,7 +337,7 @@ class ModelCatalog:
         )
 
     def _get_rnn_model(self):
-        torch.serialization.add_safe_globals([BlockRNNModel, LossSelector])
+        torch.serialization.add_safe_globals([BlockRNNModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return BlockRNNModel(
             **self._get_common_model_args(),
@@ -398,7 +350,7 @@ class ModelCatalog:
         )
 
     def _get_transformer_model(self):
-        torch.serialization.add_safe_globals([TransformerModel, LossSelector])
+        torch.serialization.add_safe_globals([TransformerModel, LossCatalog])
 
         d_model = self.config.get("d_model")
         nhead = self.config.get("nhead", self.config.get("num_attention_heads"))
@@ -436,7 +388,7 @@ class ModelCatalog:
         )
 
     def _get_nlinear_model(self):
-        torch.serialization.add_safe_globals([NLinearModel, LossSelector])
+        torch.serialization.add_safe_globals([NLinearModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return NLinearModel(
             **self._get_common_model_args(),
@@ -448,7 +400,7 @@ class ModelCatalog:
         )
 
     def _get_dlinear_model(self):
-        torch.serialization.add_safe_globals([DLinearModel, LossSelector])
+        torch.serialization.add_safe_globals([DLinearModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
         return DLinearModel(
             **self._get_common_model_args(),
@@ -460,7 +412,7 @@ class ModelCatalog:
         )
 
     def _get_tide_model(self):
-        torch.serialization.add_safe_globals([TiDEModel, LossSelector])
+        torch.serialization.add_safe_globals([TiDEModel, LossCatalog])
         ReproducibilityGate.Config.audit_architecture(self.config)
 
         # ---- 1. Model construction (STRICT access only) ----

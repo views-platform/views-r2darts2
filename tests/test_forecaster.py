@@ -58,8 +58,13 @@ def forecaster(mock_dataset, mock_model, partition_dict):
         patch.object(DartsForecaster, "get_device", return_value="cpu"),
     ):
         forecaster = DartsForecaster(
-            dataset=mock_dataset, model=mock_model, partition_dict=partition_dict
+            dataset=mock_dataset,
+            model=mock_model,
+            partition_dict=partition_dict,
+            random_state=42,
         )
+
+    
     return forecaster
 
 
@@ -87,7 +92,9 @@ def forecaster_with_scalers(mock_dataset, mock_model, partition_dict):
             partition_dict=partition_dict,
             feature_scaler="StandardScaler",
             target_scaler="StandardScaler",  # Using the same for simplicity
+            random_state=42,
         )
+    
     return forecaster
 
 
@@ -117,6 +124,7 @@ class TestDartsForecaster:
                 partition_dict=partition_dict,
                 feature_scaler="StandardScaler",
                 target_scaler="RobustScaler",
+                random_state=42,
             )
 
             assert forecaster._feature_scaler_cfg == "StandardScaler"
@@ -170,7 +178,10 @@ class TestDartsForecaster:
             patch.object(DartsForecaster, "get_device", return_value="cuda"),
         ):
             forecaster = DartsForecaster(
-                dataset=mock_dataset, model=mock_model, partition_dict=partition_dict
+                dataset=mock_dataset,
+                model=mock_model,
+                partition_dict=partition_dict,
+                random_state=42,
             )
 
             assert forecaster.device == "cuda"
@@ -533,6 +544,7 @@ class TestDartsForecaster:
             partition_dict=partition_dict,
             target_scaler=forecaster_with_scalers._target_scaler_cfg,
             feature_scaler=forecaster_with_scalers._feature_scaler_cfg,
+            random_state=42,
         )
         new_forecaster.load_model(str(model_path))
 
@@ -632,7 +644,10 @@ class TestDartsForecasterIntegration:
         """Test complete workflow without scalers."""
         with patch("views_r2darts2.model.forecaster.ScalerSelector"):
             forecaster = DartsForecaster(
-                dataset=mock_dataset, model=mock_model, partition_dict=partition_dict
+                dataset=mock_dataset,
+                model=mock_model,
+                partition_dict=partition_dict,
+                random_state=42,
             )
 
             assert forecaster.target_scaler is None

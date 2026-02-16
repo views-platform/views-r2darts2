@@ -1,7 +1,7 @@
 import pytest
 import torch
 from views_r2darts2.utils.loss import (
-    LossSelector,
+    LossCatalog,
     WeightedHuberLoss,
     TimeAwareWeightedHuberLoss,
     SpikeFocalLoss,
@@ -12,85 +12,92 @@ from views_r2darts2.utils.loss import (
 )
 
 
-class TestLossSelector:
+class TestLossCatalog:
     def test_get_weighted_huber_loss(self):
-        loss = LossSelector.get_loss_function(
-            "WeightedHuberLoss", zero_threshold=0.02, delta=1.0, non_zero_weight=10.0
-        )
+        config = {
+            "loss_function": "WeightedHuberLoss",
+            "zero_threshold": 0.02,
+            "delta": 1.0,
+            "non_zero_weight": 10.0
+        }
+        loss = LossCatalog(config).get_loss()
         assert isinstance(loss, WeightedHuberLoss)
         assert loss.threshold == 0.02
         assert loss.delta == 1.0
         assert loss.non_zero_weight == 10.0
 
     def test_get_time_aware_weighted_huber_loss(self):
-        loss = LossSelector.get_loss_function(
-            "TimeAwareWeightedHuberLoss",
-            zero_weight=0.5,
-            non_zero_weight=2.0,
-            decay_factor=0.9,
-            delta=1.0,
-        )
+        config = {
+            "loss_function": "TimeAwareWeightedHuberLoss",
+            "zero_weight": 0.5,
+            "non_zero_weight": 2.0,
+            "decay_factor": 0.9,
+            "delta": 1.0,
+        }
+        loss = LossCatalog(config).get_loss()
         assert isinstance(loss, TimeAwareWeightedHuberLoss)
         assert loss.zero_weight == 0.5
         assert loss.non_zero_weight == 2.0
 
     def test_get_spike_focal_loss(self):
-        loss = LossSelector.get_loss_function(
-            "SpikeFocalLoss", alpha=0.7, gamma=3.0, spike_threshold=5.0
-        )
+        config = {
+            "loss_function": "SpikeFocalLoss",
+            "alpha": 0.7,
+            "gamma": 3.0,
+            "spike_threshold": 5.0
+        }
+        loss = LossCatalog(config).get_loss()
         assert isinstance(loss, SpikeFocalLoss)
         assert loss.alpha == 0.7
         assert loss.gamma == 3.0
 
     def test_get_weighted_penalty_huber_loss(self):
-        loss = LossSelector.get_loss_function(
-            "WeightedPenaltyHuberLoss",
-            zero_threshold=0.05,
-            delta=0.8,
-            non_zero_weight=6.0,
-            false_positive_weight=12.0,
-            false_negative_weight=18.0,
-        )
+        config = {
+            "loss_function": "WeightedPenaltyHuberLoss",
+            "zero_threshold": 0.05,
+            "delta": 0.8,
+            "non_zero_weight": 6.0,
+            "false_positive_weight": 12.0,
+            "false_negative_weight": 18.0,
+        }
+        loss = LossCatalog(config).get_loss()
         assert isinstance(loss, WeightedPenaltyHuberLoss)
         assert loss.threshold == 0.05
 
     def test_unknown_loss_function(self):
+        config = {"loss_function": "NonExistentLoss"}
         with pytest.raises(ValueError, match="Unknown loss function"):
-            LossSelector.get_loss_function("NonExistentLoss")
+            LossCatalog(config).get_loss()
 
-    def test_filters_invalid_kwargs(self):
-        loss = LossSelector.get_loss_function(
-            "WeightedHuberLoss",
-            zero_threshold=0.01,
-            delta=1.0,
-            non_zero_weight=5.0,
-            invalid_param=999,
-        )
-        assert isinstance(loss, WeightedHuberLoss)
-        assert loss.delta == 1.0
+    def test_missing_mandatory_genes(self):
+        config = {
+            "loss_function": "WeightedHuberLoss",
+            "zero_threshold": 0.01,
+            # missing delta, non_zero_weight
+        }
+        with pytest.raises(ValueError, match="MANDATORY LOSS GENES MISSING"):
+            LossCatalog(config).get_loss()
 
     def test_get_mse_loss(self):
-        loss = LossSelector.get_loss_function("MSELoss")
+        config = {"loss_function": "MSELoss"}
+        loss = LossCatalog(config).get_loss()
         assert isinstance(loss, torch.nn.MSELoss)
 
     def test_get_l1_loss(self):
-        loss = LossSelector.get_loss_function("L1Loss")
+        config = {"loss_function": "L1Loss"}
+        loss = LossCatalog(config).get_loss()
         assert isinstance(loss, torch.nn.L1Loss)
 
     def test_get_huber_loss_standard(self):
-        loss = LossSelector.get_loss_function("HuberLoss", delta=0.7)
+        config = {"loss_function": "HuberLoss", "delta": 0.7}
+        loss = LossCatalog(config).get_loss()
         assert isinstance(loss, torch.nn.HuberLoss)
         assert loss.delta == 0.7
 
-    def test_get_smooth_l1_loss(self):
-        loss = LossSelector.get_loss_function("SmoothL1Loss", beta=0.6)
-        assert isinstance(loss, torch.nn.SmoothL1Loss)
-        assert loss.beta == 0.6
-
     def test_get_poisson_nll_loss(self):
-        loss = LossSelector.get_loss_function("PoissonNLLLoss", log_input=False)
+        config = {"loss_function": "PoissonNLLLoss"}
+        loss = LossCatalog(config).get_loss()
         assert isinstance(loss, torch.nn.PoissonNLLLoss)
-        assert not loss.log_input
 
 
 class TestWeightedHuberLoss:

@@ -11,7 +11,7 @@ from darts.models import (
     NLinearModel,
     TiDEModel,
 )
-from views_r2darts2.utils.loss import LossSelector
+from views_r2darts2.utils.loss import LossCatalog
 
 # Define a small, consistent dataset for all integration tests
 ts_train = TimeSeries.from_values(
@@ -78,7 +78,7 @@ def test_l1_loss_with_darts_models(model_name, model_tuple, seed):
     model_cls, model_kwargs = model_tuple
     torch.manual_seed(seed)  # for reproducibility
 
-    loss_fn = LossSelector.get_loss_function("L1Loss")
+    loss_fn = LossCatalog({"loss_function": "L1Loss"}).get_loss()
 
     model = model_cls(
         **model_kwargs,

@@ -1,4 +1,5 @@
 import pytest
+import torch
 from unittest.mock import patch, MagicMock
 from views_r2darts2.model.catalog import ModelCatalog
 from darts.models.forecasting.nbeats import NBEATSModel
@@ -222,7 +223,6 @@ class TestModelCatalogInitialization:
 
         assert catalog.config == basic_config
         assert catalog.device == "cpu"
-        assert catalog.loss_name == "WeightedPenaltyHuberLoss"
         assert len(catalog.models) == 10
 
     def test_init_with_valid_loss_functions(self, basic_config):
@@ -232,7 +232,7 @@ class TestModelCatalogInitialization:
         for loss_name in valid_losses:
             config = {**basic_config, "loss_function": loss_name}
             catalog = ModelCatalog(config)
-            assert catalog.loss_name == loss_name
+            assert isinstance(catalog.loss_fn, torch.nn.Module)
 
     def test_init_with_invalid_loss_raises_error(self, basic_config):
         """Test that invalid loss function raises ValueError."""
@@ -240,16 +240,6 @@ class TestModelCatalogInitialization:
 
         with pytest.raises(ValueError, match="Unknown loss function"):
             ModelCatalog(config)
-
-    def test_loss_args_from_config(self, full_config):
-        """Test that loss arguments are correctly extracted from config."""
-        catalog = ModelCatalog(full_config)
-
-        assert catalog.loss_args["zero_threshold"] == 0.05
-        assert catalog.loss_args["delta"] == 0.5
-        assert catalog.loss_args["non_zero_weight"] == 5.0
-        assert catalog.loss_args["false_negative_weight"] == 15.0
-        assert catalog.loss_args["false_positive_weight"] == 10.0
 
     def test_lr_scheduler_args(self, full_config):
         """Test that learning rate scheduler arguments are set correctly."""
@@ -599,25 +589,9 @@ class TestConfigurationHandling:
         with pytest.raises(KeyError, match="output_chunk_length"):
             catalog_missing._get_nbeats()
 
-    def test_default_values_applied(self, basic_config):
-        """Test that configured values are correctly applied."""
+    def test_optimizer_config_applied(self, basic_config):
+        """Test that optimizer values are correctly applied."""
         catalog = ModelCatalog(basic_config)
-
-        # Check loss function parameters from basic_config
-        assert catalog.loss_args["zero_threshold"] == 0.01
-        assert catalog.loss_args["delta"] == 0.5
-        assert catalog.loss_args["non_zero_weight"] == 5.0
-
-    def test_custom_values_override_defaults(self, basic_config):
-        """Test that custom values are correctly applied."""
-        config = {
-            **basic_config,
-            "zero_threshold": 0.5,
-            "delta": 1.0,
-            "non_zero_weight": 10.0,
-        }
-        catalog = ModelCatalog(config)
-
-        assert catalog.loss_args["zero_threshold"] == 0.5
-        assert catalog.loss_args["delta"] == 1.0
-        assert catalog.loss_args["non_zero_weight"] == 10.0
+        kwargs = catalog.opt_catalog.get_optimizer_kwargs()
+        assert kwargs["lr"] == 3e-4
+        assert kwargs["weight_decay"] == 1e-3

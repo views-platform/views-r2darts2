@@ -8,9 +8,6 @@ from darts.models.forecasting.nbeats import (
     _Block,
 )
 from darts.utils.torch import MonteCarloDropout
-from darts.models import NBEATSModel
-import numpy as np
-from darts import TimeSeries
 
 logger = get_logger(__name__)
 

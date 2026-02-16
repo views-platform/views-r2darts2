@@ -1,5 +1,4 @@
 import torch
-import inspect
 import logging
 from .shrinkage import ShrinkageLoss
 from .weighted_huber import WeightedHuberLoss
@@ -12,22 +11,50 @@ from .zero_inflated import ZeroInflatedLoss
 
 logger = logging.getLogger(__name__)
 
-class LossSelector:
-    @staticmethod
-    def get_loss_function(loss_name, **kwargs):
+class LossCatalog:
+    """
+    Genome Translator for mathematical loss functions.
+    
+    This class is responsible for mapping configuration DNA to concrete torch.nn.Module 
+    instances, ensuring that all mandatory loss hyperparameters are present and valid.
+    """
+    def __init__(self, config: dict):
+        self.config = config
+        self.loss_name = self.config["loss_function"]
+        
+        # Dictionary of all potential loss genes recognized by the Fortress
+        self._all_potential_args = {
+            # Huber-family
+            "zero_threshold": self.config.get("zero_threshold"),
+            "delta": self.config.get("delta"),
+            "non_zero_weight": self.config.get("non_zero_weight"),
+            "false_negative_weight": self.config.get("false_negative_weight"),
+            "false_positive_weight": self.config.get("false_positive_weight"),
+            # Quantile-family
+            "tau": self.config.get("tau"),
+            # Shrinkage-family
+            "a": self.config.get("a"),
+            "c": self.config.get("c"),
+            # SpikeFocal-family
+            "alpha": self.config.get("alpha"),
+            "gamma": self.config.get("gamma"),
+            "spike_threshold": self.config.get("spike_threshold"),
+            # ZeroInflated-family
+            "zero_weight": self.config.get("zero_weight"),
+            "count_weight": self.config.get("count_weight"),
+            # Tweedie-family
+            "p": self.config.get("p"),
+            "eps": self.config.get("eps"),
+            # Time-Aware family
+            "decay_factor": self.config.get("decay_factor"),
+        }
+
+    def get_loss(self) -> torch.nn.Module:
         """
-        Returns an instance of the specified loss function class with provided keyword arguments.
-
-        Parameters:
-            loss_name (str): The name of the loss function to instantiate. 
-            **kwargs: Arbitrary keyword arguments to pass to the loss function's constructor.
-
-        Returns:
-            An instance of the requested loss function class.
-
-        Raises:
-            ValueError: If the provided loss_name is not recognized.
+        Instantiates and returns the loss function module based on the DNA.
         """
+        from views_r2darts2.utils.gates import ReproducibilityGate
+        
         loss_classes = {
             "WeightedHuberLoss": WeightedHuberLoss,
             "TimeAwareWeightedHuberLoss": TimeAwareWeightedHuberLoss,
@@ -37,7 +64,6 @@ class LossSelector:
             "AsymmetricQuantileLoss": AsymmetricQuantileLoss,
             "ZeroInflatedLoss": ZeroInflatedLoss,
             "ShrinkageLoss": ShrinkageLoss,
-            # Standard PyTorch losses
             "MSELoss": torch.nn.MSELoss,
             "L1Loss": torch.nn.L1Loss,
             "HuberLoss": torch.nn.HuberLoss,
@@ -45,26 +71,27 @@ class LossSelector:
             "PoissonNLLLoss": torch.nn.PoissonNLLLoss,
         }
 
-        if loss_name not in loss_classes:
-            raise ValueError(f"Unknown loss function: {loss_name}")
+        if self.loss_name not in loss_classes:
+            raise ValueError(f"Unknown loss function: {self.loss_name}")
 
-        cls = loss_classes[loss_name]
+        cls = loss_classes[self.loss_name]
         
-        # Standard PyTorch losses might not need filtering if they take standard args
+        # Standard PyTorch losses (no filtering needed)
         if cls.__module__.startswith("torch.nn"):
-             return cls(**kwargs)
+             # Filter recognized args for HuberLoss
+             if self.loss_name == "HuberLoss":
+                 return cls(delta=self.config.get("delta", 1.0))
+             return cls()
 
-        # For our custom losses, filter kwargs to only include valid parameters
-        params = inspect.signature(cls).parameters
-        valid_kwargs = {k: v for k, v in kwargs.items() if k in params}
+        # For custom Fortress losses, filter using the registered Genome in the Gate
+        loss_genome = ReproducibilityGate.Config.LOSS_GENOMES.get(self.loss_name, [])
+        valid_kwargs = {k: v for k, v in self._all_potential_args.items() if k in loss_genome}
         
-        # Check for missing parameters (NO DEFAULTS rule enforcement at instantiation)
-        required_params = [
-            k for k, v in params.items() 
-            if v.default is inspect.Parameter.empty and v.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-        ]
-        missing = [p for p in required_params if p not in valid_kwargs]
+        # Ensure no mandatory parameters are None (enforcing No-Defaults Rule)
+        missing = [k for k in loss_genome if valid_kwargs.get(k) is None]
         if missing:
-            raise ValueError(f"MANDATORY LOSS PARAMETERS MISSING for {loss_name}: {missing}")
+            error_msg = f"MANDATORY LOSS GENES MISSING for {self.loss_name}: {missing}"
+            logger.critical(error_msg)
+            raise ValueError(error_msg)
 
         return cls(**valid_kwargs)

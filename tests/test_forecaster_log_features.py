@@ -94,6 +94,7 @@ class TestDartsForecasterLogFeatures:
             model=dummy_model,
             partition_dict=partition_dict,
             log_features=log_features_config,
+            random_state=42,
         )
 
         # 2. Get the raw TimeSeries list from the dataset

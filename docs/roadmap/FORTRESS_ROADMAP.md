@@ -38,6 +38,14 @@
 *   **The Solution:** Cross-reference `ModelCatalog` with Darts source/docs.
 *   **Action:** Verify all exposed HPs exist in Darts, are passed correctly, and that no declared HP remains unused.
 
+### 2.3 Architectural Decomposition (The Triple Catalog)
+*   **The Problem:** `ModelCatalog` is currently a "God Object" violating the Single Responsibility Principle. It manages model architecture, loss instantiation (with 20+ arguments), and optimizer genomes. This coupling makes the codebase brittle and violates ADR-003.
+*   **The Solution:** Decompose the logic into three specialized **Genome Translators**:
+    *   **LossCatalog (Math Factory):** A dedicated class inside `utils/loss/` that owns the `LOSS_GENOMES`. It consumes the DNA, filters for loss-specific parameters, and returns a fully initialized `torch.nn.Module`.
+    *   **OptimizerCatalog (Training Engine Factory):** A new utility in `utils/optimizer.py` that owns the `OPTIMIZER_GENOMES`. It handles the handshake between the DNA and `torch.optim` requirements (e.g., momentum, alpha).
+    *   **ModelCatalog (Architecture Orchestrator):** A simplified orchestrator that delegates loss and optimizer creation to the specialized catalogs. It focuses purely on architecture-specific parameters and PyTorch Lightning trainer callbacks.
+*   **Action:** Refactor `ModelCatalog` and create the new `LossCatalog` and `OptimizerCatalog` entities.
+
 ---
 
 ## Phase 3: The Red Team Audit (Verification)

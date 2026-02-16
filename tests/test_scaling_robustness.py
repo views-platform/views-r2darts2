@@ -157,6 +157,7 @@ class TestScalingRobustness:
             partition_dict={"train": (0, 100), "test": (100, 120)},
             target_scaler="MinMaxScaler",
             feature_scaler="StandardScaler",
+            random_state=42,
         )
 
         # Verify that instantiated scalers behave globally

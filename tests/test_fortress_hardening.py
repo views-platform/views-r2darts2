@@ -1,3 +1,4 @@
+
 import pytest
 import torch
 import numpy as np
@@ -5,7 +6,7 @@ import pandas as pd
 from unittest.mock import MagicMock
 from views_r2darts2.utils.gates import ReproducibilityGate, NumericalSanityError
 from views_r2darts2.model.forecaster import DartsForecaster
-from views_r2darts2.utils.loss import LossSelector
+from views_r2darts2.utils.loss import LossCatalog
 
 def test_entropy_locking_parity():
     """Green Team: Verify entropy locking parity."""
@@ -35,7 +36,7 @@ def test_loss_numerical_purge_red_team_all_losses():
     }
 
     for name, kwargs in losses_to_test.items():
-        loss_fn = LossSelector.get_loss_function(name, **kwargs)
+        loss_fn = LossCatalog({**kwargs, "loss_function": name}).get_loss()
         
         # Test NaN in Predictions
         preds_nan = torch.tensor([1.0, float('nan')], requires_grad=True)
@@ -60,7 +61,6 @@ def test_loss_gradients_green_team():
         },
         "ShrinkageLoss": {"a": 10.0, "c": 0.2},
         "WeightedHuberLoss": {"zero_threshold": 0.01, "delta": 0.5, "non_zero_weight": 5.0},
-        # TimeAware omitted due to complex shape requirements in this simple test
         "SpikeFocalLoss": {"alpha": 0.8, "gamma": 2.0, "spike_threshold": 3.0},
         "TweedieLoss": {"non_zero_weight": 5.0, "zero_threshold": 0.01, "p": 1.5, "false_positive_weight": 1.0, "false_negative_weight": 1.0, "eps": 1e-8},
         "AsymmetricQuantileLoss": {"tau": 0.75, "non_zero_weight": 5.0, "zero_threshold": 0.01},
@@ -68,7 +68,7 @@ def test_loss_gradients_green_team():
     }
 
     for name, kwargs in losses_to_test.items():
-        loss_fn = LossSelector.get_loss_function(name, **kwargs)
+        loss_fn = LossCatalog({**kwargs, "loss_function": name}).get_loss()
         preds = torch.tensor([0.5, 1.5, 0.0], requires_grad=True)
         targets = torch.tensor([0.0, 2.0, 0.0])
         
@@ -86,7 +86,6 @@ def test_forecaster_beige_team_constraints():
     model = MagicMock()
     partition = {"train": [0, 10], "test": [11, 20]}
     
-    # Test Missing random_state
     with pytest.raises(ValueError, match="MANDATORY PARAMETER MISSING"):
         DartsForecaster(
             dataset=dataset,
@@ -105,14 +104,13 @@ def test_forecaster_nan_airlock_red_team():
     dataset.features = []
     dataset.as_darts_timeseries.return_value = []
     
-    model = MagicMock()
-    # Mock predict to return a series that will produce NaNs
     from darts import TimeSeries
     nan_series = TimeSeries.from_times_and_values(
         pd.date_range("2000-01-01", periods=1),
         np.array([[[np.nan]]]),
         static_covariates=pd.DataFrame({"entity": [1]})
     )
+    model = MagicMock()
     model.predict.return_value = [nan_series]
     model.input_chunk_length = 1
     

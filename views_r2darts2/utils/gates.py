@@ -242,11 +242,59 @@ class ReproducibilityGate:
             ],
         }
 
+        # Optimizer-specific genes
+        OPTIMIZER_GENOMES = {
+            "Adam": ["lr", "weight_decay"],
+            "AdamW": ["lr", "weight_decay"],
+            "SGD": ["lr", "weight_decay", "momentum"],
+            "RMSprop": ["lr", "weight_decay", "momentum", "alpha"],
+        }
+
+        # Loss-specific genes
+        LOSS_GENOMES = {
+            "WeightedPenaltyHuberLoss": [
+                "zero_threshold",
+                "delta",
+                "non_zero_weight",
+                "false_positive_weight",
+                "false_negative_weight",
+            ],
+            "WeightedHuberLoss": ["zero_threshold", "delta", "non_zero_weight"],
+            "TimeAwareWeightedHuberLoss": [
+                "zero_weight",
+                "non_zero_weight",
+                "decay_factor",
+                "delta",
+            ],
+            "SpikeFocalLoss": ["alpha", "gamma", "spike_threshold"],
+            "TweedieLoss": [
+                "p",
+                "non_zero_weight",
+                "zero_threshold",
+                "false_positive_weight",
+                "false_negative_weight",
+                "eps",
+            ],
+            "AsymmetricQuantileLoss": ["tau", "non_zero_weight", "zero_threshold"],
+            "ZeroInflatedLoss": [
+                "zero_weight",
+                "count_weight",
+                "delta",
+                "zero_threshold",
+                "eps",
+            ],
+            "ShrinkageLoss": ["a", "c"],
+            "MSELoss": [],
+            "L1Loss": [],
+            "HuberLoss": ["delta"],
+            "PoissonNLLLoss": [],
+        }
+
         @staticmethod
         def audit_manifest(config: Dict[str, Any]) -> None:
             """
             Verifies the presence of all mandatory DNA keys in the configuration.
-            Dynamically determines the required genome based on the chosen algorithm.
+            Dynamically determines the required genome based on algorithm, optimizer, and loss.
             """
             # 1. Audit Core Genome
             missing_core = [
@@ -257,7 +305,7 @@ class ReproducibilityGate:
                 logger.error(error_msg)
                 raise MissingHyperparameterError(error_msg)
 
-            # 2. Identify Algorithm
+            # 2. Identify Algorithm & Audit Architecture Genome
             algo = config.get("algorithm")
             if algo not in ReproducibilityGate.Config.ALGORITHM_GENOMES:
                 error_msg = (
@@ -266,7 +314,6 @@ class ReproducibilityGate:
                 logger.error(error_msg)
                 raise MissingHyperparameterError(error_msg)
 
-            # 3. Audit Algorithm Genome
             algo_genome = ReproducibilityGate.Config.ALGORITHM_GENOMES[algo]
             missing_algo = [k for k in algo_genome if k not in config]
             if missing_algo:
@@ -277,8 +324,47 @@ class ReproducibilityGate:
                 logger.error(error_msg)
                 raise MissingHyperparameterError(error_msg)
 
-            # 4. Check for None values in ALL required keys (Core + Algo)
-            all_required = ReproducibilityGate.Config.CORE_GENOME + algo_genome
+            # 3. Identify Optimizer & Audit Optimizer Genome
+            opt = config.get("optimizer_cls")
+            if opt in ReproducibilityGate.Config.OPTIMIZER_GENOMES:
+                opt_genome = ReproducibilityGate.Config.OPTIMIZER_GENOMES[opt]
+                missing_opt = [k for k in opt_genome if k not in config]
+                if missing_opt:
+                    error_msg = (
+                        f"REPRODUCIBILITY CONTRACT VIOLATED: Optimizer '{opt}' "
+                        f"requires missing parameters: {missing_opt}"
+                    )
+                    logger.error(error_msg)
+                    raise MissingHyperparameterError(error_msg)
+            else:
+                logger.warning(
+                    f"Optimizer '{opt}' is not registered in OPTIMIZER_GENOMES. Skipping specific audit."
+                )
+
+            # 4. Identify Loss & Audit Loss Genome
+            loss = config.get("loss_function")
+            if loss in ReproducibilityGate.Config.LOSS_GENOMES:
+                loss_genome = ReproducibilityGate.Config.LOSS_GENOMES[loss]
+                missing_loss = [k for k in loss_genome if k not in config]
+                if missing_loss:
+                    error_msg = (
+                        f"REPRODUCIBILITY CONTRACT VIOLATED: Loss '{loss}' "
+                        f"requires missing parameters: {missing_loss}"
+                    )
+                    logger.error(error_msg)
+                    raise MissingHyperparameterError(error_msg)
+            else:
+                logger.warning(
+                    f"Loss '{loss}' is not registered in LOSS_GENOMES. Skipping specific audit."
+                )
+
+            # 5. Check for None values in ALL required keys (Core + Algo + Opt + Loss)
+            all_required = (
+                ReproducibilityGate.Config.CORE_GENOME
+                + algo_genome
+                + ReproducibilityGate.Config.OPTIMIZER_GENOMES.get(opt, [])
+                + ReproducibilityGate.Config.LOSS_GENOMES.get(loss, [])
+            )
             explicit_nones = [k for k in all_required if config.get(k) is None]
             if explicit_nones:
                 error_msg = (

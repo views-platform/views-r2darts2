@@ -17,12 +17,7 @@ from darts.models import (
 
 
 def test_shrinkage_loss_init():
-    """Tests the initialization of ShrinkageLoss with default and custom parameters."""
-    # Test default initialization
-    loss_fn_default = ShrinkageLoss()
-    assert loss_fn_default.a == 10.0
-    assert loss_fn_default.c == 0.2
-
+    """Tests the initialization of ShrinkageLoss with custom parameters."""
     # Test custom initialization
     loss_fn_custom = ShrinkageLoss(a=5.0, c=0.5)
     assert loss_fn_custom.a == 5.0
@@ -201,7 +196,7 @@ def test_shrinkage_loss_with_darts_models(model_name, model_tuple, seed):
     model_cls, model_kwargs = model_tuple
     torch.manual_seed(seed)  # for reproducibility
 
-    loss_fn = ShrinkageLoss()
+    loss_fn = ShrinkageLoss(a=10.0, c=0.2)
 
     model = model_cls(
         **model_kwargs,

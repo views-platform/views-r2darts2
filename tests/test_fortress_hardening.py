@@ -4,10 +4,10 @@ import torch
 import numpy as np
 import pandas as pd
 from unittest.mock import MagicMock
-from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
-from views_r2darts2.utils.exceptions import NumericalSanityError
-from views_r2darts2.model.darts_forecaster import DartsForecaster
-from views_r2darts2.utils.loss.loss_catalog import LossCatalog
+from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.infrastructure.exceptions import NumericalSanityError
+from views_r2darts2.engines.darts_forecaster import DartsForecaster
+from views_r2darts2.catalogs.loss_catalog import LossCatalog
 
 def test_entropy_locking_parity():
     """Green Team: Verify entropy locking parity."""

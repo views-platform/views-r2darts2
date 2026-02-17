@@ -2,7 +2,7 @@
 
 import torch
 import pytest
-from views_r2darts2.utils.loss.shrinkage_loss import ShrinkageLoss
+from views_r2darts2.math.shrinkage_loss import ShrinkageLoss
 from darts import TimeSeries
 from darts.models import (
     NBEATSModel,

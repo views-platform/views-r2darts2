@@ -11,7 +11,7 @@ from darts.models import NBEATSModel
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping  # Explicit import
 import torch.optim
 
-from views_r2darts2.utils.loss import WeightedPenaltyHuberLoss, AsymmetricQuantileLoss
+from views_r2darts2.math import WeightedPenaltyHuberLoss, AsymmetricQuantileLoss
 
 
 class BaseModel:

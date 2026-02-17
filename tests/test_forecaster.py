@@ -6,8 +6,8 @@ from unittest.mock import Mock, patch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
 from sklearn.preprocessing import StandardScaler
-from views_r2darts2.model.darts_forecaster import DartsForecaster
-from views_r2darts2.data.views_dataset_darts import _ViewsDatasetDarts
+from views_r2darts2.engines.darts_forecaster import DartsForecaster
+from views_r2darts2.transformers.views_dataset_darts import _ViewsDatasetDarts
 
 
 @pytest.fixture
@@ -54,7 +54,7 @@ def forecaster(mock_dataset, mock_model, partition_dict):
     mock_model.model.parameters.return_value = iter([mock_param])
 
     with (
-        patch("views_r2darts2.model.darts_forecaster.ScalerSelector"),
+        patch("views_r2darts2.engines.darts_forecaster.ScalerSelector"),
         patch.object(DartsForecaster, "get_device", return_value="cpu"),
     ):
         forecaster = DartsForecaster(
@@ -81,7 +81,7 @@ def forecaster_with_scalers(mock_dataset, mock_model, partition_dict):
     # We patch the selector to return our real scaler instance
     with (
         patch(
-            "views_r2darts2.model.darts_forecaster.ScalerSelector.get_scaler",
+            "views_r2darts2.engines.darts_forecaster.ScalerSelector.get_scaler",
             return_value=StandardScaler(),
         ),
         patch.object(DartsForecaster, "get_device", return_value="cpu"),
@@ -114,7 +114,7 @@ class TestDartsForecaster:
     ):
         """Test initialization with feature and target scalers."""
         with patch(
-            "views_r2darts2.model.darts_forecaster.ScalerSelector"
+            "views_r2darts2.engines.darts_forecaster.ScalerSelector"
         ) as mock_scaler_selector:
             mock_scaler_selector.get_scaler.return_value = Mock()
 
@@ -174,7 +174,7 @@ class TestDartsForecaster:
         mock_model.model.parameters.return_value = iter([mock_param])
 
         with (
-            patch("views_r2darts2.model.darts_forecaster.ScalerSelector"),
+            patch("views_r2darts2.engines.darts_forecaster.ScalerSelector"),
             patch.object(DartsForecaster, "get_device", return_value="cuda"),
         ):
             forecaster = DartsForecaster(
@@ -329,7 +329,7 @@ class TestDartsForecaster:
 
     def test_process_predictions_raises_on_nans(self, forecaster):
         """[RED TEAM] Test that NaN values trigger a NumericalSanityError."""
-        from views_r2darts2.utils.exceptions import NumericalSanityError
+        from views_r2darts2.infrastructure.exceptions import NumericalSanityError
 
         times = pd.date_range("2020-01-01", periods=1, freq="M")
         # 1 timestep, 2 components, 1 sample each
@@ -462,7 +462,7 @@ class TestDartsForecaster:
 
     def test_predict_raises_on_nans(self, forecaster):
         """[RED TEAM] Test that predictions with NaN trigger a NumericalSanityError."""
-        from views_r2darts2.utils.exceptions import NumericalSanityError
+        from views_r2darts2.infrastructure.exceptions import NumericalSanityError
 
         mock_ts = Mock(spec=TimeSeries)
         mock_ts.astype = Mock(return_value=mock_ts)
@@ -642,7 +642,7 @@ class TestDartsForecasterIntegration:
         self, mock_dataset, mock_model, partition_dict
     ):
         """Test complete workflow without scalers."""
-        with patch("views_r2darts2.model.darts_forecaster.ScalerSelector"):
+        with patch("views_r2darts2.engines.darts_forecaster.ScalerSelector"):
             forecaster = DartsForecaster(
                 dataset=mock_dataset,
                 model=mock_model,

@@ -1,8 +1,8 @@
 import pytest
 from unittest.mock import MagicMock, patch, PropertyMock
-from views_r2darts2.manager.darts_forecasting_model_manager import DartsForecastingModelManager
+from views_r2darts2.engines.darts_forecasting_model_manager import DartsForecastingModelManager
 from views_pipeline_core.managers.model.model import ModelPathManager
-from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 
 
 class TestReproducibilityInfra:
@@ -13,11 +13,11 @@ class TestReproducibilityInfra:
     @pytest.fixture
     def mock_manager(self):
         with patch(
-            "views_r2darts2.manager.darts_forecasting_model_manager.ForecastingModelManager.__init__",
+            "views_r2darts2.engines.darts_forecasting_model_manager.ForecastingModelManager.__init__",
             return_value=None,
         ):
-            with patch("views_r2darts2.manager.darts_forecasting_model_manager.torch.load"):
-                with patch("views_r2darts2.manager.darts_forecasting_model_manager.logger"):
+            with patch("views_r2darts2.engines.darts_forecasting_model_manager.torch.load"):
+                with patch("views_r2darts2.engines.darts_forecasting_model_manager.logger"):
                     path_manager = MagicMock(spec=ModelPathManager)
                     path_manager.darts_forecasting_model_manager_name = "test_model"
 
@@ -69,7 +69,7 @@ class TestReproducibilityInfra:
 
     def test_predict_kwargs_validation(self, mock_manager):
         """Ensures the manager raises an error if mandatory prediction params are missing."""
-        from views_r2darts2.utils.exceptions import MissingHyperparameterError
+        from views_r2darts2.infrastructure.exceptions import MissingHyperparameterError
 
         # Case 1: Missing n_jobs (new strict requirement)
         config_missing = {"num_samples": 100, "mc_dropout": True}
@@ -133,7 +133,7 @@ class TestReproducibilityInfra:
 
     def test_partition_continuity_enforcement(self, mock_manager):
         """Ensures the manager refuses to run on discontinuous partitions (t+1 check)."""
-        from views_r2darts2.utils.exceptions import TemporalDiscontinuityError
+        from views_r2darts2.infrastructure.exceptions import TemporalDiscontinuityError
 
         # Case 1: Gap detected
         partition_gap = {"train": (100, 200), "test": (202, 210)}
@@ -147,7 +147,7 @@ class TestReproducibilityInfra:
 
     def test_horizon_standard_warning(self, mock_manager):
         """Verifies that the manager logs a warning for non-36 step horizons."""
-        with patch("views_r2darts2.utils.reproducibility_gate.logger.warning") as mock_warn:
+        with patch("views_r2darts2.infrastructure.reproducibility_gate.logger.warning") as mock_warn:
             ReproducibilityGate.Config.audit_architecture(
                 {"steps": list(range(1, 13)), "output_chunk_length": 1}
             )
@@ -155,7 +155,7 @@ class TestReproducibilityInfra:
 
     def test_data_leakage_prevention(self, mock_manager):
         """Tests that the system detects if test data months leaked into training."""
-        from views_r2darts2.utils.exceptions import DataLeakageError
+        from views_r2darts2.infrastructure.exceptions import DataLeakageError
         from darts import TimeSeries
         import pandas as pd
         import numpy as np
@@ -174,7 +174,7 @@ class TestReproducibilityInfra:
 
     def test_training_continuity_enforcement(self, mock_manager):
         """Ensures that training data must be a contiguous range with no holes."""
-        from views_r2darts2.utils.exceptions import TemporalHoleError
+        from views_r2darts2.infrastructure.exceptions import TemporalHoleError
         import numpy as np
 
         time_ids_holey = np.array([100, 101, 103, 104])
@@ -201,7 +201,7 @@ class TestReproducibilityInfra:
         [BEIGE TEAM] Ensures that the system refuses to predict if 'boring' but
         deadly parameters are missing.
         """
-        from views_r2darts2.utils.exceptions import MissingHyperparameterError
+        from views_r2darts2.infrastructure.exceptions import MissingHyperparameterError
 
         # A user forgets n_jobs in their config
         config_human_error = {
@@ -218,7 +218,7 @@ class TestReproducibilityInfra:
         [RED TEAM] Deliberately injects poisonous data to ensure the
         DataSanity gate kills the run.
         """
-        from views_r2darts2.utils.exceptions import NumericalSanityError
+        from views_r2darts2.infrastructure.exceptions import NumericalSanityError
         from darts import TimeSeries
         import pandas as pd
         import numpy as np
@@ -237,7 +237,7 @@ class TestReproducibilityInfra:
         [RED TEAM] Proves that the system KILLS the run if the training data
         stops before the partition boundary (Starvation).
         """
-        from views_r2darts2.utils.exceptions import DataStarvationError
+        from views_r2darts2.infrastructure.exceptions import DataStarvationError
         from darts import TimeSeries
         import pandas as pd
 
@@ -255,7 +255,7 @@ class TestReproducibilityInfra:
         [RED TEAM] Proves that the system KILLS the run if the training data
         exceeds the partition boundary (Leakage).
         """
-        from views_r2darts2.utils.exceptions import DataLeakageError
+        from views_r2darts2.infrastructure.exceptions import DataLeakageError
         from darts import TimeSeries
         import pandas as pd
 
@@ -318,7 +318,7 @@ class TestRedTeamAttacks:
     )
     def test_null_dna_injection(self, poison_key, poison_value):
         """[RED TEAM] Try to induce hidden defaults by passing None."""
-        from views_r2darts2.utils.exceptions import MissingHyperparameterError
+        from views_r2darts2.infrastructure.exceptions import MissingHyperparameterError
 
         config = {
             "random_state": 42,
@@ -359,7 +359,7 @@ class TestRedTeamAttacks:
 
     def test_off_by_one_peeking(self):
         """[RED TEAM] End training at t+1 (Boundary is 100, data goes to 101)."""
-        from views_r2darts2.utils.exceptions import DataLeakageError
+        from views_r2darts2.infrastructure.exceptions import DataLeakageError
         from darts import TimeSeries
         import pandas as pd
 
@@ -376,7 +376,7 @@ class TestRedTeamAttacks:
 
     def test_off_by_one_starvation(self):
         """[RED TEAM] End training at t-1 (Boundary is 100, data stops at 99)."""
-        from views_r2darts2.utils.exceptions import DataStarvationError
+        from views_r2darts2.infrastructure.exceptions import DataStarvationError
         from darts import TimeSeries
         import pandas as pd
 
@@ -393,7 +393,7 @@ class TestRedTeamAttacks:
 
     def test_swiss_cheese_sequence(self):
         """[RED TEAM] Inject a single missing month in a long series."""
-        from views_r2darts2.utils.exceptions import TemporalHoleError
+        from views_r2darts2.infrastructure.exceptions import TemporalHoleError
 
         # Sequence: 100, 101, [MISSING 102], 103, 104
         time_ids = [100, 101, 103, 104]
@@ -402,7 +402,7 @@ class TestRedTeamAttacks:
 
     def test_fence_post_eval_overflow(self):
         """[RED TEAM] Overflow test end by exactly 1 month."""
-        from views_r2darts2.utils.exceptions import PredictionHorizonError
+        from views_r2darts2.infrastructure.exceptions import PredictionHorizonError
 
         # train_end=100, test_end=110, steps=10, sequences=2
         # Max pred = 100 + (2-1) + 10 = 111 (OVERFLOW)
@@ -417,7 +417,7 @@ class TestRedTeamAttacks:
 
     def test_deep_nan_covariate_poisoning(self):
         """[RED TEAM] Hide a NaN in covariates to bypass target-only checks."""
-        from views_r2darts2.utils.exceptions import NumericalSanityError
+        from views_r2darts2.infrastructure.exceptions import NumericalSanityError
         from darts import TimeSeries
         import numpy as np
 
@@ -428,7 +428,7 @@ class TestRedTeamAttacks:
 
     def test_architecture_hash_mismatch(self):
         """[RED TEAM] Force an incompatible output chunk length."""
-        from views_r2darts2.utils.exceptions import ArchitectureMismatchError
+        from views_r2darts2.infrastructure.exceptions import ArchitectureMismatchError
 
         config = {"steps": list(range(36)), "output_chunk_length": 7}  # 36 % 7 != 0
         with pytest.raises(ArchitectureMismatchError):
@@ -436,7 +436,7 @@ class TestRedTeamAttacks:
 
     def test_reproduction_dna_lockdown(self):
         """[RED TEAM] Verifies that all DNA keys are strictly required for any run."""
-        from views_r2darts2.utils.exceptions import MissingHyperparameterError
+        from views_r2darts2.infrastructure.exceptions import MissingHyperparameterError
 
         # Skeleton config missing almost everything
         skeletal_config = {"algorithm": "NBEATS", "steps": [1, 2, 3]}

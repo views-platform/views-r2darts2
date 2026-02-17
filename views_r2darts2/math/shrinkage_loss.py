@@ -38,7 +38,7 @@ class ShrinkageLoss(torch.nn.Module):
         )
 
     def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        from views_r2darts2.utils.exceptions import NumericalSanityError
+        from views_r2darts2.infrastructure.exceptions import NumericalSanityError
         
         if torch.isnan(preds).any() or torch.isinf(preds).any():
             raise NumericalSanityError("Numerical Sanity Violation: NaN or Inf detected in predictions.")

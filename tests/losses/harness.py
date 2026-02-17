@@ -1,7 +1,7 @@
 import torch
 from typing import Dict, Any, Tuple
 from dataclasses import dataclass
-from views_r2darts2.utils.scaler_selector import ScalerSelector
+from views_r2darts2.transformers.scaler_selector import ScalerSelector
 
 @dataclass
 class LossSpec:

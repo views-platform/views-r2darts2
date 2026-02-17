@@ -1,13 +1,13 @@
 import logging
 import torch  # noqa: F401
-from views_r2darts2.data.views_dataset_darts import _ViewsDatasetDarts
-from views_r2darts2.model.darts_forecaster import DartsForecaster
+from views_r2darts2.transformers.views_dataset_darts import _ViewsDatasetDarts
+from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_pipeline_core.files.utils import generate_model_file_name
 from views_pipeline_core.managers.model import ModelPathManager, ForecastingModelManager
 
-from views_r2darts2.model.model_catalog import ModelCatalog
-from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
-from views_r2darts2.utils.patches import apply_all_patches
+from views_r2darts2.catalogs.model_catalog import ModelCatalog
+from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.infrastructure.patches import apply_all_patches
 
 logger = logging.getLogger(__name__)
 

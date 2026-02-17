@@ -1,8 +1,8 @@
 import pytest
 import torch
 from tests.losses.harness import LossSpec, LossIntegrityHarness, make_fake_views_batch
-from views_r2darts2.utils.loss.loss_catalog import LossCatalog
-from views_r2darts2.utils.exceptions import NumericalSanityError
+from views_r2darts2.catalogs.loss_catalog import LossCatalog
+from views_r2darts2.infrastructure.exceptions import NumericalSanityError
 
 # 1. Decision: Deciding on Canonical Test Configuration
 HARNESS = LossIntegrityHarness(device="cpu", dtype=torch.float32)

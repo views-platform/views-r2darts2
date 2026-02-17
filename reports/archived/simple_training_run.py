@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from darts import TimeSeries
 from darts.models import NLinearModel
-from views_r2darts2.utils.loss import LossSelector
+from views_r2darts2.math import LossSelector
 import logging
 
 # --- Suppress excessive logging ---

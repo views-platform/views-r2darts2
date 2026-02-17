@@ -1,4 +1,3 @@
-from .loss_catalog import LossCatalog
 from .shrinkage_loss import ShrinkageLoss
 from .weighted_huber_loss import WeightedHuberLoss
 from .time_aware_weighted_huber_loss import TimeAwareWeightedHuberLoss
@@ -9,7 +8,6 @@ from .asymmetric_quantile_loss import AsymmetricQuantileLoss
 from .zero_inflated_loss import ZeroInflatedLoss
 
 __all__ = [
-    "LossCatalog",
     "ShrinkageLoss",
     "WeightedHuberLoss",
     "TimeAwareWeightedHuberLoss",

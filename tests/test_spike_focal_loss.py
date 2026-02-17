@@ -2,7 +2,7 @@
 
 import torch
 import pytest
-from views_r2darts2.utils.loss.spike_focal_loss import SpikeFocalLoss
+from views_r2darts2.math.spike_focal_loss import SpikeFocalLoss
 
 # --- Unit Tests for SpikeFocalLoss ---
 

@@ -2,7 +2,7 @@
 
 import torch
 import pytest
-from views_r2darts2.utils.loss.zero_inflated_loss import ZeroInflatedLoss
+from views_r2darts2.math.zero_inflated_loss import ZeroInflatedLoss
 
 # --- Unit Tests for ZeroInflatedLoss ---
 

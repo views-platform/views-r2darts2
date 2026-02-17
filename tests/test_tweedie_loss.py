@@ -11,8 +11,8 @@ from darts.models import (
     NLinearModel,
     TiDEModel,
 )
-from views_r2darts2.utils.loss.loss_catalog import LossCatalog
-from views_r2darts2.utils.loss.tweedie_loss import TweedieLoss
+from views_r2darts2.catalogs.loss_catalog import LossCatalog
+from views_r2darts2.math.tweedie_loss import TweedieLoss
 
 # --- Unit Tests for the new TweedieLoss (with softplus link) ---
 

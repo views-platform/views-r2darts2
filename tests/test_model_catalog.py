@@ -1,7 +1,7 @@
 import pytest
 import torch
 from unittest.mock import patch, MagicMock
-from views_r2darts2.model.model_catalog import ModelCatalog
+from views_r2darts2.catalogs.model_catalog import ModelCatalog
 from darts.models.forecasting.nbeats import NBEATSModel
 from darts.models.forecasting.tft_model import TFTModel
 from darts.models.forecasting.tcn_model import TCNModel
@@ -202,7 +202,7 @@ def full_config():
 @pytest.fixture
 def mock_device():
     """Mock the device detection."""
-    with patch("views_r2darts2.model.model_catalog.DartsForecaster.get_device") as mock:
+    with patch("views_r2darts2.catalogs.model_catalog.DartsForecaster.get_device") as mock:
         mock.return_value = "cpu"
         yield mock
 
@@ -210,7 +210,7 @@ def mock_device():
 @pytest.fixture
 def mock_wandb():
     """Mock WandB logger to prevent actual logging."""
-    with patch("views_r2darts2.model.model_catalog.WandbLogger") as mock:
+    with patch("views_r2darts2.catalogs.model_catalog.WandbLogger") as mock:
         mock_instance = MagicMock()
         mock.return_value = mock_instance
         yield mock
@@ -306,7 +306,7 @@ class TestModelCatalogInitialization:
 
 
 
-            from views_r2darts2.utils.exceptions import MissingHyperparameterError
+            from views_r2darts2.infrastructure.exceptions import MissingHyperparameterError
 
 
 
@@ -712,7 +712,7 @@ class TestConfigurationHandling:
             "output_chunk_length": 3,
         }
         catalog_invalid = ModelCatalog(config_invalid)
-        from views_r2darts2.utils.exceptions import ArchitectureMismatchError
+        from views_r2darts2.infrastructure.exceptions import ArchitectureMismatchError
 
         with pytest.raises(ArchitectureMismatchError, match="Architecture Mismatch"):
             catalog_invalid._get_nbeats()
@@ -730,7 +730,7 @@ class TestConfigurationHandling:
         if "output_chunk_length" in config_missing:
             del config_missing["output_chunk_length"]
             
-        from views_r2darts2.utils.exceptions import MissingHyperparameterError
+        from views_r2darts2.infrastructure.exceptions import MissingHyperparameterError
         with pytest.raises(MissingHyperparameterError, match="REPRODUCIBILITY CONTRACT VIOLATED"):
             ModelCatalog(config_missing)
 

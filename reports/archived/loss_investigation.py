@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # Assuming the loss functions are in the correct path
-from views_r2darts2.utils.loss import ShrinkageLoss, TweedieLoss
+from views_r2darts2.math import ShrinkageLoss, TweedieLoss
 
 
 def generate_synthetic_data(

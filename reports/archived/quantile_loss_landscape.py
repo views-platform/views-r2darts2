@@ -4,7 +4,7 @@ import sys
 
 # Ensure the path is correct to import from the parent directory's module
 sys.path.append("..")
-from views_r2darts2.utils.loss import AsymmetricQuantileLoss
+from views_r2darts2.math import AsymmetricQuantileLoss
 
 
 def plot_quantile_loss_landscape():

@@ -4,7 +4,7 @@ from views_pipeline_core.configs.pipeline import PipelineConfig
 from typing import Optional, List, Union
 import numpy as np
 from darts import TimeSeries
-from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 
 
 class _ViewsDatasetDarts(_ViewsDataset):

@@ -401,7 +401,7 @@ Every core class in the Fortress follows the **1-Class-1-File** Zen standard.
 
 ### ScalerSelector
 ```python
-from views_r2darts2.utils.scaler_selector import ScalerSelector
+from views_r2darts2.transformers.scaler_selector import ScalerSelector
 
 # Get a scaler by name
 scaler = ScalerSelector.get_scaler("AsinhTransform")
@@ -411,7 +411,7 @@ pipeline = ScalerSelector.get_chained_scaler("AsinhTransform->StandardScaler")
 
 ### FeatureScalerManager
 ```python
-from views_r2darts2.utils.feature_scaler_manager import FeatureScalerManager
+from views_r2darts2.transformers.feature_scaler_manager import FeatureScalerManager
 
 manager = FeatureScalerManager(
     feature_scaler_map={"AsinhTransform": ["ged_sb"]},
@@ -421,9 +421,9 @@ manager = FeatureScalerManager(
 
 ### Triple Catalogs (The Genomic Firewall)
 ```python
-from views_r2darts2.model.model_catalog import ModelCatalog
-from views_r2darts2.utils.loss.loss_catalog import LossCatalog
-from views_r2darts2.utils.optimizer_catalog import OptimizerCatalog
+from views_r2darts2.catalogs.model_catalog import ModelCatalog
+from views_r2darts2.catalogs.loss_catalog import LossCatalog
+from views_r2darts2.catalogs.optimizer_catalog import OptimizerCatalog
 
 # Catalogs automatically enforce DNA completeness at initialization.
 loss_fn = LossCatalog(config).get_loss()
@@ -432,7 +432,7 @@ model = ModelCatalog(config).get_model("NBEATSModel")
 
 ### ReproducibilityGate (The Law)
 ```python
-from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 
 # Centralized validation of physical and temporal invariants.
 ReproducibilityGate.Config.audit_manifest(config)

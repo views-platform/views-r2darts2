@@ -1,6 +1,6 @@
 import torch
 import logging
-from views_r2darts2.utils.exceptions import NumericalSanityError
+from views_r2darts2.infrastructure.exceptions import NumericalSanityError
 
 logger = logging.getLogger(__name__)
 

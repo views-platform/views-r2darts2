@@ -15,11 +15,11 @@ from pytorch_lightning.loggers import WandbLogger
 import torch
 import logging
 
-from views_r2darts2.model.darts_forecaster import DartsForecaster
-from views_r2darts2.utils.loss.loss_catalog import LossCatalog
-from views_r2darts2.utils.optimizer_catalog import OptimizerCatalog
-from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
-from views_r2darts2.utils.callbacks import GradientHealthCallback
+from views_r2darts2.engines.darts_forecaster import DartsForecaster
+from views_r2darts2.catalogs.loss_catalog import LossCatalog
+from views_r2darts2.catalogs.optimizer_catalog import OptimizerCatalog
+from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.infrastructure.callbacks import GradientHealthCallback
 
 
 logger = logging.getLogger(__name__)

@@ -6,9 +6,9 @@ from unittest.mock import patch, MagicMock
 
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
-from views_r2darts2.model.darts_forecaster import DartsForecaster
-from views_r2darts2.utils.reproducibility_gate import ReproducibilityGate
-from views_r2darts2.model.model_catalog import ModelCatalog
+from views_r2darts2.engines.darts_forecaster import DartsForecaster
+from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.catalogs.model_catalog import ModelCatalog
 
 # --- Mocking Utilities ---
 
@@ -98,7 +98,7 @@ def basic_config():
 
 class TestMCDropoutEntropyLock:
 
-    @patch("views_r2darts2.model.darts_forecaster.DartsForecaster.get_device", return_value="cpu")
+    @patch("views_r2darts2.engines.darts_forecaster.DartsForecaster.get_device", return_value="cpu")
     @patch.object(ModelCatalog, "get_model", autospec=True)
     def test_mc_dropout_sequence_reproducibility(
         self, mock_get_model, mock_get_device, dummy_timeseries, mock_darts_model_instance, basic_config
@@ -144,7 +144,7 @@ class TestMCDropoutEntropyLock:
         np.testing.assert_array_equal(samples_1, samples_2)
         assert len(samples_1) == num_samples
 
-    @patch("views_r2darts2.model.darts_forecaster.DartsForecaster.get_device", return_value="cpu")
+    @patch("views_r2darts2.engines.darts_forecaster.DartsForecaster.get_device", return_value="cpu")
     @patch.object(ModelCatalog, "get_model", autospec=True)
     def test_mc_dropout_samples_are_diverse(
         self, mock_get_model, mock_get_device, dummy_timeseries, mock_darts_model_instance, basic_config

@@ -630,8 +630,7 @@ class DartsForecaster:
             timeseries=timeseries,
             # start=self._test_start + sequence_number - output_length,
             start=self._test_start + sequence_number - self.model.input_chunk_length,
-            end=self._test_start
-            + sequence_number,  # self._test_start + sequence_number is exclusive
+            end=self._test_start - 1 + sequence_number,  # origin = test_start - 1 + seq (base_origin convention)
         )
 
         # Resilient Device Management: Ensure model is on the correct device

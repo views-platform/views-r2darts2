@@ -245,15 +245,19 @@ class DartsForecastingModelManager(ForecastingModelManager):
         )
         forecaster.load_model(path=path_artifact)
 
-        total_sequence_number = 12
+        # Compute sequence count from partition: (test_len - time_steps + 1)
+        # = MAX_SHIFT_COUNT + 1 for the standard pipeline contract (no hardcoding).
+        partition = self._resolve_active_partition_dict(active_config)
+        _test_start, _test_end = partition["test"]
+        _time_steps = max(active_config["steps"])
+        total_sequence_number = _test_end - _test_start + 1 - _time_steps + 1
 
         # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
-        partition = self._resolve_active_partition_dict(active_config)
         ReproducibilityGate.Temporal.audit_prediction_horizon(
             run_type=run_type,
             train_end=partition["train"][1],
-            test_end=partition["test"][1],
-            max_steps=max(active_config["steps"]),
+            test_end=_test_end,
+            max_steps=_time_steps,
             total_sequences=total_sequence_number,
         )
 
@@ -424,7 +428,10 @@ class DartsForecastingModelManager(ForecastingModelManager):
                     train_end=partition["train"][1],
                     test_end=partition["test"][1],
                     max_steps=max(active_config["steps"]),
-                    total_sequences=12,
+                    total_sequences=(
+                        partition["test"][1] - partition["test"][0] + 1
+                        - max(active_config["steps"]) + 1
+                    ),
                 )
 
                 df_predictions = self._evaluate_sweep(self._eval_type, model)
@@ -464,10 +471,10 @@ class DartsForecastingModelManager(ForecastingModelManager):
         # Snapshot the config once for the duration of evaluation
         active_config = self.configs
 
-        logger.warning(
-            "Using fixed total_sequence_number=12 for sweep evaluation eval_type will soon be deprecated."
-        )
-        total_sequence_number = 12
+        partition = self._resolve_active_partition_dict(active_config)
+        _test_start, _test_end = partition["test"]
+        _time_steps = max(active_config["steps"])
+        total_sequence_number = _test_end - _test_start + 1 - _time_steps + 1
 
         # Explicitly extract kwargs to ensure reproducibility
         predict_kwargs = self._get_predict_kwargs(active_config)

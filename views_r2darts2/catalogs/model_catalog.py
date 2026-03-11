@@ -19,7 +19,14 @@ from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
 from views_r2darts2.catalogs.optimizer_catalog import OptimizerCatalog
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
-from views_r2darts2.infrastructure.callbacks import GradientHealthCallback
+from views_r2darts2.infrastructure.callbacks import (
+    GradientHealthCallback,
+    NaNDetectionCallback,
+    WeightNormCallback,
+    PredictionSanityCallback,
+    LossStabilityCallback,
+    EpochTimingCallback,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +93,11 @@ class ModelCatalog:
             ),
             LearningRateMonitor(log_momentum=True),
             GradientHealthCallback(),
+            NaNDetectionCallback(),
+            WeightNormCallback(),
+            PredictionSanityCallback(),
+            LossStabilityCallback(),
+            EpochTimingCallback(),
         ]
         if extra_callbacks:
             callbacks.extend(extra_callbacks)

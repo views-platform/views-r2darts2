@@ -8,6 +8,7 @@ from views_r2darts2.math.weighted_penalty_huber_loss import WeightedPenaltyHuber
 from views_r2darts2.math.tweedie_loss import TweedieLoss
 from views_r2darts2.math.asymmetric_quantile_loss import AsymmetricQuantileLoss
 from views_r2darts2.math.zero_inflated_loss import ZeroInflatedLoss
+from views_r2darts2.math.spotlight_loss import SpotlightLoss
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ class LossCatalog:
             "p": self.config.get("p"),
             "eps": self.config.get("eps"),
             "decay_factor": self.config.get("decay_factor"),
+            "beta": self.config.get("beta"),
+            "kappa": self.config.get("kappa"),
         }
 
     def get_loss(self) -> torch.nn.Module:
@@ -53,6 +56,7 @@ class LossCatalog:
             "AsymmetricQuantileLoss": AsymmetricQuantileLoss,
             "ZeroInflatedLoss": ZeroInflatedLoss,
             "ShrinkageLoss": ShrinkageLoss,
+            "SpotlightLoss": SpotlightLoss,
             "MSELoss": torch.nn.MSELoss,
             "L1Loss": torch.nn.L1Loss,
             "HuberLoss": torch.nn.HuberLoss,

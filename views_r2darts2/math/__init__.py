@@ -6,6 +6,7 @@ from .weighted_penalty_huber_loss import WeightedPenaltyHuberLoss
 from .tweedie_loss import TweedieLoss
 from .asymmetric_quantile_loss import AsymmetricQuantileLoss
 from .zero_inflated_loss import ZeroInflatedLoss
+from .spotlight_loss import SpotlightLoss
 
 __all__ = [
     "ShrinkageLoss",
@@ -16,4 +17,5 @@ __all__ = [
     "TweedieLoss",
     "AsymmetricQuantileLoss",
     "ZeroInflatedLoss",
+    "SpotlightLoss",
 ]

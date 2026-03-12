@@ -10,7 +10,6 @@ from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.callbacks import LearningRateMonitor
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from pytorch_lightning.loggers import WandbLogger
 import torch
 import logging
@@ -18,6 +17,7 @@ import logging
 from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
 from views_r2darts2.catalogs.optimizer_catalog import OptimizerCatalog
+from views_r2darts2.catalogs.scheduler_catalog import SchedulerCatalog
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 from views_r2darts2.infrastructure.callbacks import (
     GradientHealthCallback,
@@ -74,14 +74,7 @@ class ModelCatalog:
         # DELEGATION: Specialized catalogs handle genomic translation
         self.loss_fn = LossCatalog(self.config).get_loss()
         self.opt_catalog = OptimizerCatalog(self.config)
-
-        self.lr_scheduler_args = {
-            "mode": "min",
-            "factor": self.config.get("lr_scheduler_factor"),
-            "patience": self.config.get("lr_scheduler_patience"),
-            "min_lr": self.config.get("lr_scheduler_min_lr"),
-            "monitor": "train_loss",
-        }
+        self.sched_catalog = SchedulerCatalog(self.config)
 
     def _get_common_pl_trainer_kwargs(self, extra_callbacks=None):
         callbacks = [
@@ -130,8 +123,8 @@ class ModelCatalog:
             "pl_trainer_kwargs": self._get_common_pl_trainer_kwargs(),
             "optimizer_cls": self.opt_catalog.get_optimizer_cls(),
             "optimizer_kwargs": self.opt_catalog.get_optimizer_kwargs(),
-            "lr_scheduler_cls": ReduceLROnPlateau,
-            "lr_scheduler_kwargs": self.lr_scheduler_args,
+            "lr_scheduler_cls": self.sched_catalog.get_scheduler_cls(),
+            "lr_scheduler_kwargs": self.sched_catalog.get_scheduler_kwargs(),
         }
 
     def get_model(self, model_name: str):

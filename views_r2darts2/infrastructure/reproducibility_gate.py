@@ -52,9 +52,7 @@ class ReproducibilityGate:
             "batch_size",
             "n_epochs",
             "optimizer_cls",
-            "lr_scheduler_factor",
-            "lr_scheduler_patience",
-            "lr_scheduler_min_lr",
+            "lr_scheduler_cls",
             "early_stopping_patience",
             "early_stopping_min_delta",
             "gradient_clip_val",
@@ -205,6 +203,22 @@ class ReproducibilityGate:
             "RMSprop": ["lr", "weight_decay", "momentum", "alpha"],
         }
 
+        # Scheduler-specific genes
+        SCHEDULER_GENOMES = {
+            "ReduceLROnPlateau": [
+                "lr_scheduler_factor",
+                "lr_scheduler_patience",
+                "lr_scheduler_min_lr",
+            ],
+            "CosineAnnealingWarmRestarts": [
+                "lr_scheduler_T_0",
+                "lr_scheduler_T_mult",
+                "lr_scheduler_eta_min",
+            ],
+            "StepLR": ["lr_scheduler_step_size", "lr_scheduler_gamma"],
+            "ExponentialLR": ["lr_scheduler_gamma"],
+        }
+
         # Loss-specific genes
         LOSS_GENOMES = {
             "WeightedPenaltyHuberLoss": [
@@ -303,7 +317,28 @@ class ReproducibilityGate:
                 logger.error(error_msg)
                 raise MissingHyperparameterError(error_msg)
 
-            # 4. Identify Loss & Audit Loss Genome
+            # 4. Identify Scheduler & Audit Scheduler Genome
+            sched = config.get("lr_scheduler_cls")
+            available_scheds = list(ReproducibilityGate.Config.SCHEDULER_GENOMES.keys())
+            if sched in ReproducibilityGate.Config.SCHEDULER_GENOMES:
+                sched_genome = ReproducibilityGate.Config.SCHEDULER_GENOMES[sched]
+                missing_sched = [k for k in sched_genome if k not in config]
+                if missing_sched:
+                    error_msg = (
+                        f"REPRODUCIBILITY CONTRACT VIOLATED: Scheduler '{sched}' "
+                        f"requires missing parameters: {missing_sched}"
+                    )
+                    logger.error(error_msg)
+                    raise MissingHyperparameterError(error_msg)
+            else:
+                error_msg = (
+                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown or unregistered scheduler '{sched}'.\n"
+                    f"Registered schedulers: {available_scheds}"
+                )
+                logger.error(error_msg)
+                raise MissingHyperparameterError(error_msg)
+
+            # 5. Identify Loss & Audit Loss Genome
             loss = config.get("loss_function")
             available_losses = list(ReproducibilityGate.Config.LOSS_GENOMES.keys())
             if loss in ReproducibilityGate.Config.LOSS_GENOMES:
@@ -324,11 +359,12 @@ class ReproducibilityGate:
                 logger.error(error_msg)
                 raise MissingHyperparameterError(error_msg)
 
-            # 5. Check for None values in ALL required keys (Core + Algo + Opt + Loss)
+            # 6. Check for None values in ALL required keys (Core + Algo + Opt + Sched + Loss)
             all_required = (
                 ReproducibilityGate.Config.CORE_GENOME
                 + algo_genome
                 + ReproducibilityGate.Config.OPTIMIZER_GENOMES.get(opt, [])
+                + ReproducibilityGate.Config.SCHEDULER_GENOMES.get(sched, [])
                 + ReproducibilityGate.Config.LOSS_GENOMES.get(loss, [])
             )
             explicit_nones = [k for k in all_required if config.get(k) is None]

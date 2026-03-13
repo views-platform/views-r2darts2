@@ -162,18 +162,19 @@ class ModelCatalog:
 
         return TFTModel(
             **self._get_common_model_args(),
-            feed_forward=self.config.get("feed_forward"),
-            add_relative_index=self.config.get("add_relative_index"),
-            use_static_covariates=self.config.get("use_static_covariates"),
-            full_attention=self.config.get("full_attention"),
+            hidden_size=self.config.get("hidden_size"),
             lstm_layers=self.config.get("lstm_layers"),
             num_attention_heads=self.config.get("num_attention_heads"),
-            hidden_size=self.config.get("hidden_size"),
+            full_attention=self.config.get("full_attention"),
+            feed_forward=self.config.get("feed_forward"),
             dropout=self.config.get("dropout"),
-            norm_type=self.config.get("norm_type"),
-            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
-            skip_interpolation=self.config.get("skip_interpolation"),
             hidden_continuous_size=self.config.get("hidden_continuous_size"),
+            categorical_embedding_sizes=self.config.get("categorical_embedding_sizes"),
+            add_relative_index=self.config.get("add_relative_index"),
+            skip_interpolation=self.config.get("skip_interpolation"),
+            norm_type=self.config.get("norm_type"),
+            use_static_covariates=self.config.get("use_static_covariates"),
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_nbeats(self):
@@ -186,6 +187,8 @@ class ModelCatalog:
             num_blocks=self.config.get("num_blocks"),
             num_layers=self.config.get("num_layers"),
             layer_widths=self.config.get("layer_widths"),
+            expansion_coefficient_dim=self.config.get("expansion_coefficient_dim"),
+            trend_polynomial_degree=self.config.get("trend_polynomial_degree"),
             activation=self.config.get("activation"),
             dropout=self.config.get("dropout"),
         )
@@ -215,7 +218,9 @@ class ModelCatalog:
             **self._get_common_model_args(),
             kernel_size=self.config.get("kernel_size"),
             num_filters=self.config.get("num_filters"),
+            num_layers=self.config.get("num_layers"),
             dilation_base=self.config.get("dilation_base"),
+            weight_norm=self.config.get("weight_norm"),
             dropout=self.config.get("dropout"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
@@ -227,9 +232,11 @@ class ModelCatalog:
             **self._get_common_model_args(),
             model=self.config.get("rnn_type"),
             hidden_dim=self.config.get("hidden_dim"),
-            activation=self.config.get("activation"),
             n_rnn_layers=self.config.get("n_rnn_layers"),
+            hidden_fc_sizes=self.config.get("hidden_fc_sizes"),
             dropout=self.config.get("dropout"),
+            activation=self.config.get("activation"),
+            use_static_covariates=self.config.get("use_static_covariates"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 

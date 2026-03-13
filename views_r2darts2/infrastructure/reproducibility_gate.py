@@ -118,6 +118,8 @@ class ReproducibilityGate:
                 "hidden_size",
                 "temporal_width_past",
                 "temporal_width_future",
+                "temporal_hidden_size_past",
+                "temporal_hidden_size_future",
                 "temporal_decoder_hidden",
                 "use_layer_norm",
                 "dropout",

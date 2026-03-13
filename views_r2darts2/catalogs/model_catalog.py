@@ -125,6 +125,7 @@ class ModelCatalog:
             "optimizer_kwargs": self.opt_catalog.get_optimizer_kwargs(),
             "lr_scheduler_cls": self.sched_catalog.get_scheduler_cls(),
             "lr_scheduler_kwargs": self.sched_catalog.get_scheduler_kwargs(),
+            "add_encoders": self.config.get("add_encoders"),
         }
 
     def get_model(self, model_name: str):
@@ -286,6 +287,8 @@ class ModelCatalog:
             hidden_size=self.config.get("hidden_size"),
             temporal_width_past=self.config.get("temporal_width_past"),
             temporal_width_future=self.config.get("temporal_width_future"),
+            temporal_hidden_size_past=self.config.get("temporal_hidden_size_past"),
+            temporal_hidden_size_future=self.config.get("temporal_hidden_size_future"),
             temporal_decoder_hidden=self.config.get("temporal_decoder_hidden"),
             use_layer_norm=self.config.get("use_layer_norm"),
             dropout=self.config.get("dropout"),

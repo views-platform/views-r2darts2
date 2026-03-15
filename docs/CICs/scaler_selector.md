@@ -29,6 +29,7 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 - **Supports Chained Specifications:** Correctly parses and instantiates complex "->"-delimited chains (e.g., "AsinhTransform->StandardScaler") into Darts native `Pipeline` objects.
 - **Ensures Global Calibration Defaults:** Guarantees that all Darts-wrapped scalers produced via chains are instantiated with `global_fit=True` (ADR-012).
 - **Provides Custom Transformation Logic:** Implements domain-specific transforms like `AsinhTransform` and `SqrtTransform` that are optimized for zero-inflated conflict counts.
+- **Provides Unified Config-to-Darts Factory:** `instantiate_darts_scaler()` translates flexible configuration formats (string, list, dict with chain/kwargs) into Darts `Scaler` or `Pipeline` objects, ensuring `global_fit=True` on all produced scalers (ADR-012).
 
 ---
 
@@ -36,6 +37,7 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 
 - **Scaler Name:** Assumes a string matching an entry in the internal registry.
 - **Chain Syntax:** Assumes that multi-step transforms use the `->` separator.
+- **Flexible Config:** `instantiate_darts_scaler` accepts `None`, string, list, or dict (with `name`/`kwargs` or `chain` keys).
 
 ---
 
@@ -43,6 +45,7 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 
 - **Estimator:** Produces an uninstantiated class type or a `partial` function for single scalers.
 - **Pipeline:** Produces an instantiated `darts.dataprocessing.Pipeline` for chained scalers.
+- **Darts Scaler/Pipeline:** `instantiate_darts_scaler` produces Darts-wrapped `Scaler` or `Pipeline` objects (not raw sklearn estimators).
 - **Side Effects:** None. This is a stateless factory.
 
 ---
@@ -51,14 +54,16 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 
 - **Unknown Scaler:** Raises `ValueError` if the requested name is not in the registry.
 - **Invalid Chain:** Raises `ValueError` if a chain specification is syntactically invalid or contains unknown components.
+- **Invalid Config Type:** Raises `TypeError` if `instantiate_darts_scaler` receives a type other than None/str/list/dict.
+- **Missing Dict Key:** Raises `ValueError` if a dict config lacks both `name` and `chain` keys.
 
 ---
 
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Primarily consumed by `FeatureScalerManager` and `DartsForecaster`.
-- **Physical Zen:** Lives in `views_r2darts2/utils/scaler_selector.py`.
-- **Dependency:** Strictly Layer 0 (ADR-002); depends only on Sklearn and Numpy.
+- **Physical Zen:** Lives in `views_r2darts2/transformers/scaler_selector.py`.
+- **Dependency:** Depends on Sklearn, Numpy, and Darts (`dataprocessing.transformers.Scaler`, `dataprocessing.Pipeline`).
 
 ---
 
@@ -73,6 +78,11 @@ asinh = ScalerSelector.get_scaler("AsinhTransform")
 
 # Get a Darts Pipeline chain
 pipeline = ScalerSelector.get_chained_scaler("AsinhTransform->RobustScaler")
+
+# Instantiate from flexible config (used by DartsForecaster and FeatureScalerManager)
+scaler = ScalerSelector.instantiate_darts_scaler("AsinhTransform->StandardScaler")
+scaler = ScalerSelector.instantiate_darts_scaler({"chain": ["AsinhTransform", "RobustScaler"]})
+scaler = ScalerSelector.instantiate_darts_scaler(None)  # returns None
 ```
 
 ---

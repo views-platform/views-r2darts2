@@ -1,32 +1,9 @@
-import torch
 import numpy as np
 import logging
 from pytorch_lightning.callbacks import Callback
 
 logger = logging.getLogger(__name__)
 
-class NaNDetectionCallback(Callback):
-    """
-    Callback to detect NaN loss and stop training early.
-    """
-    def __init__(self, patience: int = 3):
-        super().__init__()
-        self.patience = patience
-        self.nan_count = 0
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        loss = outputs.get("loss") if isinstance(outputs, dict) else outputs
-        if loss is not None and torch.isnan(loss):
-            self.nan_count += 1
-            logger.warning(
-                f"NaN loss detected at epoch {trainer.current_epoch}, batch {batch_idx} "
-                f"(consecutive NaN count: {self.nan_count}/{self.patience})"
-            )
-            if self.nan_count >= self.patience:
-                logger.error("Training stopped due to persistent NaN loss.")
-                trainer.should_stop = True
-        else:
-            self.nan_count = 0 
 
 class GradientHealthCallback(Callback):
     """
@@ -69,7 +46,7 @@ class GradientHealthCallback(Callback):
                     grad_norms.append(norm)
 
         if not grad_norms and total_params == 0:
-            return 
+            return
 
         if grad_norms:
             grad_norms = np.array(grad_norms)

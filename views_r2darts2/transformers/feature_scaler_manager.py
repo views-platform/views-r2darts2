@@ -80,47 +80,12 @@ class FeatureScalerManager:
             for feat in unmapped_features:
                 self._feature_to_scaler[feat] = scaler_key
 
-    def _instantiate_scaler(self, scaler_cfg):
-        from darts.dataprocessing import Pipeline
-
-        def _parse_chain_string(chain_str: str) -> list:
-            return [s.strip() for s in chain_str.split("->")]
-
-        def _is_chain_string(s: str) -> bool:
-            return "->" in s
-
-        def _make_pipeline(scaler_names: list):
-            darts_scalers = [
-                Scaler(ScalerSelector.get_scaler(name), global_fit=True)
-                for name in scaler_names
-            ]
-            return Pipeline(darts_scalers)
-
-        if isinstance(scaler_cfg, str):
-            if _is_chain_string(scaler_cfg):
-                return _make_pipeline(_parse_chain_string(scaler_cfg))
-            return Scaler(ScalerSelector.get_scaler(scaler_cfg), global_fit=True)
-
-        if isinstance(scaler_cfg, list):
-            if len(scaler_cfg) == 1:
-                return Scaler(ScalerSelector.get_scaler(scaler_cfg[0]), global_fit=True)
-            return _make_pipeline(scaler_cfg)
-
-        if isinstance(scaler_cfg, dict):
-            if "chain" in scaler_cfg:
-                chain_list = scaler_cfg["chain"]
-                if isinstance(chain_list, str):
-                    return _make_pipeline(_parse_chain_string(chain_list))
-                return _make_pipeline(chain_list)
-            name = scaler_cfg.get("name")
-            kwargs = scaler_cfg.get("kwargs", {})
-            if name is None:
-                raise ValueError("Scaler config must have 'name' or 'chain'.")
-            if _is_chain_string(name):
-                return _make_pipeline(_parse_chain_string(name))
-            return Scaler(ScalerSelector.get_scaler(name, **kwargs), global_fit=True)
-
-        raise TypeError(f"Invalid scaler config type: {type(scaler_cfg)}")
+    @staticmethod
+    def _instantiate_scaler(scaler_cfg):
+        """Delegate to ScalerSelector.instantiate_darts_scaler()."""
+        if scaler_cfg is None:
+            return None
+        return ScalerSelector.instantiate_darts_scaler(scaler_cfg)
 
     def fit_transform(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
         if not self._scalers:

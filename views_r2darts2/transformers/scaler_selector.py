@@ -130,3 +130,67 @@ class ScalerSelector:
         if ScalerSelector.is_chain_spec(scaler_spec):
             return ScalerSelector.get_chained_scaler(scaler_spec)
         return ScalerSelector.get_scaler(scaler_spec, **kwargs)
+
+    @staticmethod
+    def instantiate_darts_scaler(scaler_cfg):
+        """
+        Instantiate a Darts Scaler or Pipeline from a flexible config format.
+
+        Accepts:
+          - None → returns None
+          - String: 'StandardScaler' or 'AsinhTransform->StandardScaler' (chained)
+          - List: ['AsinhTransform', 'StandardScaler'] (chained)
+          - Dict: {'name': <str>, 'kwargs': <dict>}
+          - Dict with chain: {'chain': ['AsinhTransform', 'StandardScaler']}
+
+        Returns:
+          Darts Scaler (single) or Pipeline (chained) or None.
+        """
+        if scaler_cfg is None:
+            return None
+        from darts.dataprocessing import Pipeline
+
+        def _parse_chain(chain_str: str) -> list:
+            return [s.strip() for s in chain_str.split("->")]
+
+        def _make_pipeline(scaler_names: list):
+            darts_scalers = [
+                Scaler(ScalerSelector.get_scaler(name), global_fit=True)
+                for name in scaler_names
+            ]
+            return Pipeline(darts_scalers)
+
+        if isinstance(scaler_cfg, str):
+            if "->" in scaler_cfg:
+                return ScalerSelector.get_chained_scaler(scaler_cfg)
+            return Scaler(ScalerSelector.get_scaler(scaler_cfg), global_fit=True)
+
+        if isinstance(scaler_cfg, list):
+            if len(scaler_cfg) == 1:
+                return Scaler(ScalerSelector.get_scaler(scaler_cfg[0]), global_fit=True)
+            return _make_pipeline(scaler_cfg)
+
+        if isinstance(scaler_cfg, dict):
+            if "chain" in scaler_cfg:
+                chain_list = scaler_cfg["chain"]
+                if isinstance(chain_list, str):
+                    return _make_pipeline(_parse_chain(chain_list))
+                elif isinstance(chain_list, list):
+                    return _make_pipeline(chain_list)
+                else:
+                    raise TypeError(
+                        f"'chain' must be a string or list, got {type(chain_list).__name__}"
+                    )
+            name = scaler_cfg.get("name")
+            kwargs = scaler_cfg.get("kwargs", {})
+            if name is None:
+                raise ValueError(
+                    "Scaler config dict must have a 'name' key or a 'chain' key."
+                )
+            if "->" in name:
+                return ScalerSelector.get_chained_scaler(name)
+            return Scaler(ScalerSelector.get_scaler(name, **kwargs), global_fit=True)
+
+        raise TypeError(
+            f"Scaler config must be None, str, list, or dict. Got {type(scaler_cfg).__name__}."
+        )

@@ -386,6 +386,9 @@ class DartsForecastingModelManager(ForecastingModelManager):
         """
         import wandb
         from views_pipeline_core.exceptions.exceptions import PipelineException
+        from views_pipeline_core.modules.validation.core_prediction_sniffer import (
+            CorePredictionSniffer,
+        )
 
         with self._wandb_module.initialize_run(
             project=self._project,
@@ -436,17 +439,12 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
                 df_predictions = self._evaluate_sweep(self._eval_type, model)
 
+                sniffer = CorePredictionSniffer(level=active_config["level"])
                 for i, df in enumerate(df_predictions):
                     print(
                         f"\nValidating evaluation dataframe of sequence {i + 1}/{len(df_predictions)}"
                     )
-                    from views_pipeline_core.modules.validation.model import (
-                        validate_prediction_dataframe,
-                    )
-
-                    validate_prediction_dataframe(
-                        dataframe=df, target=active_config["targets"]
-                    )
+                    sniffer.sniff_predictions(df, targets=active_config["targets"])
 
                 if active_config.get("metrics"):
                     self._evaluate_prediction_dataframe(df_predictions, self._eval_type)

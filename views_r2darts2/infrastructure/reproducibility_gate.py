@@ -60,6 +60,11 @@ class ReproducibilityGate:
             "mc_dropout",
         ]
 
+        # Parameters that are allowed to be explicitly None (valid Darts configurations)
+        NULLABLE_PARAMS = {
+            "hidden_fc_sizes",      # BlockRNNModel: None = no FC layers after RNN
+        }
+
         # Algorithm-specific genes (Only audited if the algorithm matches)
         ALGORITHM_GENOMES = {
             "NBEATSModel": [
@@ -377,7 +382,7 @@ class ReproducibilityGate:
                 + ReproducibilityGate.Config.SCHEDULER_GENOMES.get(sched, [])
                 + ReproducibilityGate.Config.LOSS_GENOMES.get(loss, [])
             )
-            explicit_nones = [k for k in all_required if config.get(k) is None]
+            explicit_nones = [k for k in all_required if config.get(k) is None and k not in ReproducibilityGate.Config.NULLABLE_PARAMS]
             if explicit_nones:
                 error_msg = (
                     "REPRODUCIBILITY CONTRACT VIOLATED: Mandatory parameters set to None: "

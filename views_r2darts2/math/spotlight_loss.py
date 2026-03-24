@@ -47,7 +47,6 @@ class SpotlightLoss(torch.nn.Module):
         quadratic-to-linear transition happens at 100% relative error.
     gamma : float, default 0.0
         Weight for the temporal gradient regularisation term. Set to 0 to disable.
-    """
 
     Forward signature
     -----------------

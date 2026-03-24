@@ -7,45 +7,45 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLoss(torch.nn.Module):
     """
-    Scale-invariant asymmetric Huber loss for imbalanced time-series regression
+    Asymmetric magnitude-aware temporal Huber loss for imbalanced time-series regression
     on asinh-transformed targets.
 
-    SpotlightLoss operates on *relative* error — ``(y_pred - y_true) / (1 + |y_true|)``
-    — so that all samples contribute on a common scale regardless of magnitude.
-    This eliminates the gradient-concentration problem that magnitude weighting
-    causes on highly skewed conflict data, while still learning conflict dynamics
-    (a 20% error on Ukraine matters as much as a 20% error on a peaceful country).
+    SpotlightLoss "shines a spotlight" on the signal that matters most: it amplifies
+    loss contributions from high-magnitude events (via a cosh-based magnitude weight),
+    penalises under-prediction more harshly than over-prediction (via a smooth sigmoid
+    asymmetry gate), and optionally regularises the temporal gradient so the model
+    tracks the *shape* of the true series, not just its level.
 
     Components
     ----------
-    1. **Scale normalisation** — error is divided by ``(1 + |y_true|)`` before
-       any loss computation. High-magnitude targets no longer dominate the gradient
-       through raw error size; instead every sample's loss reflects *relative* accuracy.
-    2. **Optional magnitude boost** — ``w_mag = (1 + |y_true|) ** alpha``.
-       At alpha=0 (recommended starting point) this is uniform. Positive alpha
-       gives conflict events extra weight *on top of* scale-invariance.
-    3. **Huber base loss** — standard Huber/smooth-L1 on the relative error.
-       ``delta`` controls the quadratic-to-linear transition in relative-error space.
-    4. **Asymmetric modulation** — sigmoid gate penalises under-prediction of
-       non-zero events, operating on relative error so the asymmetry threshold
-       adapts to each sample's scale.
-    5. **Temporal gradient term** — optional Huber loss on scale-normalised
-       first-order differences, weighted by ``gamma``.
+    1. **Magnitude weighting** — ``w_mag = cosh(alpha * max(|y_true|, |y_pred|))``,
+       clamped to ``1e6`` for numerical safety. Events with large absolute values in
+       either the target or the prediction receive exponentially higher weight.
+    2. **Huber base loss** — standard Huber/smooth-L1 with configurable ``delta``,
+       combining MSE sensitivity near zero with linear-regime robustness for outliers.
+    3. **Asymmetric modulation** — a sigmoid ``sigma(-kappa * e)`` activates when the
+       model under-predicts (``y_pred < y_true``). The extra penalty scales with
+       ``beta`` and is proportional to the *relative* magnitude of the true value,
+       ``|y_true| / (1 + |y_true|)``, so asymmetry matters most for real events.
+    4. **Temporal gradient term** — optional Huber loss on first-order differences
+       ``Delta y_pred - Delta y_true``, weighted by ``gamma``. Encourages the model to
+       reproduce step-to-step dynamics, not just pointwise targets.
 
     Parameters
     ----------
-    alpha : float, default 0.0
-        Power-law exponent for optional magnitude boost after normalisation.
-        0 = pure scale-invariance, 0.5 = mild conflict upweight.
-    beta : float, default 0.0
-        Asymmetry strength on relative error. Extra penalty when under-predicting
-        non-zero events.
+    alpha : float, default 1.0
+        Magnitude amplification strength. Larger values increase the weight gap between
+        high-magnitude and near-zero samples.
+    beta : float, default 1.0
+        Asymmetry strength. Maximum extra multiplier applied when the model
+        under-predicts a non-zero true value.
     kappa : float, default 10.0
-        Sigmoid sharpness for the asymmetric gate.
+        Sharpness of the sigmoid transition that activates the asymmetric penalty.
+        Higher values create a near-binary switch around ``e = 0``.
     delta : float, default 1.0
-        Huber threshold in relative-error space. ``delta=1.0`` means the
-        quadratic-to-linear transition happens at 100% relative error.
-    gamma : float, default 0.0
+        Huber loss threshold. Errors below ``delta`` are penalised quadratically;
+        above ``delta``, linearly.
+    gamma : float, default 0.1
         Weight for the temporal gradient regularisation term. Set to 0 to disable.
 
     Forward signature
@@ -149,36 +149,28 @@ class SpotlightLoss(torch.nn.Module):
         # Pointwise error
         e = y_pred - y_true
 
-        # ---- Scale normalisation ----
-        # Divide error by target scale so all samples contribute proportionally.
-        # Ukraine (|y|=10): error of 2 → relative error 0.18
-        # Peaceful (|y|=0): error of 0.1 → relative error 0.10
-        # Both now comparable — no gradient concentration.
-        scale = 1.0 + torch.abs(y_true)
-        e_rel = e / scale
+        # ---- 1. Magnitude weight ----
+        m = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        w_mag = torch.cosh(self.alpha * m).clamp(max=1e6)
 
-        # ---- 1. Optional magnitude boost (power-law) ----
-        # At alpha=0 this is 1.0 everywhere (pure scale-invariance).
-        w_mag = scale.pow(self.alpha)
+        # ---- 2. Base Huber loss ----
+        huber = self._huber(e)
 
-        # ---- 2. Base Huber loss on relative error ----
-        huber = self._huber(e_rel)
-
-        # ---- 3. Asymmetric modulation on relative error ----
-        s_neg = torch.sigmoid(-self.kappa * e_rel)
-        true_mag_ratio = torch.abs(y_true) / scale
+        # ---- 3. Asymmetric modulation ----
+        # s_neg ≈ 1 when y_pred < y_true (under-prediction), ≈ 0 otherwise
+        s_neg = torch.sigmoid(-self.kappa * e)
+        true_mag_ratio = torch.abs(y_true) / (1.0 + torch.abs(y_true))
         w_asym = 1.0 + self.beta * s_neg * true_mag_ratio
 
         # ---- Combined pointwise loss ----
         loss_pointwise = (w_mag * huber * w_asym).mean()
 
-        # ---- 4. Temporal gradient term (also scale-normalised) ----
+        # ---- 4. Temporal gradient term ----
         if y_pred.size(1) > 1 and self.gamma > 0.0:
             diff_pred = y_pred[:, 1:] - y_pred[:, :-1]
             diff_true = y_true[:, 1:] - y_true[:, :-1]
-            scale_grad = 1.0 + 0.5 * (torch.abs(y_true[:, 1:]) + torch.abs(y_true[:, :-1]))
-            e_grad_rel = (diff_pred - diff_true) / scale_grad
-            loss_grad = self.gamma * self._huber(e_grad_rel).mean()
+            e_grad = diff_pred - diff_true
+            loss_grad = self.gamma * self._huber(e_grad).mean()
         else:
             loss_grad = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
 

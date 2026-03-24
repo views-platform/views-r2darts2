@@ -21,8 +21,10 @@ class SpotlightLoss(torch.nn.Module):
     1. **Magnitude weighting** — ``w_mag = cosh(alpha * max(|y_true|, |y_pred|))``,
        clamped to ``1e6`` for numerical safety. Events with large absolute values in
        either the target or the prediction receive exponentially higher weight.
-    2. **Huber base loss** — standard Huber/smooth-L1 with configurable ``delta``,
-       combining MSE sensitivity near zero with linear-regime robustness for outliers.
+    2. **Adaptive Huber loss** — Huber/smooth-L1 with an adaptive threshold
+       ``delta_i = delta * (1 + |y_true_i|)``. High-magnitude targets get a wide
+       quadratic basin (strong corrective gradient proportional to error), while
+       near-zero targets get a narrow one (robust to noise, capped gradient).
     3. **Asymmetric modulation** — a sigmoid ``sigma(-kappa * e)`` activates when the
        model under-predicts (``y_pred < y_true``). The extra penalty scales with
        ``beta`` and is proportional to the *relative* magnitude of the true value,
@@ -43,8 +45,8 @@ class SpotlightLoss(torch.nn.Module):
         Sharpness of the sigmoid transition that activates the asymmetric penalty.
         Higher values create a near-binary switch around ``e = 0``.
     delta : float, default 1.0
-        Huber loss threshold. Errors below ``delta`` are penalised quadratically;
-        above ``delta``, linearly.
+        Huber loss scale factor. The effective per-sample threshold is
+        ``delta * (1 + |y_true|)``: larger targets get a wider quadratic zone.
     gamma : float, default 0.1
         Weight for the temporal gradient regularisation term. Set to 0 to disable.
 
@@ -102,12 +104,13 @@ class SpotlightLoss(torch.nn.Module):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _huber(self, error: torch.Tensor) -> torch.Tensor:
-        """Element-wise Huber loss with the instance's delta."""
+    def _huber(self, error: torch.Tensor, delta: torch.Tensor | float | None = None) -> torch.Tensor:
+        """Element-wise Huber loss with a per-element or scalar delta."""
+        d = delta if delta is not None else self.delta
         abs_e = torch.abs(error)
         quadratic = 0.5 * error ** 2
-        linear = self.delta * (abs_e - 0.5 * self.delta)
-        return torch.where(abs_e <= self.delta, quadratic, linear)
+        linear = d * (abs_e - 0.5 * d)
+        return torch.where(abs_e <= d, quadratic, linear)
 
     # ------------------------------------------------------------------
     # Forward
@@ -153,8 +156,12 @@ class SpotlightLoss(torch.nn.Module):
         m = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         w_mag = torch.cosh(self.alpha * m).clamp(max=1e6)
 
-        # ---- 2. Base Huber loss ----
-        huber = self._huber(e)
+        # ---- 2. Adaptive Huber loss ----
+        # delta scales with target magnitude: large events get a wide quadratic
+        # basin (strong corrective gradient), peaceful countries get a narrow one
+        # (robust to noise). No new hyperparameter — delta is just a scale factor.
+        delta_adaptive = self.delta * (1.0 + torch.abs(y_true))
+        huber = self._huber(e, delta_adaptive)
 
         # ---- 3. Asymmetric modulation ----
         # s_neg ≈ 1 when y_pred < y_true (under-prediction), ≈ 0 otherwise

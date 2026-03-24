@@ -151,7 +151,11 @@ class SpotlightLoss(torch.nn.Module):
         e = y_pred - y_true
 
         # ---- 1. Magnitude weight ----
-        w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
+        # Use max(|y_true|, |y_pred|) so overshooting predictions auto-amplify
+        # their own loss weight. detach() severs the gradient through w_mag so
+        # y_pred cannot inflate its own importance during backprop.
+        mag = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        w_mag = torch.cosh(self.alpha * mag).clamp(max=1e6)
         # Normalize per-batch: preserves relative weighting (conflict > peaceful)
         # but stabilises total gradient magnitude across batches, preventing any
         # single country from capturing the majority of the gradient budget.

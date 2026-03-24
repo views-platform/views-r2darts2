@@ -150,7 +150,7 @@ class SpotlightLoss(torch.nn.Module):
         e = y_pred - y_true
 
         # ---- 1. Magnitude weight ----
-        m = torch.max(torch.abs(y_true), torch.abs(y_pred))
+        m = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         w_mag = torch.cosh(self.alpha * m).clamp(max=1e6)
 
         # ---- 2. Base Huber loss ----

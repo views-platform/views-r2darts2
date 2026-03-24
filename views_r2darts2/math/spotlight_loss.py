@@ -18,9 +18,10 @@ class SpotlightLoss(torch.nn.Module):
 
     Components
     ----------
-    1. **Magnitude weighting** — ``w_mag = cosh(alpha * max(|y_true|, |y_pred|))``,
-       clamped to ``1e6`` for numerical safety. Events with large absolute values in
-       either the target or the prediction receive exponentially higher weight.
+    1. **Magnitude weighting** — ``w_mag = cosh(alpha * |y_true|)``,
+       clamped to ``1e6`` for numerical safety. High-magnitude targets receive
+       exponentially higher weight based solely on ground truth — predictions
+       cannot inflate their own importance.
     2. **Huber base loss** — standard Huber/smooth-L1 with configurable ``delta``,
        combining MSE sensitivity near zero with linear-regime robustness for outliers.
     3. **Asymmetric modulation** — a sigmoid ``sigma(-kappa * e)`` activates when the
@@ -150,8 +151,11 @@ class SpotlightLoss(torch.nn.Module):
         e = y_pred - y_true
 
         # ---- 1. Magnitude weight ----
-        m = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        w_mag = torch.cosh(self.alpha * m).clamp(max=1e6)
+        w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
+        # Normalize per-batch: preserves relative weighting (conflict > peaceful)
+        # but stabilises total gradient magnitude across batches, preventing any
+        # single country from capturing the majority of the gradient budget.
+        w_mag = w_mag / (w_mag.mean() + 1e-8)
 
         # ---- 2. Base Huber loss ----
         huber = self._huber(e)

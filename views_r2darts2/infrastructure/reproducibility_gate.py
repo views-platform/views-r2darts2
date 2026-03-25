@@ -269,6 +269,7 @@ class ReproducibilityGate:
             ],
             "ShrinkageLoss": ["a", "c"],
             "SpotlightLoss": ["alpha", "beta", "kappa", "delta", "gamma"],
+            "SentinelLoss": ["alpha", "beta", "kappa", "delta", "gamma"],
             "MSELoss": [],
             "L1Loss": [],
             "HuberLoss": ["delta"],

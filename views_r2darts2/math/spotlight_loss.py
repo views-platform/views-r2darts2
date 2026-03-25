@@ -146,9 +146,7 @@ class SpotlightLoss(torch.nn.Module):
         # Using only y_true avoids a feedback loop where overshooting
         # predictions inflate their own weight via detached-max, creating
         # runaway gradient amplification during training.
-        mag = torch.max(torch.abs(y_true), torch.abs(y_pred.detach())) # test
-        w_mag = torch.cosh(self.alpha * mag).clamp(max=1e6)
-        # w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
+        w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
 
         # ---- 2. Base Huber loss ----
         huber = self._huber(e)
@@ -160,8 +158,14 @@ class SpotlightLoss(torch.nn.Module):
         true_mag_ratio = torch.abs(y_true) / (1.0 + torch.abs(y_true))
         w_amp = 1.0 + self.beta * true_mag_ratio
 
-        # ---- Combined pointwise loss ----
-        loss_pointwise = (w_mag * huber * w_amp).mean()
+        # ---- Combined pointwise loss (weighted mean) ----
+        # Using weighted mean instead of unweighted mean makes the loss
+        # scale-invariant to alpha: the spotlight's relative gradient
+        # allocation is preserved while absolute gradient magnitude stays
+        # comparable to plain Huber, preventing gradient clipping from
+        # crushing the effective learning rate.
+        weights = w_mag * w_amp
+        loss_pointwise = (weights * huber).sum() / (weights.sum() + 1e-8)
 
         # ---- 4. Magnitude-weighted temporal gradient ----
         if y_pred.size(1) > 1 and self.gamma > 0.0:
@@ -177,7 +181,7 @@ class SpotlightLoss(torch.nn.Module):
             )
             w_mag_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
 
-            loss_grad_1 = (w_mag_grad * self._huber(e_grad)).mean()
+            loss_grad_1 = (w_mag_grad * self._huber(e_grad)).sum() / (w_mag_grad.sum() + 1e-8)
 
             # Second-order: match curvature (onset/offset shape)
             if y_pred.size(1) > 2:
@@ -194,7 +198,7 @@ class SpotlightLoss(torch.nn.Module):
                 )
                 w_mag_curv = torch.cosh(self.alpha * mag_curv).clamp(max=1e6)
 
-                loss_grad_2 = 0.5 * (w_mag_curv * self._huber(e_curv)).mean()
+                loss_grad_2 = 0.5 * (w_mag_curv * self._huber(e_curv)).sum() / (w_mag_curv.sum() + 1e-8)
             else:
                 loss_grad_2 = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
 

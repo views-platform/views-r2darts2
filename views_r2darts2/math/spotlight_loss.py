@@ -172,12 +172,42 @@ class SpotlightLoss(torch.nn.Module):
         # ---- Combined pointwise loss ----
         loss_pointwise = (w_mag * huber * w_asym).mean()
 
-        # ---- 4. Temporal gradient term ----
+        # ---- 4. Magnitude-weighted temporal gradient term ----
         if y_pred.size(1) > 1 and self.gamma > 0.0:
+            # First-order: match step-to-step dynamics
             diff_pred = y_pred[:, 1:] - y_pred[:, :-1]
             diff_true = y_true[:, 1:] - y_true[:, :-1]
             e_grad = diff_pred - diff_true
-            loss_grad = self.gamma * self._huber(e_grad).mean()
+
+            # Weight by max magnitude of adjacent true values —
+            # conflict transitions get amplified, peaceful noise suppressed
+            mag_grad = torch.max(
+                torch.abs(y_true[:, 1:]), torch.abs(y_true[:, :-1])
+            )
+            w_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
+            w_grad = w_grad / (w_grad.mean() + 1e-8)
+            loss_grad_1 = (w_grad * self._huber(e_grad)).mean()
+
+            # Second-order: match curvature (onset/offset shape)
+            if y_pred.size(1) > 2:
+                curv_pred = diff_pred[:, 1:] - diff_pred[:, :-1]
+                curv_true = diff_true[:, 1:] - diff_true[:, :-1]
+                e_curv = curv_pred - curv_true
+
+                mag_curv = torch.max(
+                    torch.abs(y_true[:, 2:]),
+                    torch.max(
+                        torch.abs(y_true[:, 1:-1]),
+                        torch.abs(y_true[:, :-2]),
+                    ),
+                )
+                w_curv = torch.cosh(self.alpha * mag_curv).clamp(max=1e6)
+                w_curv = w_curv / (w_curv.mean() + 1e-8)
+                loss_grad_2 = 0.5 * (w_curv * self._huber(e_curv)).mean()
+            else:
+                loss_grad_2 = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
+
+            loss_grad = self.gamma * (loss_grad_1 + loss_grad_2)
         else:
             loss_grad = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
 

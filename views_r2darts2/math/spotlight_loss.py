@@ -27,9 +27,12 @@ class SpotlightLoss(torch.nn.Module):
        where ``mag_ratio = |y_true| / (1 + |y_true|)``.  Both over- and
        under-prediction receive the same extra penalty, scaled by how much
        conflict signal exists in the true target.
-    4. **Temporal gradient term** — optional Huber loss on first-order differences
-       ``Delta y_pred - Delta y_true``, weighted by ``gamma``. Encourages the model to
-       reproduce step-to-step dynamics, not just pointwise targets.
+    4. **Magnitude-weighted temporal gradient** — Huber loss on first-order
+       (velocity) and second-order (curvature) differences, weighted by the
+       same cosh magnitude scheme so that dynamics during conflict matter
+       more than noise during peace.  Second-order matching penalises
+       onset/offset shape errors (acceleration), at half weight since
+       curvature is inherently noisier.
 
     Parameters
     ----------
@@ -166,12 +169,44 @@ class SpotlightLoss(torch.nn.Module):
         # ---- Combined pointwise loss ----
         loss_pointwise = (w_mag * huber * w_asym).mean()
 
-        # ---- 4. Temporal gradient term ----
+        # ---- 4. Magnitude-weighted temporal gradient ----
         if y_pred.size(1) > 1 and self.gamma > 0.0:
+            # First-order: match step-to-step dynamics
             diff_pred = y_pred[:, 1:] - y_pred[:, :-1]
             diff_true = y_true[:, 1:] - y_true[:, :-1]
             e_grad = diff_pred - diff_true
-            loss_grad = self.gamma * self._huber(e_grad).mean()
+
+            # Weight by max magnitude of adjacent true values —
+            # transitions into/out of conflict get amplified
+            mag_grad = torch.max(
+                torch.abs(y_true[:, 1:]), torch.abs(y_true[:, :-1])
+            )
+            w_mag_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
+            w_mag_grad = w_mag_grad / (w_mag_grad.mean() + 1e-8)
+
+            loss_grad_1 = (w_mag_grad * self._huber(e_grad)).mean()
+
+            # Second-order: match curvature (onset/offset shape)
+            if y_pred.size(1) > 2:
+                curv_pred = diff_pred[:, 1:] - diff_pred[:, :-1]
+                curv_true = diff_true[:, 1:] - diff_true[:, :-1]
+                e_curv = curv_pred - curv_true
+
+                mag_curv = torch.max(
+                    torch.abs(y_true[:, 2:]),
+                    torch.max(
+                        torch.abs(y_true[:, 1:-1]),
+                        torch.abs(y_true[:, :-2]),
+                    ),
+                )
+                w_mag_curv = torch.cosh(self.alpha * mag_curv).clamp(max=1e6)
+                w_mag_curv = w_mag_curv / (w_mag_curv.mean() + 1e-8)
+
+                loss_grad_2 = 0.5 * (w_mag_curv * self._huber(e_curv)).mean()
+            else:
+                loss_grad_2 = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
+
+            loss_grad = self.gamma * (loss_grad_1 + loss_grad_2)
         else:
             loss_grad = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
 

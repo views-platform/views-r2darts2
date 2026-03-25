@@ -146,7 +146,9 @@ class SpotlightLoss(torch.nn.Module):
         # Using only y_true avoids a feedback loop where overshooting
         # predictions inflate their own weight via detached-max, creating
         # runaway gradient amplification during training.
-        w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
+        mag = torch.max(torch.abs(y_true), torch.abs(y_pred.detach())) # test
+        w_mag = torch.cosh(self.alpha * mag).clamp(max=1e6)
+        # w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
 
         # ---- 2. Base Huber loss ----
         huber = self._huber(e)

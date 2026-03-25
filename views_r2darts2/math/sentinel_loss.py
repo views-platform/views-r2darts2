@@ -43,23 +43,24 @@ class SentinelLoss(torch.nn.Module):
        2.0   100:1                     15–25
        ====  ========================  ========================
 
-    3. **Bidirectional asymmetric penalty** — SiLU-based penalty for both
+    3. **Symmetric error amplification** — SiLU-based penalty for both
        over- and under-prediction, magnitude-gated to conflict zones:
 
-           w_asym = 1 + beta * [SiLU(e) + tanh(SiLU(-e))] * mag_ratio
+           w_asym = 1 + beta * [SiLU(e) + SiLU(-e)] * mag_ratio
 
        where ``SiLU(x) = x * sigmoid(x)`` and
        ``mag_ratio = |y_true| / (1 + |y_true|)``.
 
-       Properties guaranteed by the SiLU formulation:
+       ``SiLU(e) + SiLU(-e) = e * (2*sigmoid(e) - 1)`` is a smooth,
+       symmetric function that grows linearly as |e| for large errors
+       in BOTH directions.
+
+       Properties:
        - ``w_asym(0) = 1`` exactly (zero overlap with kappa).
        - ``w_asym'(0) = 0`` (no directional bias at the loss minimum).
-       - ``w_asym(e) >= 1`` for all e (proven: SiLU(e) + tanh(SiLU(-e)) >= 0).
-       - Over-prediction (e>0): penalty grows linearly (~e), unbounded.
-         Strong gradient pressure against OOD extrapolation.
-       - Under-prediction (e<0): penalty saturates at ~1 via tanh.
-         Gentle nudge toward conflict tracking, bounded gradient.
-       - At |e|=3: over/under ratio is 3.2:1.  Anti-extrapolation dominates.
+       - ``w_asym(e) >= 1`` for all e.
+       - Symmetric: both over- and under-prediction penalised equally.
+       - Large errors amplified linearly (~|e|) on top of base loss.
        - Inactive on peaceful targets (mag_ratio ~ 0).
 
        kappa and beta are fully separated: kappa controls WHICH samples
@@ -77,9 +78,9 @@ class SentinelLoss(torch.nn.Module):
         ``alpha=1`` -> Charbonnier / pseudo-Huber.  ``alpha < 1`` -> robust
         / Cauchy-like.
     beta : float
-        Bidirectional asymmetry strength.  Controls over-prediction
-        suppression (linear, anti-extrapolation) and under-prediction
-        nudge (saturating, early warning).  Set to 0 to disable.
+        Symmetric error amplification strength.  Amplifies loss for
+        large errors in conflict zones equally in both directions.
+        Set to 0 to disable.
     kappa : float
         Power-law magnitude weighting exponent.
     delta : float
@@ -171,12 +172,17 @@ class SentinelLoss(torch.nn.Module):
         # ---- 2. Base loss (adaptive robust) ----
         base = self._base_loss(e)
 
-        # ---- 3. Bidirectional asymmetric penalty (SiLU-based) ----
+        # ---- 3. Symmetric error amplification (SiLU-based) ----
+        # SiLU(e) + SiLU(-e) = e * (2*sigmoid(e) - 1):
+        #   - Exactly 0 at e=0 (no kappa overlap)
+        #   - Zero derivative at e=0 (no directional bias)
+        #   - >= 0 everywhere
+        #   - Symmetric: same penalty for over- and under-prediction
+        #   - Linear growth ~|e| for large errors
         if self.beta > 0.0:
             mag_ratio = torch.abs(y_true) / (1.0 + torch.abs(y_true))
-            over_penalty = F.silu(e)
-            under_penalty = torch.tanh(F.silu(-e))
-            w_asym = 1.0 + self.beta * (over_penalty + under_penalty) * mag_ratio
+            error_amplifier = F.silu(e) + F.silu(-e)
+            w_asym = 1.0 + self.beta * error_amplifier * mag_ratio
         else:
             w_asym = 1.0
 

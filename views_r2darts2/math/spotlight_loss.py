@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import logging
 
 logger = logging.getLogger(__name__)
@@ -7,14 +6,14 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLoss(torch.nn.Module):
     """
-    Asymmetric magnitude-aware temporal Huber loss for imbalanced time-series regression
+    Symmetric magnitude-aware temporal Huber loss for imbalanced time-series regression
     on asinh-transformed targets.
 
     SpotlightLoss "shines a spotlight" on the signal that matters most: it amplifies
     loss contributions from high-magnitude events (via a cosh-based magnitude weight),
-    penalises under-prediction more harshly than over-prediction (via a smooth sigmoid
-    asymmetry gate), and optionally regularises the temporal gradient so the model
-    tracks the *shape* of the true series, not just its level.
+    applies a symmetric magnitude-gated penalty in conflict zones, and optionally
+    regularises the temporal gradient so the model tracks the *shape* of the true
+    series, not just its level.
 
     Components
     ----------
@@ -24,10 +23,10 @@ class SpotlightLoss(torch.nn.Module):
        cannot inflate their own importance.
     2. **Huber base loss** — standard Huber/smooth-L1 with configurable ``delta``,
        combining MSE sensitivity near zero with linear-regime robustness for outliers.
-    3. **Asymmetric modulation** — a sigmoid ``sigma(-kappa * e)`` activates when the
-       model under-predicts (``y_pred < y_true``). The extra penalty scales with
-       ``beta`` and is proportional to the *relative* magnitude of the true value,
-       ``|y_true| / (1 + |y_true|)``, so asymmetry matters most for real events.
+    3. **Symmetric magnitude-gated amplification** — ``w_asym = 1 + beta * mag_ratio``
+       where ``mag_ratio = |y_true| / (1 + |y_true|)``.  Both over- and
+       under-prediction receive the same extra penalty, scaled by how much
+       conflict signal exists in the true target.
     4. **Temporal gradient term** — optional Huber loss on first-order differences
        ``Delta y_pred - Delta y_true``, weighted by ``gamma``. Encourages the model to
        reproduce step-to-step dynamics, not just pointwise targets.
@@ -38,11 +37,8 @@ class SpotlightLoss(torch.nn.Module):
         Magnitude amplification strength. Larger values increase the weight gap between
         high-magnitude and near-zero samples.
     beta : float, default 1.0
-        Asymmetry strength. Maximum extra multiplier applied when the model
-        under-predicts a non-zero true value.
-    kappa : float, default 10.0
-        Sharpness of the sigmoid transition that activates the asymmetric penalty.
-        Higher values create a near-binary switch around ``e = 0``.
+        Symmetric amplification strength. Maximum extra multiplier applied to
+        errors on conflict-zone targets (approaches beta for high-magnitude targets).
     delta : float, default 1.0
         Huber loss threshold. Errors below ``delta`` are penalised quadratically;
         above ``delta``, linearly.
@@ -68,7 +64,7 @@ class SpotlightLoss(torch.nn.Module):
 
     Examples
     --------
-    >>> loss_fn = SpotlightLoss(alpha=1.0, beta=1.5, kappa=10.0, delta=1.0, gamma=0.1)
+    >>> loss_fn = SpotlightLoss(alpha=1.0, beta=1.5, delta=1.0, gamma=0.1)
     >>> pred = torch.randn(32, 36)
     >>> true = torch.randn(32, 36)
     >>> loss = loss_fn(pred, true)
@@ -78,23 +74,20 @@ class SpotlightLoss(torch.nn.Module):
         self,
         alpha: float,
         beta: float,
-        kappa: float,
         delta: float,
         gamma: float,
     ):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
-        self.kappa = kappa
         self.delta = delta
         self.gamma = gamma
 
         logger.info(
-            "SpotlightLoss initialised | alpha=%.4f  beta=%.4f  kappa=%.4f  "
+            "SpotlightLoss initialised | alpha=%.4f  beta=%.4f  "
             "delta=%.4f  gamma=%.4f",
             self.alpha,
             self.beta,
-            self.kappa,
             self.delta,
             self.gamma,
         )
@@ -164,11 +157,11 @@ class SpotlightLoss(torch.nn.Module):
         # ---- 2. Base Huber loss ----
         huber = self._huber(e)
 
-        # ---- 3. Asymmetric modulation ----
-        # s_neg ≈ 1 when y_pred < y_true (under-prediction), ≈ 0 otherwise
-        s_neg = torch.sigmoid(-self.kappa * e)
+        # ---- 3. Symmetric magnitude-gated amplification ----
+        # Both over- and under-prediction receive the same extra penalty,
+        # scaled by how much conflict signal exists in the true target.
         true_mag_ratio = torch.abs(y_true) / (1.0 + torch.abs(y_true))
-        w_asym = 1.0 + self.beta * s_neg * true_mag_ratio
+        w_asym = 1.0 + self.beta * true_mag_ratio
 
         # ---- Combined pointwise loss ----
         loss_pointwise = (w_mag * huber * w_asym).mean()
@@ -202,5 +195,5 @@ class SpotlightLoss(torch.nn.Module):
     def __repr__(self) -> str:
         return (
             f"SpotlightLoss(alpha={self.alpha}, beta={self.beta}, "
-            f"kappa={self.kappa}, delta={self.delta}, gamma={self.gamma})"
+            f"delta={self.delta}, gamma={self.gamma})"
         )

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import logging
 
 logger = logging.getLogger(__name__)
@@ -6,49 +7,54 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLoss(torch.nn.Module):
     """
-    Symmetric magnitude-aware temporal Huber loss for imbalanced time-series regression
+    Asymmetric magnitude-aware temporal Huber loss for imbalanced time-series regression
     on asinh-transformed targets.
 
     SpotlightLoss "shines a spotlight" on the signal that matters most: it amplifies
     loss contributions from high-magnitude events (via a cosh-based magnitude weight),
-    applies a symmetric magnitude-gated penalty in conflict zones, and optionally
-    regularises the temporal gradient so the model tracks the *shape* of the true
-    series, not just its level.
+    penalises under-prediction more harshly than over-prediction (via a smooth sigmoid
+    asymmetry gate), and optionally regularises the temporal gradient so the model
+    tracks the *shape* of the true series, not just its level.
 
     Components
     ----------
     1. **Magnitude weighting** — ``w_mag = cosh(alpha * |y_true|)``,
        clamped to ``1e6`` for numerical safety. High-magnitude targets receive
        exponentially higher weight based solely on ground truth — predictions
-       cannot inflate their own importance. No per-batch normalisation is
-       applied; gradient clipping handles cross-batch magnitude stability.
+       cannot inflate their own importance.
     2. **Huber base loss** — standard Huber/smooth-L1 with configurable ``delta``,
        combining MSE sensitivity near zero with linear-regime robustness for outliers.
-    3. **Symmetric conflict-zone amplification** — ``w_amp = 1 + beta * mag_ratio``
-       where ``mag_ratio = |y_true| / (1 + |y_true|)``.  Both over- and
-       under-prediction receive the same extra penalty, scaled by how much
-       conflict signal exists in the true target.  Saturates at ``1 + beta``
-       for high-magnitude targets.
-    4. **Magnitude-weighted temporal gradient** — Huber loss on first-order
-       (velocity) and second-order (curvature) differences, weighted by the
-       same cosh magnitude scheme so that dynamics during conflict matter
-       more than noise during peace.  Second-order matching penalises
-       onset/offset shape errors (acceleration), at half weight since
-       curvature is inherently noisier.
+    3. **Asymmetric modulation** — a sigmoid ``sigma(-kappa * e)`` activates when the
+       model under-predicts (``y_pred < y_true``). The extra penalty scales with
+       ``beta`` and is proportional to the *relative* magnitude of the true value,
+       ``|y_true| / (1 + |y_true|)``, so asymmetry matters most for real events.
+    4. **Temporal gradient term** — optional Huber loss on first-order differences
+       ``Delta y_pred - Delta y_true``, weighted by ``gamma``. Encourages the model to
+       reproduce step-to-step dynamics, not just pointwise targets.
 
     Parameters
     ----------
-    alpha : float
+    alpha : float, default 1.0
         Magnitude amplification strength. Larger values increase the weight gap between
         high-magnitude and near-zero samples.
-    beta : float
-        Symmetric amplification strength. Maximum extra multiplier applied to
-        errors on conflict-zone targets (approaches ``1 + beta`` for high-magnitude targets).
-    delta : float
+    beta : float, default 1.0
+        Asymmetry strength. Maximum extra multiplier applied when the model
+        under-predicts a non-zero true value.
+    kappa : float, default 10.0
+        Sharpness of the sigmoid transition that activates the asymmetric penalty.
+        Higher values create a near-binary switch around ``e = 0``.
+    delta : float, default 1.0
         Huber loss threshold. Errors below ``delta`` are penalised quadratically;
         above ``delta``, linearly.
-    gamma : float
+    gamma : float, default 0.1
         Weight for the temporal gradient regularisation term. Set to 0 to disable.
+
+    Forward signature
+    -----------------
+    y_pred : torch.Tensor
+        Predicted values, shape ``(batch, seq_len)`` or ``(batch, seq_len, 1)``.
+    y_true : torch.Tensor
+        Ground-truth values, same shape as ``y_pred``.
 
     Returns
     -------
@@ -62,7 +68,7 @@ class SpotlightLoss(torch.nn.Module):
 
     Examples
     --------
-    >>> loss_fn = SpotlightLoss(alpha=1.0, beta=1.5, delta=1.0, gamma=0.1)
+    >>> loss_fn = SpotlightLoss(alpha=1.0, beta=1.5, kappa=10.0, delta=1.0, gamma=0.1)
     >>> pred = torch.randn(32, 36)
     >>> true = torch.randn(32, 36)
     >>> loss = loss_fn(pred, true)
@@ -72,20 +78,23 @@ class SpotlightLoss(torch.nn.Module):
         self,
         alpha: float,
         beta: float,
+        kappa: float,
         delta: float,
         gamma: float,
     ):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.kappa = kappa
         self.delta = delta
         self.gamma = gamma
 
         logger.info(
-            "SpotlightLoss initialised | alpha=%.4f  beta=%.4f  "
+            "SpotlightLoss initialised | alpha=%.4f  beta=%.4f  kappa=%.4f  "
             "delta=%.4f  gamma=%.4f",
             self.alpha,
             self.beta,
+            self.kappa,
             self.delta,
             self.gamma,
         )
@@ -143,66 +152,32 @@ class SpotlightLoss(torch.nn.Module):
 
         # ---- 1. Magnitude weight ----
         # Ground-truth only: conflict samples get exponentially higher weight.
-        # Using only y_true avoids a feedback loop where overshooting
-        # predictions inflate their own weight via detached-max, creating
-        # runaway gradient amplification during training.
+        # Using only y_true prevents a feedback loop where overshooting
+        # predictions inflate their own weight (via detached-max), which
+        # caused runaway OOD blowups during out-of-sample forecasting.
         w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
+        # Normalize per-batch: preserves relative weighting (conflict > peaceful)
+        # but stabilises total gradient magnitude across batches.
+        w_mag = w_mag / (w_mag.mean() + 1e-8)
 
         # ---- 2. Base Huber loss ----
         huber = self._huber(e)
 
-        # ---- 3. Symmetric conflict-zone amplification ----
-        # Both over- and under-prediction receive the same extra penalty,
-        # scaled by how much conflict signal exists in the true target.
-        # Saturates at (1 + beta) for high-magnitude targets.
+        # ---- 3. Asymmetric modulation ----
+        # s_neg ≈ 1 when y_pred < y_true (under-prediction), ≈ 0 otherwise
+        s_neg = torch.sigmoid(-self.kappa * e)
         true_mag_ratio = torch.abs(y_true) / (1.0 + torch.abs(y_true))
-        w_amp = 1.0 + self.beta * true_mag_ratio
+        w_asym = 1.0 + self.beta * s_neg * true_mag_ratio
 
-        # ---- Combined pointwise loss (weighted mean) ----
-        # Using weighted mean instead of unweighted mean makes the loss
-        # scale-invariant to alpha: the spotlight's relative gradient
-        # allocation is preserved while absolute gradient magnitude stays
-        # comparable to plain Huber, preventing gradient clipping from
-        # crushing the effective learning rate.
-        weights = w_mag * w_amp
-        loss_pointwise = (weights * huber).sum() / (weights.sum() + 1e-8)
+        # ---- Combined pointwise loss ----
+        loss_pointwise = (w_mag * huber * w_asym).mean()
 
-        # ---- 4. Magnitude-weighted temporal gradient ----
+        # ---- 4. Temporal gradient term ----
         if y_pred.size(1) > 1 and self.gamma > 0.0:
-            # First-order: match step-to-step dynamics
             diff_pred = y_pred[:, 1:] - y_pred[:, :-1]
             diff_true = y_true[:, 1:] - y_true[:, :-1]
             e_grad = diff_pred - diff_true
-
-            # Weight by max magnitude of adjacent true values —
-            # transitions into/out of conflict get amplified
-            mag_grad = torch.max(
-                torch.abs(y_true[:, 1:]), torch.abs(y_true[:, :-1])
-            )
-            w_mag_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
-
-            loss_grad_1 = (w_mag_grad * self._huber(e_grad)).sum() / (w_mag_grad.sum() + 1e-8)
-
-            # Second-order: match curvature (onset/offset shape)
-            if y_pred.size(1) > 2:
-                curv_pred = diff_pred[:, 1:] - diff_pred[:, :-1]
-                curv_true = diff_true[:, 1:] - diff_true[:, :-1]
-                e_curv = curv_pred - curv_true
-
-                mag_curv = torch.max(
-                    torch.abs(y_true[:, 2:]),
-                    torch.max(
-                        torch.abs(y_true[:, 1:-1]),
-                        torch.abs(y_true[:, :-2]),
-                    ),
-                )
-                w_mag_curv = torch.cosh(self.alpha * mag_curv).clamp(max=1e6)
-
-                loss_grad_2 = 0.5 * (w_mag_curv * self._huber(e_curv)).sum() / (w_mag_curv.sum() + 1e-8)
-            else:
-                loss_grad_2 = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
-
-            loss_grad = self.gamma * (loss_grad_1 + loss_grad_2)
+            loss_grad = self.gamma * self._huber(e_grad).mean()
         else:
             loss_grad = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
 
@@ -226,5 +201,5 @@ class SpotlightLoss(torch.nn.Module):
     def __repr__(self) -> str:
         return (
             f"SpotlightLoss(alpha={self.alpha}, beta={self.beta}, "
-            f"delta={self.delta}, gamma={self.gamma})"
+            f"kappa={self.kappa}, delta={self.delta}, gamma={self.gamma})"
         )

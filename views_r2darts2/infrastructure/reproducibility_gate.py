@@ -63,6 +63,8 @@ class ReproducibilityGate:
         # Parameters that are allowed to be explicitly None (valid Darts configurations)
         NULLABLE_PARAMS = {
             "hidden_fc_sizes",      # BlockRNNModel: None = no FC layers after RNN
+            "pooling_kernel_sizes", # NHiTSModel: None = Darts auto-computes from input_chunk_length
+            "n_freq_downsample",    # NHiTSModel: None = Darts auto-computes from output_chunk_length
         }
 
         # Algorithm-specific genes (Only audited if the algorithm matches)

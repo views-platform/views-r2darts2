@@ -156,9 +156,6 @@ class SpotlightLoss(torch.nn.Module):
         # predictions inflate their own weight (via detached-max), which
         # caused runaway OOD blowups during out-of-sample forecasting.
         w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
-        # Normalize per-batch: preserves relative weighting (conflict > peaceful)
-        # but stabilises total gradient magnitude across batches.
-        w_mag = w_mag / (w_mag.mean() + 1e-8)
 
         # ---- 2. Base Huber loss ----
         huber = self._huber(e)
@@ -185,7 +182,6 @@ class SpotlightLoss(torch.nn.Module):
                 torch.abs(y_true[:, 1:]), torch.abs(y_true[:, :-1])
             )
             w_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
-            w_grad = w_grad / (w_grad.mean() + 1e-8)
             loss_grad_1 = (w_grad * self._huber(e_grad)).mean()
 
             # Second-order: match curvature (onset/offset shape)
@@ -202,7 +198,6 @@ class SpotlightLoss(torch.nn.Module):
                     ),
                 )
                 w_curv = torch.cosh(self.alpha * mag_curv).clamp(max=1e6)
-                w_curv = w_curv / (w_curv.mean() + 1e-8)
                 loss_grad_2 = 0.5 * (w_curv * self._huber(e_curv)).mean()
             else:
                 loss_grad_2 = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)

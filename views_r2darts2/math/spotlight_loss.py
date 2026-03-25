@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLoss(torch.nn.Module):
     """
-    Asymmetric magnitude-aware temporal Huber loss for imbalanced time-series regression
+    Asymmetric magnitude-aware temporal loss for imbalanced time-series regression
     on asinh-transformed targets.
 
     SpotlightLoss "shines a spotlight" on the signal that matters most: it amplifies
@@ -22,13 +22,18 @@ class SpotlightLoss(torch.nn.Module):
        clamped to ``1e6`` for numerical safety. High-magnitude targets receive
        exponentially higher weight based solely on ground truth — predictions
        cannot inflate their own importance.
-    2. **Huber base loss** — standard Huber/smooth-L1 with configurable ``delta``,
-       combining MSE sensitivity near zero with linear-regime robustness for outliers.
+    2. **Scaled log-cosh base loss** — parameter-free replacement for Huber.
+       ``L_i = s_i * log(cosh(e_i / s_i))`` where ``s_i = 1 + |y_true| / (1 + |y_true|)``.
+       Behaves quadratically for small errors, linearly for large errors, with a smooth
+       transition (no curvature discontinuity). Gradient bounded at ±1 always.
+       The scale ``s_i`` widens the quadratic zone for conflict cells (up to |e|≈2)
+       while keeping it tight for peace cells (|e|≈1), preventing sweep
+       misconfiguration that previously caused 1B+ OOD blowups.
     3. **Asymmetric modulation** — a sigmoid ``sigma(-kappa * e)`` activates when the
        model under-predicts (``y_pred < y_true``). The extra penalty scales with
        ``beta`` and is proportional to the *relative* magnitude of the true value,
        ``|y_true| / (1 + |y_true|)``, so asymmetry matters most for real events.
-    4. **Temporal gradient term** — optional Huber loss on first-order differences
+    4. **Temporal gradient term** — optional scaled log-cosh on first-order differences
        ``Delta y_pred - Delta y_true``, weighted by ``gamma``. Encourages the model to
        reproduce step-to-step dynamics, not just pointwise targets.
 
@@ -43,9 +48,6 @@ class SpotlightLoss(torch.nn.Module):
     kappa : float, default 10.0
         Sharpness of the sigmoid transition that activates the asymmetric penalty.
         Higher values create a near-binary switch around ``e = 0``.
-    delta : float, default 1.0
-        Huber loss threshold. Errors below ``delta`` are penalised quadratically;
-        above ``delta``, linearly.
     gamma : float, default 0.1
         Weight for the temporal gradient regularisation term. Set to 0 to disable.
 
@@ -68,7 +70,7 @@ class SpotlightLoss(torch.nn.Module):
 
     Examples
     --------
-    >>> loss_fn = SpotlightLoss(alpha=1.0, beta=1.5, kappa=10.0, delta=1.0, gamma=0.1)
+    >>> loss_fn = SpotlightLoss(alpha=1.0, beta=1.5, kappa=10.0, gamma=0.1)
     >>> pred = torch.randn(32, 36)
     >>> true = torch.randn(32, 36)
     >>> loss = loss_fn(pred, true)
@@ -79,23 +81,20 @@ class SpotlightLoss(torch.nn.Module):
         alpha: float,
         beta: float,
         kappa: float,
-        delta: float,
         gamma: float,
     ):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
         self.kappa = kappa
-        self.delta = delta
         self.gamma = gamma
 
         logger.info(
             "SpotlightLoss initialised | alpha=%.4f  beta=%.4f  kappa=%.4f  "
-            "delta=%.4f  gamma=%.4f",
+            "gamma=%.4f",
             self.alpha,
             self.beta,
             self.kappa,
-            self.delta,
             self.gamma,
         )
 
@@ -103,12 +102,21 @@ class SpotlightLoss(torch.nn.Module):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _huber(self, error: torch.Tensor) -> torch.Tensor:
-        """Element-wise Huber loss with the instance's delta."""
-        abs_e = torch.abs(error)
-        quadratic = 0.5 * error ** 2
-        linear = self.delta * (abs_e - 0.5 * self.delta)
-        return torch.where(abs_e <= self.delta, quadratic, linear)
+    @staticmethod
+    def _log_cosh_scaled(error: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        """Scaled log-cosh loss: s * log(cosh(e / s)).
+
+        Parameter-free base loss. Quadratic for |e| << s, linear for |e| >> s,
+        with a smooth transition. Gradient = tanh(e/s), hard-bounded at ±1.
+
+        Uses the numerically stable identity:
+            log(cosh(x)) = |x| + log(1 + exp(-2|x|)) - log(2)
+        which avoids overflow for large |x|.
+        """
+        z = error / scale
+        abs_z = torch.abs(z)
+        # Stable: for large |z|, exp(-2|z|) → 0, so this → |z| - ln2
+        return scale * (abs_z + torch.nn.functional.softplus(-2.0 * abs_z) - 0.6931471805599453) # log(2) ≈ 0.6931471805599453, hardcoded for precision and to avoid an extra function call yeet
 
     # ------------------------------------------------------------------
     # Forward
@@ -157,8 +165,10 @@ class SpotlightLoss(torch.nn.Module):
         # caused runaway OOD blowups during out-of-sample forecasting.
         w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
 
-        # ---- 2. Base Huber loss ----
-        huber = self._huber(e)
+        # ---- 2. Scaled log-cosh base loss ----
+        # s_i ∈ [1, 2): peace cells ≈ 1 (tight quadratic), conflict → 2 (wider)
+        scale = 1.0 + torch.abs(y_true) / (1.0 + torch.abs(y_true))
+        base_loss = self._log_cosh_scaled(e, scale)
 
         # ---- 3. Asymmetric modulation ----
         # s_neg ≈ 1 when y_pred < y_true (under-prediction), ≈ 0 otherwise
@@ -167,7 +177,7 @@ class SpotlightLoss(torch.nn.Module):
         w_asym = 1.0 + self.beta * s_neg * true_mag_ratio
 
         # ---- Combined pointwise loss ----
-        loss_pointwise = (w_mag * huber * w_asym).mean()
+        loss_pointwise = (w_mag * base_loss * w_asym).mean()
 
         # ---- 4. Magnitude-weighted temporal gradient term ----
         if y_pred.size(1) > 1 and self.gamma > 0.0:
@@ -182,7 +192,8 @@ class SpotlightLoss(torch.nn.Module):
                 torch.abs(y_true[:, 1:]), torch.abs(y_true[:, :-1])
             )
             w_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
-            loss_grad_1 = (w_grad * self._huber(e_grad)).mean()
+            scale_grad = 1.0 + mag_grad / (1.0 + mag_grad)
+            loss_grad_1 = (w_grad * self._log_cosh_scaled(e_grad, scale_grad)).mean()
 
             # Second-order: match curvature (onset/offset shape)
             if y_pred.size(1) > 2:
@@ -198,7 +209,8 @@ class SpotlightLoss(torch.nn.Module):
                     ),
                 )
                 w_curv = torch.cosh(self.alpha * mag_curv).clamp(max=1e6)
-                loss_grad_2 = 0.5 * (w_curv * self._huber(e_curv)).mean()
+                scale_curv = 1.0 + mag_curv / (1.0 + mag_curv)
+                loss_grad_2 = 0.5 * (w_curv * self._log_cosh_scaled(e_curv, scale_curv)).mean()
             else:
                 loss_grad_2 = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
 
@@ -226,5 +238,5 @@ class SpotlightLoss(torch.nn.Module):
     def __repr__(self) -> str:
         return (
             f"SpotlightLoss(alpha={self.alpha}, beta={self.beta}, "
-            f"kappa={self.kappa}, delta={self.delta}, gamma={self.gamma})"
+            f"kappa={self.kappa}, gamma={self.gamma})"
         )

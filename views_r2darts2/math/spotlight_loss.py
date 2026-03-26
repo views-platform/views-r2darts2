@@ -163,9 +163,9 @@ class SpotlightLoss(torch.nn.Module):
         # Using only y_true prevents a feedback loop where overshooting
         # predictions inflate their own weight (via detached-max), which
         # caused runaway OOD blowups during out-of-sample forecasting.
-        mag = torch.max(torch.abs(y_true), torch.abs(y_pred.detach())) # test
-        w_mag = torch.cosh(self.alpha * mag).clamp(max=1e6)
-        # w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
+        # mag = torch.max(torch.abs(y_true), torch.abs(y_pred.detach())) # test
+        # w_mag = torch.cosh(self.alpha * mag).clamp(max=1e6)
+        w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
 
         # ---- 2. Scaled log-cosh base loss ----
         # s_i ∈ [1, 2): peace cells ≈ 1 (tight quadratic), conflict → 2 (wider)

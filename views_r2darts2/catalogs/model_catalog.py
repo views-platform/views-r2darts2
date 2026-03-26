@@ -18,6 +18,7 @@ from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
 from views_r2darts2.catalogs.optimizer_catalog import OptimizerCatalog
 from views_r2darts2.catalogs.scheduler_catalog import SchedulerCatalog
+from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 from views_r2darts2.infrastructure.callbacks import (
     GradientHealthCallback,
@@ -125,8 +126,39 @@ class ModelCatalog:
             "optimizer_kwargs": self.opt_catalog.get_optimizer_kwargs(),
             "lr_scheduler_cls": self.sched_catalog.get_scheduler_cls(),
             "lr_scheduler_kwargs": self.sched_catalog.get_scheduler_kwargs(),
-            "add_encoders": self.config.get("add_encoders"),
+            "add_encoders": self._resolve_add_encoders(),
         }
+
+    def _resolve_add_encoders(self) -> dict | None:
+        """Return the add_encoders dict for this run.
+
+        Priority:
+        1. Explicit ``add_encoders`` key in config — returned as-is.
+        2. ``use_cyclic_encoders: True`` flag — selects encoder functions
+           automatically from ``config['level']`` (e.g. 'cm', 'pgd', 'cw')
+           so the sweep config stays JSON-serialisable (no function objects).
+           The temporal resolution is inferred from the last character:
+             m → month-of-year (period 12)
+             w → week-of-year  (period 52)
+             d → day-of-week (period 7) + day-of-year (period 365)
+             y → no cyclic encoding (yearly data has no intra-year cycle)
+        3. Neither set — returns None.
+        """
+        if self.config.get("add_encoders") is not None:
+            return self.config["add_encoders"]
+
+        if self.config.get("use_cyclic_encoders", False):
+            level = self.config.get("level", "cm")
+            resolution = level[-1]  # 'cm' → 'm', 'pgd' → 'd', etc.
+            encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
+            if not encoders:
+                return None
+            return {
+                "custom": {"past": encoders, "future": encoders},
+                "position": {"past": ["relative"], "future": ["relative"]},
+            }
+
+        return None
 
     def get_model(self, model_name: str):
         """

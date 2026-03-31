@@ -208,6 +208,7 @@ class ReproducibilityGate:
                 "dilation_base",
                 "weight_norm",
                 "dropout",
+                "use_static_covariates",
                 "use_reversible_instance_norm",
             ],
         }

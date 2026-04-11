@@ -412,6 +412,77 @@ class TestDartsForecaster:
         assert len(result) == 2
         forecaster.model.predict.assert_called_once()
 
+    def test_predict_rolling_origin_sequence_zero_ends_at_test_start_minus_one(
+        self, forecaster
+    ):
+        """[REGRESSION — C-01 / commit f78bbf7] Rolling-origin base-origin convention.
+
+        For `sequence_number=0`, the input window must end at `test_start - 1`
+        (exclusive of the first test month), so that the first forecast month
+        equals `partition['test'][0]`. An off-by-one here had `end = test_start`,
+        causing the model to observe month `test_start` itself and forecast one
+        month too late (e.g. 446–481 instead of 445–480 for the standard
+        adolecent_slob partition). Only caught in production by the
+        views-pipeline-core `_assert_predictions_in_step_window()` pre-flight.
+        """
+        # fixture partition: train=(0,100), test=(100,150); input_chunk_length=12
+        mock_ts = Mock(spec=TimeSeries)
+        mock_pred = Mock(spec=TimeSeries)
+        mock_pred.static_covariates = pd.DataFrame({"entity_id": [42]})
+        mock_pred.all_values = Mock(return_value=np.array([[1.0, 2.0]]))
+        mock_pred.start_time = Mock(return_value=pd.Timestamp("2020-01-31"))
+        mock_pred.freq = pd.offsets.MonthEnd()
+
+        forecaster.dataset.as_darts_timeseries = Mock(return_value=[mock_ts])
+        forecaster._preprocess_timeseries = Mock(return_value=([mock_ts], [mock_ts]))
+        forecaster.model.predict = Mock(return_value=[mock_pred])
+
+        forecaster.predict(sequence_number=0, output_length=1)
+
+        _, kwargs = forecaster._preprocess_timeseries.call_args
+        assert kwargs["end"] == forecaster._test_start - 1, (
+            f"sequence_number=0 must produce end={forecaster._test_start - 1} "
+            f"(base_origin convention), got end={kwargs['end']}. "
+            "An off-by-one here produces forecasts one month too late."
+        )
+        # input window starts `input_chunk_length` months before the origin
+        assert kwargs["start"] == (
+            forecaster._test_start - forecaster.model.input_chunk_length
+        )
+
+    def test_predict_rolling_origin_advances_one_month_per_sequence(self, forecaster):
+        """[REGRESSION — C-01] Sequence n must advance the origin by exactly n months.
+
+        If the start/end arithmetic in `predict()` ever drifts from the contract
+        `end = test_start - 1 + sequence_number`, this test fails before the
+        views-pipeline-core pre-flight ever gets to catch it.
+        """
+        mock_ts = Mock(spec=TimeSeries)
+        mock_pred = Mock(spec=TimeSeries)
+        mock_pred.static_covariates = pd.DataFrame({"entity_id": [42]})
+        mock_pred.all_values = Mock(return_value=np.array([[1.0, 2.0]]))
+        mock_pred.start_time = Mock(return_value=pd.Timestamp("2020-01-31"))
+        mock_pred.freq = pd.offsets.MonthEnd()
+
+        forecaster.dataset.as_darts_timeseries = Mock(return_value=[mock_ts])
+        forecaster._preprocess_timeseries = Mock(return_value=([mock_ts], [mock_ts]))
+        forecaster.model.predict = Mock(return_value=[mock_pred])
+
+        # predict() calls next(self.model.model.parameters()) on every invocation
+        # for device verification — refresh the iterator before each call so it
+        # doesn't exhaust after the first sequence.
+        mock_param = Mock()
+        mock_param.device = torch.device("cpu")
+        for seq in (0, 1, 5, 12):
+            forecaster.model.model.parameters.return_value = iter([mock_param])
+            forecaster._preprocess_timeseries.reset_mock()
+            forecaster.predict(sequence_number=seq, output_length=1)
+            _, kwargs = forecaster._preprocess_timeseries.call_args
+            assert kwargs["end"] == forecaster._test_start - 1 + seq
+            assert kwargs["start"] == (
+                forecaster._test_start + seq - forecaster.model.input_chunk_length
+            )
+
     def test_predict_with_scaler_inverse_transform(self, forecaster_with_scalers):
         """Test prediction with target scaler inverse transform."""
         mock_ts = Mock(spec=TimeSeries)

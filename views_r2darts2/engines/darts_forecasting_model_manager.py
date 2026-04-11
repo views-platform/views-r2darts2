@@ -110,6 +110,40 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         return partition
 
+    @staticmethod
+    def _resolve_total_sequence_number(partition: dict, max_steps: int) -> int:
+        """
+        Derive the total number of rolling-origin sequences from the test partition.
+
+        The count equals `test_len - max_steps + 1`, the standard pipeline contract
+        for rolling-origin evaluation. Guards against the silent-failure mode where
+        `max_steps > test_len` yields zero or negative sequences, which Python would
+        silently accept (`[None] * -1 == []`, `range(-1) == []`) and propagate as an
+        empty prediction batch through downstream evaluation.
+
+        Args:
+            partition: Resolved partition dict containing a `test` key with a
+                (test_start, test_end) tuple (inclusive, both ends).
+            max_steps: Maximum forecast horizon — typically `max(config['steps'])`.
+
+        Returns:
+            Number of rolling-origin sequences (always >= 1).
+
+        Raises:
+            ValueError: If the test partition is shorter than `max_steps`, which
+                would otherwise produce an empty evaluation batch with no error.
+        """
+        test_start, test_end = partition["test"]
+        test_len = test_end - test_start + 1
+        if test_len < max_steps:
+            raise ValueError(
+                f"Invalid evaluation configuration: test partition length "
+                f"({test_len}) is smaller than the maximum forecast horizon "
+                f"({max_steps}). Rolling-origin evaluation requires "
+                f"test_len >= max(steps); otherwise no sequences can be produced."
+            )
+        return test_len - max_steps + 1
+
     def _train_model_artifact(self):
         """
         Trains a forecasting model using the specified configuration and dataset, and saves the trained model artifact.
@@ -245,18 +279,17 @@ class DartsForecastingModelManager(ForecastingModelManager):
         )
         forecaster.load_model(path=path_artifact)
 
-        # Compute sequence count from partition: (test_len - time_steps + 1)
-        # = MAX_SHIFT_COUNT + 1 for the standard pipeline contract (no hardcoding).
         partition = self._resolve_active_partition_dict(active_config)
-        _test_start, _test_end = partition["test"]
         _time_steps = max(active_config["steps"])
-        total_sequence_number = _test_end - _test_start + 1 - _time_steps + 1
+        total_sequence_number = self._resolve_total_sequence_number(
+            partition, _time_steps
+        )
 
         # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
         ReproducibilityGate.Temporal.audit_prediction_horizon(
             run_type=run_type,
             train_end=partition["train"][1],
-            test_end=_test_end,
+            test_end=partition["test"][1],
             max_steps=_time_steps,
             total_sequences=total_sequence_number,
         )
@@ -426,14 +459,14 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
                 # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
                 partition = self._resolve_active_partition_dict(active_config)
+                _max_steps = max(active_config["steps"])
                 ReproducibilityGate.Temporal.audit_prediction_horizon(
                     run_type=active_config["run_type"],
                     train_end=partition["train"][1],
                     test_end=partition["test"][1],
-                    max_steps=max(active_config["steps"]),
-                    total_sequences=(
-                        partition["test"][1] - partition["test"][0] + 1
-                        - max(active_config["steps"]) + 1
+                    max_steps=_max_steps,
+                    total_sequences=self._resolve_total_sequence_number(
+                        partition, _max_steps
                     ),
                 )
 
@@ -470,9 +503,10 @@ class DartsForecastingModelManager(ForecastingModelManager):
         active_config = self.configs
 
         partition = self._resolve_active_partition_dict(active_config)
-        _test_start, _test_end = partition["test"]
         _time_steps = max(active_config["steps"])
-        total_sequence_number = _test_end - _test_start + 1 - _time_steps + 1
+        total_sequence_number = self._resolve_total_sequence_number(
+            partition, _time_steps
+        )
 
         # Explicitly extract kwargs to ensure reproducibility
         predict_kwargs = self._get_predict_kwargs(active_config)

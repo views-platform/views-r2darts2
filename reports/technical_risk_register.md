@@ -5,9 +5,9 @@
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
 | Last Updated      | 2026-04-11                           |
-| Total Concerns    | 3                                    |
-| Open Concerns     | 1                                    |
-| Resolved Concerns | 2                                    |
+| Total Concerns    | 4                                    |
+| Open Concerns     | 0                                    |
+| Resolved Concerns | 4                                    |
 | Governed by       | ADR-014                              |
 
 ---
@@ -35,13 +35,7 @@
 
 ## Open Concerns
 
-### C-03 — Chain-spec construction divergence in `ScalerSelector.instantiate_darts_scaler`
-
-- **Tier:** 3
-- **Source:** pr-review (PR #10)
-- **Location:** `views_r2darts2/transformers/scaler_selector.py:135-195` (new `instantiate_darts_scaler` method)
-- **Trigger:** When adding a new scaler type, a new transformer wrapper, or a new normalization step to the chain-construction logic — verify that the behavior is identical across all four input forms (`"A->B"`, `["A", "B"]`, `{"chain": "A->B"}`, `{"chain": ["A", "B"]}`). Adding a step to one code path and forgetting the other is the expected failure mode.
-- **Narrative:** `instantiate_darts_scaler` accepts four equivalent ways to specify a scaler chain, but routes them through two different constructors: string chains (`"A->B"`) go through `ScalerSelector.get_chained_scaler()`, while list and dict-chain forms go through a local `_make_pipeline()` helper that builds the `darts.Pipeline` inline. The two paths should produce semantically identical objects today, but a future change (e.g. adding `global_fit=True` handling, adding an intermediate `InvertibleDataTransformer` wrap, or changing how scalers are named) must be made in both places. A reviewer cannot tell by inspection that the two paths are equivalent — they are structurally different. Prefer routing list/dict-chain inputs through `get_chained_scaler` (after joining with `->`), or invert the delegation so `get_chained_scaler` calls `_make_pipeline`.
+(All concerns resolved as of 2026-04-11. See Resolved Concerns below.)
 
 ---
 
@@ -68,6 +62,25 @@
 - **Source:** pr-review (PR #10) + Copilot comment on `darts_forecasting_model_manager.py:253`
 - **Location:** Previously at `darts_forecasting_model_manager.py:253`, `:434`, `:475`
 - **Resolution:** Extracted `DartsForecastingModelManager._resolve_total_sequence_number(partition, max_steps)` as a `@staticmethod` with a `ValueError` guard that fails loudly when `test_len < max_steps` (instead of silently returning zero or negative, which previously produced an empty prediction batch). All three call sites now delegate to the helper. Unit tests in `tests/test_darts_forecasting_model_manager.py` cover the standard case, the `test_len == max_steps` boundary (returns 1), and the `test_len < max_steps` failure mode Copilot flagged.
+
+---
+
+### C-03 — Chain-spec construction divergence in `ScalerSelector.instantiate_darts_scaler` *(resolved 2026-04-11)*
+
+- **Tier:** 3
+- **Source:** pr-review (PR #10) + Copilot comment on `scaler_selector.py:179`
+- **Location:** Previously at `views_r2darts2/transformers/scaler_selector.py:135-195`
+- **Resolution:** Collapsed the divergent list / dict-chain-list / dict-chain-str code paths into a single `ScalerSelector._build_chain_or_single(scaler_names)` helper. All chain-spec forms — string, list, dict-with-string-chain, dict-with-list-chain — now route through one definition, so adding a new scaler step or changing chain semantics is a single edit. The helper also fixes a bug Copilot surfaced separately: single-element dict-chain inputs (`{"chain": ["StandardScaler"]}` and `{"chain": "StandardScaler"}`) previously returned a one-element `Pipeline`, inconsistent with the list-form `["StandardScaler"]` which returned a bare `Scaler`; all single-element forms now return a bare `Scaler`, and empty lists / non-string elements raise `ValueError`/`TypeError` instead of silently producing malformed pipelines. Regression tests in `tests/test_scaling.py::TestInstantiateDartsScalerConsolidation` cover all four equivalent chain forms, the single-element collapse, and the empty/invalid-element error paths.
+
+---
+
+### C-04 — `FeatureScalerManager._instantiate_scaler` silently propagates `None` *(resolved 2026-04-11)*
+
+- **Tier:** 2
+- **Source:** Copilot comment on `feature_scaler_manager.py:87` (PR #10)
+- **Location:** Previously at `views_r2darts2/transformers/feature_scaler_manager.py:83-88`
+- **Resolution:** `_instantiate_scaler(None)` used to return `None`, which was then stored in `self._scalers` and later dereferenced as a Darts `Scaler`/`Pipeline` at fit time, producing an `AttributeError` on `scaler.transformer` that was hard to trace back to the misconfigured group. The fix makes `FeatureScalerManager._instantiate_scaler` raise `ValueError` at parse time when `scaler_cfg is None`, so the misconfiguration fails loudly at manager construction rather than at fit time. `DartsForecaster._instantiate_scaler` retains its `None → None` pass-through because a forecaster legitimately supports having no target or feature scaler — the narrow fix applies only to the manager where `None` is always a misconfiguration. Regression test in `tests/test_scaling.py::TestFeatureScalerManagerRejectsNoneScalerConfig` covers the direct `None` rejection and the named-group-without-scaler-and-no-default reproducer.
+- **Note:** Registered and resolved in the same commit — this was surfaced by a second Copilot comment during PR #10 review after the initial register (7b92bfa). Tier 2 because the silent propagation reached downstream fit code and only surfaced as a non-obvious `AttributeError`, meeting the "structural fragility with clear trigger" criterion.
 
 ---
 

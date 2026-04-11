@@ -82,9 +82,25 @@ class FeatureScalerManager:
 
     @staticmethod
     def _instantiate_scaler(scaler_cfg):
-        """Delegate to ScalerSelector.instantiate_darts_scaler()."""
+        """
+        Delegate to ScalerSelector.instantiate_darts_scaler(), rejecting None.
+
+        `ScalerSelector.instantiate_darts_scaler(None)` legitimately returns
+        `None` for the forecaster-level target/feature scaler paths, where a
+        missing scaler is a valid configuration. Inside `FeatureScalerManager`,
+        however, a `None` entry gets stored in `self._scalers` and later
+        propagated into `fit()` / `transform()` / `inverse_transform()` calls
+        that assume every entry is a Darts Scaler or Pipeline, producing an
+        `AttributeError` at fit time that is hard to trace back to the
+        misconfigured group. Fail loudly at parse time instead.
+        """
         if scaler_cfg is None:
-            return None
+            raise ValueError(
+                "Scaler configuration cannot be None in FeatureScalerManager. "
+                "Provide a valid scaler configuration (str, list, or dict) for "
+                "each group, or set `default_scaler` on the manager so groups "
+                "without an explicit `scaler` key have a fallback."
+            )
         return ScalerSelector.instantiate_darts_scaler(scaler_cfg)
 
     def fit_transform(self, series_list: List[TimeSeries]) -> List[TimeSeries]:

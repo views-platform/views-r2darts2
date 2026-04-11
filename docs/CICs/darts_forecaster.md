@@ -58,13 +58,14 @@ The `DartsForecaster` is a stateful wrapper that manages the tight coupling betw
 - **Device Failure:** Raises `RuntimeError` if hardware self-healing (CPU -> GPU) fails (ADR-008).
 - **Numerical Insanity:** Fails loudly if NaNs or Infs are detected in the model input stream.
 - **Schema Mismatch:** Fails if the provided dataset components do not match the expected DNA manifest.
+- **Missing Entity Metadata:** Raises `ValueError` if a prediction `TimeSeries` lacks `static_covariates` (required for entity ID extraction).
 
 ---
 
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Managed by `DartsForecastingModelManager`.
-- **Physical Zen:** Lives in `views_r2darts2/model/darts_forecaster.py`.
+- **Physical Zen:** Lives in `views_r2darts2/engines/darts_forecaster.py`.
 - **Downstream:** Orchestrates `FeatureScalerManager` and specific Darts `TorchForecastingModel` instances.
 - **Validator:** Deeply coupled with `ReproducibilityGate` for boundary auditing.
 
@@ -102,8 +103,10 @@ results_df = forecaster.predict(sequence_number=0)
 ## 11. Evolution Notes
 
 ### Known Deviations / Technical Debt
-- **Silent Data Cleaning:** Currently replaces `NaN` and `Inf` with `0.0` in `_process_predictions`. This violates ADR-008 (Fail-Loud) and should be refactored to raise an error if numerical insanity is detected post-inference.
 - **Manual Log Implementation:** Implements its own `_apply_log_to_features`. This should be refactored to use Darts' native `LogTransformer` inside the scaling `Pipeline` for better consistency.
+
+### Resolved Debt
+- **Silent Data Cleaning (resolved):** Previously replaced `NaN` and `Inf` with `0.0` in `_process_predictions`. Now raises `NumericalSanityError` via `ReproducibilityGate.Data.audit_numerical_sanity` before processing, satisfying ADR-008 (Fail-Loud).
 
 ---
 

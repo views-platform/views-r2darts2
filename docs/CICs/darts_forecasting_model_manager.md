@@ -63,7 +63,7 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Interacts with `views_pipeline_core` for configuration and lifecycle control.
-- **Physical Zen:** Lives in `views_r2darts2/manager/darts_forecasting_model_manager.py`.
+- **Physical Zen:** Lives in `views_r2darts2/engines/darts_forecasting_model_manager.py`.
 - **Downstream:** Depends on `ModelCatalog` (for instantiation) and `DartsForecaster` (for execution).
 - **Airlock:** Interacts with `ReproducibilityGate` to validate all boundaries.
 

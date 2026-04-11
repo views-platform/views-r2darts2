@@ -110,6 +110,40 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         return partition
 
+    @staticmethod
+    def _resolve_total_sequence_number(partition: dict, max_steps: int) -> int:
+        """
+        Derive the total number of rolling-origin sequences from the test partition.
+
+        The count equals `test_len - max_steps + 1`, the standard pipeline contract
+        for rolling-origin evaluation. Guards against the silent-failure mode where
+        `max_steps > test_len` yields zero or negative sequences, which Python would
+        silently accept (`[None] * -1 == []`, `range(-1) == []`) and propagate as an
+        empty prediction batch through downstream evaluation.
+
+        Args:
+            partition: Resolved partition dict containing a `test` key with a
+                (test_start, test_end) tuple (inclusive, both ends).
+            max_steps: Maximum forecast horizon — typically `max(config['steps'])`.
+
+        Returns:
+            Number of rolling-origin sequences (always >= 1).
+
+        Raises:
+            ValueError: If the test partition is shorter than `max_steps`, which
+                would otherwise produce an empty evaluation batch with no error.
+        """
+        test_start, test_end = partition["test"]
+        test_len = test_end - test_start + 1
+        if test_len < max_steps:
+            raise ValueError(
+                f"Invalid evaluation configuration: test partition length "
+                f"({test_len}) is smaller than the maximum forecast horizon "
+                f"({max_steps}). Rolling-origin evaluation requires "
+                f"test_len >= max(steps); otherwise no sequences can be produced."
+            )
+        return test_len - max_steps + 1
+
     def _train_model_artifact(self):
         """
         Trains a forecasting model using the specified configuration and dataset, and saves the trained model artifact.
@@ -245,15 +279,18 @@ class DartsForecastingModelManager(ForecastingModelManager):
         )
         forecaster.load_model(path=path_artifact)
 
-        total_sequence_number = 12
+        partition = self._resolve_active_partition_dict(active_config)
+        _time_steps = max(active_config["steps"])
+        total_sequence_number = self._resolve_total_sequence_number(
+            partition, _time_steps
+        )
 
         # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
-        partition = self._resolve_active_partition_dict(active_config)
         ReproducibilityGate.Temporal.audit_prediction_horizon(
             run_type=run_type,
             train_end=partition["train"][1],
             test_end=partition["test"][1],
-            max_steps=max(active_config["steps"]),
+            max_steps=_time_steps,
             total_sequences=total_sequence_number,
         )
 
@@ -382,6 +419,9 @@ class DartsForecastingModelManager(ForecastingModelManager):
         """
         import wandb
         from views_pipeline_core.exceptions.exceptions import PipelineException
+        from views_pipeline_core.modules.validation.core_prediction_sniffer import (
+            CorePredictionSniffer,
+        )
 
         with self._wandb_module.initialize_run(
             project=self._project,
@@ -419,29 +459,27 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
                 # HORIZON LOCKDOWN: Prevent forecasting beyond ground truth
                 partition = self._resolve_active_partition_dict(active_config)
+                _max_steps = max(active_config["steps"])
                 ReproducibilityGate.Temporal.audit_prediction_horizon(
                     run_type=active_config["run_type"],
                     train_end=partition["train"][1],
                     test_end=partition["test"][1],
-                    max_steps=max(active_config["steps"]),
-                    total_sequences=12,
+                    max_steps=_max_steps,
+                    total_sequences=self._resolve_total_sequence_number(
+                        partition, _max_steps
+                    ),
                 )
 
                 df_predictions = self._evaluate_sweep(self._eval_type, model)
 
+                sniffer = CorePredictionSniffer(level=active_config["level"])
                 for i, df in enumerate(df_predictions):
                     print(
                         f"\nValidating evaluation dataframe of sequence {i + 1}/{len(df_predictions)}"
                     )
-                    from views_pipeline_core.modules.validation.model import (
-                        validate_prediction_dataframe,
-                    )
+                    sniffer.sniff_predictions(df, targets=active_config["targets"])
 
-                    validate_prediction_dataframe(
-                        dataframe=df, target=active_config["targets"]
-                    )
-
-                if active_config.get("metrics"):
+                if self._has_evaluation_metrics():
                     self._evaluate_prediction_dataframe(df_predictions, self._eval_type)
                 else:
                     raise PipelineException(
@@ -464,10 +502,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
         # Snapshot the config once for the duration of evaluation
         active_config = self.configs
 
-        logger.warning(
-            "Using fixed total_sequence_number=12 for sweep evaluation eval_type will soon be deprecated."
+        partition = self._resolve_active_partition_dict(active_config)
+        _time_steps = max(active_config["steps"])
+        total_sequence_number = self._resolve_total_sequence_number(
+            partition, _time_steps
         )
-        total_sequence_number = 12
 
         # Explicitly extract kwargs to ensure reproducibility
         predict_kwargs = self._get_predict_kwargs(active_config)

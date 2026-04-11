@@ -130,3 +130,104 @@ class ScalerSelector:
         if ScalerSelector.is_chain_spec(scaler_spec):
             return ScalerSelector.get_chained_scaler(scaler_spec)
         return ScalerSelector.get_scaler(scaler_spec, **kwargs)
+
+    @staticmethod
+    def instantiate_darts_scaler(scaler_cfg):
+        """
+        Instantiate a Darts Scaler or Pipeline from a flexible config format.
+
+        All four chain-spec forms below produce structurally identical objects:
+          - "A->B"                — string with arrow
+          - ["A", "B"]            — list
+          - {"chain": "A->B"}     — dict with string chain
+          - {"chain": ["A", "B"]} — dict with list chain
+        Single-element forms (`"A"`, `["A"]`, `{"chain": ["A"]}`) all return a
+        bare `Scaler`, not a one-element `Pipeline`. Empty lists / empty chain
+        strings raise `ValueError` instead of silently producing empty Pipelines.
+
+        Accepts:
+          - None → returns None
+          - String: 'StandardScaler' or 'AsinhTransform->StandardScaler' (chained)
+          - List: ['AsinhTransform', 'StandardScaler'] (chained)
+          - Dict: {'name': <str>, 'kwargs': <dict>}
+          - Dict with chain: {'chain': ['AsinhTransform', 'StandardScaler']}
+            or {'chain': 'AsinhTransform->StandardScaler'}
+
+        Returns:
+          Darts Scaler (single) or Pipeline (chained) or None.
+        """
+        if scaler_cfg is None:
+            return None
+
+        if isinstance(scaler_cfg, str):
+            if "->" in scaler_cfg:
+                return ScalerSelector._build_chain_or_single(
+                    [s.strip() for s in scaler_cfg.split("->")]
+                )
+            return Scaler(ScalerSelector.get_scaler(scaler_cfg), global_fit=True)
+
+        if isinstance(scaler_cfg, list):
+            return ScalerSelector._build_chain_or_single(scaler_cfg)
+
+        if isinstance(scaler_cfg, dict):
+            if "chain" in scaler_cfg:
+                chain_list = scaler_cfg["chain"]
+                if isinstance(chain_list, str):
+                    return ScalerSelector._build_chain_or_single(
+                        [s.strip() for s in chain_list.split("->")]
+                    )
+                if isinstance(chain_list, list):
+                    return ScalerSelector._build_chain_or_single(chain_list)
+                raise TypeError(
+                    f"'chain' must be a string or list, got {type(chain_list).__name__}"
+                )
+            name = scaler_cfg.get("name")
+            kwargs = scaler_cfg.get("kwargs", {})
+            if name is None:
+                raise ValueError(
+                    "Scaler config dict must have a 'name' key or a 'chain' key."
+                )
+            if "->" in name:
+                return ScalerSelector._build_chain_or_single(
+                    [s.strip() for s in name.split("->")]
+                )
+            return Scaler(ScalerSelector.get_scaler(name, **kwargs), global_fit=True)
+
+        raise TypeError(
+            f"Scaler config must be None, str, list, or dict. Got {type(scaler_cfg).__name__}."
+        )
+
+    @staticmethod
+    def _build_chain_or_single(scaler_names: list):
+        """
+        Sole chain-construction helper used by `instantiate_darts_scaler`.
+
+        Collapses the previously-divergent list / dict-chain-list / dict-chain-str
+        code paths (flagged by Copilot on PR #10 and tracked as C-03) into a
+        single definition. All chain specs — regardless of input form — go
+        through here, so adding a new scaler step or changing chain semantics
+        only requires one edit.
+
+        Single-element chains return a bare `Scaler` to match the legacy
+        single-scaler path; multi-element chains return a `darts.Pipeline`.
+        Empty lists and non-string elements raise instead of silently producing
+        malformed pipelines.
+        """
+        from darts.dataprocessing import Pipeline
+
+        if not isinstance(scaler_names, list) or len(scaler_names) == 0:
+            raise ValueError(
+                "Scaler chain must be a non-empty list of scaler name strings."
+            )
+        if not all(isinstance(name, str) and name for name in scaler_names):
+            raise TypeError(
+                "Scaler chain must contain only non-empty string scaler names, "
+                f"got {scaler_names!r}."
+            )
+        if len(scaler_names) == 1:
+            return Scaler(ScalerSelector.get_scaler(scaler_names[0]), global_fit=True)
+        darts_scalers = [
+            Scaler(ScalerSelector.get_scaler(name), global_fit=True)
+            for name in scaler_names
+        ]
+        return Pipeline(darts_scalers)

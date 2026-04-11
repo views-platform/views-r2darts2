@@ -9,7 +9,6 @@ from views_r2darts2.transformers.scaler_selector import ScalerSelector
 from views_r2darts2.transformers.feature_scaler_manager import FeatureScalerManager
 from views_r2darts2.transformers.views_dataset_darts import _ViewsDatasetDarts
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
-from darts.dataprocessing.transformers import Scaler
 
 import logging
 
@@ -108,12 +107,11 @@ class DartsForecaster:
             self._log_targets = False
 
         if self._log_features and feature_scaler == "LogTransform":
-            logger.error(
+            raise ValueError(
                 "Both log_features and feature_scaler='LogTransform' are set. "
-                "This may apply log transform twice on overlapping features! "
-                "Consider using only one transformation method."
+                "This will apply log transform twice on overlapping features. "
+                "Use only one transformation method."
             )
-            raise
 
         self.scaler_fitted = False
 
@@ -142,90 +140,12 @@ class DartsForecaster:
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
             self.model.model.to(self.device)
 
-    def _instantiate_scaler(self, scaler_cfg):
-        """
-        Instantiate and wrap a scaler config using Darts Pipeline for chained scalers.
-
-        Using Darts Pipeline (instead of custom ChainedScaler) properly preserves
-        the sample dimension for probabilistic forecasts during inverse_transform.
-
-        Accepts:
-          - None
-          - String: 'StandardScaler' or 'AsinhTransform->StandardScaler' (chained)
-          - List: ['AsinhTransform', 'StandardScaler'] (chained)
-          - Dict: {'name': <str>, 'kwargs': <dict>}
-          - Dict with chain: {'chain': ['AsinhTransform', 'StandardScaler']}
-
-        Returns:
-          Darts Scaler (single) or Pipeline (chained) or None.
-        """
+    @staticmethod
+    def _instantiate_scaler(scaler_cfg):
+        """Delegate to ScalerSelector.instantiate_darts_scaler()."""
         if scaler_cfg is None:
             return None
-        from darts.dataprocessing import Pipeline
-
-        def _parse_chain_string(chain_str: str) -> list:
-            """Parse 'Scaler1->Scaler2' into ['Scaler1', 'Scaler2']."""
-            return [s.strip() for s in chain_str.split("->")]
-
-        def _is_chain_string(s: str) -> bool:
-            return "->" in s
-
-        def _make_pipeline(scaler_names: list):
-            """Create a Darts Pipeline from a list of scaler names."""
-            darts_scalers = [
-                Scaler(ScalerSelector.get_scaler(name), global_fit=True)
-                for name in scaler_names
-            ]
-            return Pipeline(darts_scalers)
-
-        if isinstance(scaler_cfg, str):
-            if _is_chain_string(scaler_cfg):
-                # Chain syntax: "AsinhTransform->StandardScaler"
-                scaler_names = _parse_chain_string(scaler_cfg)
-                return _make_pipeline(scaler_names)
-            else:
-                # Single scaler
-                estimator = ScalerSelector.get_scaler(scaler_cfg)
-                return Scaler(estimator, global_fit=True)
-
-        if isinstance(scaler_cfg, list):
-            # List of scalers to chain: ["AsinhTransform", "StandardScaler"]
-            if len(scaler_cfg) == 1:
-                estimator = ScalerSelector.get_scaler(scaler_cfg[0])
-                return Scaler(estimator, global_fit=True)
-            else:
-                return _make_pipeline(scaler_cfg)
-
-        if isinstance(scaler_cfg, dict):
-            # Check for chain config
-            if "chain" in scaler_cfg:
-                chain_list = scaler_cfg["chain"]
-                if isinstance(chain_list, str):
-                    scaler_names = _parse_chain_string(chain_list)
-                    return _make_pipeline(scaler_names)
-                elif isinstance(chain_list, list):
-                    return _make_pipeline(chain_list)
-                else:
-                    raise TypeError(
-                        f"'chain' must be a string or list, got {type(chain_list).__name__}"
-                    )
-
-            # Standard dict format
-            name = scaler_cfg.get("name")
-            kwargs = scaler_cfg.get("kwargs", {})
-            if name is None:
-                raise ValueError(
-                    "Scaler config dict must have a 'name' key or a 'chain' key."
-                )
-            if _is_chain_string(name):
-                scaler_names = _parse_chain_string(name)
-                return _make_pipeline(scaler_names)
-            estimator = ScalerSelector.get_scaler(name, **kwargs)
-            return Scaler(estimator, global_fit=True)
-
-        raise TypeError(
-            f"Scaler config must be None, str, list, or dict. Got {type(scaler_cfg).__name__}."
-        )
+        return ScalerSelector.instantiate_darts_scaler(scaler_cfg)
 
     def _apply_log_to_targets(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
         """
@@ -536,6 +456,11 @@ class DartsForecaster:
         results = []
         eps = 1e-8
         for pred in timeseries_pred:
+            if pred.static_covariates is None:
+                raise ValueError(
+                    "Prediction TimeSeries is missing static_covariates. "
+                    "Ensure data was grouped by entity via TimeSeries.from_group_dataframe()."
+                )
             entity_id = int(pred.static_covariates.iat[0, 0])
             pred_values = pred.all_values(copy=False)
             if pred_values.ndim == 2:
@@ -630,8 +555,7 @@ class DartsForecaster:
             timeseries=timeseries,
             # start=self._test_start + sequence_number - output_length,
             start=self._test_start + sequence_number - self.model.input_chunk_length,
-            end=self._test_start
-            + sequence_number,  # self._test_start + sequence_number is exclusive
+            end=self._test_start - 1 + sequence_number,  # origin = test_start - 1 + seq (base_origin convention)
         )
 
         # Resilient Device Management: Ensure model is on the correct device

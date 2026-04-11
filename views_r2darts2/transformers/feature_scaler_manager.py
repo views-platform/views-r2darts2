@@ -80,47 +80,28 @@ class FeatureScalerManager:
             for feat in unmapped_features:
                 self._feature_to_scaler[feat] = scaler_key
 
-    def _instantiate_scaler(self, scaler_cfg):
-        from darts.dataprocessing import Pipeline
+    @staticmethod
+    def _instantiate_scaler(scaler_cfg):
+        """
+        Delegate to ScalerSelector.instantiate_darts_scaler(), rejecting None.
 
-        def _parse_chain_string(chain_str: str) -> list:
-            return [s.strip() for s in chain_str.split("->")]
-
-        def _is_chain_string(s: str) -> bool:
-            return "->" in s
-
-        def _make_pipeline(scaler_names: list):
-            darts_scalers = [
-                Scaler(ScalerSelector.get_scaler(name), global_fit=True)
-                for name in scaler_names
-            ]
-            return Pipeline(darts_scalers)
-
-        if isinstance(scaler_cfg, str):
-            if _is_chain_string(scaler_cfg):
-                return _make_pipeline(_parse_chain_string(scaler_cfg))
-            return Scaler(ScalerSelector.get_scaler(scaler_cfg), global_fit=True)
-
-        if isinstance(scaler_cfg, list):
-            if len(scaler_cfg) == 1:
-                return Scaler(ScalerSelector.get_scaler(scaler_cfg[0]), global_fit=True)
-            return _make_pipeline(scaler_cfg)
-
-        if isinstance(scaler_cfg, dict):
-            if "chain" in scaler_cfg:
-                chain_list = scaler_cfg["chain"]
-                if isinstance(chain_list, str):
-                    return _make_pipeline(_parse_chain_string(chain_list))
-                return _make_pipeline(chain_list)
-            name = scaler_cfg.get("name")
-            kwargs = scaler_cfg.get("kwargs", {})
-            if name is None:
-                raise ValueError("Scaler config must have 'name' or 'chain'.")
-            if _is_chain_string(name):
-                return _make_pipeline(_parse_chain_string(name))
-            return Scaler(ScalerSelector.get_scaler(name, **kwargs), global_fit=True)
-
-        raise TypeError(f"Invalid scaler config type: {type(scaler_cfg)}")
+        `ScalerSelector.instantiate_darts_scaler(None)` legitimately returns
+        `None` for the forecaster-level target/feature scaler paths, where a
+        missing scaler is a valid configuration. Inside `FeatureScalerManager`,
+        however, a `None` entry gets stored in `self._scalers` and later
+        propagated into `fit()` / `transform()` / `inverse_transform()` calls
+        that assume every entry is a Darts Scaler or Pipeline, producing an
+        `AttributeError` at fit time that is hard to trace back to the
+        misconfigured group. Fail loudly at parse time instead.
+        """
+        if scaler_cfg is None:
+            raise ValueError(
+                "Scaler configuration cannot be None in FeatureScalerManager. "
+                "Provide a valid scaler configuration (str, list, or dict) for "
+                "each group, or set `default_scaler` on the manager so groups "
+                "without an explicit `scaler` key have a fallback."
+            )
+        return ScalerSelector.instantiate_darts_scaler(scaler_cfg)
 
     def fit_transform(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
         if not self._scalers:

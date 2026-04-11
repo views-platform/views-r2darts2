@@ -756,3 +756,127 @@ class TestFeatureScalerManagerChaining:
             recovered[0].all_values()[:, ged_sb_idx],
             decimal=4,
         )
+
+
+class TestInstantiateDartsScalerConsolidation:
+    """C-03 regression: all four chain-spec input forms must route through
+    `_build_chain_or_single` and produce equivalent objects. Previously the
+    list / dict-chain-list / dict-chain-str paths went through divergent
+    constructors and had inconsistent single-element semantics (flagged by
+    Copilot on PR #10, scaler_selector.py:179)."""
+
+    def test_single_element_list_returns_bare_scaler_not_pipeline(self):
+        from darts.dataprocessing import Pipeline
+        from darts.dataprocessing.transformers import Scaler
+
+        result = ScalerSelector.instantiate_darts_scaler(["StandardScaler"])
+        assert isinstance(result, Scaler)
+        assert not isinstance(result, Pipeline)
+
+    def test_single_element_dict_chain_list_returns_bare_scaler(self):
+        """[REGRESSION — Copilot on PR #10] The previous implementation of the
+        dict-chain-list branch always returned a one-element Pipeline here,
+        which broke `isinstance(..., Pipeline)` downstream routing and was
+        inconsistent with the equivalent `["StandardScaler"]` list input."""
+        from darts.dataprocessing import Pipeline
+        from darts.dataprocessing.transformers import Scaler
+
+        result = ScalerSelector.instantiate_darts_scaler(
+            {"chain": ["StandardScaler"]}
+        )
+        assert isinstance(result, Scaler)
+        assert not isinstance(result, Pipeline)
+
+    def test_single_element_dict_chain_str_returns_bare_scaler(self):
+        """`{"chain": "StandardScaler"}` must behave like `"StandardScaler"`
+        and `["StandardScaler"]` — not create a one-element Pipeline."""
+        from darts.dataprocessing import Pipeline
+        from darts.dataprocessing.transformers import Scaler
+
+        result = ScalerSelector.instantiate_darts_scaler(
+            {"chain": "StandardScaler"}
+        )
+        assert isinstance(result, Scaler)
+        assert not isinstance(result, Pipeline)
+
+    def test_two_element_chain_forms_all_produce_pipelines(self):
+        """All four equivalent ways of specifying a two-element chain must
+        produce a Pipeline of the same structural shape."""
+        from darts.dataprocessing import Pipeline
+
+        forms = [
+            "AsinhTransform->StandardScaler",
+            ["AsinhTransform", "StandardScaler"],
+            {"chain": "AsinhTransform->StandardScaler"},
+            {"chain": ["AsinhTransform", "StandardScaler"]},
+        ]
+        results = [ScalerSelector.instantiate_darts_scaler(f) for f in forms]
+        for r in results:
+            assert isinstance(r, Pipeline)
+        # All Pipelines should have the same number of transformers
+        lengths = {len(list(r._transformers)) for r in results}
+        assert len(lengths) == 1, (
+            f"Chain forms produced Pipelines of differing lengths: {lengths}"
+        )
+
+    def test_empty_list_raises(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            ScalerSelector.instantiate_darts_scaler([])
+
+    def test_empty_dict_chain_list_raises(self):
+        with pytest.raises(ValueError, match="non-empty list"):
+            ScalerSelector.instantiate_darts_scaler({"chain": []})
+
+    def test_list_with_non_string_element_raises(self):
+        with pytest.raises(TypeError, match="non-empty string"):
+            ScalerSelector.instantiate_darts_scaler(["StandardScaler", 42])
+
+    def test_list_with_empty_string_element_raises(self):
+        with pytest.raises(TypeError, match="non-empty string"):
+            ScalerSelector.instantiate_darts_scaler(["StandardScaler", ""])
+
+
+class TestFeatureScalerManagerRejectsNoneScalerConfig:
+    """[REGRESSION — Copilot on PR #10, feature_scaler_manager.py:87]
+    `_instantiate_scaler(None)` used to return `None`, which then propagated
+    into `self._scalers` and later crashed downstream at fit/transform time
+    with a non-obvious `AttributeError` on `scaler.transformer`. The fix makes
+    the misconfiguration fail loudly at parse time."""
+
+    def test_instantiate_scaler_raises_on_none(self):
+        with pytest.raises(ValueError, match="cannot be None"):
+            FeatureScalerManager._instantiate_scaler(None)
+
+    def test_named_group_without_scaler_and_no_default_raises_at_construction(
+        self,
+    ):
+        """The original bug reproducer: a named group with no `scaler` key
+        plus `default_scaler=None` used to silently store a `None` scaler and
+        fail later at fit time. Should now raise at construction."""
+        config = {
+            "conflict": {
+                # note: no "scaler" key
+                "features": ["ged_sb", "ged_ns"],
+            },
+        }
+        with pytest.raises(ValueError, match="cannot be None"):
+            FeatureScalerManager(
+                feature_scaler_map=config,
+                default_scaler=None,
+                all_features=["ged_sb", "ged_ns"],
+            )
+
+    def test_named_group_without_scaler_falls_back_to_explicit_default(self):
+        """Control case: the same config with an explicit default_scaler must
+        still work — we only raise when the fallback itself is None."""
+        config = {
+            "conflict": {
+                "features": ["ged_sb", "ged_ns"],
+            },
+        }
+        manager = FeatureScalerManager(
+            feature_scaler_map=config,
+            default_scaler="RobustScaler",
+            all_features=["ged_sb", "ged_ns"],
+        )
+        assert manager is not None

@@ -446,17 +446,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
                     )
                     sniffer.sniff_predictions(df, targets=active_config["targets"])
 
-                has_metrics = any([
-                    active_config.get("metrics"),
-                    active_config.get("regression_metrics"),
-                    active_config.get("classification_metrics"),
-                    active_config.get("regression_point_metrics"),
-                    active_config.get("regression_sample_metrics"),
-                    active_config.get("classification_point_metrics"),
-                    active_config.get("classification_sample_metrics"),
-                ])
-
-                if has_metrics:
+                if self._has_evaluation_metrics():
                     self._evaluate_prediction_dataframe(df_predictions, self._eval_type)
                 else:
                     raise PipelineException(

@@ -254,7 +254,6 @@ class ModelCatalog:
             dilation_base=self.config.get("dilation_base"),
             weight_norm=self.config.get("weight_norm"),
             dropout=self.config.get("dropout"),
-            use_static_covariates=self.config.get("use_static_covariates"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 

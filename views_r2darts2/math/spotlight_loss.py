@@ -11,17 +11,20 @@ class SpotlightLoss(torch.nn.Module):
     on asinh-transformed targets.
 
     SpotlightLoss "shines a spotlight" on the signal that matters most: it amplifies
-    loss contributions from high-magnitude events (via a cosh-based magnitude weight),
-    penalises under-prediction more harshly than over-prediction (via a smooth sigmoid
-    asymmetry gate), and optionally regularises the temporal gradient so the model
-    tracks the *shape* of the true series, not just its level.
+    loss contributions from high-magnitude events (via a concave power-law magnitude
+    weight), penalises under-prediction more harshly than over-prediction (via a smooth
+    sigmoid asymmetry gate), and optionally regularises the temporal gradient so the
+    model tracks the *shape* of the true series, not just its level.
 
     Components
     ----------
-    1. **Magnitude weighting** — ``w_mag = cosh(alpha * |y_true|)``,
-       clamped to ``1e6`` for numerical safety. High-magnitude targets receive
-       exponentially higher weight based solely on ground truth — predictions
-       cannot inflate their own importance.
+    1. **Magnitude weighting** — ``w_mag = (1 + |y_true|) ** alpha``.
+       Concave power-law: the marginal extra weight *decreases* as magnitude
+       increases.  Peace-vs-conflict is a big distinction; moderate-vs-extreme
+       conflict is a small one.  Unlike the previous ``cosh``-based weight,
+       this cannot produce exponentially large weights in the tail, which
+       prevents the model from learning "strong attractors" that cause OOD
+       escalations during inference.
     2. **Scaled log-cosh base loss** — parameter-free replacement for Huber.
        ``L_i = s_i * log(cosh(e_i / s_i))`` where ``s_i = 1 + |y_true| / (1 + |y_true|)``.
        Behaves quadratically for small errors, linearly for large errors, with a smooth
@@ -42,8 +45,9 @@ class SpotlightLoss(torch.nn.Module):
     Parameters
     ----------
     alpha : float, default 1.0
-        Magnitude amplification strength. Larger values increase the weight gap between
-        high-magnitude and near-zero samples.
+        Magnitude amplification exponent for the concave power-law weight
+        ``(1 + |y|)^alpha``.  0 = uniform weights, 0.5 = square-root (recommended),
+        1.0 = linear.  Values < 1 give diminishing returns for extreme magnitudes.
     beta : float, default 1.0
         Asymmetry strength. Maximum extra multiplier applied when the model
         under-predicts a non-zero true value.
@@ -161,13 +165,14 @@ class SpotlightLoss(torch.nn.Module):
         e = y_pred - y_true
 
         # ---- 1. Magnitude weight ----
-        # Ground-truth only: conflict samples get exponentially higher weight.
-        # Using only y_true prevents a feedback loop where overshooting
-        # predictions inflate their own weight (via detached-max), which
-        # caused runaway OOD blowups during out-of-sample forecasting.
-        # mag = torch.max(torch.abs(y_true), torch.abs(y_pred.detach())) # test
-        # w_mag = torch.cosh(self.alpha * mag).clamp(max=1e6)
-        w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
+        # Concave power-law: (1 + |y_true|)^alpha
+        # Marginal weight gain decreases with magnitude — peace-vs-conflict
+        # is the big distinction, moderate-vs-extreme conflict is small.
+        # This replaces the exponential cosh weight which caused OOD
+        # escalations by creating extreme-magnitude attractors.
+        # OLD (exponential, caused 50k+ blowups):
+        # w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
+        w_mag = torch.pow(1.0 + torch.abs(y_true), self.alpha)
 
         # ---- 2. Scaled log-cosh base loss ----
         # s_i ∈ [1, 2): peace cells ≈ 1 (tight quadratic), conflict → 2 (wider)
@@ -195,7 +200,9 @@ class SpotlightLoss(torch.nn.Module):
             mag_grad = torch.max(
                 torch.abs(y_true[:, 1:]), torch.abs(y_true[:, :-1])
             )
-            w_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
+            # OLD (exponential, matched w_mag):
+            # w_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
+            w_grad = torch.pow(1.0 + mag_grad, self.alpha)
             scale_grad = 1.0 + mag_grad / (1.0 + mag_grad)
             loss_grad_1 = (w_grad * self._log_cosh_scaled(e_grad, scale_grad)).mean()
 

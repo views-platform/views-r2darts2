@@ -35,7 +35,9 @@ class SpotlightLoss(torch.nn.Module):
        ``|y_true| / (1 + |y_true|)``, so asymmetry matters most for real events.
     4. **Temporal gradient term** — optional scaled log-cosh on first-order differences
        ``Delta y_pred - Delta y_true``, weighted by ``gamma``. Encourages the model to
-       reproduce step-to-step dynamics, not just pointwise targets.
+       reproduce step-to-step dynamics, not just pointwise targets. Only first-order
+       (velocity); second-order curvature matching was removed to prevent compound
+       escalation during autoregressive rollout.
 
     Parameters
     ----------
@@ -197,26 +199,7 @@ class SpotlightLoss(torch.nn.Module):
             scale_grad = 1.0 + mag_grad / (1.0 + mag_grad)
             loss_grad_1 = (w_grad * self._log_cosh_scaled(e_grad, scale_grad)).mean()
 
-            # Second-order: match curvature (onset/offset shape)
-            if y_pred.size(1) > 2:
-                curv_pred = diff_pred[:, 1:] - diff_pred[:, :-1]
-                curv_true = diff_true[:, 1:] - diff_true[:, :-1]
-                e_curv = curv_pred - curv_true
-
-                mag_curv = torch.max(
-                    torch.abs(y_true[:, 2:]),
-                    torch.max(
-                        torch.abs(y_true[:, 1:-1]),
-                        torch.abs(y_true[:, :-2]),
-                    ),
-                )
-                w_curv = torch.cosh(self.alpha * mag_curv).clamp(max=1e6)
-                scale_curv = 1.0 + mag_curv / (1.0 + mag_curv)
-                loss_grad_2 = 0.5 * (w_curv * self._log_cosh_scaled(e_curv, scale_curv)).mean()
-            else:
-                loss_grad_2 = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
-
-            loss_grad = self.gamma * (loss_grad_1 + loss_grad_2)
+            loss_grad = self.gamma * loss_grad_1
         else:
             loss_grad = torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
 

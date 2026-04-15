@@ -11,27 +11,24 @@ class SpotlightLoss(torch.nn.Module):
     on asinh-transformed targets.
 
     SpotlightLoss "shines a spotlight" on the signal that matters most: it amplifies
-    loss contributions from high-magnitude events (via a concave power-law magnitude
+    loss contributions from high-magnitude events (via a clamped cosh magnitude
     weight), penalises under-prediction more harshly than over-prediction (via a smooth
     sigmoid asymmetry gate), and optionally regularises the temporal gradient so the
     model tracks the *shape* of the true series, not just its level.
 
     Components
     ----------
-    1. **Magnitude weighting** — ``w_mag = (1 + |y_true|) ** alpha``.
-       Concave power-law: the marginal extra weight *decreases* as magnitude
-       increases.  Peace-vs-conflict is a big distinction; moderate-vs-extreme
-       conflict is a small one.  Unlike the previous ``cosh``-based weight,
-       this cannot produce exponentially large weights in the tail, which
-       prevents the model from learning "strong attractors" that cause OOD
-       escalations during inference.
+    1. **Magnitude weighting** — ``w_mag = clamp(cosh(alpha * |y_true|), max=W_MAX)``.
+       Exponential cosh weight ensures the model pays strong attention to extreme
+       conflict cells (e.g. ~23× for Ukraine at alpha=0.4).  A hard clamp at
+       ``W_MAX=1000`` prevents runaway gradients if alpha drifts high during sweeps.
+       The recommended alpha range is 0.2–0.5 (smol_cat best: 0.387).
     2. **Scaled log-cosh base loss** — parameter-free replacement for Huber.
        ``L_i = s_i * log(cosh(e_i / s_i))`` where ``s_i = 1 + |y_true| / (1 + |y_true|)``.
        Behaves quadratically for small errors, linearly for large errors, with a smooth
        transition (no curvature discontinuity). Gradient bounded at ±1 always.
        The scale ``s_i`` widens the quadratic zone for conflict cells (up to |e|≈2)
-       while keeping it tight for peace cells (|e|≈1), preventing sweep
-       misconfiguration that previously caused 1B+ OOD blowups.
+       while keeping it tight for peace cells (|e|≈1).
     3. **Asymmetric modulation** — a sigmoid ``sigma(-kappa * e)`` activates when the
        model under-predicts (``y_pred < y_true``). The extra penalty scales with
        ``beta`` and is proportional to the *relative* magnitude of the true value,
@@ -44,13 +41,14 @@ class SpotlightLoss(torch.nn.Module):
 
     Parameters
     ----------
-    alpha : float, default 1.0
-        Magnitude amplification exponent for the concave power-law weight
-        ``(1 + |y|)^alpha``.  0 = uniform weights, 0.5 = square-root (recommended),
-        1.0 = linear.  Values < 1 give diminishing returns for extreme magnitudes.
-    beta : float, default 1.0
+    alpha : float, default 0.4
+        Magnitude amplification rate for the cosh weight ``cosh(alpha * |y|)``.
+        Controls how much more the loss attends to extreme conflict cells vs peace.
+        At alpha=0.4, Ukraine-level conflict (~10k fatalities, asinh≈9.9) receives
+        ~23× the weight of a peace cell.  Recommended range: 0.2–0.5.
+    beta : float, default 0.2
         Asymmetry strength. Maximum extra multiplier applied when the model
-        under-predicts a non-zero true value.
+        under-predicts a non-zero true value. 0.2 = FN costs 1.2× FP on events.
     kappa : float, default 10.0
         Sharpness of the sigmoid transition that activates the asymmetric penalty.
         Higher values create a near-binary switch around ``e = 0``.
@@ -165,14 +163,13 @@ class SpotlightLoss(torch.nn.Module):
         e = y_pred - y_true
 
         # ---- 1. Magnitude weight ----
-        # Concave power-law: (1 + |y_true|)^alpha
-        # Marginal weight gain decreases with magnitude — peace-vs-conflict
-        # is the big distinction, moderate-vs-extreme conflict is small.
-        # This replaces the exponential cosh weight which caused OOD
-        # escalations by creating extreme-magnitude attractors.
-        # OLD (exponential, caused 50k+ blowups):
-        # w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=1e6)
-        w_mag = torch.pow(1.0 + torch.abs(y_true), self.alpha)
+        # Clamped cosh: cosh(alpha * |y_true|), hard-capped at W_MAX.
+        # At alpha=0.387 (smol_cat best), Ukraine-level conflict (asinh≈9.9)
+        # gets ~23× weight — peace-vs-conflict is the big distinction.
+        # The clamp prevents runaway gradients if alpha drifts high during
+        # sweeps (alpha=1.0 would give cosh(9.9)≈10k without clamp).
+        _W_MAX = 1e3
+        w_mag = torch.cosh(self.alpha * torch.abs(y_true)).clamp(max=_W_MAX)
 
         # ---- 2. Scaled log-cosh base loss ----
         # s_i ∈ [1, 2): peace cells ≈ 1 (tight quadratic), conflict → 2 (wider)
@@ -200,9 +197,7 @@ class SpotlightLoss(torch.nn.Module):
             mag_grad = torch.max(
                 torch.abs(y_true[:, 1:]), torch.abs(y_true[:, :-1])
             )
-            # OLD (exponential, matched w_mag):
-            # w_grad = torch.cosh(self.alpha * mag_grad).clamp(max=1e6)
-            w_grad = torch.pow(1.0 + mag_grad, self.alpha)
+            w_grad = torch.cosh(self.alpha * mag_grad).clamp(max=_W_MAX)
             scale_grad = 1.0 + mag_grad / (1.0 + mag_grad)
             loss_grad_1 = (w_grad * self._log_cosh_scaled(e_grad, scale_grad)).mean()
 

@@ -29,19 +29,16 @@ class SpotlightLoss(torch.nn.Module):
        transition (no curvature discontinuity). Gradient bounded at ±1 always.
        The scale ``s_i`` widens the quadratic zone for conflict cells (up to |e|≈2)
        while keeping it tight for peace cells (|e|≈1).
-    3. **Basu residual dampening** — adapted from the Gaussian Density Power
-       Divergence (Basu et al. 1998, Biometrika 85(3) 549–559).  The magnitude
-       weight is gated by a Gaussian kernel on the scaled residual:
-       ``w_eff = 1 + (w_mag - 1) * exp(-alpha/2 * z^2), z = e / s``.
-       When the model is far from the target (large |z|), ``w_eff`` decays
-       toward 1 (uniform weighting); when the model is close, the full cosh
-       amplification is restored.  This prevents gradient shocks in
-       cross-channel architectures (TSMixer, Transformer) during early training
-       while preserving the full spotlight effect once predictions converge.
-       Reuses ``alpha`` — the same parameter that sets the amplification rate
-       also sets the dampening rate, creating a self-regulating coupling:
-       stronger amplification automatically implies stronger dampening for
-       gross mispredictions.
+    3. **Directional Basu DPD residual dampening** — a Gaussian gate
+       ``exp(-alpha/2 * z^2)`` that only activates for **underprediction**
+       (``y_pred < y_true``).  When the model underpredicts a conflict cell by
+       a large margin, the gate dampens w_mag toward 1.0, preventing hard
+       outliers from destabilising early training (original DPD robustness).
+       When the model **overpredicts**, the gate is held at 1.0 so the full
+       cosh weight is preserved — the loss provides maximum corrective gradient
+       pushing predictions back down.  This breaks the symmetric Basu attractor
+       that previously allowed high-alpha configs to park in an overprediction
+       basin where ``w_mag → 1`` killed the recovery signal.
     4. **Asymmetric modulation** — a sigmoid ``sigma(-kappa * e)`` activates when the
        model under-predicts (``y_pred < y_true``). The extra penalty scales with
        ``beta`` and is proportional to the *relative* magnitude of the true value,
@@ -50,7 +47,9 @@ class SpotlightLoss(torch.nn.Module):
        ``Delta y_pred - Delta y_true``, weighted by ``gamma``. Encourages the model to
        reproduce step-to-step dynamics, not just pointwise targets. Only first-order
        (velocity); second-order curvature matching was removed to prevent compound
-       escalation during autoregressive rollout.
+       escalation during autoregressive rollout.  Uses the same directional Basu
+       gate: full weight when predicted dynamics overshoot truth, dampened when
+       they undershoot.
 
     Parameters
     ----------
@@ -62,10 +61,12 @@ class SpotlightLoss(torch.nn.Module):
         At alpha=0.4, Ukraine-level conflict (~10k fatalities, asinh≈9.9) receives
         ~23× the weight of a peace cell.
 
-        **Basu residual dampening:** also serves as the robustness parameter in
-        the DPD gate ``exp(-alpha/2 * z^2)``.  Higher alpha → stronger dampening
-        of cells where the model is currently far from the target.  The peak of
-        the influence function sits at ``z = 1/sqrt(alpha)`` scaled residuals.
+        **Basu residual dampening (underprediction only):** also serves as the
+        robustness parameter in the directional DPD gate.  For underprediction
+        (``e < 0``), ``exp(-alpha/2 * z^2)`` dampens the cosh weight — higher
+        alpha means stronger dampening and a narrower influence peak at
+        ``z = 1/sqrt(alpha)``.  For overprediction (``e > 0``), the gate is 1.0
+        and the full cosh weight applies regardless of alpha.
 
         Recommended range: 0.2–0.5 (smol_cat best: 0.387, influence peak at z≈1.6).
     beta : float, default 0.2
@@ -186,10 +187,6 @@ class SpotlightLoss(torch.nn.Module):
 
         # ---- 1. Magnitude weight ----
         # Clamped cosh: cosh(alpha * |y_true|), hard-capped at W_MAX.
-        # At alpha=0.387 (smol_cat best), Ukraine-level conflict (asinh≈9.9)
-        # gets ~23× weight — peace-vs-conflict is the big distinction.
-        # The clamp prevents runaway gradients if alpha drifts high during
-        # sweeps (alpha=1.0 would give cosh(9.9)≈10k without clamp).
         _W_MAX = 1e3
         abs_y = torch.abs(y_true)
         w_mag_raw = torch.cosh(self.alpha * abs_y).clamp(max=_W_MAX)
@@ -199,20 +196,14 @@ class SpotlightLoss(torch.nn.Module):
         scale = 1.0 + abs_y / (1.0 + abs_y)
         base_loss = self._log_cosh_scaled(e, scale)
 
-        # ---- 3. Basu DPD residual dampening ----
-        # Adapted from the Gaussian Density Power Divergence (Basu et al. 1998).
-        # The gate exp(-alpha/2 * z^2) interpolates the effective magnitude
-        # weight between 1.0 (uniform, when model is far off) and w_mag_raw
-        # (full cosh, when model is close).  Reuses the same alpha that
-        # controls cosh amplification: stronger amplification automatically
-        # implies stronger dampening for large residuals — self-regulating.
-        #
-        # At alpha=0.387, Ukraine, across training:
-        #   z=5 (early):  gate=0.008 → w_eff=1.2×  (stable, nearly uniform)
-        #   z=2 (mid):    gate=0.46  → w_eff=11×   (ramping up)
-        #   z=0.1 (late): gate=1.0   → w_eff=23×   (full spotlight)
+        # ---- 3. Directional Basu DPD residual dampening ----
+        # Only dampen for underprediction (e < 0, z < 0).  For overprediction
+        # (e > 0), gate = 1.0 → full cosh weight → maximum corrective gradient.
+        # clamp(z, max=0) zeros out positive z so exp(0)=1.  At z=0 both
+        # branches give 1.0 and derivative 0 → continuous + smooth.
         z = e / scale
-        basu_gate = torch.exp(-0.5 * self.alpha * z * z)
+        z_under = z.clamp(max=0.0)
+        basu_gate = torch.exp(-0.5 * self.alpha * z_under * z_under)
         w_mag = 1.0 + (w_mag_raw - 1.0) * basu_gate
 
         # ---- 4. Asymmetric modulation ----
@@ -239,9 +230,12 @@ class SpotlightLoss(torch.nn.Module):
             w_grad_raw = torch.cosh(self.alpha * mag_grad).clamp(max=_W_MAX)
             scale_grad = 1.0 + mag_grad / (1.0 + mag_grad)
 
-            # Basu DPD gate on temporal weight (same coupling as pointwise)
+            # Directional Basu DPD gate on temporal weight:
+            # e_grad > 0 = predicted dynamics overshoot truth → full weight
+            # e_grad < 0 = predicted dynamics undershoot truth → dampened
             z_grad = e_grad / scale_grad
-            basu_gate_grad = torch.exp(-0.5 * self.alpha * z_grad * z_grad)
+            z_grad_under = z_grad.clamp(max=0.0)
+            basu_gate_grad = torch.exp(-0.5 * self.alpha * z_grad_under * z_grad_under)
             w_grad = 1.0 + (w_grad_raw - 1.0) * basu_gate_grad
 
             loss_grad_1 = (w_grad * self._log_cosh_scaled(e_grad, scale_grad)).mean()

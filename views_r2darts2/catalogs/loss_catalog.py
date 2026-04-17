@@ -26,6 +26,7 @@ class LossCatalog:
         
         self._all_potential_args = {
             "zero_threshold": self.config.get("zero_threshold"),
+            "non_zero_threshold": self.config.get("non_zero_threshold"),
             "delta": self.config.get("delta"),
             "non_zero_weight": self.config.get("non_zero_weight"),
             "false_negative_weight": self.config.get("false_negative_weight"),

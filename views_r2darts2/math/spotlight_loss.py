@@ -114,37 +114,28 @@ class SpotlightLoss(torch.nn.Module):
         cosh_pred = torch.cosh(self.alpha * abs_y_pred.detach())
         w_mag = 0.5 * (cosh_true + cosh_pred)
 
-        # ---- 2. Time-series continuity score ----
-        # For each cell (b, t), sum distance-decayed conflict evidence across
-        # all other time steps in the window.  Closer conflict → higher weight.
-        # Distinguishes a one-off spike in a peace-only series (low score)
-        # from an isolated spike in a conflict-active series (meaningful score).
-        #
-        # Multi-target: reduce across targets first — conflict at step t
-        # if any target exceeds threshold.  Continuity is a per-cell
-        # temporal property, not per-target.
+        # ---- 2. Time-series continuity score (per-target) ----
+        # For each cell (b, t, c), sum distance-decayed conflict evidence
+        # across all other time steps in the window.  Closer conflict →
+        # higher weight.  Each target's dampening reflects its own temporal
+        # context independently.
         T = y_true.size(1)
-        event_mask = abs_y > self.non_zero_threshold
-        if event_mask.dim() == 3:
-            conflict_1d = event_mask.any(dim=-1).float()                # [B, T]
-        else:
-            conflict_1d = event_mask.float()                            # [B, T]
+        conflict_mask = (abs_y > self.non_zero_threshold).float()       # [B, T] or [B, T, C]
 
         t_idx = torch.arange(T, dtype=y_true.dtype, device=y_true.device)
         dist = torch.abs(t_idx.unsqueeze(0) - t_idx.unsqueeze(1))      # [T, T]
-        # Decay half-life = T/4: events within a quarter-window contribute strongly
         decay = torch.exp(-dist / max(T / 4.0, 1.0))                   # [T, T]
-        # Zero out self-contribution so a spike can't support itself
         decay = decay * (1.0 - torch.eye(T, dtype=y_true.dtype, device=y_true.device))
-        # support[b, t] = Σ_t' conflict[b, t'] * decay[t', t]
-        support = torch.matmul(conflict_1d, decay)                      # [B, T]
-        # Normalise by max possible support (all-conflict series)
-        max_support = decay.sum(dim=0)                                  # [T]
-        continuity = support / max_support.unsqueeze(0).clamp(min=1e-8) # [B, T] ∈ [0, 1]
+        max_support = decay.sum(dim=0).clamp(min=1e-8)                  # [T]
 
-        # Broadcast to [B, T, C] when multi-target
-        if w_mag.dim() == 3:
-            continuity = continuity.unsqueeze(-1)
+        if conflict_mask.dim() == 3:
+            # Multi-target: [B, T, C] → transpose to [B, C, T] for batched matmul
+            support = torch.matmul(conflict_mask.transpose(1, 2), decay)  # [B, C, T]
+            continuity = (support / max_support.unsqueeze(0).unsqueeze(0)).transpose(1, 2)  # [B, T, C]
+        else:
+            # Single target: [B, T] @ [T, T] → [B, T]
+            support = torch.matmul(conflict_mask, decay)
+            continuity = support / max_support.unsqueeze(0)
 
         # ---- 3. Effective spotlight: sqrt(w_mag) floor ----
         # Interpolates between sqrt(w_mag) and w_mag along the continuity axis:

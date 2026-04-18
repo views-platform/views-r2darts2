@@ -16,16 +16,24 @@ class SpotlightLoss(torch.nn.Module):
     losses collapse to flat-line predictions; this loss prevents that via
     four coordinated mechanisms.
 
-    Mechanism 1 — Cosh magnitude weighting:
-        Each cell (batch_sample, timestep, target_channel) is weighted by the 
-        arithmetic mean of cosh applied to the true and predicted magnitudes::
+    Mechanism 1 — Asymmetric spotlight weight:
+        Each cell is weighted by the arithmetic mean of two asymmetric terms:
 
-            w_mag = 0.5 * (cosh(alpha * |y|) + cosh(alpha * |ŷ|.detach()))
+            w_mag = 0.5 * (cosh(alpha * |y|) + (1 + log_cosh(alpha * |ŷ|.detach())))
 
-        Using the arithmetic mean ensures equal upward/downward gradient
-        pressure. Detaching the prediction side prevents sinh gradient
-        explosions while keeping the weight value symmetric. At alpha=0.4:
-        y=0 → w=1, y=5 → w≈3.8, y=10 → w≈27.
+        Truth side uses cosh — exponential growth, bounded by the data domain
+        (max UCDP asinh ≈ 7.6, so cosh is finite for all real inputs). This
+        preserves the exponential intra-event contrast: a 10k-death war is
+        penalised exponentially more than a 100-death skirmish.
+
+        Prediction side uses 1 + log_cosh — linear for large |ŷ|, minimum 1.0,
+        overflow-safe for any prediction magnitude including OOD blowups. Its
+        role is only to keep weights elevated when the model already predicts
+        large values — linear growth is sufficient for that purpose.
+
+        Detaching the prediction side keeps the gradient path clean:
+        ∂L/∂ŷ = w_eff * tanh(e/s), hard-bounded regardless of error size.
+        At alpha=0.31: y=0 → w≈1, y=5 → w≈2.5, y=10 → w≈8.5.
 
     Mechanism 2 — Temporal continuity score:
         An exponential-decay convolution kernel (tau = T/4, radius = 3*tau)
@@ -108,6 +116,51 @@ class SpotlightLoss(torch.nn.Module):
         gamma: float,
         non_zero_threshold: float,
     ):
+        # ---- Parameter guardrails ----
+        if alpha <= 0.0:
+            raise ValueError(f"SpotlightLoss: alpha must be positive, got {alpha}")
+        if alpha > 0.7:
+            logger.warning(
+                "SpotlightLoss: alpha=%.4f is well above the recommended range (0.2–0.5). "
+                "Truth-side cosh(alpha * |y|) at max UCDP asinh (~7.6) gives cosh(%.2f) ≈ %.0f. "
+                "Spotlight contrast will be extreme and gradients for large events will be very large.",
+                alpha, alpha * 7.6, math.cosh(alpha * 7.6),
+            )
+        elif alpha > 0.5:
+            logger.warning(
+                "SpotlightLoss: alpha=%.4f exceeds recommended range (0.2–0.5). "
+                "Monitor for training instability on high-magnitude batches.",
+                alpha,
+            )
+
+        if gamma < 0.0:
+            raise ValueError(f"SpotlightLoss: gamma must be non-negative, got {gamma}")
+        if gamma > 1.0:
+            logger.warning(
+                "SpotlightLoss: gamma=%.4f > 1.0. The dynamics term will dominate pointwise loss. "
+                "This is known to cause OOD extrapolation and training instability. "
+                "Strongly recommend gamma <= 0.7.",
+                gamma,
+            )
+        elif gamma > 0.7:
+            logger.warning(
+                "SpotlightLoss: gamma=%.4f > 0.7 may amplify velocity trends. "
+                "Monitor predictions for OOD extrapolation in early epochs.",
+                gamma,
+            )
+
+        if non_zero_threshold <= 0.0:
+            raise ValueError(
+                f"SpotlightLoss: non_zero_threshold must be positive, got {non_zero_threshold}"
+            )
+        if non_zero_threshold > 2.0:
+            logger.warning(
+                "SpotlightLoss: non_zero_threshold=%.4f corresponds to >%.1f raw deaths (asinh scale). "
+                "Most conflict cells will be classified as peace, potentially starving the event group "
+                "in the balanced mean. Recommended range: 0.5–1.5.",
+                non_zero_threshold, math.sinh(non_zero_threshold),
+            )
+
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -137,6 +190,23 @@ class SpotlightLoss(torch.nn.Module):
         z = error / scale
         abs_z = torch.abs(z)
         return scale * (abs_z + F.softplus(-2.0 * abs_z) - math.log(2.0))
+
+    @staticmethod
+    def _safe_pred_weight(x: torch.Tensor) -> torch.Tensor:
+        """1 + log(cosh(x)). Overflow-safe, minimum 1.0, linear for large |x|.
+
+        Used for the detached prediction side of the spotlight weight.
+        The prediction domain is unbounded during early training, so this
+        replaces the exponential cosh to prevent float32 overflow (cosh
+        overflows at |x| > ~88.7). Grows linearly for large |x|, which
+        is sufficient to keep weights elevated on blown-up predictions
+        without producing inf or nan.
+
+        Numerically stable via:
+            log(cosh(x)) = |x| + softplus(-2|x|) - ln2
+        """
+        abs_x = torch.abs(x)
+        return 1.0 + abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     def _balanced_mean(
         self, per_sample: torch.Tensor, is_event: torch.Tensor
@@ -191,11 +261,12 @@ class SpotlightLoss(torch.nn.Module):
         abs_y = torch.abs(y_true)
         abs_y_pred = torch.abs(y_pred)
 
-        # ---- 1. Pointwise spotlight weight ----
-        # Arithmetic Mean Spotlight with detached prediction.
-        # Value = AM (perfect equal pressure). Gradient = detached (no sinh explosion).
+        # ---- 1. Pointwise spotlight weight (asymmetric) ----
+        # Truth side: cosh — exponential spotlight, safe because |y| is bounded by data.
+        # Pred side: 1 + log_cosh — linear for large |ŷ|, overflow-safe for OOD blowups.
+        # Gradient flows only through truth-side; pred side is fully detached.
         cosh_true = torch.cosh(self.alpha * abs_y)
-        cosh_pred = torch.cosh(self.alpha * abs_y_pred.detach())
+        cosh_pred = self._safe_pred_weight(self.alpha * abs_y_pred.detach())
         w_mag = 0.5 * (cosh_true + cosh_pred)
 
         # ---- 2. Time-series continuity score (Local Conv1d) ----
@@ -270,9 +341,10 @@ class SpotlightLoss(torch.nn.Module):
             abs_diff_true = torch.abs(diff_true)
             abs_diff_pred = torch.abs(diff_pred)
 
-            # AM with detach for dynamics
+            # Asymmetric weight for dynamics: truth cosh, pred safe (same rationale as pointwise).
+            # Diff-pred is also unbounded in early training, so _safe_pred_weight prevents overflow.
             cosh_dyn_true = torch.cosh(self.alpha * abs_diff_true)
-            cosh_dyn_pred = torch.cosh(self.alpha * abs_diff_pred.detach())
+            cosh_dyn_pred = self._safe_pred_weight(self.alpha * abs_diff_pred.detach())
             w_dyn = 0.5 * (cosh_dyn_true + cosh_dyn_pred)
             
             scale_dyn = 1.0 + abs_diff_true / (1.0 + abs_diff_true)

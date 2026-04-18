@@ -8,37 +8,98 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLoss(torch.nn.Module):
     """
-    Magnitude-aware temporal loss for zero-inflated conflict time-series
-    on asinh-transformed targets (UCDP GED sb).
+    Magnitude-aware temporal loss for zero-inflated conflict time-series.
 
-    Prevents flat-line forecasts via cosh magnitude weighting and a temporal
-    dynamics term. Uses balanced dual-mean averaging to guarantee conflict
-    gradients are never diluted by 90%+ zero-inflation.
+    Designed for asinh-transformed targets (UCDP GED state-based conflict),
+    where ~90% of cells are structural zeros and a small minority of high-
+    magnitude conflict events carry the forecasting signal. Standard mean
+    losses collapse to flat-line predictions; this loss prevents that via
+    four coordinated mechanisms.
 
-    Ensures equal upwards/downwards pressure via an Arithmetic Mean spotlight
-    weight with a detached prediction (preventing sinh gradient explosions).
+    Mechanism 1 — Cosh magnitude weighting:
+        Each cell (batch_sample, timestep, target_channel) is weighted by the 
+        arithmetic mean of cosh applied to the true and predicted magnitudes::
 
-    Uses a global continuity score to distinguish isolated spikes (likely
-    noise) from sustained onsets/cessations. Interpolates the spotlight
-    weight between sqrt(w_mag) and w_mag based on continuity, providing
-    a data-driven, sub-linear dampening floor for one-off events.
+            w_mag = 0.5 * (cosh(alpha * |y|) + cosh(alpha * |ŷ|.detach()))
 
-    Parameters
-    ----------
-    alpha : float
-        Rate for cosh magnitude weight cosh(alpha * |y|).
-        At alpha=0.4: y=0 → w=1, y=5 → w≈3.8, y=10 → w≈27.
-        Recommended range 0.2–0.5.
-    gamma : float
-        Weight for the temporal dynamics term.  Set to 0 to disable.
-        Default 1.0 gives dynamics equal footing with pointwise loss
-        after both are balanced-mean normalised.  Reduce to 0.5 if
-        dynamics tracking dominates pointwise accuracy during tuning.
-    non_zero_threshold : float
-        asinh threshold separating "event" from "peace" cells for
-        balanced averaging.  0.88 ≈ asinh(1), i.e. ≥1 battle-related
-        death.  Applied to |y_true| for pointwise and |Δy_true| for
-        dynamics.
+        Using the arithmetic mean ensures equal upward/downward gradient
+        pressure. Detaching the prediction side prevents sinh gradient
+        explosions while keeping the weight value symmetric. At alpha=0.4:
+        y=0 → w=1, y=5 → w≈3.8, y=10 → w≈27.
+
+    Mechanism 2 — Temporal continuity score:
+        An exponential-decay convolution kernel (tau = T/4, radius = 3*tau)
+        is applied to the binary conflict mask to measure how much nearby
+        conflict evidence surrounds each cell. The kernel self-excludes the
+        current time step so a single isolated spike cannot support itself.
+        Normalized against the maximum possible support (accounting for
+        sequence boundaries), yielding continuity ∈ [0, 1] per cell.
+
+    Mechanism 3 — Adaptive spotlight interpolation:
+        The effective weight interpolates between a sub-linear floor and the
+        full magnitude weight based on continuity::
+
+            w_eff = sqrt(w_mag) + (w_mag - sqrt(w_mag)) * continuity
+
+        continuity=0 (isolated spike) → w_eff = sqrt(w_mag)  (dampened)
+        continuity=1 (sustained conflict) → w_eff = w_mag  (full weight)
+
+        The floor is data-derived from the same cosh weight, requiring no
+        manually tuned constants and automatically scaling with alpha.
+
+    Mechanism 4 — Balanced dual-mean aggregation:
+        Per-cell weighted losses are aggregated with equal 50/50 weight across
+        event and peace groups, regardless of their relative frequency. If one
+        group is absent from a batch, the present group receives 100% weight
+        rather than 50%, preventing silent gradient halving. Balancing is
+        computed per target channel so multi-target scenarios with different
+        zero-inflation rates are handled independently.
+
+    Base loss — Scaled log-cosh:
+        The per-cell base loss uses a scaled log-cosh::
+
+            L(e, s) = s * log(cosh(e / s)),   s = 1 + |y| / (1 + |y|)
+
+        Quadratic for |e| << s, linear for |e| >> s. The gradient tanh(e/s)
+        is hard-bounded in (-1, 1), providing natural gradient clipping
+        without a discontinuous Huber transition. The adaptive scale s
+        widens the quadratic region for larger targets.
+
+    Optional dynamics term:
+        When gamma > 0 and sequence length > 1, a second balanced-mean loss
+        is computed on the first differences (Δy_pred - Δy_true), using the
+        same cosh weighting and scaled log-cosh base loss. This encourages
+        the model to track conflict onsets and cessations, not just levels.
+        The event/peace split uses |Δy_true| against the same threshold.
+
+    Args:
+        alpha (float): Exponent for cosh magnitude weight cosh(alpha * |y|).
+            Controls how aggressively high-magnitude conflict cells are
+            up-weighted relative to peace. Recommended range: 0.2–0.5.
+            Higher values risk training instability on extreme outliers.
+        gamma (float): Scalar weight applied to the temporal dynamics loss
+            before summing with the pointwise loss. Set to 0.0 to disable
+            the dynamics term entirely. At gamma=1.0, dynamics and pointwise
+            losses have equal footing after balanced-mean normalisation.
+            Reduce to 0.5 if dynamics tracking dominates pointwise accuracy
+            during early tuning.
+        non_zero_threshold (float): asinh-space threshold separating "event"
+            (conflict) cells from "peace" cells for balanced averaging.
+            0.88 ≈ asinh(1), corresponding to ≥1 battle-related death in the
+            raw UCDP count. Applied to |y_true| for the pointwise term and
+            to |Δy_true| for the dynamics term.
+
+    Raises:
+        RuntimeError: If the computed total loss is NaN. Includes pointwise
+            and dynamics component values in the message to aid diagnosis.
+
+    Example:
+        >>> loss_fn = SpotlightLoss(alpha=0.4, gamma=1.0, non_zero_threshold=0.88)
+        >>> y_pred = torch.randn(8, 36)   # [batch, seq_len]
+        >>> y_true = torch.zeros(8, 36)
+        >>> y_true[:, 10:15] = 2.5        # sustained conflict window
+        >>> loss = loss_fn(y_pred, y_true)
+        >>> loss.backward()
     """
 
     def __init__(
@@ -153,7 +214,7 @@ class SpotlightLoss(torch.nn.Module):
         # Construct the 1D kernel
         t_idx_k = torch.arange(K, dtype=y_true.dtype, device=y_true.device) - radius
         kernel = torch.exp(-torch.abs(t_idx_k) / tau)
-        kernel[radius] = 0.0  # CRITICAL: Zero out center so a spike can't support itself
+        kernel[radius] = 0.0  # Zero out center so a spike can't support itself
 
         # Reshape kernel for conv1d: [out_channels, in_channels/groups, K]
         # We will use groups=C to compute continuity independently per target

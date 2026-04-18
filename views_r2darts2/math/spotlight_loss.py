@@ -82,15 +82,38 @@ class SpotlightLoss(torch.nn.Module):
     ) -> torch.Tensor:
         """Equal-weighted average over event and non-event cells.
 
-        Prevents the majority class (peace) from diluting the minority
-        class (conflict) gradient.  Each group contributes 50% of the
-        loss regardless of its frequency in the batch.
+        Prevents the majority class from diluting the minority class gradient.
+        Each group contributes 50% if both are present. If one group is
+        entirely absent, the present group contributes 100%, preventing
+        silent gradient scaling issues.
         """
-        n_event = is_event.sum().clamp(min=1)
-        n_peace = (~is_event).sum().clamp(min=1)
-        loss_event = (per_sample * is_event).sum() / n_event
-        loss_peace = (per_sample * ~is_event).sum() / n_peace
-        return 0.5 * loss_event + 0.5 * loss_peace
+        # Standardize to 3D [B, T, C] for vectorized per-target logic
+        if per_sample.dim() == 2:
+            per_sample = per_sample.unsqueeze(-1)
+            is_event = is_event.unsqueeze(-1)
+
+        C = per_sample.size(-1)
+        ps_flat = per_sample.reshape(-1, C)
+        ie_flat = is_event.reshape(-1, C)
+
+        n_event = ie_flat.sum(0)           # [C]
+        n_peace = (~ie_flat).sum(0)        # [C]
+
+        # Calculate average loss per class (clamp prevents div/0)
+        loss_event = (ps_flat * ie_flat).sum(0) / n_event.clamp(min=1)   # [C]
+        loss_peace = (ps_flat * ~ie_flat).sum(0) / n_peace.clamp(min=1)  # [C]
+
+        # Dynamic weights: 50/50 if both present, 100/0 if one is absent
+        w_e = 0.5 * (n_event > 0).float()
+        w_p = 0.5 * (n_peace > 0).float()
+        total_w = (w_e + w_p).clamp(min=1e-8)  # clamp prevents div/0 on empty batch
+        w_e = w_e / total_w
+        w_p = w_p / total_w
+
+        balanced = w_e * loss_event + w_p * loss_peace  # [C]
+
+        # Average across target channels
+        return balanced.mean()
 
     # ------------------------------------------------------------------
     # Forward
@@ -114,28 +137,50 @@ class SpotlightLoss(torch.nn.Module):
         cosh_pred = torch.cosh(self.alpha * abs_y_pred.detach())
         w_mag = 0.5 * (cosh_true + cosh_pred)
 
-        # ---- 2. Time-series continuity score (per-target) ----
-        # For each cell (b, t, c), sum distance-decayed conflict evidence
-        # across all other time steps in the window.  Closer conflict →
-        # higher weight.  Each target's dampening reflects its own temporal
-        # context independently.
-        T = y_true.size(1)
-        conflict_mask = (abs_y > self.non_zero_threshold).float()       # [B, T] or [B, T, C]
+        # ---- 2. Time-series continuity score (Local Conv1d) ----
+        # Continuity is a local property. We use a 1D convolution with an
+        # exponential decay kernel to measure local conflict support.
 
-        t_idx = torch.arange(T, dtype=y_true.dtype, device=y_true.device)
-        dist = torch.abs(t_idx.unsqueeze(0) - t_idx.unsqueeze(1))      # [T, T]
-        decay = torch.exp(-dist / max(T / 4.0, 1.0))                   # [T, T]
-        decay = decay * (1.0 - torch.eye(T, dtype=y_true.dtype, device=y_true.device))
-        max_support = decay.sum(dim=0).clamp(min=1e-8)                  # [T]
+        T = y_true.size(1)
+        conflict_mask = (abs_y > self.non_zero_threshold).float()  # [B, T] or [B, T, C]
+
+        # Define kernel parameters
+        # Half-life of T/4 means ~95% of weight is within 2 months for T=36
+        tau = max(T / 4.0, 1.0)
+        radius = int(math.ceil(3 * tau))  # Capture 95% of exponential decay
+        K = 2 * radius + 1
+
+        # Construct the 1D kernel
+        t_idx_k = torch.arange(K, dtype=y_true.dtype, device=y_true.device) - radius
+        kernel = torch.exp(-torch.abs(t_idx_k) / tau)
+        kernel[radius] = 0.0  # CRITICAL: Zero out center so a spike can't support itself
+
+        # Reshape kernel for conv1d: [out_channels, in_channels/groups, K]
+        # We will use groups=C to compute continuity independently per target
+        if conflict_mask.dim() == 3:
+            C = conflict_mask.size(-1)
+            weight = kernel.view(1, 1, K).repeat(C, 1, 1)  # [C, 1, K]
+            mask_input = conflict_mask.transpose(1, 2)       # [B, C, T]
+            groups = C
+        else:
+            weight = kernel.view(1, 1, K)                   # [1, 1, K]
+            mask_input = conflict_mask.unsqueeze(1)          # [B, 1, T]
+            groups = 1
+
+        # Calculate local support (numerator)
+        support = F.conv1d(mask_input, weight, padding=radius, groups=groups)
+
+        # Calculate max possible local support for normalization (denominator)
+        ones_input = torch.ones_like(mask_input)
+        max_support = F.conv1d(ones_input, weight, padding=radius, groups=groups)
+
+        # Normalize to [0, 1] and restore shape
+        continuity = support / max_support.clamp(min=1e-8)
 
         if conflict_mask.dim() == 3:
-            # Multi-target: [B, T, C] → transpose to [B, C, T] for batched matmul
-            support = torch.matmul(conflict_mask.transpose(1, 2), decay)  # [B, C, T]
-            continuity = (support / max_support.unsqueeze(0).unsqueeze(0)).transpose(1, 2)  # [B, T, C]
+            continuity = continuity.transpose(1, 2)  # Back to [B, T, C]
         else:
-            # Single target: [B, T] @ [T, T] → [B, T]
-            support = torch.matmul(conflict_mask, decay)
-            continuity = support / max_support.unsqueeze(0)
+            continuity = continuity.squeeze(1)       # Back to [B, T]
 
         # ---- 3. Effective spotlight: sqrt(w_mag) floor ----
         # Interpolates between sqrt(w_mag) and w_mag along the continuity axis:

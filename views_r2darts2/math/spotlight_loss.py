@@ -346,9 +346,17 @@ class SpotlightLoss(torch.nn.Module):
             cosh_dyn_true = torch.cosh(self.alpha * abs_diff_true)
             cosh_dyn_pred = self._safe_pred_weight(self.alpha * abs_diff_pred.detach())
             w_dyn = 0.5 * (cosh_dyn_true + cosh_dyn_pred)
-            
+
+            # Continuity dampening for dynamics: reuse pointwise continuity at the
+            # midpoint of each adjacent pair. Isolated velocity spikes (e.g. Feb 2022
+            # onset: 7k→50k in one step) get dampened to sqrt(w_dyn), while sustained
+            # acceleration patterns keep full w_dyn. Same logic as pointwise mechanism 3.
+            continuity_dyn = 0.5 * (continuity[:, :-1] + continuity[:, 1:])
+            w_dyn_soft = torch.sqrt(w_dyn)
+            w_dyn_eff = w_dyn_soft + (w_dyn - w_dyn_soft) * continuity_dyn
+
             scale_dyn = 1.0 + abs_diff_true / (1.0 + abs_diff_true)
-            per_sample_dyn = w_dyn * self._log_cosh_scaled(e_grad, scale_dyn)
+            per_sample_dyn = w_dyn_eff * self._log_cosh_scaled(e_grad, scale_dyn)
 
             is_dynamic = abs_diff_true > self.non_zero_threshold
             loss_dynamics = self._balanced_mean(per_sample_dyn, is_dynamic)

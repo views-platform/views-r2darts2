@@ -17,25 +17,36 @@ class SpotlightLoss(torch.nn.Module):
     three coordinated mechanisms.
 
     Mechanism 1 — Truth-only inverse-density weight:
-        Each cell is weighted by cosh(alpha * |y|), a parametric approximation
-        of inverse label density (Yang et al. 2021, "Delving into Deep
-        Imbalanced Regression"). Zeros are most frequent → weight 1.0×.
-        High conflict is rare → weight up to ~16× at alpha=0.3, y=11.5.
+        Each cell is weighted by 1 + log_cosh(alpha * |y|), a saturating
+        approximation of inverse label density (Yang et al. 2021, "Delving
+        into Deep Imbalanced Regression"). Zeros are most frequent →
+        weight 1.0×. High conflict is rare → weight up to ~3.8× at
+        alpha=0.3, y=11.5.
 
-            w(y) = cosh(alpha * |y|)
+            w(y) = 1 + log_cosh(alpha * |y|)
 
         At alpha=0.3 in asinh space:
-            y=0  → 1.0×    (peace, ~90% of cells)
-            y=5  → 2.4×    (moderate conflict)
-            y=10 → 10.1×   (high conflict)
+            y=0   → 1.0×    (peace, ~90% of cells)
+            y=5   → 1.9×    (moderate conflict)
+            y=10  → 3.3×    (high conflict)
+            y=11.5→ 3.8×    (max UCDP)
+
+        log_cosh grows linearly for large arguments (log_cosh(x) → |x| - ln2
+        for |x| >> 1), so the weight saturates gracefully. This prevents
+        noisy high-magnitude events (e.g., an unexplained 50k spike) from
+        dominating the event group's gradient budget. Contrast: cosh would
+        give 15.8× at the same point, meaning a single unpredictable extreme
+        cell contributes 4× as much as four moderate-conflict cells combined.
+        With log_cosh, that ratio drops to 2:1 — the extreme cell still gets
+        more attention, but cannot hijack shared MLP weights.
 
         Truth-only: no prediction-side weight. The gradient is:
             ∂L/∂ŷ = w(y) × tanh(e/s)
         which has a clean separation of concerns: w(y) controls *importance*
         (how much to care about this cell), tanh(e/s) controls *direction*
         (which way to push ŷ). OOD gradient magnitude is bounded by
-        w(y) × 1.0 (tanh saturation) and further controlled by gradient
-        clipping and the adaptive LR (RAdam/AdamW).
+        w(y) × 1.0 (tanh saturation) — at most ~3.8× at alpha=0.3, well
+        within gradient clip range.
 
         No pred-side weight avoids:
           - The "shock absorber" interaction with gradient clipping (two
@@ -45,8 +56,7 @@ class SpotlightLoss(torch.nn.Module):
           - Non-detached pred weight creating zero-attracting bias (path 2
             gradient always pushes ŷ toward zero via ∂w/∂ŷ)
 
-        cosh is safe on truth because the data distribution is bounded
-        (asinh space max ≈ 11.5 → cosh(3.45) ≈ 15.8 at alpha=0.3).
+        Numerically safe for any finite input (log_cosh(x) ≤ |x|).
 
     Mechanism 2 — Balanced dual-mean aggregation:
         Per-cell weighted losses are aggregated with equal 50/50 weight
@@ -90,10 +100,10 @@ class SpotlightLoss(torch.nn.Module):
         [1, 2) widens the quadratic region for larger targets.
 
     Args:
-        alpha (float): Scale for the truth-only cosh weight. Controls how
+        alpha (float): Scale for the truth-only log-cosh weight. Controls how
             aggressively high-magnitude conflict cells are up-weighted
             relative to peace. Recommended range: 0.2–0.5. At alpha=0.3,
-            max UCDP (asinh≈11.5) gets cosh(3.45) ≈ 16× weight.
+            max UCDP (asinh≈11.5) gets 1+log_cosh(3.45) ≈ 3.8× weight.
         gamma (float): Weight for the TV smoothness regularizer. Set to 0.0
             to disable. Higher values enforce smoother predictions where the
             truth is smooth. Recommended range: 0.1–1.0.
@@ -120,10 +130,11 @@ class SpotlightLoss(torch.nn.Module):
         if alpha <= 0.0:
             raise ValueError(f"SpotlightLoss: alpha must be positive, got {alpha}")
         if alpha > 0.7:
+            _w = 1.0 + math.log(math.cosh(min(alpha * 11.5, 88.0)))
             logger.warning(
-                "SpotlightLoss: alpha=%.4f > 0.7. cosh weight at max UCDP "
-                "(asinh≈11.5) = cosh(%.2f) ≈ %.0f×. May cause instability.",
-                alpha, alpha * 11.5, math.cosh(min(alpha * 11.5, 88.0)),
+                "SpotlightLoss: alpha=%.4f > 0.7. Weight at max UCDP "
+                "(asinh≈11.5) = 1+log_cosh(%.2f) ≈ %.1f×. May cause instability.",
+                alpha, alpha * 11.5, _w,
             )
         if gamma < 0.0:
             raise ValueError(f"SpotlightLoss: gamma must be non-negative, got {gamma}")
@@ -158,6 +169,12 @@ class SpotlightLoss(torch.nn.Module):
         z = error / scale
         abs_z = torch.abs(z)
         return scale * (abs_z + F.softplus(-2.0 * abs_z) - math.log(2.0))
+
+    @staticmethod
+    def _log_cosh(x: torch.Tensor) -> torch.Tensor:
+        """Numerically stable log(cosh(x)) = |x| + softplus(-2|x|) - ln2."""
+        abs_x = torch.abs(x)
+        return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     def _balanced_mean(
         self, per_sample: torch.Tensor, is_event: torch.Tensor
@@ -200,7 +217,9 @@ class SpotlightLoss(torch.nn.Module):
         abs_y = torch.abs(y_true)
 
         # ---- 1. Truth-only inverse-density weight ----
-        w = torch.cosh(self.alpha * abs_y)
+        # 1 + log_cosh(α|y|): linear growth for large |y|, minimum 1.0.
+        # Saturates gracefully — noisy extremes get ~3.8× at α=0.3 (vs 16× with cosh).
+        w = 1.0 + self._log_cosh(self.alpha * abs_y)
 
         # ---- 2. Pointwise loss ----
         scale = 1.0 + abs_y / (1.0 + abs_y)

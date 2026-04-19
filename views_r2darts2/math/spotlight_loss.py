@@ -16,10 +16,10 @@ class SpotlightLoss(torch.nn.Module):
     losses collapse to flat-line predictions; this loss prevents that via
     four coordinated mechanisms.
 
-    Mechanism 1 — Asymmetric spotlight weight (cosh truth, quadratic pred):
+    Mechanism 1 — Asymmetric spotlight weight (cosh truth, log-cosh pred):
         Each cell is weighted by the arithmetic mean of two complementary terms:
 
-            w_mag = 0.5 * (cosh(alpha * |y|) + (1 + (alpha * |ŷ|.detach())^2))
+            w_mag = 0.5 * (cosh(alpha * |y|) + (1 + log_cosh(alpha * |ŷ|.detach())))
 
         Truth side: cosh(alpha * |y|) — exponential growth, delivering strong
         intra-event contrast on real data which is bounded by the data distribution
@@ -29,15 +29,19 @@ class SpotlightLoss(torch.nn.Module):
             y=10 → 47×   (high conflict)
         Contrast ratio high/moderate ≈ 6×, vs ~3× for quadratic at the same alpha.
 
-        Pred side: 1 + (alpha * |ŷ|)^2 — quadratic, minimum 1.0, float32-safe for
-        any finite input including OOD blowups. For |ŷ|=100: weight = 901 — finite.
-        Gradient is still bounded: ∂L/∂ŷ = w_eff * tanh(e/s).
+        Pred side: 1 + log_cosh(alpha * |ŷ|) — linear for large |ŷ| (since
+        log_cosh(x) → |x| - ln2 for |x| >> 1), minimum 1.0, overflow-safe.
+        Acts as a shock absorber for OOD blowups: for |ŷ|=50 at alpha=0.3,
+        pred weight ≈ 16 vs 226 for quadratic. This caps the gradient magnitude
+        (w_mag × tanh(e/s)) at a controlled level, preventing violent AdamW
+        momentum updates that cause oscillation and divergence.
 
-        Asymmetry is gradient-neutral: the prediction side is detached, so no
-        gradient flows through w_mag. Both sides only control loss magnitude,
-        not gradient direction. Using cosh on bounded real data and quadratic on
-        potentially unbounded predictions gives maximum contrast where it matters
-        (truth) with overflow safety where it's needed (pred).
+        The prediction side is detached: no second-order gradient flows through
+        w_mag. However, w_mag is a direct first-order scalar multiplier on the
+        gradient (∂L/∂ŷ = w_eff × tanh(e/s)), so its magnitude matters. Linear
+        growth on the pred side keeps OOD recovery gradients firm but bounded,
+        while exponential growth on the truth side maximises contrast on real
+        data where the distribution is known and bounded.
 
     Mechanism 2 — Temporal continuity score:
         An exponential-decay convolution kernel (tau = T/4, radius = 3*tau)
@@ -89,7 +93,7 @@ class SpotlightLoss(torch.nn.Module):
             high-magnitude conflict cells are up-weighted relative to peace.
             Recommended range: 0.2–0.5. Truth side uses cosh(alpha * |y|) for
             exponential contrast on bounded real data. Pred side uses
-            1 + (alpha * |ŷ|)^2 for OOD-safe quadratic growth.
+            1 + log_cosh(alpha * |ŷ|) for OOD-safe linear-growth damping.
         gamma (float): Scalar weight applied to the temporal dynamics loss
             before summing with the pointwise loss. Set to 0.0 to disable
             the dynamics term entirely. At gamma=1.0, dynamics and pointwise
@@ -206,16 +210,20 @@ class SpotlightLoss(torch.nn.Module):
         return scale * (abs_z + F.softplus(-2.0 * abs_z) - math.log(2.0))
 
     @staticmethod
-    def _quad_weight(x: torch.Tensor) -> torch.Tensor:
-        """1 + x^2. Quadratic spotlight weight, minimum 1.0.
+    def _safe_pred_weight(x: torch.Tensor) -> torch.Tensor:
+        """1 + log_cosh(x). Linear-growth spotlight weight, minimum 1.0.
 
-        Symmetric, superlinear, and float32-safe for any finite input.
-        For OOD blowup (|x|=100): weight = 10001 — finite and bounded.
-        Contrast between high and low conflict is quadratic not linear,
-        giving stronger intra-event differentiation than 1+log_cosh
-        while avoiding the exponential overflow of raw cosh.
+        For small |x|: ≈ 1 + x²/2 (quadratic-like, smooth at origin).
+        For large |x|: ≈ 1 + |x| - ln2 (linear growth, shock absorber).
+        Overflow-safe for any finite input (log_cosh is bounded by |x|).
+
+        OOD comparison at alpha=0.3, |ŷ|=50:
+            1 + log_cosh(15) ≈ 16   vs   1 + 15² = 226 (quadratic)
+        The linear regime caps gradient magnitude during OOD recovery,
+        preventing violent AdamW momentum updates.
         """
-        return 1.0 + x * x
+        abs_x = torch.abs(x)
+        return 1.0 + abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     def _balanced_mean(
         self, per_sample: torch.Tensor, is_event: torch.Tensor
@@ -268,13 +276,14 @@ class SpotlightLoss(torch.nn.Module):
         abs_y = torch.abs(y_true)
         abs_y_pred = torch.abs(y_pred)
 
-        # ---- 1. Pointwise spotlight weight (asymmetric: cosh truth, quadratic pred) ----
+        # ---- 1. Pointwise spotlight weight (asymmetric: cosh truth, log-cosh pred) ----
         # Truth side: cosh(alpha*|y|) — exponential contrast on bounded real data.
         #   At alpha=0.3: peace→1×, y=5→7.5×, y=10→47×. Strong intra-event contrast.
-        # Pred side: 1+(alpha*|ŷ|)^2 — quadratic, OOD-safe for any blown-up prediction.
-        # Prediction side is detached: no gradient flows through w_mag at all.
+        # Pred side: 1+log_cosh(alpha*|ŷ|) — linear for large |ŷ|, OOD shock absorber.
+        #   At alpha=0.3, |ŷ|=50: w_pred≈16 → gradient≈8.5 (vs 113.5 with quadratic).
+        # Prediction side is detached: no second-order gradient through w_mag.
         w_true = torch.cosh(self.alpha * abs_y)
-        w_pred = self._quad_weight(self.alpha * abs_y_pred.detach())
+        w_pred = self._safe_pred_weight(self.alpha * abs_y_pred.detach())
         w_mag = 0.5 * (w_true + w_pred)
 
         # ---- 2. Time-series continuity score (Local Conv1d) ----
@@ -349,11 +358,11 @@ class SpotlightLoss(torch.nn.Module):
             abs_diff_true = torch.abs(diff_true)
             abs_diff_pred = torch.abs(diff_pred)
 
-            # Asymmetric weight for dynamics: cosh truth, quadratic pred.
+            # Asymmetric weight for dynamics: cosh truth, log-cosh pred.
             # Same rationale as pointwise: cosh on bounded Δy_true for contrast,
-            # quadratic on potentially unbounded Δŷ_pred for OOD safety.
+            # log-cosh on potentially unbounded Δŷ_pred for linear OOD damping.
             w_dyn_true = torch.cosh(self.alpha * abs_diff_true)
-            w_dyn_pred = self._quad_weight(self.alpha * abs_diff_pred.detach())
+            w_dyn_pred = self._safe_pred_weight(self.alpha * abs_diff_pred.detach())
             w_dyn = 0.5 * (w_dyn_true + w_dyn_pred)
 
             # Continuity dampening for dynamics: reuse pointwise continuity at the

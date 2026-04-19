@@ -274,7 +274,7 @@ class ReproducibilityGate:
                 "eps",
             ],
             "ShrinkageLoss": ["a", "c"],
-            "SpotlightLoss": ["alpha", "non_zero_threshold", "gamma"],
+            "SpotlightLoss": ["alpha", "non_zero_threshold", "delta"],
             "SentinelLoss": ["alpha", "beta", "kappa", "delta", "gamma"],
             "MSELoss": [],
             "L1Loss": [],

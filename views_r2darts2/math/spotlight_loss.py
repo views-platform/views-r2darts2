@@ -74,19 +74,49 @@ class SpotlightLoss(torch.nn.Module):
     Base loss — Scaled log-cosh:
         The per-cell base loss uses a scaled log-cosh::
 
-            L(e, s) = s * log(cosh(e / s)),   s = 1 + |y| / (1 + |y|)
+            L(e, s) = s * log(cosh(e / s)),
+            s = 1 + |y| / (1 + |y|) + relu(|ŷ|.detach() - |y|)
 
-        Quadratic for |e| << s, linear for |e| >> s. The gradient tanh(e/s)
-        is hard-bounded in (-1, 1), providing natural gradient clipping
-        without a discontinuous Huber transition. The adaptive scale s
-        widens the quadratic region for larger targets.
+        The scale has two components:
+        - Truth-based floor: 1 + |y|/(1+|y|) ∈ [1.0, 2.0). Quadratic for |e| << s,
+          linear for |e| >> s, smooth transition. The gradient tanh(e/s) is
+          hard-bounded in (-1, 1) — natural gradient clipping without Huber.
+        - OOD extension: relu(|ŷ| - |y|) adds the excess prediction beyond truth
+          directly to the scale, without saturation. For in-distribution (ŷ ≈ y),
+          relu = 0, no change. For OOD (ŷ=50, y=0): scale = 1 + 0 + 50 = 51,
+          so tanh(50/51) = 0.75 — still in the linear (unsaturated) gradient
+          regime. Without this, tanh(50/1.0) = 1.0 for all |e| > 3, meaning
+          the model receives identical corrective gradient for ŷ=20 and ŷ=200.
+          The prediction-aware scale ensures gradient grows with error magnitude,
+          giving the optimizer increasing incentive to return from OOD.
 
     Optional dynamics term:
         When gamma > 0 and sequence length > 1, a second balanced-mean loss
-        is computed on the first differences (Δy_pred - Δy_true), using the
-        same cosh weighting and scaled log-cosh base loss. This encourages
-        the model to track conflict onsets and cessations, not just levels.
-        The event/peace split uses |Δy_true| against the same threshold.
+        is computed on the first differences (Δy_pred - Δy_true), using
+        level-based weighting and scaled log-cosh base loss. This encourages
+        the model to track conflict onsets and cessations, and — critically —
+        to maintain temporal coherence at high conflict levels.
+
+        The dynamics weight uses the midpoint level between each adjacent step
+        pair, not the velocity:
+
+            abs_y_mid = 0.5 * (|y[t]| + |y[t+1]|)
+            w_dyn_true = cosh(alpha * abs_y_mid)
+
+        This gives plateau steps at y=11.5 weight ≈16× — identical to the
+        pointwise term. Velocity-based weighting gave plateau steps weight
+        ≈1×, allowing the model to produce slowly escalating output predictions
+        without meaningful penalty. At inference on Ukraine-like contexts, this
+        drift compounds across all 36 output steps, producing OOD extrapolation.
+
+        The event/peace split is also level-based: abs_y_mid > threshold
+        classifies a diff step as high-conflict (event), regardless of whether
+        Δy_true is large or small. This ensures 50% of the dynamics budget goes
+        to high-level outputs (plateaus included), not just onset/cessation steps.
+
+        The scale is level-based (consistent with the pointwise scale):
+        plateau steps at y_mid=11.5 get scale≈1.91 (wide quadratic region),
+        giving finer gradient signal near the target velocity.
 
     Args:
         alpha (float): Scale for spotlight weights. Controls how aggressively
@@ -340,7 +370,14 @@ class SpotlightLoss(torch.nn.Module):
         w_eff = w_soft + (w_mag - w_soft) * continuity
 
         # ---- 4. Pointwise loss ----
-        scale = 1.0 + abs_y / (1.0 + abs_y)
+        # Prediction-aware scale: truth floor + OOD extension.
+        # Floor: 1 + |y|/(1+|y|) ∈ [1, 2) — standard adaptive scale.
+        # Extension: relu(|ŷ| - |y|) widens scale when pred overshoots truth,
+        # keeping tanh(e/s) in its linear regime for OOD errors.
+        # In-distribution (ŷ ≈ y): relu=0, no effect.
+        # OOD (ŷ=50, y=0): scale=51, tanh(50/51)=0.75 (linear) vs tanh(50/1)=1.0 (saturated).
+        ood_excess = F.relu(abs_y_pred.detach() - abs_y)
+        scale = 1.0 + abs_y / (1.0 + abs_y) + ood_excess
         base_loss = self._log_cosh_scaled(e, scale)
 
         per_sample_pw = w_eff * base_loss
@@ -356,13 +393,17 @@ class SpotlightLoss(torch.nn.Module):
             e_grad = diff_pred - diff_true
 
             abs_diff_true = torch.abs(diff_true)
-            abs_diff_pred = torch.abs(diff_pred)
 
-            # Asymmetric weight for dynamics: cosh truth, log-cosh pred.
-            # Same rationale as pointwise: cosh on bounded Δy_true for contrast,
-            # log-cosh on potentially unbounded Δŷ_pred for linear OOD damping.
-            w_dyn_true = torch.cosh(self.alpha * abs_diff_true)
-            w_dyn_pred = self._safe_pred_weight(self.alpha * abs_diff_pred.detach())
+            # Weight, scale, and event/peace split all use midpoint LEVEL, not velocity.
+            # Plateau steps at y_mid=11.5 get cosh(alpha*11.5)≈16× weight — the model
+            # cannot produce a slowly escalating output without paying the same cost as
+            # a pointwise error of equal magnitude. Velocity weighting (cosh(alpha*|Dy|))
+            # gave plateau steps weight≈1×, which allowed inference OOD drift.
+            abs_y_mid = 0.5 * (abs_y[:, :-1] + abs_y[:, 1:])
+            abs_y_pred_mid = 0.5 * (abs_y_pred[:, :-1] + abs_y_pred[:, 1:])
+
+            w_dyn_true = torch.cosh(self.alpha * abs_y_mid)
+            w_dyn_pred = self._safe_pred_weight(self.alpha * abs_y_pred_mid.detach())
             w_dyn = 0.5 * (w_dyn_true + w_dyn_pred)
 
             # Continuity dampening for dynamics: reuse pointwise continuity at the
@@ -373,10 +414,18 @@ class SpotlightLoss(torch.nn.Module):
             w_dyn_soft = torch.sqrt(w_dyn)
             w_dyn_eff = w_dyn_soft + (w_dyn - w_dyn_soft) * continuity_dyn
 
-            scale_dyn = 1.0 + abs_diff_true / (1.0 + abs_diff_true)
+            # Level-based scale with OOD extension (same as pointwise).
+            # Plateau at y_mid=11.5 → floor≈1.91. OOD excess from pred_mid widens
+            # the scale to keep dynamics gradient unsaturated during blowups.
+            ood_excess_dyn = F.relu(abs_y_pred_mid.detach() - abs_y_mid)
+            scale_dyn = 1.0 + abs_y_mid / (1.0 + abs_y_mid) + ood_excess_dyn
             per_sample_dyn = w_dyn_eff * self._log_cosh_scaled(e_grad, scale_dyn)
 
-            is_dynamic = abs_diff_true > self.non_zero_threshold
+            # Event/peace split by LEVEL: plateau at y_mid=11.5 counts as event,
+            # sharing 50% of dynamics budget with onset/cessation steps.
+            # Velocity split would classify plateaus as peace, burying them in
+            # the 50% shared with uninformative peace-to-peace zero transitions.
+            is_dynamic = abs_y_mid > self.non_zero_threshold
             loss_dynamics = self._balanced_mean(per_sample_dyn, is_dynamic)
 
         total_loss = loss_pointwise + self.gamma * loss_dynamics

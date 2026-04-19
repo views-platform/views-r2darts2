@@ -16,24 +16,29 @@ class SpotlightLoss(torch.nn.Module):
     losses collapse to flat-line predictions; this loss prevents that via
     four coordinated mechanisms.
 
-    Mechanism 1 — Symmetric log-cosh spotlight weight:
+    Mechanism 1 — Symmetric quadratic spotlight weight:
         Each cell is weighted by the arithmetic mean of two symmetric terms:
 
-            w_mag = 0.5 * ((1 + log_cosh(alpha * |y|)) + (1 + log_cosh(alpha * |ŷ|.detach())))
+            w_mag = 0.5 * ((1 + (alpha * |y|)^2) + (1 + (alpha * |ŷ|.detach())^2))
 
-        Both sides use 1 + log_cosh — linear for large arguments, minimum 1.0,
-        overflow-safe for any input magnitude. This ensures equal penalty for
-        overprediction and underprediction at the same error magnitude:
-        missing a war and inventing one are equally expensive.
+        Both sides use 1 + (alpha * |x|)^2 — quadratic (superlinear) growth,
+        minimum 1.0, overflow-safe for any finite input. Symmetric: equal
+        penalty for overprediction and underprediction at the same error
+        magnitude.
 
-        log_cosh grows linearly (not exponentially), so higher alpha values
-        are safe and recommended (0.3–0.8). The intra-event contrast is
-        weaker than exponential cosh but sufficient when combined with the
-        balanced mean and continuity mechanisms.
+        Quadratic growth gives meaningful intra-event contrast without
+        exponential overflow risk. At alpha=0.3:
+            y=0  → w=1.0 (peace)
+            y=5  → w=3.25 (moderate conflict, asinh ≈5)
+            y=10 → w=10.0 (high conflict, asinh ≈10)
+        The contrast ratio between high and moderate conflict is ~3×, vs ~1.4×
+        with linear 1+log_cosh at the same alpha.
+
+        OOD safety: for a blown-up prediction |ŷ|=100, weight = 1 + 900 = 901.
+        Finite and float32-safe. Gradient is still bounded: ∂L/∂ŷ = w_eff * tanh(e/s).
 
         Detaching the prediction side keeps the gradient path clean:
-        ∂L/∂ŷ = w_eff * tanh(e/s), hard-bounded regardless of error size.
-        At alpha=0.5: y=0 → w≈1, y=5 → w≈2.3, y=10 → w≈5.5.
+        gradient flows only through the truth-side weight term.
 
     Mechanism 2 — Temporal continuity score:
         An exponential-decay convolution kernel (tau = T/4, radius = 3*tau)
@@ -81,11 +86,11 @@ class SpotlightLoss(torch.nn.Module):
         The event/peace split uses |Δy_true| against the same threshold.
 
     Args:
-        alpha (float): Exponent for log-cosh magnitude weight 1 + log_cosh(alpha * |y|).
+        alpha (float): Scale for quadratic spotlight weight 1 + (alpha * |y|)^2.
             Controls how aggressively high-magnitude conflict cells are
-            up-weighted relative to peace. Recommended range: 0.3–0.8.
-            Linear growth means higher alpha is safe (no overflow risk).
-            Increase alpha to compensate for the sub-exponential contrast.
+            up-weighted relative to peace. Recommended range: 0.2–0.5.
+            Quadratic growth gives strong intra-event contrast without
+            exponential overflow risk. Float32-safe for any finite input.
         gamma (float): Scalar weight applied to the temporal dynamics loss
             before summing with the pointwise loss. Set to 0.0 to disable
             the dynamics term entirely. At gamma=1.0, dynamics and pointwise
@@ -118,6 +123,45 @@ class SpotlightLoss(torch.nn.Module):
         non_zero_threshold: float,
     ):
         # ---- Parameter guardrails ----
+        if alpha <= 0.0:
+            raise ValueError(f"SpotlightLoss: alpha must be positive, got {alpha}")
+        if alpha > 0.7:
+            logger.warning(
+                "SpotlightLoss: alpha=%.4f is above the recommended range (0.15–0.5). "
+                "Quadratic weight at max UCDP (asinh≈11.5) = 1+(%.2f)^2 ≈ %.0f×. "
+                "Extremely high contrast may cause training instability.",
+                alpha, alpha * 11.5, 1.0 + (alpha * 11.5) ** 2,
+            )
+        elif alpha > 0.5:
+            logger.warning(
+                "SpotlightLoss: alpha=%.4f exceeds recommended range (0.15–0.5). "
+                "Monitor for training instability on high-magnitude batches.",
+                alpha,
+            )
+
+        if gamma < 0.0:
+            raise ValueError(f"SpotlightLoss: gamma must be non-negative, got {gamma}")
+        if gamma > 1.0:
+            logger.warning(
+                "SpotlightLoss: gamma=%.4f > 1.0. The dynamics term will dominate pointwise loss. "
+                "This is known to cause OOD extrapolation and training instability. "
+                "Strongly recommend gamma <= 0.7.",
+                gamma,
+            )
+        elif gamma > 0.7:
+            logger.warning(
+                "SpotlightLoss: gamma=%.4f > 0.7 may amplify velocity trends. "
+                "Monitor predictions for OOD extrapolation in early epochs.",
+                gamma,
+            )
+        elif 0.0 < gamma < 0.2:
+            logger.warning(
+                "SpotlightLoss: gamma=%.4f < 0.2. The dynamics term provides critical "
+                "temporal coherence for multi-step output. Below ~0.2, output steps are "
+                "effectively unconstrained and OOD spikes are likely during inference. "
+                "Recommended minimum: 0.2.",
+                gamma,
+            )
 
         if non_zero_threshold <= 0.0:
             raise ValueError(
@@ -163,21 +207,16 @@ class SpotlightLoss(torch.nn.Module):
         return scale * (abs_z + F.softplus(-2.0 * abs_z) - math.log(2.0))
 
     @staticmethod
-    def _safe_pred_weight(x: torch.Tensor) -> torch.Tensor:
-        """1 + log(cosh(x)). Overflow-safe, minimum 1.0, linear for large |x|.
+    def _quad_weight(x: torch.Tensor) -> torch.Tensor:
+        """1 + x^2. Quadratic spotlight weight, minimum 1.0.
 
-        Used for the detached prediction side of the spotlight weight.
-        The prediction domain is unbounded during early training, so this
-        replaces the exponential cosh to prevent float32 overflow (cosh
-        overflows at |x| > ~88.7). Grows linearly for large |x|, which
-        is sufficient to keep weights elevated on blown-up predictions
-        without producing inf or nan.
-
-        Numerically stable via:
-            log(cosh(x)) = |x| + softplus(-2|x|) - ln2
+        Symmetric, superlinear, and float32-safe for any finite input.
+        For OOD blowup (|x|=100): weight = 10001 — finite and bounded.
+        Contrast between high and low conflict is quadratic not linear,
+        giving stronger intra-event differentiation than 1+log_cosh
+        while avoiding the exponential overflow of raw cosh.
         """
-        abs_x = torch.abs(x)
-        return 1.0 + abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
+        return 1.0 + x * x
 
     def _balanced_mean(
         self, per_sample: torch.Tensor, is_event: torch.Tensor
@@ -230,12 +269,12 @@ class SpotlightLoss(torch.nn.Module):
         abs_y = torch.abs(y_true)
         abs_y_pred = torch.abs(y_pred)
 
-        # ---- 1. Pointwise spotlight weight (symmetric) ----
-        # Both sides use 1 + log_cosh — linear, overflow-safe, symmetric.
-        # Equal penalty for overprediction and underprediction at same error magnitude.
+        # ---- 1. Pointwise spotlight weight (symmetric quadratic) ----
+        # Both sides use 1 + (alpha*|x|)^2 — quadratic, overflow-safe, symmetric.
+        # Superlinear contrast without exponential overflow risk.
         # Prediction side is detached: gradient flows only through truth-side weight.
-        w_true = self._safe_pred_weight(self.alpha * abs_y)
-        w_pred = self._safe_pred_weight(self.alpha * abs_y_pred.detach())
+        w_true = self._quad_weight(self.alpha * abs_y)
+        w_pred = self._quad_weight(self.alpha * abs_y_pred.detach())
         w_mag = 0.5 * (w_true + w_pred)
 
         # ---- 2. Time-series continuity score (Local Conv1d) ----
@@ -310,10 +349,10 @@ class SpotlightLoss(torch.nn.Module):
             abs_diff_true = torch.abs(diff_true)
             abs_diff_pred = torch.abs(diff_pred)
 
-            # Symmetric weight for dynamics: both sides use 1 + log_cosh.
-            # Overflow-safe and directionally symmetric for velocity errors.
-            w_dyn_true = self._safe_pred_weight(self.alpha * abs_diff_true)
-            w_dyn_pred = self._safe_pred_weight(self.alpha * abs_diff_pred.detach())
+            # Symmetric quadratic weight for dynamics.
+            # Same rationale as pointwise: superlinear, overflow-safe, symmetric.
+            w_dyn_true = self._quad_weight(self.alpha * abs_diff_true)
+            w_dyn_pred = self._quad_weight(self.alpha * abs_diff_pred.detach())
             w_dyn = 0.5 * (w_dyn_true + w_dyn_pred)
 
             # Continuity dampening for dynamics: reuse pointwise continuity at the

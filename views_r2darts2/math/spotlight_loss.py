@@ -317,7 +317,7 @@ class SpotlightLoss(torch.nn.Module):
             window = torch.hann_window(n_fft, device=pred.device)
 
             # center=False: no zero-padding. We want exact T coverage.
-            # return_complex=True: gives complex tensor, .abs() = magnitude.
+            # return_complex=True: gives complex tensor with .real / .imag.
             S_pred = torch.stft(
                 pred, n_fft, hop_length=hop, win_length=n_fft,
                 window=window, center=False, return_complex=True,
@@ -327,12 +327,19 @@ class SpotlightLoss(torch.nn.Module):
                 window=window, center=False, return_complex=True,
             )
 
-            # L1 magnitude difference wrapped in log_cosh.
-            # NOT log-domain. NOT L2. log_cosh = best of both worlds:
-            # quadratic for small diffs (gentle tuning), linear for large
-            # diffs (no explosion). Gradient = tanh(...) ∈ (-1, 1).
-            # No ε needed.
-            total = total + self._log_cosh(S_pred.abs() - S_true.abs()).mean()
+            # Safe magnitude for pred: sqrt(re² + im² + ε).
+            # DO NOT use S_pred.abs() here. PyTorch's complex abs backward
+            # computes conj(z) / (2|z|), which blows up when |z| → 0.
+            # Early in training, y_pred ≈ 0 for ~90% of series → |S_pred| ≈ 0
+            # → gradient → ∞ → 3e9 predictions. Found this the hard way.
+            # sqrt(re² + im² + ε) gradient = re / sqrt(re² + im² + ε) ∈ (-1,1)
+            # always, for any finite re, im. Bounded. No ε bias (same ε on both
+            # terms in the difference cancels — but we only need it on pred
+            # since S_true has no gradient).
+            mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
+            mag_true = S_true.abs()  # truth: not in graph, no gradient, .abs() fine
+
+            total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 
         # Average across resolutions. If somehow none were valid (T < 6),

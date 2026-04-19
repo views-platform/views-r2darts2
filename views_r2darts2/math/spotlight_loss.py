@@ -193,11 +193,11 @@ class SpotlightLoss(torch.nn.Module):
         self.delta = delta
         self.non_zero_threshold = non_zero_threshold
 
-        # Pre-register Hann windows as buffers so they follow .to(device).
-        # One per STFT resolution. Without this, windows stay on CPU when
-        # model moves to GPU.
-        for n_fft, _ in self.SPECTRAL_RESOLUTIONS:
-            self.register_buffer(f"_hann_{n_fft}", torch.hann_window(n_fft))
+        # NO register_buffer for Hann windows. Buffers enter state_dict,
+        # which causes checkpoint incompatibility when loss class changes
+        # (PL load_from_checkpoint strict=True → RuntimeError on unexpected
+        # or missing keys). Windows are created inline in _spectral_loss
+        # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
             "SpotlightLoss v20 | alpha=%.4f delta=%.4f threshold=%.4f",
@@ -311,9 +311,10 @@ class SpotlightLoss(torch.nn.Module):
             if T < n_fft:
                 continue
 
-            # Hann window registered in __init__. Lives on same device
-            # as model parameters because register_buffer.
-            window = getattr(self, f"_hann_{n_fft}")
+            # Create Hann window inline on same device as pred.
+            # Not a buffer (no state_dict entry) — avoids checkpoint
+            # incompatibility when loss version changes across deployments.
+            window = torch.hann_window(n_fft, device=pred.device)
 
             # center=False: no zero-padding. We want exact T coverage.
             # return_complex=True: gives complex tensor, .abs() = magnitude.

@@ -219,6 +219,8 @@ class ReproducibilityGate:
         OPTIMIZER_GENOMES = {
             "Adam": ["lr", "weight_decay"],
             "AdamW": ["lr", "weight_decay"],
+            "RAdam": ["lr", "weight_decay"],
+            "RAdamW": ["lr", "weight_decay"],
             "SGD": ["lr", "weight_decay", "momentum"],
             "RMSprop": ["lr", "weight_decay", "momentum", "alpha"],
         }

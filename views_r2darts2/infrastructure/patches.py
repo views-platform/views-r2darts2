@@ -142,4 +142,4 @@ def apply_nbeats_patch():
 
 def apply_all_patches():
     apply_torch_load_patch()
-    apply_nbeats_patch()
+    # apply_nbeats_patch()

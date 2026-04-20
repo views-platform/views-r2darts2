@@ -107,7 +107,11 @@ class GradientHealthCallback(Callback):
                     nan_count += 1
                 elif np.isinf(norm):
                     inf_count += 1
-                elif norm == 0:
+                elif norm == 0 and not name.endswith(".bias"):
+                    # Skip bias parameters: LayerNorm/Linear biases are zero-initialized
+                    # by PyTorch, and on zero-inflated data (90% peace cells) their
+                    # gradients underflow to exactly 0.0 in early training — same false
+                    # alarm as the collapsed-bias fix in WeightNormCallback.
                     zero_count += 1
                 else:
                     grad_norms.append(norm)
@@ -214,7 +218,11 @@ class WeightNormCallback(Callback):
 
             if norm > self.explode_threshold:
                 exploding_layers.append((name, norm))
-            elif norm < self.collapse_threshold:
+            elif norm < self.collapse_threshold and not name.endswith(".bias"):
+                # Skip bias parameters: LayerNorm, BatchNorm, and Linear biases are
+                # zero-initialized by PyTorch convention (e.g. LayerNorm.bias = 0.0).
+                # Flagging them as "collapsed" is a false alarm — the weight matrices
+                # are what matters, and a zero bias norm is expected at epoch 0.
                 collapsed_layers.append((name, norm))
 
         if not weight_norms:

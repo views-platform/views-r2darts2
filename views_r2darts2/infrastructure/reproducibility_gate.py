@@ -86,6 +86,7 @@ class ReproducibilityGate:
                 "dropout",
                 "generic_architecture",
                 "force_reset",
+                "use_reversible_instance_norm",
             ],
             "NHiTSModel": [
                 "input_chunk_length",

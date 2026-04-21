@@ -223,6 +223,7 @@ class ModelCatalog:
             trend_polynomial_degree=self.config.get("trend_polynomial_degree"),
             activation=self.config.get("activation"),
             dropout=self.config.get("dropout"),
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_nhits(self):

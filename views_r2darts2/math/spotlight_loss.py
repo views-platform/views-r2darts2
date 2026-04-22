@@ -290,6 +290,13 @@ class SpotlightLoss(torch.nn.Module):
         enormous, so 90% of data (peace, near-zero spectrum) generates
         phantom gradient pulling everything toward zero. We have enough
         zero-bias already.
+
+        Only computed on sequences containing at least one event cell.
+        Zero sequences have zero spectrum — comparing spectra there is
+        meaningless and adds zero-attracting bias (penalizes any non-zero
+        prediction for daring to have spectral energy). This is the
+        spectral equivalent of Stage 2's balanced mean: the "vibe check"
+        only runs where there is a vibe to check.
         """
         # Multi-target: flatten (B, T, C) → (B×C, T) so each channel
         # gets its own STFT. torch.stft wants (batch, signal_length).
@@ -300,6 +307,15 @@ class SpotlightLoss(torch.nn.Module):
         else:
             pred = y_pred
             true = y_true
+
+        # Filter to event-containing sequences only. Peace-only sequences
+        # have zero spectrum; including them wastes STFT compute on ~90%
+        # of the batch and adds zero-attracting spectral bias.
+        has_event = (torch.abs(true) > self.non_zero_threshold).any(dim=1)
+        if not has_event.any():
+            return pred.new_tensor(0.0)
+        pred = pred[has_event]
+        true = true[has_event]
 
         T = pred.size(1)
         total = pred.new_tensor(0.0)  # new_tensor: inherits device + dtype

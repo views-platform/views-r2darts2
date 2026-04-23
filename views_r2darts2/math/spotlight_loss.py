@@ -25,13 +25,16 @@ class SpotlightLoss(torch.nn.Module):
     of cells that actually matter (wars, crises) get outvoted. MSE 
     rewards predicting flat lines.
 
-    Solution: weight each cell by how rare its truth value is::
+    Solution: weight each cell by how important it is — determined by
+    whichever is larger, the truth or the (detached) prediction::
 
-        w(y) = 1 + log_cosh(alpha * |y|)
+        w = 1 + log_cosh(alpha * max(|y|, |ŷ_sg|))
 
-    Zeros (very common) → weight 1.0. Major wars (very rare) → weight ~3.8×.
-    This is a continuous approximation to 1/p(y) — the theoretically optimal
-    weight for imbalanced regression (Liu & Lin 2022, "Balanced MSE").
+    Zeros (very common, correctly predicted) → weight 1.0.
+    Major wars (very rare) → weight ~3.8×.
+    False alarms (y=0, ŷ=10) → weight ~3.3× (same as missing a war).
+    This is symmetric: misses and false alarms of equal magnitude get
+    equal corrective pressure, preventing systematic overprediction.
 
     Why log_cosh and not just exp() or (1+|y|)^β?
     Because I tried both. exp() lets a single noisy 50k-death event get
@@ -40,21 +43,32 @@ class SpotlightLoss(torch.nn.Module):
     et al. 2021 "LDS" tail truncation, analytically), so extreme events
     can't hijack training. α is one knob with known bounds.
 
-    Why truth-only (no pred-side weight)?
-    Because I spent a week debugging pred-side weight. It amplifies OOD
-    predictions (model guesses ŷ=50, gets 50× gradient, explodes), and
-    even detached it acts as a first-order gradient multiplier. The shock
-    absorber interaction with gradient clipping is a whole separate horror
-    story.
+    Why max(|y|, |ŷ_sg|) and not truth-only?
+    Truth-only weight creates asymmetric correction: missing a war
+    (y=10, ŷ=0) gets gradient ~3.3×, but a false alarm (y=0, ŷ=10)
+    gets only ~1.0×. The model learns to hedge by inflating baselines.
+    Symmetric max gives equal pressure to both error directions.
 
-    With truth-only weight at α=0.3:
-        y=0    → w=1.0   (peace)
-        y=5    → w=1.9   (small war)
-        y=10   → w=3.3   (big war)
-        y=11.5 → w=3.8   (max UCDP, ~100k deaths in raw space)
+    Why detach the pred side?
+    Non-detached pred-side weight lets gradient flow through w, creating
+    a second-order term that amplifies OOD predictions (model guesses
+    ŷ=50, gets 50× gradient, explodes). Detaching makes w a simple
+    scalar multiplier each forward pass. The pred-side influence is a
+    first-order gradient multiplier across iterations, but log_cosh's
+    linear growth (not exponential) keeps this controllable.
 
-    Gradient = w(y) × tanh(e/s), hard-bounded at w(y) × 1.0. Max gradient
-    magnitude = 3.8 at α=0.3. No explosion possible.
+    Near convergence (ŷ→y), max(|y|, |ŷ_sg|) → |y|, so the weight
+    degrades to truth-only behavior — stable fine-tuning gradient.
+
+    With symmetric weight at α=0.3:
+        y=0,  ŷ=0   → w=1.0   (peace, correct)
+        y=5,  ŷ=0   → w=1.9   (missed small war)
+        y=0,  ŷ=5   → w=1.9   (false alarm, equally penalized)
+        y=10, ŷ=0   → w=3.3   (missed big war)
+        y=0,  ŷ=10  → w=3.3   (big false alarm, equally penalized)
+
+    Gradient = w × tanh(e/s), hard-bounded at w × 1.0. For in-distribution
+    predictions, max weight ≈ 3.8 at α=0.3. No explosion possible.
 
     ── Stage 2: "Equal airtime" (50/50 balanced mean) ────────────────
 
@@ -295,8 +309,7 @@ class SpotlightLoss(torch.nn.Module):
         Zero sequences have zero spectrum — comparing spectra there is
         meaningless and adds zero-attracting bias (penalizes any non-zero
         prediction for daring to have spectral energy). This is the
-        spectral equivalent of Stage 2's balanced mean: the "vibe check"
-        only runs where there is a vibe to check.
+        spectral equivalent of Stage 2's balanced mean.
         """
         # Multi-target: flatten (B, T, C) → (B×C, T) so each channel
         # gets its own STFT. torch.stft wants (batch, signal_length).
@@ -377,11 +390,20 @@ class SpotlightLoss(torch.nn.Module):
         abs_y = torch.abs(y_true)
 
         # ── Stage 1: How much do we care about each cell? ─────────────
-        # w(y) = 1 + log_cosh(α|y|). Peace → 1.0×. Max war → ~3.8×.
-        # Truth-only: gradient bounded at w(y) × tanh(...) ≤ 3.8.
-        # Tried pred-side weight five different ways. All exploded or
-        # created zero-attracting bias. This is the one that works somewhat.
-        w = 1.0 + self._log_cosh(self.alpha * abs_y)
+        # Symmetric importance: a cell matters if either truth or
+        # prediction is large. miss (y=10, ŷ=0) and false alarm
+        # (y=0, ŷ=10) get equal weight → no systematic overprediction.
+        # Pred-side is detached (no gradient through weight).
+        #
+        # Uses max(|y|, |ŷ_sg|) inside the log_cosh weight. log_cosh
+        # grows linearly for large args (≈|x| − ln2), so the weight
+        # itself is bounded by 1 + α×max(|y|,|ŷ|). At α=0.3, even a
+        # wildly wrong ŷ=50 gives w≈16 — strong correction, not
+        # explosion, because tanh(e/s) still caps gradient direction
+        # at ±1. Near convergence (ŷ→y), max→|y| = truth-only behavior.
+        abs_y_hat = torch.abs(y_pred.detach())
+        cell_importance = torch.max(abs_y, abs_y_hat)
+        w = 1.0 + self._log_cosh(self.alpha * cell_importance)
 
         # ── Stage 2: Pointwise loss with balanced aggregation ─────────
         # Scale s ∈ [1, 2) widens the loss's quadratic basin for big

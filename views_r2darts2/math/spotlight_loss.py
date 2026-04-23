@@ -174,8 +174,12 @@ class SpotlightLoss(torch.nn.Module):
         delta: Spectral loss weight. 0.0 = disable (pointwise only, bad).
             0.15 = spectral is ~20–30% of gradient. Range: 0.05–0.3.
             Above 0.3: spectral dominates, pointwise accuracy suffers.
+        dual_mean: Whether to use the event/peace balanced mean (Stage 2).
+            True = split into event/peace buckets, combine with event_weight
+            ratio. False = plain per-cell mean (event_weight ignored).
         event_weight: Fraction of gradient budget allocated to event cells
-            in the balanced mean. 0.50 = old 50/50 split (overpredicts).
+            in the balanced mean. Only used when dual_mean=True.
+            0.50 = old 50/50 split (overpredicts).
             0.25 = moderate boost. 0.10 = natural prevalence. Range: 0.10–0.50.
             Interacts with alpha: alpha controls per-cell importance,
             event_weight controls per-class budget. Two orthogonal knobs.
@@ -184,7 +188,7 @@ class SpotlightLoss(torch.nn.Module):
             this unless you have a good reason. I didn't.
 
     Example:
-        >>> loss_fn = SpotlightLoss(alpha=0.3, delta=0.15, event_weight=0.25, non_zero_threshold=0.88)
+        >>> loss_fn = SpotlightLoss(alpha=0.3, delta=0.15, dual_mean=True, event_weight=0.25, non_zero_threshold=0.88)
         >>> y_pred = torch.randn(8, 36)
         >>> y_true = torch.zeros(8, 36)
         >>> y_true[:, 10:15] = 2.5 
@@ -203,6 +207,7 @@ class SpotlightLoss(torch.nn.Module):
         self,
         alpha: float,
         delta: float,
+        dual_mean: bool,
         event_weight: float,
         non_zero_threshold: float,
     ):
@@ -219,7 +224,7 @@ class SpotlightLoss(torch.nn.Module):
             )
         if delta < 0.0:
             raise ValueError(f"SpotlightLoss: delta must be non-negative, got {delta}")
-        if not (0.0 < event_weight <= 0.5):
+        if dual_mean and not (0.0 < event_weight <= 0.5):
             raise ValueError(
                 f"SpotlightLoss: event_weight must be in (0, 0.5], got {event_weight}"
             )
@@ -231,6 +236,7 @@ class SpotlightLoss(torch.nn.Module):
         super().__init__()
         self.alpha = alpha
         self.delta = delta
+        self.dual_mean = dual_mean
         self.event_weight = event_weight
         self.non_zero_threshold = non_zero_threshold
 
@@ -241,8 +247,8 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v22 | alpha=%.4f delta=%.4f event_weight=%.4f threshold=%.4f",
-            alpha, delta, event_weight, non_zero_threshold,
+            "SpotlightLoss v23 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
+            alpha, delta, dual_mean, event_weight, non_zero_threshold,
         )
 
     # ------------------------------------------------------------------
@@ -453,11 +459,13 @@ class SpotlightLoss(torch.nn.Module):
         per_sample = w * base_loss
 
         # Hard binary split at threshold. "Event" = at least 1 death.
-        # Balanced mean ensures events get event_weight fraction of the
-        # gradient budget. At 0.5 they're equal; lower values reduce
-        # event amplification to prevent overprediction.
+        # dual_mean=True: split into event/peace buckets, combine with
+        # event_weight ratio. dual_mean=False: plain per-cell mean.
         is_event = abs_y > self.non_zero_threshold
-        loss_pointwise = self._balanced_mean(per_sample, is_event)
+        if self.dual_mean:
+            loss_pointwise = self._balanced_mean(per_sample, is_event)
+        else:
+            loss_pointwise = per_sample.mean()
 
         # ── Stage 3: Do the predicted time series look right? ─────────
         # Match STFT magnitude spectra at 3 resolutions. Catches:

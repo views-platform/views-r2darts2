@@ -44,6 +44,7 @@ class LossCatalog:
             "decay_factor": self.config.get("decay_factor"),
             "beta": self.config.get("beta"),
             "kappa": self.config.get("kappa"),
+            "event_weight": self.config.get("event_weight"),
         }
 
     def get_loss(self) -> torch.nn.Module:

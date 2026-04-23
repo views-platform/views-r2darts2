@@ -70,16 +70,32 @@ class SpotlightLoss(torch.nn.Module):
     Gradient = w × tanh(e/s), hard-bounded at w × 1.0. For in-distribution
     predictions, max weight ≈ 3.8 at α=0.3. No explosion possible.
 
-    ── Stage 2: "Equal airtime" (50/50 balanced mean) ────────────────
+    ── Stage 2: "Weighted airtime" (event/peace balanced mean) ──────
 
     Problem: even with Stage 1 weights, 90% peace cells still dominate
     gradient sum via sheer numbers. 1000 peace cells × 1.0 = 1000 gradient.
     100 event cells × 3.0 = 300 gradient. Peace still wins 3:1.
 
     Solution: split loss into two buckets (event vs peace), average each
-    bucket separately, then combine 50/50. Now each bucket gets exactly
-    half the gradient budget regardless of headcount. This is the
-    continuous regression version of class-balanced loss (Cui et al. 2019).
+    bucket separately, then combine with event_weight / (1−event_weight).
+    This controls how much gradient budget goes to events vs peace.
+
+    At event_weight=0.50 (the old hardcoded default), events get 50% of
+    the budget — a ~5.7× per-cell amplification over natural prevalence
+    (~10%). This caused systematic overprediction: the positive bias
+    leaked into shared MLP weights, RevIN denorm made it multiplicative,
+    and sinh() amplified it exponentially. Order-of-magnitude overpredict.
+
+    Lower event_weight reduces this amplification:
+        event_weight=0.50 → 5.7× per-cell influence (old default, overpredicts)
+        event_weight=0.25 → 2.85× per-cell influence (moderate boost)
+        event_weight=0.15 → ~1.6× per-cell influence (light boost)
+        event_weight=0.10 → ~1.0× per-cell influence (natural prevalence)
+
+    With v21's symmetric weight (Stage 1), false alarms already get
+    corrective pressure — the model has less incentive to hedge upward.
+    So events may not need the full 50% budget anymore. Sweeping
+    event_weight lets Bayes find the right balance.
 
     Bonus: within the event bucket, a single noisy spike is diluted among
     other events (~2% if 50 event cells). So Stage 1 caps per-cell weight,
@@ -158,12 +174,17 @@ class SpotlightLoss(torch.nn.Module):
         delta: Spectral loss weight. 0.0 = disable (pointwise only, bad).
             0.15 = spectral is ~20–30% of gradient. Range: 0.05–0.3.
             Above 0.3: spectral dominates, pointwise accuracy suffers.
+        event_weight: Fraction of gradient budget allocated to event cells
+            in the balanced mean. 0.50 = old 50/50 split (overpredicts).
+            0.25 = moderate boost. 0.10 = natural prevalence. Range: 0.10–0.50.
+            Interacts with alpha: alpha controls per-cell importance,
+            event_weight controls per-class budget. Two orthogonal knobs.
         non_zero_threshold: asinh-space cutoff for event vs peace.
             0.88 ≈ asinh(1) = "at least 1 battle death." Don't change
             this unless you have a good reason. I didn't.
 
     Example:
-        >>> loss_fn = SpotlightLoss(alpha=0.3, delta=0.15, non_zero_threshold=0.88)
+        >>> loss_fn = SpotlightLoss(alpha=0.3, delta=0.15, event_weight=0.25, non_zero_threshold=0.88)
         >>> y_pred = torch.randn(8, 36)
         >>> y_true = torch.zeros(8, 36)
         >>> y_true[:, 10:15] = 2.5 
@@ -182,6 +203,7 @@ class SpotlightLoss(torch.nn.Module):
         self,
         alpha: float,
         delta: float,
+        event_weight: float,
         non_zero_threshold: float,
     ):
         if alpha <= 0.0:
@@ -197,6 +219,10 @@ class SpotlightLoss(torch.nn.Module):
             )
         if delta < 0.0:
             raise ValueError(f"SpotlightLoss: delta must be non-negative, got {delta}")
+        if not (0.0 < event_weight <= 0.5):
+            raise ValueError(
+                f"SpotlightLoss: event_weight must be in (0, 0.5], got {event_weight}"
+            )
         if non_zero_threshold <= 0.0:
             raise ValueError(
                 f"SpotlightLoss: non_zero_threshold must be positive, got {non_zero_threshold}"
@@ -205,6 +231,7 @@ class SpotlightLoss(torch.nn.Module):
         super().__init__()
         self.alpha = alpha
         self.delta = delta
+        self.event_weight = event_weight
         self.non_zero_threshold = non_zero_threshold
 
         # NO register_buffer for Hann windows. Buffers enter state_dict,
@@ -214,8 +241,8 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v21 | alpha=%.4f delta=%.4f threshold=%.4f",
-            alpha, delta, non_zero_threshold,
+            "SpotlightLoss v22 | alpha=%.4f delta=%.4f event_weight=%.4f threshold=%.4f",
+            alpha, delta, event_weight, non_zero_threshold,
         )
 
     # ------------------------------------------------------------------
@@ -254,14 +281,14 @@ class SpotlightLoss(torch.nn.Module):
     def _balanced_mean(
         self, per_sample: torch.Tensor, is_event: torch.Tensor
     ) -> torch.Tensor:
-        """50/50 split between event and peace cells.
+        """Weighted split between event and peace cells.
 
         Without this, 90% peace gradient drowns 10% event gradient.
         Even with per-cell weighting.
 
         Each group (event / peace) gets averaged separately, then
-        combined with equal 0.5 weight. If one group is empty in a
-        batch (rare but happens), the other gets 100%.
+        combined with event_weight / (1−event_weight). If one group
+        is empty in a batch (rare but happens), the other gets 100%.
         """
         # Handle multi-target: unsqueeze to (N, C) for per-channel balance
         if per_sample.dim() == 2:
@@ -279,9 +306,10 @@ class SpotlightLoss(torch.nn.Module):
         loss_event = (ps_flat * ie_flat).sum(0) / n_event.clamp(min=1)
         loss_peace = (ps_flat * ~ie_flat).sum(0) / n_peace.clamp(min=1)
 
-        # 0.5 each if both present, 1.0 for the survivor if one is absent
-        w_e = 0.5 * (n_event > 0).float()
-        w_p = 0.5 * (n_peace > 0).float()
+        # event_weight for events, (1−event_weight) for peace.
+        # If one group is absent, the other gets 100%.
+        w_e = self.event_weight * (n_event > 0).float()
+        w_p = (1.0 - self.event_weight) * (n_peace > 0).float()
         total_w = (w_e + w_p).clamp(min=1e-8)  # paranoia clamp
 
         return ((w_e / total_w) * loss_event + (w_p / total_w) * loss_peace).mean()
@@ -425,8 +453,9 @@ class SpotlightLoss(torch.nn.Module):
         per_sample = w * base_loss
 
         # Hard binary split at threshold. "Event" = at least 1 death.
-        # 50/50 balanced mean ensures events get half the gradient budget
-        # regardless of being outnumbered 9:1 by peace cells.
+        # Balanced mean ensures events get event_weight fraction of the
+        # gradient budget. At 0.5 they're equal; lower values reduce
+        # event amplification to prevent overprediction.
         is_event = abs_y > self.non_zero_threshold
         loss_pointwise = self._balanced_mean(per_sample, is_event)
 
@@ -460,5 +489,5 @@ class SpotlightLoss(torch.nn.Module):
     def __repr__(self) -> str:
         return (
             f"SpotlightLoss(alpha={self.alpha}, delta={self.delta}, "
-            f"non_zero_threshold={self.non_zero_threshold})"
+            f"event_weight={self.event_weight}, non_zero_threshold={self.non_zero_threshold})"
         )

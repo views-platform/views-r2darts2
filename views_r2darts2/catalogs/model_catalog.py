@@ -27,6 +27,7 @@ from views_r2darts2.infrastructure.callbacks import (
     PredictionSanityCallback,
     LossStabilityCallback,
     EpochTimingCallback,
+    YHatBarCallback,
 )
 
 
@@ -92,6 +93,7 @@ class ModelCatalog:
             PredictionSanityCallback(),
             LossStabilityCallback(),
             EpochTimingCallback(),
+            YHatBarCallback(),
         ]
         if extra_callbacks:
             callbacks.extend(extra_callbacks)

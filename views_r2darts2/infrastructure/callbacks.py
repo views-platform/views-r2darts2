@@ -622,3 +622,146 @@ class EpochTimingCallback(Callback):
             hours = int(seconds // 3600)
             minutes = int((seconds % 3600) // 60)
             return f"{hours}h {minutes}m"
+
+
+# ---------------------------------------------------------------------------
+# Y-Hat Bar (Prediction Calibration Monitor)
+# ---------------------------------------------------------------------------
+
+
+class YHatBarCallback(Callback):
+    """
+    Epoch-level mean-prediction calibration monitor in raw (un-transformed) space.
+
+    Intent Contract:
+        - Purpose: Track ``y_hat_bar`` — the mean prediction across all cells in
+          raw space — as the primary calibration diagnostic for zero-inflated
+          conflict forecasting. Complements MSLE, which rewards mild upward bias
+          and cannot distinguish a well-calibrated model from an overpredicting one.
+        - Guarantees: At the end of every ``log_every_n_epochs`` epoch, logs the
+          overall mean and median raw prediction, the mean raw truth, the
+          overprediction ratio (mean_pred / mean_truth), and per-channel means.
+          All metrics are pushed to wandb.
+        - Non-Goals: Does not stop training. Does not replace a proper calibration
+          evaluation on held-out data.
+
+    How it works:
+        ``on_train_batch_end`` accumulates (prediction, truth) pairs in (B, T, C)
+        form. ``on_train_epoch_end`` applies the ``sinh`` inverse transform, then
+        computes calibration statistics overall and per output channel.
+
+    Parameters
+    ----------
+    log_every_n_epochs : int, default 1
+        How often to compute and log calibration statistics.
+    """
+
+    def __init__(self, log_every_n_epochs: int = 1):
+        super().__init__()
+        self.log_every_n_epochs = log_every_n_epochs
+        self._preds: list[torch.Tensor] = []
+        self._truths: list[torch.Tensor] = []
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Grab predictions from outputs dict or pl_module fallback
+        preds = None
+        if isinstance(outputs, dict) and "preds" in outputs:
+            preds = outputs["preds"].detach().float()
+        elif isinstance(outputs, dict) and "y_hat" in outputs:
+            preds = outputs["y_hat"].detach().float()
+        elif hasattr(pl_module, "last_predictions"):
+            preds = pl_module.last_predictions.detach().float()
+
+        # Grab truth from batch. Darts passes batch as (past_target, ..., future_target)
+        # where future_target is the last element (a tuple/list) or a tensor directly.
+        truth = None
+        if preds is not None and batch is not None:
+            try:
+                future = batch[-1]
+                if isinstance(future, (list, tuple)):
+                    future = future[0]
+                if isinstance(future, torch.Tensor):
+                    truth = future.detach().float()
+            except Exception:
+                truth = None
+
+        if preds is not None:
+            # Normalise to (B, T, C): unsqueeze trailing dim if missing
+            if preds.dim() == 2:
+                preds = preds.unsqueeze(-1)
+            self._preds.append(preds)
+
+        if truth is not None:
+            if truth.dim() == 2:
+                truth = truth.unsqueeze(-1)
+            self._truths.append(truth)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            self._preds.clear()
+            self._truths.clear()
+            return
+
+        if not self._preds:
+            return
+
+        # Shape: (N, T, C) on CPU
+        all_preds = torch.cat(self._preds, dim=0).cpu()
+        has_truth = len(self._truths) == len(self._preds)
+        all_truths = torch.cat(self._truths, dim=0).cpu() if has_truth else None
+
+        # Convert from asinh space to raw space — keep (N, T, C)
+        raw_preds = torch.sinh(all_preds)
+        raw_truths = torch.sinh(all_truths) if all_truths is not None else None
+
+        # ── Overall stats ──────────────────────────────────────────────
+        y_hat_bar_mean = raw_preds.mean().item()
+        y_hat_bar_median = raw_preds.median().item()
+
+        metrics: dict[str, float] = {
+            "y_hat_bar/mean": y_hat_bar_mean,
+            "y_hat_bar/median": y_hat_bar_median,
+        }
+        log_parts = [
+            f"mean={y_hat_bar_mean:.2f}",
+            f"median={y_hat_bar_median:.2f}",
+        ]
+
+        if raw_truths is not None:
+            y_bar_mean = raw_truths.mean().item()
+            ratio = y_hat_bar_mean / y_bar_mean if y_bar_mean > 1e-6 else float("nan")
+            metrics["y_hat_bar/y_bar_mean"] = y_bar_mean
+            metrics["y_hat_bar/ratio"] = ratio
+            log_parts += [f"y_bar={y_bar_mean:.2f}", f"ratio={ratio:.2f}x"]
+
+        # ── Per-channel stats ──────────────────────────────────────────
+        # raw_preds shape: (N, T, C). Iterate channels, log as ch_0, ch_1, ...
+        n_channels = raw_preds.size(-1)
+        ch_parts = []
+        for c in range(n_channels):
+            ch_pred = raw_preds[:, :, c]
+            ch_mean = ch_pred.mean().item()
+            metrics[f"y_hat_bar/ch_{c}"] = ch_mean
+            if raw_truths is not None:
+                ch_truth = raw_truths[:, :, c]
+                ch_y_bar = ch_truth.mean().item()
+                ch_ratio = ch_mean / ch_y_bar if ch_y_bar > 1e-6 else float("nan")
+                metrics[f"y_hat_bar/ch_{c}_y_bar"] = ch_y_bar
+                metrics[f"y_hat_bar/ch_{c}_ratio"] = ch_ratio
+                ch_parts.append(f"ch{c}={ch_mean:.2f}(×{ch_ratio:.2f})")
+            else:
+                ch_parts.append(f"ch{c}={ch_mean:.2f}")
+
+        if n_channels > 1:
+            log_parts.append("[" + " ".join(ch_parts) + "]")
+
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        logger.info(
+            f"[Epoch {trainer.current_epoch}] Calibration | " + ", ".join(log_parts)
+        )
+
+        self._preds.clear()
+        self._truths.clear()
+

@@ -321,14 +321,19 @@ class SpotlightLoss(torch.nn.Module):
             pred = y_pred
             true = y_true
 
-        # Filter to event-containing sequences only. Peace-only sequences
-        # have zero spectrum; including them wastes STFT compute on ~90%
-        # of the batch and adds zero-attracting spectral bias.
-        has_event = (torch.abs(true) > self.non_zero_threshold).any(dim=1)
-        if not has_event.any():
+        # Filter to sequences with signal in either truth or prediction.
+        # Peace-only sequences (both y≈0 and ŷ≈0) have near-zero spectrum;
+        # including them wastes STFT compute and adds zero-attracting bias.
+        # Pred-side check (detached) ensures false alarm series (y=0, ŷ=8)
+        # still get spectral penalty — same symmetry principle as Stage 1.
+        has_signal = (
+            (torch.abs(true) > self.non_zero_threshold)
+            | (torch.abs(pred.detach()) > self.non_zero_threshold)
+        ).any(dim=1)
+        if not has_signal.any():
             return pred.new_tensor(0.0)
-        pred = pred[has_event]
-        true = true[has_event]
+        pred = pred[has_signal]
+        true = true[has_signal]
 
         T = pred.size(1)
         total = pred.new_tensor(0.0)  # new_tensor: inherits device + dtype

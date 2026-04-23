@@ -214,7 +214,7 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v20 | alpha=%.4f delta=%.4f threshold=%.4f",
+            "SpotlightLoss v21 | alpha=%.4f delta=%.4f threshold=%.4f",
             alpha, delta, non_zero_threshold,
         )
 
@@ -305,11 +305,12 @@ class SpotlightLoss(torch.nn.Module):
         phantom gradient pulling everything toward zero. We have enough
         zero-bias already.
 
-        Only computed on sequences containing at least one event cell.
-        Zero sequences have zero spectrum — comparing spectra there is
-        meaningless and adds zero-attracting bias (penalizes any non-zero
-        prediction for daring to have spectral energy). This is the
-        spectral equivalent of Stage 2's balanced mean.
+        Only computed on sequences with signal in either truth or
+        (detached) prediction. Pure-peace sequences where both y≈0 and
+        ŷ≈0 have near-zero spectrum — comparing spectra there wastes
+        compute and adds zero-attracting bias. Including false alarm
+        series (y=0, ŷ>>0) ensures spectral penalty on overprediction,
+        matching Stage 1's symmetric weight principle.
         """
         # Multi-target: flatten (B, T, C) → (B×C, T) so each channel
         # gets its own STFT. torch.stft wants (batch, signal_length).

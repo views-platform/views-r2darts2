@@ -253,7 +253,7 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v26 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
+            "SpotlightLoss v28 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
             alpha, delta, dual_mean, event_weight, non_zero_threshold,
         )
 
@@ -436,21 +436,16 @@ class SpotlightLoss(torch.nn.Module):
         abs_y = torch.abs(y_true)
 
         # ── DC/AC decomposition (per-series) ─────────────────────────
-        # Core problem: at initialization, ŷ ≈ 0 for all cells. Event
-        # cells (y > 0) produce 100% upward gradient. Peace cells (y = 0)
-        # produce zero gradient. Net batch gradient is entirely upward,
-        # regardless of event_weight, dual_mean, or RevIN. This creates
-        # a persistent DC offset that accumulates in shared weights.
+        # At initialization, ŷ ≈ 0 for all cells. Event cells (y > 0)
+        # produce 100% upward gradient. Peace cells (y = 0) produce zero
+        # gradient. Net batch gradient is entirely upward regardless of
+        # event_weight or dual_mean — a correlated DC offset accumulates
+        # in shared weights within the first 5-10 epochs.
         #
-        # demean the error per series before computing the pointwise loss.
-        # Within each series, peace months get positive demeaned error
-        # (push down) and event months get negative demeaned error (push
-        # up). The within-series gradient is balanced from epoch 0.
-        #
-        # A separate level-matching term handles calibration through a
-        # uniform per-cell gradient that can't be hijacked by importance
-        # weighting or class-budget mechanics.
-        
+        # Fix: demean the error per series (project onto J = I - 11ᵀ/T).
+        # J has zero column sums → ∑ᵢ ∂L_shape/∂ŷᵢ = 0 exactly, for any
+        # weighting scheme downstream. DC offset accumulation is
+        # structurally impossible through the shape loss.
         e_series_mean = e.mean(dim=1, keepdim=True)  # (B, 1) per-series mean error
         e_shape = e - e_series_mean                   # AC: zero-mean per series
 
@@ -482,48 +477,25 @@ class SpotlightLoss(torch.nn.Module):
 
         # ── Stage 3: Do the predicted time series look right? ─────────
         # Spectral loss on ORIGINAL predictions (not demeaned).
-        # STFT naturally decomposes into frequency bins — the DC bin
-        # (bin 0) captures level, higher bins capture shape. Spectral
-        # loss already handles AC; the DC bin's weak signal
-        # is now supplemented by the explicit level term below.
+        # DC/AC decomposition already ensures the shape loss can't
+        # accumulate a level offset — spectral is purely for temporal
+        # coherence (oscillation, seasonality, smooth drift).
         loss_spectral = y_pred.new_tensor(0.0)
         if self.delta > 0.0 and y_pred.size(1) >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        # ── Stage 4: Level matching (calibration) ─────────────────────
-        # Per-series mean prediction vs mean truth. Because y_pred.mean(dim=1)
-        # aggregates over T steps, backprop through the mean introduces a 1/T
-        # factor: ∂loss_level/∂ŷ_{b,t} = tanh(offset_b) / T.
-        #
-        # The shape loss gradient is O(w) per cell ≈ O(1). Level is O(1/T).
-        # At T=36 this is a 36× mismatch: shape drives offsets 36× faster
-        # than level corrects them. Scaling loss_level by T restores parity:
-        # both terms contribute O(1) gradient per cell per step.
-        #
-        # Two failure modes this fixes:
-        #   1. Peace months in event series get pushed below zero by shape
-        #      loss (AC target is negative: 0 - mean_y < 0). Without T-scaling,
-        #      level correction is too slow — negatives compound.
-        #   2. After CAWR restarts (hot LR), shape can re-introduce a DC
-        #      offset in 5-10 epochs faster than unscaled level absorbs it.
-        T = y_pred.size(1)
-        loss_level = self._log_cosh(
-            y_pred.mean(dim=1) - y_true.mean(dim=1)
-        ).mean() * T
-
-        total_loss = loss_shape + self.delta * loss_spectral + loss_level
+        total_loss = loss_shape + self.delta * loss_spectral
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
-                f"spectral={loss_spectral.item():.6f} level={loss_level.item():.6f}"
+                f"spectral={loss_spectral.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f spec=%.6f level=%.6f total=%.6f",
+            "SpotlightLoss | shape=%.6f spec=%.6f total=%.6f",
             loss_shape.item(),
             loss_spectral.item(),
-            loss_level.item(),
             total_loss.item(),
         )
 

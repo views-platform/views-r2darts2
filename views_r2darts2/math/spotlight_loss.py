@@ -253,7 +253,7 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v28 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
+            "SpotlightLoss v30 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
             alpha, delta, dual_mean, event_weight, non_zero_threshold,
         )
 
@@ -414,6 +414,19 @@ class SpotlightLoss(torch.nn.Module):
             mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
             mag_true = S_true.abs()  # truth: not in graph, no gradient, .abs() fine
 
+            # Zero out DC bin (frequency bin 0) in both pred and true.
+            # The DC bin captures the windowed series mean — exactly what the
+            # level loss already handles with correct sign-aware gradients.
+            # Leaving DC in the spectral loss creates interference: STFT magnitude
+            # discards sign, so when mean(ŷ) < mean(y), the spectral DC gradient
+            # pushes predictions DOWN (wrong direction). Masking DC means spectral
+            # is purely about temporal structure (oscillation, seasonality, drift)
+            # with no overlap with the level term.
+            mag_pred = mag_pred.clone()
+            mag_pred[:, 0, :] = 0.0
+            mag_true = mag_true.clone()
+            mag_true[:, 0, :] = 0.0
+
             total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 
@@ -484,18 +497,41 @@ class SpotlightLoss(torch.nn.Module):
         if self.delta > 0.0 and y_pred.size(1) >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + self.delta * loss_spectral
+        # ── Stage 4: Level anchor ──────────────────────────────────────
+        # Without RevIN, nothing anchors the per-series mean prediction.
+        # The shape loss (AC) provides level signal early in training via
+        # the initialization transient, but as e_mean → 0 this signal
+        # vanishes. Spectral DC bin is too weak (O(delta/n_bins) ≈ 0.01)
+        # to correct drift during CAWR restarts.
+        #
+        # T-scaling restores gradient parity between level and shape:
+        #   Shape gradient on peace cell:  w × tanh(e_shape) ≈ 0.265 (downward)
+        #   Level gradient per cell (×1):  tanh(offset)/T  ≈ 0.0076 (upward)
+        #   Level gradient per cell (×T):  tanh(offset)    ≈ 0.273  (upward)
+        #
+        # Unscaled (×1) is 35× too weak — peace cells are driven negative
+        # by the shape loss with no effective counter-force. T-scaling gives
+        # near-perfect balance at initialization and doesn't cause
+        # lazy-mean-prediction: event cells have w≈3.8 × tanh≈1 shape
+        # gradient that keeps the model learning beyond the mean.
+        T = y_pred.size(1)
+        loss_level = self._log_cosh(
+            y_pred.mean(dim=1) - y_true.mean(dim=1)
+        ).mean() * T
+
+        total_loss = loss_shape + self.delta * loss_spectral + loss_level
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
-                f"spectral={loss_spectral.item():.6f}"
+                f"spectral={loss_spectral.item():.6f} level={loss_level.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f spec=%.6f total=%.6f",
+            "SpotlightLoss | shape=%.6f spec=%.6f level=%.6f total=%.6f",
             loss_shape.item(),
             loss_spectral.item(),
+            loss_level.item(),
             total_loss.item(),
         )
 

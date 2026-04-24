@@ -253,7 +253,7 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v24 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
+            "SpotlightLoss v25 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
             alpha, delta, dual_mean, event_weight, non_zero_threshold,
         )
 
@@ -435,64 +435,88 @@ class SpotlightLoss(torch.nn.Module):
         e = y_pred - y_true
         abs_y = torch.abs(y_true)
 
-        # ── Stage 1: How much do we care about each cell? ─────────────
-        # Symmetric importance: a cell matters if either truth or
-        # prediction is large. miss (y=10, ŷ=0) and false alarm
-        # (y=0, ŷ=10) get equal weight → no systematic overprediction.
-        # Pred-side is detached (no gradient through weight).
+        # ── DC/AC decomposition (per-series) ─────────────────────────
+        # Core problem: at initialization, ŷ ≈ 0 for all cells. Event
+        # cells (y > 0) produce 100% upward gradient. Peace cells (y = 0)
+        # produce zero gradient. Net batch gradient is entirely upward,
+        # regardless of event_weight, dual_mean, or RevIN. This creates
+        # a persistent DC offset that accumulates in shared weights.
         #
-        # Uses max(|y|, |ŷ_sg|) inside the log_cosh weight. log_cosh
-        # grows linearly for large args (≈|x| − ln2), so the weight
-        # itself is bounded by 1 + α×max(|y|,|ŷ|). At α=0.3, even a
-        # wildly wrong ŷ=50 gives w≈16 — strong correction, not
-        # explosion, because tanh(e/s) still caps gradient direction
-        # at ±1. Near convergence (ŷ→y), max→|y| = truth-only behavior.
+        # demean the error per series before computing the pointwise loss.
+        # Within each series, peace months get positive demeaned error
+        # (push down) and event months get negative demeaned error (push
+        # up). The within-series gradient is balanced from epoch 0.
+        #
+        # A separate level-matching term handles calibration through a
+        # uniform per-cell gradient that can't be hijacked by importance
+        # weighting or class-budget mechanics.
+        
+        e_series_mean = e.mean(dim=1, keepdim=True)  # (B, 1) per-series mean error
+        e_shape = e - e_series_mean                   # AC: zero-mean per series
+
+        # ── Stage 1: How much do we care about each cell? ─────────────
+        # Importance weight on ORIGINAL magnitudes (not demeaned).
+        # A 50k-death event still gets 3.8× weight — absolute event size
+        # determines within-class priority. The demeaning only affects
+        # the error direction, not the importance ordering.
         abs_y_hat = torch.abs(y_pred.detach())
         cell_importance = torch.max(abs_y, abs_y_hat)
         w = 1.0 + self._log_cosh(self.alpha * cell_importance)
 
-        # ── Stage 2: Pointwise loss with balanced aggregation ─────────
-        # Plain log-cosh per cell. Gradient = w × tanh(e), bounded.
-        # v22 used adaptive scale s = 1+|y|/(1+|y|) to widen the
-        # quadratic basin for large targets. But it created a gradient
-        # valley at small events (y ≈ 0.88–3): scale reduced gradient
-        # by ~30% while importance weight barely compensated (w ≈ 1.02).
-        # MSLE is most sensitive to these exact cells. Removing the
-        # scale eliminates the valley — w handles all magnitude scaling.
-        base_loss = self._log_cosh(e)
+        # ── Stage 2: Pointwise loss on SHAPE (demeaned error) ─────────
+        # log_cosh(e_shape) is the per-cell base loss. Because e_shape
+        # is zero-mean per series, the weighted gradient sum cannot
+        # accumulate a DC offset — peace months in event series produce
+        # downward gradient that balances the upward push from event
+        # months. This is structurally guaranteed, not tuning-dependent.
+        base_loss = self._log_cosh(e_shape)
         per_sample = w * base_loss
 
         # Hard binary split at threshold. "Event" = at least 1 death.
-        # dual_mean=True: split into event/peace buckets, combine with
-        # event_weight ratio. dual_mean=False: plain per-cell mean.
+        # Classification on original y (not demeaned).
         is_event = abs_y > self.non_zero_threshold
         if self.dual_mean:
-            loss_pointwise = self._balanced_mean(per_sample, is_event)
+            loss_shape = self._balanced_mean(per_sample, is_event)
         else:
-            loss_pointwise = per_sample.mean()
+            loss_shape = per_sample.mean()
 
         # ── Stage 3: Do the predicted time series look right? ─────────
-        # Match STFT magnitude spectra at 3 resolutions. Catches:
-        # - Oscillation between adjacent steps (n_fft=6)
-        # - Missing 12-month seasonality (n_fft=12, bin 1)
-        # - Slow hockey-stick drift (n_fft=24, low-freq bins)
-        # And forgives timing errors via phase invariance.
+        # Spectral loss on ORIGINAL predictions (not demeaned).
+        # STFT naturally decomposes into frequency bins — the DC bin
+        # (bin 0) captures level, higher bins capture shape. Spectral
+        # loss already handles AC; the DC bin's weak signal
+        # is now supplemented by the explicit level term below.
         loss_spectral = y_pred.new_tensor(0.0)
         if self.delta > 0.0 and y_pred.size(1) >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_pointwise + self.delta * loss_spectral
+        # ── Stage 4: Level matching (calibration) ─────────────────────
+        # Per-series mean prediction vs mean truth. Gradient is
+        # tanh(mean(ŷ) - mean(y)) / T per cell, uniform across all
+        # time steps. This provides a direct calibration signal that:
+        #   - Can't be hijacked by importance weighting (uniform grad)
+        #   - Doesn't interact with event/peace classification
+        #   - Is zero when calibrated (no interference with convergence)
+        #   - Is bounded at tanh(offset)/T per cell (tiny, non-disruptive)
+        # No hyperparameter needed: both shape and level terms are
+        # log-cosh-based and produce comparable gradient magnitudes.
+        loss_level = self._log_cosh(
+            y_pred.mean(dim=1) - y_true.mean(dim=1)
+        ).mean()
+
+        total_loss = loss_shape + self.delta * loss_spectral + loss_level
 
         if torch.isnan(total_loss):
             raise RuntimeError(
-                f"NaN in SpotlightLoss: pointwise={loss_pointwise.item():.6f} "
-                f"spectral={loss_spectral.item():.6f}"
+                f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
+                f"spectral={loss_spectral.item():.6f} level={loss_level.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLoss | pw=%.6f spec=%.6f total=%.6f",
-            loss_pointwise.item(),
+            "SpotlightLoss | shape=%.6f spec=%.6f level=%.6f total=%.6f",
+            loss_shape.item(),
             loss_spectral.item(),
+            loss_level.item(),
             total_loss.item(),
         )
 
@@ -500,6 +524,6 @@ class SpotlightLoss(torch.nn.Module):
 
     def __repr__(self) -> str:
         return (
-            f"SpotlightLoss(alpha={self.alpha}, delta={self.delta}, "
+            f"SpotlightLoss(alpha={self.alpha}, delta={self.delta}, dual_mean={self.dual_mean}, "
             f"event_weight={self.event_weight}, non_zero_threshold={self.non_zero_threshold})"
         )

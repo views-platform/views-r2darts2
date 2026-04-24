@@ -153,16 +153,22 @@ class SpotlightLoss(torch.nn.Module):
     Skips resolutions where n_fft > T automatically. Works for T < 36.
     Cost at T=36 B=64: ~6720 log_cosh evals ≈ 3× MSE. Fine.
 
-    ── Base cell loss: Scaled log-cosh ─────────────────────────────────
+    ── Base cell loss: log-cosh ─────────────────────────────────────────
 
-    L(e, s) = s × log(cosh(e / s)),    s = 1 + |y| / (1 + |y|)
+    L(e) = log(cosh(e))
 
-    Quadratic near zero, linear far away. Gradient = tanh(e/s) ∈ (−1, 1).
+    Quadratic near zero, linear far away. Gradient = tanh(e) ∈ (−1, 1).
     Like Huber but smooth — no discontinuous kink at the transition.
-    Scale s ∈ [1, 2) widens quadratic basin for high-value targets, so
-    the model gets useful gradient direction (not just ±1) when it's close
-    to getting a war right. Took me embarrassingly long to realize
-    fixed-scale log_cosh was starving high-value cells of gradient signal.
+
+    v22 used adaptive scale s = 1 + |y|/(1+|y|) to widen the quadratic
+    basin for large targets. But the scale grows fast at low magnitudes
+    (s=1.47 at the threshold) while the importance weight barely
+    compensates (w≈1.02). This creates a gradient valley at y≈0.88–3
+    where effective gain (w/s) drops to 0.67–0.70× — below peace cells.
+    MSLE is most sensitive to exactly these small-event cells (1–10
+    deaths), which is why MSE could be good but MSLE bad.
+    Removing the scale eliminates the valley. The importance weight w
+    now handles all magnitude-dependent gradient scaling.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -247,7 +253,7 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v23 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
+            "SpotlightLoss v24 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
             alpha, delta, dual_mean, event_weight, non_zero_threshold,
         )
 
@@ -446,16 +452,14 @@ class SpotlightLoss(torch.nn.Module):
         w = 1.0 + self._log_cosh(self.alpha * cell_importance)
 
         # ── Stage 2: Pointwise loss with balanced aggregation ─────────
-        # Scale s ∈ [1, 2) widens the loss's quadratic basin for big
-        # targets. Intuition: when truth is y=10, being off by 0.5 should
-        # still give gradient proportional to error, not a saturated ±1.
-        # Fixed scale was starving high-value cells of gradient direction.
-        scale = 1.0 + abs_y / (1.0 + abs_y)
-
-        # Weighted log-cosh per cell. w controls importance, log_cosh
-        # controls shape. Separation of concerns that took 18 versions
-        # to arrive at.
-        base_loss = self._log_cosh_scaled(e, scale)
+        # Plain log-cosh per cell. Gradient = w × tanh(e), bounded.
+        # v22 used adaptive scale s = 1+|y|/(1+|y|) to widen the
+        # quadratic basin for large targets. But it created a gradient
+        # valley at small events (y ≈ 0.88–3): scale reduced gradient
+        # by ~30% while importance weight barely compensated (w ≈ 1.02).
+        # MSLE is most sensitive to these exact cells. Removing the
+        # scale eliminates the valley — w handles all magnitude scaling.
+        base_loss = self._log_cosh(e)
         per_sample = w * base_loss
 
         # Hard binary split at threshold. "Event" = at least 1 death.

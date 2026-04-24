@@ -253,7 +253,7 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v25 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
+            "SpotlightLoss v26 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
             alpha, delta, dual_mean, event_weight, non_zero_threshold,
         )
 
@@ -491,18 +491,25 @@ class SpotlightLoss(torch.nn.Module):
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
         # ── Stage 4: Level matching (calibration) ─────────────────────
-        # Per-series mean prediction vs mean truth. Gradient is
-        # tanh(mean(ŷ) - mean(y)) / T per cell, uniform across all
-        # time steps. This provides a direct calibration signal that:
-        #   - Can't be hijacked by importance weighting (uniform grad)
-        #   - Doesn't interact with event/peace classification
-        #   - Is zero when calibrated (no interference with convergence)
-        #   - Is bounded at tanh(offset)/T per cell (tiny, non-disruptive)
-        # No hyperparameter needed: both shape and level terms are
-        # log-cosh-based and produce comparable gradient magnitudes.
+        # Per-series mean prediction vs mean truth. Because y_pred.mean(dim=1)
+        # aggregates over T steps, backprop through the mean introduces a 1/T
+        # factor: ∂loss_level/∂ŷ_{b,t} = tanh(offset_b) / T.
+        #
+        # The shape loss gradient is O(w) per cell ≈ O(1). Level is O(1/T).
+        # At T=36 this is a 36× mismatch: shape drives offsets 36× faster
+        # than level corrects them. Scaling loss_level by T restores parity:
+        # both terms contribute O(1) gradient per cell per step.
+        #
+        # Two failure modes this fixes:
+        #   1. Peace months in event series get pushed below zero by shape
+        #      loss (AC target is negative: 0 - mean_y < 0). Without T-scaling,
+        #      level correction is too slow — negatives compound.
+        #   2. After CAWR restarts (hot LR), shape can re-introduce a DC
+        #      offset in 5-10 epochs faster than unscaled level absorbs it.
+        T = y_pred.size(1)
         loss_level = self._log_cosh(
             y_pred.mean(dim=1) - y_true.mean(dim=1)
-        ).mean()
+        ).mean() * T
 
         total_loss = loss_shape + self.delta * loss_spectral + loss_level
 

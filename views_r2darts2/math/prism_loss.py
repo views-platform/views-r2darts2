@@ -316,13 +316,22 @@ class PrismLoss(torch.nn.Module):
         cell_loss = 0.5 * e * e
 
         # ── Budget allocation ─────────────────────────────────────────
-        # dual_mean splits event/peace into separate buckets and controls
-        # gradient budget via event_weight. This is the ONLY class-balance
-        # mechanism — no per-cell alpha boost needed because MSE's
-        # quadratic scaling naturally upweights large errors (which are
-        # events: peace cells at y=0 with ŷ≈0 contribute ~0 gradient).
+        # is_event uses max(|y|, |ŷ_sg|) > τ so false alarms (y=0, ŷ>τ)
+        # share the event bucket with misses (y>τ, ŷ≈0). Without the
+        # pred-side check, false alarms fall in the peace bucket and get
+        # ~3× less per-cell gradient budget than misses of equal magnitude
+        # (at event_weight=0.25, n_peace/n_event=9).
+        #
+        # Each cell's gradient direction is still correct regardless of bucket
+        # (miss → negative e → pushes ŷ up; false alarm → positive e → pushes
+        # ŷ down). Bucket membership only controls the scale factor 1/n_bucket.
+        # Both misses and false alarms are high-priority cells — they share the
+        # event_weight budget, ensuring equal per-cell correction scale.
+        #
+        # Detach pred: classification must not create a gradient path through w.
         abs_y = torch.abs(y_true)
-        is_event = abs_y > self.non_zero_threshold
+        abs_y_hat = torch.abs(y_pred.detach())
+        is_event = (abs_y > self.non_zero_threshold) | (abs_y_hat > self.non_zero_threshold)
         if self.dual_mean:
             loss_main = self._balanced_mean(cell_loss, is_event)
         else:

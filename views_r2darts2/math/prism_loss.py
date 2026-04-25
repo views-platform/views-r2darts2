@@ -83,8 +83,9 @@ class PrismLoss(torch.nn.Module):
 
     Example:
         >>> loss_fn = PrismLoss(delta=0.10, dual_mean=True, event_weight=0.25, non_zero_threshold=0.693)
+        >>> y_pred = torch.randn(8, 36)
         >>> y_true = torch.zeros(8, 36)
-        >>> y_true[:, 10:15] = 2.5 
+        >>> y_true[:, 10:15] = 2.5
         >>> loss = loss_fn(y_pred, y_true)
         >>> loss.backward()
     """
@@ -137,49 +138,48 @@ class PrismLoss(torch.nn.Module):
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
-        """Plain log(cosh(x)). Same stable identity, no scale param.
+        """Plain log(cosh(x)). Numerically stable identity: |x| + softplus(-2|x|) - ln2.
 
-        Used everywhere: base weight, spectral comparisons. 
-        I want something between L1 and L2 that won't explode."
+        Used for spectral magnitude comparison only. Bounded gradient (tanh)
+        prevents any single frequency bin from dominating the regulariser.
         """
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     def _balanced_mean(
-        self, per_sample: torch.Tensor, is_event: torch.Tensor
+        self, per_sample: torch.Tensor, is_active: torch.Tensor
     ) -> torch.Tensor:
-        """Weighted split between event and peace cells.
+        """Weighted split between active (events + false alarms) and peace cells.
 
-        Without this, 90% peace gradient drowns 10% event gradient.
-        Even with per-cell weighting.
+        Without this, 90% peace gradient drowns 10% active gradient.
 
-        Each group (event / peace) gets averaged separately, then
+        Each group (active / peace) gets averaged separately, then
         combined with event_weight / (1−event_weight). If one group
         is empty in a batch (rare but happens), the other gets 100%.
         """
         # Handle multi-target: unsqueeze to (N, C) for per-channel balance
         if per_sample.dim() == 2:
             per_sample = per_sample.unsqueeze(-1)
-            is_event = is_event.unsqueeze(-1)
+            is_active = is_active.unsqueeze(-1)
 
         C = per_sample.size(-1)
         ps_flat = per_sample.reshape(-1, C)  # (batch×seq, channels)
-        ie_flat = is_event.reshape(-1, C)
+        ia_flat = is_active.reshape(-1, C)
 
-        n_event = ie_flat.sum(0)
-        n_peace = (~ie_flat).sum(0)
+        n_active = ia_flat.sum(0)
+        n_peace = (~ia_flat).sum(0)
 
         # clamp(min=1) prevents div-by-zero when a group is empty
-        loss_event = (ps_flat * ie_flat).sum(0) / n_event.clamp(min=1)
-        loss_peace = (ps_flat * ~ie_flat).sum(0) / n_peace.clamp(min=1)
+        loss_active = (ps_flat * ia_flat).sum(0) / n_active.clamp(min=1)
+        loss_peace = (ps_flat * ~ia_flat).sum(0) / n_peace.clamp(min=1)
 
-        # event_weight for events, (1−event_weight) for peace.
+        # event_weight for active cells, (1−event_weight) for peace.
         # If one group is absent, the other gets 100%.
-        w_e = self.event_weight * (n_event > 0).float()
+        w_a = self.event_weight * (n_active > 0).float()
         w_p = (1.0 - self.event_weight) * (n_peace > 0).float()
-        total_w = (w_e + w_p).clamp(min=1e-8)  # paranoia clamp
+        total_w = (w_a + w_p).clamp(min=1e-8)  # paranoia clamp
 
-        return ((w_e / total_w) * loss_event + (w_p / total_w) * loss_peace).mean()
+        return ((w_a / total_w) * loss_active + (w_p / total_w) * loss_peace).mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison.

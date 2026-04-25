@@ -460,18 +460,30 @@ class SpotlightLoss(torch.nn.Module):
         e = y_pred - y_true
         cell_loss = self._log_cosh(e)
 
-        # ── Flat event boost ──────────────────────────────────────────
+        # ── Symmetric event boost ─────────────────────────────────────
         # Events get (1 + alpha)× weight — flat across all event sizes.
         # The log1p transform already provides correct magnitude-aware
         # gradients (a 1-death miss and a 50k-death miss of the same
         # log-ratio get equal gradient). The flat boost addresses only
         # class imbalance: 90% peace cells outnumber events 9:1.
+        #
+        # Symmetry: classify on max(|y|, |ŷ_sg|) so false alarms
+        # (y=0, ŷ > threshold) also get event-level weight. Without
+        # pred-side classification, a miss (y=5, ŷ=0) gets (1+α)×
+        # gradient but a false alarm (y=0, ŷ=5) gets only 1× —
+        # asymmetry that creates mild overprediction bias. Detaching
+        # ŷ means no gradient flows through w.
         abs_y = torch.abs(y_true)
-        is_event = abs_y > self.non_zero_threshold
-        w = torch.where(is_event, 1.0 + self.alpha, torch.ones_like(y_true))
+        abs_y_hat = torch.abs(y_pred.detach())
+        is_active = (abs_y > self.non_zero_threshold) | (abs_y_hat > self.non_zero_threshold)
+        w = torch.where(is_active, 1.0 + self.alpha, torch.ones_like(y_true))
         per_sample = w * cell_loss
 
         # ── Budget allocation ─────────────────────────────────────────
+        # is_event uses truth-only for the balanced mean split — the
+        # dual_mean budget mechanism is about which cells are truly
+        # events, not which cells are being actively corrected.
+        is_event = abs_y > self.non_zero_threshold
         if self.dual_mean:
             loss_main = self._balanced_mean(per_sample, is_event)
         else:

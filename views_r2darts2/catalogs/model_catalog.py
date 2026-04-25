@@ -21,6 +21,7 @@ from views_r2darts2.catalogs.scheduler_catalog import SchedulerCatalog
 from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 from views_r2darts2.infrastructure.callbacks import (
+    TrainingStepPatchCallback,
     GradientHealthCallback,
     NaNDetectionCallback,
     WeightNormCallback,
@@ -80,6 +81,7 @@ class ModelCatalog:
 
     def _get_common_pl_trainer_kwargs(self, extra_callbacks=None):
         callbacks = [
+            TrainingStepPatchCallback(),  # MUST be first: patches training_step to expose predictions
             EarlyStopping(
                 monitor="train_loss",
                 patience=self.config.get("early_stopping_patience"),

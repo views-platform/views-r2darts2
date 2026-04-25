@@ -13,6 +13,64 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+class TrainingStepPatchCallback(Callback):
+    """
+    Patches Darts' training_step to expose predictions to downstream callbacks.
+
+    Intent Contract:
+        - Purpose: Darts' ``training_step`` returns only the scalar loss, so
+          callbacks like ``YHatBarCallback`` and ``PredictionSanityCallback`` that
+          need access to ``y_pred`` and ``y_true`` during training receive nothing.
+          This callback monkey-patches ``training_step`` at ``on_fit_start`` to
+          store predictions on ``pl_module.last_predictions`` and truth on
+          ``pl_module.last_targets`` after each batch.
+        - Guarantees: Downstream callbacks that check ``hasattr(pl_module,
+          'last_predictions')`` will get fresh per-batch tensors. Original
+          ``training_step`` behaviour (loss, logging, metrics) is unchanged.
+        - Non-Goals: Does not add memory cost beyond one batch of detached tensors.
+
+    Must be placed FIRST in the callback list so the patch is applied before
+    other callbacks run.
+    """
+
+    def on_fit_start(self, trainer, pl_module):
+        if hasattr(pl_module, "_original_training_step"):
+            return  # Already patched
+
+        original = pl_module.training_step
+
+        def patched_training_step(train_batch, batch_idx):
+            # Darts convention: batch[-1] = future target, batch[-2] = sample weights
+            output = pl_module._produce_train_output(train_batch[:-2])
+            sample_weight = train_batch[-2]
+            target = train_batch[-1]
+            loss = pl_module._compute_loss(
+                output, target, pl_module.train_criterion, sample_weight
+            )
+            pl_module.log(
+                "train_loss",
+                loss,
+                batch_size=train_batch[0].shape[0],
+                prog_bar=True,
+                sync_dist=True,
+            )
+            pl_module._update_metrics(output, target, pl_module.train_metrics)
+
+            # ── Store predictions & truth for downstream callbacks ────
+            # Squeeze likelihood dimension: (B, T, C, n_params) → (B, T, C)
+            preds = output.detach()
+            if preds.dim() == 4:
+                preds = preds[..., 0]  # point forecast (first likelihood param)
+            pl_module.last_predictions = preds
+            pl_module.last_targets = target.detach()
+
+            return loss
+
+        pl_module._original_training_step = original
+        pl_module.training_step = patched_training_step
+        logger.info("TrainingStepPatchCallback: patched training_step to expose predictions")
+
+
 class NaNDetectionCallback(Callback):
     """
     Batch-level NaN sentinel that halts training after consecutive NaN losses.
@@ -710,9 +768,10 @@ class YHatBarCallback(Callback):
         has_truth = len(self._truths) == len(self._preds)
         all_truths = torch.cat(self._truths, dim=0).cpu() if has_truth else None
 
-        # Convert from asinh space to raw space — keep (N, T, C)
-        raw_preds = torch.sinh(all_preds)
-        raw_truths = torch.sinh(all_truths) if all_truths is not None else None
+        # Convert from log1p space to raw space — keep (N, T, C)
+        # Models use LogTransform (log1p/expm1), not asinh/sinh.
+        raw_preds = torch.expm1(all_preds)
+        raw_truths = torch.expm1(all_truths) if all_truths is not None else None
 
         # ── Overall stats ──────────────────────────────────────────────
         y_hat_bar_mean = raw_preds.mean().item()

@@ -8,7 +8,8 @@ from views_r2darts2.math.weighted_penalty_huber_loss import WeightedPenaltyHuber
 from views_r2darts2.math.tweedie_loss import TweedieLoss
 from views_r2darts2.math.asymmetric_quantile_loss import AsymmetricQuantileLoss
 from views_r2darts2.math.zero_inflated_loss import ZeroInflatedLoss
-from views_r2darts2.math.spotlight_loss import SpotlightLoss
+from views_r2darts2.math.prism_loss import PrismLoss
+from views_r2darts2.math.spotlight_focal_loss import SpotlightFocalLoss
 from views_r2darts2.math.sentinel_loss import SentinelLoss
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,8 @@ class LossCatalog:
             "AsymmetricQuantileLoss": AsymmetricQuantileLoss,
             "ZeroInflatedLoss": ZeroInflatedLoss,
             "ShrinkageLoss": ShrinkageLoss,
-            "SpotlightLoss": SpotlightLoss,
+            "PrismLoss": PrismLoss,
+            "SpotlightFocalLoss": SpotlightFocalLoss,
             "SentinelLoss": SentinelLoss,
             "MSELoss": torch.nn.MSELoss,
             "L1Loss": torch.nn.L1Loss,

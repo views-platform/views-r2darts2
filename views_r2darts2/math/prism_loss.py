@@ -316,8 +316,8 @@ class PrismLoss(torch.nn.Module):
         cell_loss = 0.5 * e * e
 
         # ── Budget allocation ─────────────────────────────────────────
-        # is_event uses max(|y|, |ŷ_sg|) > τ so false alarms (y=0, ŷ>τ)
-        # share the event bucket with misses (y>τ, ŷ≈0). Without the
+        # is_active uses max(|y|, |ŷ_sg|) > τ so false alarms (y=0, ŷ>τ)
+        # share the priority bucket with misses (y>τ, ŷ≈0). Without the
         # pred-side check, false alarms fall in the peace bucket and get
         # ~3× less per-cell gradient budget than misses of equal magnitude
         # (at event_weight=0.25, n_peace/n_event=9).
@@ -331,9 +331,9 @@ class PrismLoss(torch.nn.Module):
         # Detach pred: classification must not create a gradient path through w.
         abs_y = torch.abs(y_true)
         abs_y_hat = torch.abs(y_pred.detach())
-        is_event = (abs_y > self.non_zero_threshold) | (abs_y_hat > self.non_zero_threshold)
+        is_active = (abs_y > self.non_zero_threshold) | (abs_y_hat > self.non_zero_threshold)
         if self.dual_mean:
-            loss_main = self._balanced_mean(cell_loss, is_event)
+            loss_main = self._balanced_mean(cell_loss, is_active)
         else:
             loss_main = cell_loss.mean()
 

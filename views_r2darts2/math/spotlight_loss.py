@@ -217,16 +217,13 @@ class SpotlightLoss(torch.nn.Module):
         event_weight: float,
         non_zero_threshold: float,
     ):
-        if alpha <= 0.0:
-            raise ValueError(f"SpotlightLoss: alpha must be positive, got {alpha}")
-        if alpha > 0.7:
-            # You probably don't want this. At α=0.7, max weight ≈ 8.5×.
-            # Model will overpredict everything. Trust me.
-            _w = 1.0 + math.log(math.cosh(min(alpha * 11.5, 88.0)))
+        if alpha < 0.0:
+            raise ValueError(f"SpotlightLoss: alpha must be non-negative, got {alpha}")
+        if alpha > 5.0:
             logger.warning(
-                "SpotlightLoss: alpha=%.4f > 0.7. Weight at max UCDP "
-                "(asinh≈11.5) = 1+log_cosh(%.2f) ≈ %.1f×. May cause instability.",
-                alpha, alpha * 11.5, _w,
+                "SpotlightLoss: alpha=%.4f > 5.0. Events get %.1f× weight. "
+                "May cause instability.",
+                alpha, 1.0 + alpha,
             )
         if delta < 0.0:
             raise ValueError(f"SpotlightLoss: delta must be non-negative, got {delta}")
@@ -253,7 +250,7 @@ class SpotlightLoss(torch.nn.Module):
         # with device=pred.device instead. Cost: ~3µs per forward. Fine.
 
         logger.info(
-            "SpotlightLoss v30 | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
+            "SpotlightLoss v32 (log1p-native) | alpha=%.4f delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
             alpha, delta, dual_mean, event_weight, non_zero_threshold,
         )
 
@@ -414,17 +411,16 @@ class SpotlightLoss(torch.nn.Module):
             mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
             mag_true = S_true.abs()  # truth: not in graph, no gradient, .abs() fine
 
-            # Zero out DC bin (frequency bin 0) in both pred and true.
-            # The DC bin captures the windowed series mean — exactly what the
-            # level loss already handles with correct sign-aware gradients.
-            # Leaving DC in the spectral loss creates interference: STFT magnitude
-            # discards sign, so when mean(ŷ) < mean(y), the spectral DC gradient
-            # pushes predictions DOWN (wrong direction). Masking DC means spectral
-            # is purely about temporal structure (oscillation, seasonality, drift)
-            # with no overlap with the level term.
+            # Zero out DC bin (frequency bin 0) before comparing.
+            # DC captures windowed mean — the pointwise loss already handles
+            # mean calibration with the correct sign. Leaving DC in creates
+            # a conflicting gradient: when ŷ < y in mean, |DC_pred| < |DC_true|,
+            # STFT gradient pushes ŷ DOWN (wrong). Masking makes spectral
+            # purely an AC temporal-structure term with no overlap with
+            # the pointwise loss.
             mag_pred = mag_pred.clone()
-            mag_pred[:, 0, :] = 0.0
             mag_true = mag_true.clone()
+            mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
 
             total = total + self._log_cosh(mag_pred - mag_true).mean()
@@ -445,93 +441,66 @@ class SpotlightLoss(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
-        e = y_pred - y_true
-        abs_y = torch.abs(y_true)
-
-        # ── DC/AC decomposition (per-series) ─────────────────────────
-        # At initialization, ŷ ≈ 0 for all cells. Event cells (y > 0)
-        # produce 100% upward gradient. Peace cells (y = 0) produce zero
-        # gradient. Net batch gradient is entirely upward regardless of
-        # event_weight or dual_mean — a correlated DC offset accumulates
-        # in shared weights within the first 5-10 epochs.
+        # ── Pointwise loss in log1p space ─────────────────────────────
+        # Model receives log1p-transformed targets (LogTransform scaler).
+        # log_cosh(ŷ - y) in log1p space directly optimises MSLE —
+        # no transformation chain needed.
         #
-        # Fix: demean the error per series (project onto J = I - 11ᵀ/T).
-        # J has zero column sums → ∑ᵢ ∂L_shape/∂ŷᵢ = 0 exactly, for any
-        # weighting scheme downstream. DC offset accumulation is
-        # structurally impossible through the shape loss.
-        e_series_mean = e.mean(dim=1, keepdim=True)  # (B, 1) per-series mean error
-        e_shape = e - e_series_mean                   # AC: zero-mean per series
+        # Gradient = tanh(ŷ - y) ∈ (−1, 1), always bounded.
+        #
+        # Upward/downward pressure:
+        #   Event underprediction (ŷ < y): e < 0, tanh(e) < 0 → pushes ŷ up ✓
+        #   Event overprediction  (ŷ > y): e > 0, tanh(e) > 0 → pushes ŷ down ✓
+        #   Peace correct  (ŷ = 0, y = 0): e = 0, tanh(0) = 0 → no pressure ✓
+        #   Peace overfit  (ŷ > 0, y = 0): e > 0, tanh(e) > 0 → pushes ŷ down ✓
+        #
+        # The moment ŷ drifts positive on peace cells, downward correction
+        # activates automatically. No DC/AC decomposition needed — the
+        # log1p space geometry self-corrects by construction.
+        e = y_pred - y_true
+        cell_loss = self._log_cosh(e)
 
-        # ── Stage 1: How much do we care about each cell? ─────────────
-        # Importance weight on ORIGINAL magnitudes (not demeaned).
-        # A 50k-death event still gets 3.8× weight — absolute event size
-        # determines within-class priority. The demeaning only affects
-        # the error direction, not the importance ordering.
-        abs_y_hat = torch.abs(y_pred.detach())
-        cell_importance = torch.max(abs_y, abs_y_hat)
-        w = 1.0 + self._log_cosh(self.alpha * cell_importance)
-
-        # ── Stage 2: Pointwise loss on SHAPE (demeaned error) ─────────
-        # log_cosh(e_shape) is the per-cell base loss. Because e_shape
-        # is zero-mean per series, the weighted gradient sum cannot
-        # accumulate a DC offset — peace months in event series produce
-        # downward gradient that balances the upward push from event
-        # months. This is structurally guaranteed, not tuning-dependent.
-        base_loss = self._log_cosh(e_shape)
-        per_sample = w * base_loss
-
-        # Hard binary split at threshold. "Event" = at least 1 death.
-        # Classification on original y (not demeaned).
+        # ── Flat event boost ──────────────────────────────────────────
+        # Events get (1 + alpha)× weight — flat across all event sizes.
+        # The log1p transform already provides correct magnitude-aware
+        # gradients (a 1-death miss and a 50k-death miss of the same
+        # log-ratio get equal gradient). The flat boost addresses only
+        # class imbalance: 90% peace cells outnumber events 9:1.
+        abs_y = torch.abs(y_true)
         is_event = abs_y > self.non_zero_threshold
-        if self.dual_mean:
-            loss_shape = self._balanced_mean(per_sample, is_event)
-        else:
-            loss_shape = per_sample.mean()
+        w = torch.where(is_event, 1.0 + self.alpha, torch.ones_like(y_true))
+        per_sample = w * cell_loss
 
-        # ── Stage 3: Do the predicted time series look right? ─────────
-        # Spectral loss on ORIGINAL predictions (not demeaned).
-        # DC/AC decomposition already ensures the shape loss can't
-        # accumulate a level offset — spectral is purely for temporal
-        # coherence (oscillation, seasonality, smooth drift).
+        # ── Budget allocation ─────────────────────────────────────────
+        if self.dual_mean:
+            loss_main = self._balanced_mean(per_sample, is_event)
+        else:
+            loss_main = per_sample.mean()
+
+        # ── Spectral — AC bins only ───────────────────────────────────
+        # DC bin is masked; spectral is purely temporal structure.
+        # Flat forecasts cannot be locally optimal when δ > 0: a flat
+        # ŷ = c has zero energy in all AC bins. Any truth with temporal
+        # variation has non-zero |S_true[k]| for k > 0, so gradient is
+        # non-zero and pushes ŷ away from flat toward the frequencies
+        # present in truth. Seasonal patterns (n_fft=12, bin 1 = annual
+        # cycle) must be learned — the loss penalises their absence.
         loss_spectral = y_pred.new_tensor(0.0)
         if self.delta > 0.0 and y_pred.size(1) >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        # ── Stage 4: Level anchor ──────────────────────────────────────
-        # Without RevIN, nothing anchors the per-series mean prediction.
-        # The shape loss (AC) provides level signal early in training via
-        # the initialization transient, but as e_mean → 0 this signal
-        # vanishes. Spectral DC bin is too weak (O(delta/n_bins) ≈ 0.01)
-        # to correct drift during CAWR restarts.
-        #
-        # T-scaling restores gradient parity between level and shape:
-        #   Shape gradient on peace cell:  w × tanh(e_shape) ≈ 0.265 (downward)
-        #   Level gradient per cell (×1):  tanh(offset)/T  ≈ 0.0076 (upward)
-        #   Level gradient per cell (×T):  tanh(offset)    ≈ 0.273  (upward)
-        #
-        # Unscaled (×1) is 35× too weak — peace cells are driven negative
-        # by the shape loss with no effective counter-force. T-scaling gives
-        # near-perfect balance at initialization and doesn't cause
-        # lazy-mean-prediction: event cells have w≈3.8 × tanh≈1 shape
-        # gradient that keeps the model learning beyond the mean.
-        T = y_pred.size(1)
-        loss_level = self._log_cosh(
-            y_pred.mean(dim=1) - y_true.mean(dim=1)
-        ).mean() * T
-
-        total_loss = loss_shape + self.delta * loss_spectral + loss_level
+        total_loss = loss_main + self.delta * loss_spectral
 
         if torch.isnan(total_loss):
             raise RuntimeError(
-                f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
-                f"spectral={loss_spectral.item():.6f} level={loss_level.item():.6f}"
+                f"NaN in SpotlightLoss: main={loss_main.item():.6f} "
+                f"spectral={loss_spectral.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f spec=%.6f level=%.6f total=%.6f",
-            loss_shape.item(),
+            "SpotlightLoss | main=%.6f spec=%.6f total=%.6f",
+            loss_main.item(),
             loss_spectral.item(),
-            loss_level.item(),
             total_loss.item(),
         )
 

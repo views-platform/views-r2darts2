@@ -25,6 +25,12 @@ class SchedulerCatalog:
             "lr_scheduler_T_mult": "T_mult",
             "lr_scheduler_eta_min": "eta_min",
         },
+        "WarmupCAWR": {
+            "lr_scheduler_warmup_epochs": "warmup_epochs",
+            "lr_scheduler_T_0": "T_0",
+            "lr_scheduler_T_mult": "T_mult",
+            "lr_scheduler_eta_min": "eta_min",
+        },
         "StepLR": {
             "lr_scheduler_step_size": "step_size",
             "lr_scheduler_gamma": "gamma",
@@ -43,8 +49,20 @@ class SchedulerCatalog:
         self.config = config
         self.sched_name = self.config["lr_scheduler_cls"]
 
+    # Custom scheduler classes not in torch.optim.lr_scheduler.
+    _CUSTOM_SCHEDULERS = {}
+
+    @classmethod
+    def _load_custom_schedulers(cls):
+        if not cls._CUSTOM_SCHEDULERS:
+            from views_r2darts2.math.warmup_cawr import WarmupCAWR
+            cls._CUSTOM_SCHEDULERS["WarmupCAWR"] = WarmupCAWR
+
     def get_scheduler_cls(self) -> Type:
         """Returns the torch.optim.lr_scheduler class based on the DNA name."""
+        self._load_custom_schedulers()
+        if self.sched_name in self._CUSTOM_SCHEDULERS:
+            return self._CUSTOM_SCHEDULERS[self.sched_name]
         try:
             return getattr(torch.optim.lr_scheduler, self.sched_name)
         except AttributeError:

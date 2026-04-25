@@ -237,6 +237,12 @@ class ReproducibilityGate:
                 "lr_scheduler_T_mult",
                 "lr_scheduler_eta_min",
             ],
+            "WarmupCAWR": [
+                "lr_scheduler_warmup_epochs",
+                "lr_scheduler_T_0",
+                "lr_scheduler_T_mult",
+                "lr_scheduler_eta_min",
+            ],
             "StepLR": ["lr_scheduler_step_size", "lr_scheduler_gamma"],
             "ExponentialLR": ["lr_scheduler_gamma"],
         }

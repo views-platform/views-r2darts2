@@ -328,7 +328,10 @@ class PrismLoss(torch.nn.Module):
         log_std = log_loss.std()
 
         alpha = log_std / (log_std + 1.0)
-        z = (log_loss - log_loss.mean()) / log_std.clamp(min=1e-8)
+        # Clamp at 0.1, not 1e-8: std<0.1 means losses span <1.1×,
+        # too little variation for meaningful z-scores. At 1e-8, z can
+        # reach 1e8 → log1p(1e8) ≈ 18.4 → NaN after normalisation × 0.
+        z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
         w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
         w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
         w_dro = w_dro.view_as(cell_loss)
@@ -340,6 +343,8 @@ class PrismLoss(torch.nn.Module):
         # regardless of batch composition.
         w_total = w_compound * w_dro
         w_total = w_total / w_total.mean()
+        # Safety: any residual NaN from degenerate batches → weight=1
+        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         loss_main = (w_total * cell_loss).mean()
 

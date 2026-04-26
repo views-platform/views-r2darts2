@@ -38,40 +38,61 @@ class PrismLoss(torch.nn.Module):
     Normalised to mean=1. Steers gradient direction toward cells
     that are both hard AND important. Detached — no gradient coupling.
 
-    ── Stage 3: χ²-DRO tail aggregation ────────────────────────────
+    ── Stage 3: KL-DRO tail aggregation (log-space) ─────────────────
 
     Replaces event_weight / balanced_mean. Parameter-free, label-free.
+    Computed on raw cell_loss (before compound weighting) so compound
+    and DRO address orthogonal concerns independently.
 
-    Instead of a plain mean over weighted cell losses, compute the
-    closed-form dual of distributionally robust optimisation over a
-    unit-radius χ²-divergence ball (Duchi & Namkoong 2018):
+    Z-scoring raw cell_loss (χ²-DRO) detects *absolute* outliers —
+    a Syria cell with loss=5 dominates a village cell with loss=0.5.
+    The model optimizes by nailing big events (MSE drops) while
+    neglecting small events (MSLE stays high).
 
-        z = (l − mean(l)) / std(l)     # z-score of each cell loss
-        dro_w = clamp(1 + z, min=0)     # χ²-DRO dual solution
-        dro_w = dro_w / mean(dro_w)     # normalise to mean=1
-        loss = mean(dro_w × l)
+    Fix: z-score log(cell_loss) instead. Equivalent to DRO over a
+    KL-divergence ball rather than χ². KL-DRO detects *proportional*
+    outliers: a village miss at 10× the median loss gets the same
+    boost as a Syria miss at 10× the median::
+
+        log_l = log(l + ε)                   # log-transform losses
+        z = (log_l − mean(log_l)) / std(log_l)  # log-space z-score
+        dro_w = log1p(clamp(1+z, min=0))     # concave compression
+        dro_w = dro_w / mean(dro_w)          # normalise to mean=1
+        α = log_std / (log_std + 1.0)        # soft activation
+        dro_w = α × dro_w + (1 − α)         # blend toward uniform
+        w_total = w_compound × dro_w         # combine independently
+        w_total = w_total / mean(w_total)    # joint normalisation
+        loss = mean(w_total × l)
 
     Properties:
-    - **Tail-focusing**: cells with above-average loss get w > 1;
-      cells with below-average loss get w < 1 or w = 0. In the
-      90/10 peace/event distribution, event cells dominate the tail
-      and receive ~75-85% of gradient budget automatically.
+    - **Proportional tail-focus**: sensitive to *relative* loss
+      outliers, not absolute. A 5-death miss (10× median) and a
+      1000-death miss (10× median) receive similar DRO emphasis.
+      Aligned with MSLE which penalises proportional errors.
     - **No labels needed**: operates purely on the loss distribution.
-      No event_weight, no non_zero_threshold for budget allocation.
-    - **No hyperparameter**: unit-radius χ² ball is the canonical
-      default. The z-score is the natural parameterisation.
+    - **No hyperparameter**: unit-radius KL ball. Log z-score is
+      the natural parameterisation.
     - **Self-correcting**: as the model improves on events, their
       losses shrink and exit the tail. Budget redistributes to
       whatever is currently hardest — natural curriculum.
-    - **Prevents zero-attractor**: a model predicting ≈0 everywhere
-      has high loss on event cells, which dominate the DRO tail.
-      The model can only reduce DRO loss by learning events.
+    - **Prevents zero-attractor**: peace cells have log(~0.001) ≈ −7,
+      event misses have log(~0.5) ≈ −0.7. Clear separation preserved
+      in log space. Model predicting ≈0 everywhere → events dominate
+      the DRO tail → must learn events.
+    - **Concave compression**: log1p maps DRO weight sub-linearly.
+      No hardcoded cap. Gradient clipping handles the rest.
+    - **Smooth activation**: α = log_std/(log_std + 1.0). In log-loss
+      space, std < 1 means losses span < e ≈ 2.7× → too little
+      variation for meaningful DRO. Blends to uniform gracefully.
+    - **Cross-series**: Flatten across (batch × timesteps) is
+      intentional. Per-series DRO would give each series equal weight,
+      restoring the zero-attractor.
     - **Detached**: z-scores computed from detached losses.
 
     Stage 2 (compound weight) and Stage 3 (DRO aggregation) address
     orthogonal problems: compound weight steers *which cells matter
     per-se* (hard + important); DRO steers *how losses are aggregated*
-    (tail-focused, not count-dominated).
+    (proportional-tail-focused, not count-dominated).
 
     ── Stage 4: multi-resolution spectral (temporal coherence) ───────
 
@@ -273,10 +294,6 @@ class PrismLoss(torch.nn.Module):
         # difficulty = 1 − exp(−|e|) : how wrong the model is (curriculum)
         # importance = 1 − exp(−mag) : how consequential the cell is
         # w = 1 + difficulty × importance : both must be present
-        #
-        # Normalised by w.mean() so weights are relative (mean=1).
-        # Total gradient magnitude stays constant across batches;
-        # only direction changes (toward hard + important cells).
         abs_e = torch.abs(e.detach())
         abs_y = torch.abs(y_true)
         abs_y_hat = torch.abs(y_pred.detach())
@@ -284,37 +301,55 @@ class PrismLoss(torch.nn.Module):
 
         difficulty = 1.0 - torch.exp(-abs_e)
         importance = 1.0 - torch.exp(-magnitude)
-        w = 1.0 + difficulty * importance
-        w = w / w.mean()  # relative weights, mean=1
-        cell_loss = w * cell_loss
+        w_compound = 1.0 + difficulty * importance
 
-        # ── χ²-DRO tail aggregation ───────────────────────────────────
-        # Closed-form dual of DRO over a unit-radius χ²-divergence ball
-        # (Duchi & Namkoong 2018). Replaces event_weight / balanced_mean.
+        # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
+        # Z-scoring raw cell_loss (χ²-DRO) detects absolute outliers:
+        # a Syria cell with loss=5 dominates z-scores over a village
+        # cell with loss=0.5. The model optimizes by nailing Syria
+        # (MSE drops) while neglecting hundreds of small events (MSLE
+        # stays high). Symptom: low MSE + high MSLE + good y_hat_bar.
         #
-        # z = (l - mean(l)) / std(l): z-score of each cell loss
-        # dro_w = clamp(1 + z, min=0): χ²-DRO dual solution
-        # dro_w = dro_w / mean(dro_w): normalise to mean=1
+        # Fix: z-score log(cell_loss) instead. This is equivalent to
+        # DRO over a KL-divergence ball (rather than χ²). KL-DRO is
+        # sensitive to *proportional* outliers: a village miss at 10×
+        # the median loss gets the same DRO boost as a Syria miss at
+        # 10× the median. Both are "big relative to baseline."
         #
-        # Cells with above-average loss get dro_w > 1 (more gradient).
-        # Cells with below-average loss get dro_w < 1 or 0 (less/none).
-        # With 90% peace (low loss) and 10% events (high loss), events
-        # dominate the tail and receive ~75-85% of gradient budget.
+        # Effect on the peace/event separation is preserved: peace
+        # cells have log(~0.001) ≈ -7, event misses have log(~0.5) ≈
+        # -0.7. The gap is still clear in log space. Zero-attractor
+        # prevention is maintained.
         #
-        # Prevents zero-attractor: a model predicting ≈0 everywhere has
-        # high loss on events → events dominate DRO tail → model must
-        # learn events to reduce DRO loss.
+        # Flattening across (batch × timesteps) is intentional: DRO
+        # must operate cross-series so event *cells* dominate the tail
+        # regardless of which country they belong to. Per-series DRO
+        # would give each of ~115 peace series equal weight, restoring
+        # the count-dominated zero-attractor.
+        #
+        # Soft activation α = log_std / (log_std + 1) transitions from
+        # uniform (α→0) to full DRO (α→1). ε=1.0 because in log-loss
+        # space, std < 1 means losses span less than a factor of e ≈
+        # 2.7×, too little variation for meaningful DRO differentiation.
         loss_flat = cell_loss.detach().flatten()
-        loss_std = loss_flat.std()
-        if loss_std > 1e-8:
-            z = (loss_flat - loss_flat.mean()) / loss_std
-            dro_w = (1.0 + z).clamp(min=0.0)
-            dro_w = dro_w / dro_w.mean()
-            dro_w = dro_w.view_as(cell_loss)
-            loss_main = (dro_w * cell_loss).mean()
-        else:
-            # All losses identical (degenerate batch) — plain mean
-            loss_main = cell_loss.mean()
+        log_loss = torch.log(loss_flat + 1e-8)
+        log_std = log_loss.std()
+
+        alpha = log_std / (log_std + 1.0)
+        z = (log_loss - log_loss.mean()) / log_std.clamp(min=1e-8)
+        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
+        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
+        w_dro = w_dro.view_as(cell_loss)
+        # Blend toward uniform when log-loss variance is negligible
+        w_dro = alpha * w_dro + (1.0 - alpha)
+
+        # Combine both weight signals and normalise jointly to mean=1.
+        # Single normalisation keeps gradient magnitude invariant
+        # regardless of batch composition.
+        w_total = w_compound * w_dro
+        w_total = w_total / w_total.mean()
+
+        loss_main = (w_total * cell_loss).mean()
 
         # ── Spectral — AC bins only ───────────────────────────────────
         # DC bin is masked; spectral is purely temporal structure.

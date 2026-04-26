@@ -139,59 +139,67 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm Mean-Only Patch (σ ≡ 1) ---
+# --- 3. RINorm log(1+σ) Compression Patch ---
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm to mean-only mode: forward subtracts μ, inverse adds μ.
-    σ is set to 1, eliminating all scale amplification.
+    Patches Darts RINorm to use log(1+σ) compressed standard deviation.
 
     Standard RevIN denormalizes as ŷ = ẑ·σ + μ. When σ is large (high-variance
     entities like Ukraine with σ≈4 in asinh space) and the inverse transform is
     convex (sinh), small normalized-space outputs get exponentially amplified:
 
-        ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
+        Raw σ:    ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
 
-    Mean-only RevIN sets σ ≡ 1 in BOTH directions:
+    log(1+σ) compresses σ sublinearly, bounding amplification while preserving
+    the normalization that makes the learning task tractable:
 
-        forward:  z = x − μ
-        inverse:  ŷ = ẑ + μ
+        σ_raw=0.5  →  σ_compressed=0.41    (peaceful: minimal change)
+        σ_raw=1.0  →  σ_compressed=0.69    (low-conflict: mild compression)
+        σ_raw=4.0  →  σ_compressed=1.61    (Ukraine-level: 2.5× reduction)
+        σ_raw=10   →  σ_compressed=2.40    (extreme: 4.2× reduction)
 
-    No σ multiplication at all. Zero amplification factor:
+    With log(1+σ), Ukraine at inference:
 
-        Ukraine (ẑ=2.5, μ=5): ŷ = 2.5 + 5 = 7.5  →  sinh(7.5) ≈ 905
-        Chad    (ẑ=2.5, μ=0.3): ŷ = 2.5 + 0.3 = 2.8  →  sinh(2.8) ≈ 8.2
+        ŷ = 2.5 × 1.61 + 5 = 9.025  →  sinh(9.025) ≈ 4,143 deaths
 
-    The model retains full per-entity scale information — Ukraine's input
-    has wider swings than Chad's. This is information, not noise. The FC
-    stack (512-wide, 3 layers) has ample capacity to handle scale diversity
-    in asinh space, which is already compressed.
+    Why not σ≡1 (mean-only)? Without ANY σ normalization, the model sees
+    multi-scale z-targets (Ukraine ±4, peaceful ±0.1). This makes learning
+    harder — many HP configurations produce outlier predictions (ẑ=6+)
+    that still explode through sinh. log(1+σ) keeps z-targets normalized
+    (similar σ across entities) so the model learns in a uniform-scale space.
 
-    Compatible with SpotlightLoss DC/AC decomposition: the shape loss
-    demeanes errors (e_shape = e − mean(e)), the level anchor handles
-    the mean. Mean-only RevIN aligns normalization with loss architecture.
+    Properties of log(1+σ):
+    - Monotonic, concave, ≥0 for σ≥0
+    - Preserves ordering (high-variance entities still have higher σ)
+    - Gradient: 1/(1+σ) — dampens large σ, passes small σ unchanged
+    - Inverse is exact: sinh inverse uses σ_compressed automatically
     """
     from darts.models.components.layer_norm_variants import RINorm
 
     if getattr(RINorm.forward, '_compressed', False):
         return  # Already patched
 
-    def _mean_only_forward(self, x: torch.Tensor):
+    def _compressed_forward(self, x: torch.Tensor):
         calc_dims = tuple(range(1, x.ndim - 1))
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-        # σ ≡ 1: no scale normalization, no scale amplification on inverse.
-        self.stdev = torch.ones_like(self.mean)
-        x = x - self.mean
+        raw_stdev = torch.sqrt(
+            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + 1e-5
+        ).detach()
+        # log(1+σ): sublinear compression. Bounds amplification while keeping
+        # z-targets normalized across entities of different variance.
+        self.stdev = torch.log1p(raw_stdev)
+        x = (x - self.mean) / self.stdev
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    _mean_only_forward._compressed = True
-    RINorm.forward = _mean_only_forward
+    _compressed_forward._compressed = True
+    RINorm.forward = _compressed_forward
     logger.info(
-        "🐨 Patched RINorm: mean-only mode (σ≡1). "
-        "Zero scale amplification on denormalization."
+        "🐨 Patched RINorm: log(1+σ) compression. "
+        "Bounds scale amplification while preserving normalized z-space."
     )
 
 

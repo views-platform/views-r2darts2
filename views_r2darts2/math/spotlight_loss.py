@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLoss(torch.nn.Module):
     """
-    SpotlightLoss v35 — simplified for asinh + RevIN.
+    SpotlightLoss v36 — asinh + RevIN compatible, with DRO aggregation.
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -16,7 +16,7 @@ class SpotlightLoss(torch.nn.Module):
 
     ── Design rationale ─────────────────────────────────────────────────
 
-    Three orthogonal components, each addressing a specific failure mode:
+    Four orthogonal components, each addressing a specific failure mode:
 
     1. **DC/AC decomposition** — prevents RevIN DC offset amplification.
        Error is demeaned per series: e_shape = e − mean(e). The shape
@@ -35,70 +35,78 @@ class SpotlightLoss(torch.nn.Module):
        in raw counts. The DC/AC split makes it structurally impossible
        for the shape loss to accumulate any DC bias, period.
 
-    2. **Importance weight** — continuous inverse-density reweighting.
+    2. **Adaptive compound weighting** — parameter-free, replaces alpha.
 
-           w = 1 + log_cosh(α · max(|y|, |ŷ_sg|))
+       Per-cell weight is the product of two bounded signals:
 
-       Equivalent to inverse label-density weighting (Yang et al. 2021,
-       "Delving into Deep Imbalanced Regression") but without requiring
-       explicit density estimation. Since UCDP label density decreases
-       monotonically with magnitude, magnitude-based weighting is
-       isomorphic to inverse-density weighting.
+           difficulty  = 1 − exp(−|e_shape|)            ∈ [0, 1)
+           importance  = 1 − exp(−max(|y|, |ŷ_sg|))    ∈ [0, 1)
+           w_compound  = 1 + difficulty × importance     ∈ [1, 2)
 
-       Symmetric max(|y|, |ŷ_sg|) gives equal corrective pressure to
-       misses and false alarms of equal magnitude. ŷ is detached to
-       prevent second-order gradient amplification. log_cosh saturates
-       linearly, so extreme events (50k deaths → asinh ≈ 11.5) get at
-       most ~3.8× weight (at α=0.3) — cannot hijack shared weights.
+       Both must be present for high weight: a cell must be **both hard
+       AND important**. Detached — no gradient coupling. Normalised to
+       mean=1 jointly with DRO weights.
 
-       This replaces the old dual_mean/event_weight mechanism. dual_mean
-       introduced a hard binary split and two extra hyperparameters, but
-       the importance weight already provides soft continuous reweighting.
-       At α=0.3 with 90% zeros, the effective event gradient budget is
-       ~30% — adequate balance without the overprediction risk of
-       dual_mean at event_weight ≥ 0.25. (Ren et al. 2022, "Balanced
-       MSE": explicit inverse-density reweighting is a complete
-       solution; stacking class-based bucketing on top is redundant.)
+       Replaces the alpha-tuned `w = 1 + log_cosh(α · mag)` from v35.
+       Alpha was a hyperparameter controlling event budget; compound
+       weighting achieves this automatically — cells the model already
+       predicts well get difficulty→0 → w→1 regardless of magnitude.
 
-    3. **Level anchor** — T-scaled log_cosh on per-series mean error.
+    3. **KL-DRO tail aggregation (log-space)** — parameter-free.
+
+       Instead of a plain mean over weighted shape losses, z-score
+       log(cell_loss) and apply concave-compressed DRO weights:
+
+           log_l = log(l + ε)
+           z = (log_l − mean(log_l)) / std(log_l)
+           dro_w = log1p(clamp(1+z, min=0))
+           dro_w = dro_w / mean(dro_w)
+
+       KL-DRO detects *proportional* outliers, not absolute. A
+       5-death miss at 10× the median loss gets the same DRO emphasis
+       as a 1000-death miss at 10× the median. Aligned with the
+       proportional error sensitivity of asinh-space prediction.
+
+       Soft activation α = log_std/(log_std + 1.0) blends toward
+       uniform when log-loss variance is small (early training).
+
+       Compound weight and DRO are combined independently (product,
+       normalised jointly to mean=1) — they address orthogonal concerns:
+       compound steers *which cells matter*, DRO steers *how losses
+       are aggregated* across the 90/10 peace/event split.
+
+    4. **Level anchor** — T-scaled log_cosh on per-series mean error.
 
            L_level = T · mean_over_series[ log_cosh(mean(ŷ) − mean(y)) ]
 
        The ONLY mechanism that can shift per-series means. Necessary
        because the shape loss (DC/AC decomposed) is structurally blind
-       to level. T-scaling compensates for the 1/T chain-rule factor
-       through the mean, making level gradient O(1) per cell — comparable
-       to shape gradient magnitude. Natural curriculum: large mean error
-       early → tanh saturates → level dominates → calibrate means first.
-       Small mean error later → shape gradient takes over → learn detail.
-       Bounded at ±1 per series — no overcorrection from outlier batches.
+       to level. T-scaling compensates for the 1/T chain-rule factor.
+       Natural curriculum: large mean error early → level dominates →
+       calibrate means first. Small mean error later → shape takes over.
+       Not DRO-weighted — operates on a fundamentally different
+       aggregation dimension (per-series means, not per-cell losses).
 
-    4. **Spectral regularization** (optional, gated by δ > 0).
+    5. **Spectral regularization** (optional, gated by δ > 0).
        Multi-resolution STFT magnitude comparison with DC bin masked.
-       Phase-invariant: timing errors (1 month early) ≈ zero penalty.
-       Prevents flat forecasts, hockey sticks, missing seasonality.
-       log_cosh on magnitude differences with bounded gradients.
+       Unchanged from v35. Phase-invariant; log_cosh on magnitude diffs.
 
     ── Base cell loss: log_cosh ─────────────────────────────────────────
 
     log_cosh(x) ≈ 0.5x² for |x| < 1, ≈ |x| − ln2 for |x| > 2.
     Gradient = tanh(x) ∈ (−1, +1). Bounded by construction.
-    Max effective gradient per cell: w · tanh(e_shape) ≤ 3.8 (α=0.3).
 
-    ── Gradient analysis ────────────────────────────────────────────────
+    ── Changes from v35 ─────────────────────────────────────────────────
 
-    Shape gradient per cell i:  w_i · tanh(e_shape_i) − (1/T)·Σⱼ wⱼ · tanh(e_shape_j)
-    Sum over series:            exactly 0 (structural guarantee)
-    Level gradient per cell:    tanh(μ_e) (uniform, only DC control)
-    Total gradient norm:        bounded ≤ α_max + 1 ≈ 4.8 per cell
+    - `alpha` parameter removed. Compound weighting is parameter-free.
+    - KL-DRO aggregation replaces simple weighted mean on shape loss.
+    - Compound weight (difficulty × importance) replaces alpha-scaled
+      log_cosh importance weight.
+    - Level anchor unchanged. Spectral unchanged.
 
     ─────────────────────────────────────────────────────────────────────
 
     Args:
-        alpha: Importance weight steepness. Controls how much gradient
-            goes to rare high-magnitude cells vs common zero cells.
-            0.3 → w ∈ [1.0, 3.8], effective event budget ~30%.
-            Range: [0.15, 0.5]. Sweep this.
         delta: Spectral loss weight. 0.0 = disable.
             0.10–0.15 = spectral is ~15–25% of gradient.
             Range: [0.05, 0.20].
@@ -107,7 +115,7 @@ class SpotlightLoss(torch.nn.Module):
             0.88 ≈ asinh(1) ≈ 1 battle death.
 
     Example:
-        >>> loss_fn = SpotlightLoss(alpha=0.3, delta=0.10, non_zero_threshold=0.88)
+        >>> loss_fn = SpotlightLoss(delta=0.10, non_zero_threshold=0.88)
         >>> y_pred = torch.randn(8, 36)  # asinh-space predictions
         >>> y_true = torch.zeros(8, 36)
         >>> y_true[:, 10:15] = 2.5
@@ -119,18 +127,16 @@ class SpotlightLoss(torch.nn.Module):
 
     def __init__(
         self,
-        alpha: float,
         delta: float,
         non_zero_threshold: float,
+        alpha: float = 0.0,  # deprecated — ignored, kept for backward compat
     ):
-        if alpha <= 0.0:
-            raise ValueError(f"SpotlightLoss: alpha must be positive, got {alpha}")
-        if alpha > 0.7:
-            _w = 1.0 + math.log(math.cosh(min(alpha * 11.5, 88.0)))
+        if alpha != 0.0:
             logger.warning(
-                "SpotlightLoss: alpha=%.4f > 0.7. Max weight at asinh≈11.5 "
-                "= %.1f×. Likely to cause overprediction.",
-                alpha, _w,
+                "SpotlightLoss v36: alpha is deprecated and ignored. "
+                "Compound weighting + KL-DRO replaces alpha-based importance. "
+                "Remove alpha from your config. (received alpha=%.4f)",
+                alpha,
             )
         if delta < 0.0:
             raise ValueError(f"SpotlightLoss: delta must be non-negative, got {delta}")
@@ -140,13 +146,12 @@ class SpotlightLoss(torch.nn.Module):
             )
 
         super().__init__()
-        self.alpha = alpha
         self.delta = delta
         self.non_zero_threshold = non_zero_threshold
 
         logger.info(
-            "SpotlightLoss v35 | alpha=%.4f delta=%.4f threshold=%.4f",
-            alpha, delta, non_zero_threshold,
+            "SpotlightLoss v36 (DRO) | delta=%.4f threshold=%.4f",
+            delta, non_zero_threshold,
         )
 
     # ------------------------------------------------------------------
@@ -225,18 +230,51 @@ class SpotlightLoss(torch.nn.Module):
         e = y_pred - y_true
 
         # ── DC/AC decomposition ───────────────────────────────────────
+        # e_shape sums to zero per series → shape gradient is DC-free.
+        # This is the structural RevIN safety mechanism.
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Importance weight (detached, symmetric) ───────────────────
+        # ── Base cell loss: log_cosh on demeaned error ────────────────
+        cell_loss = self._log_cosh(e_shape)
+
+        # ── Adaptive compound weighting ───────────────────────────────
+        # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
+        # importance = 1 − exp(−mag) : how consequential
+        # w_compound = 1 + difficulty × importance ∈ [1, 2)
+        abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
         abs_y_hat = torch.abs(y_pred.detach())
-        w = 1.0 + self._log_cosh(self.alpha * torch.max(abs_y, abs_y_hat))
+        magnitude = torch.max(abs_y, abs_y_hat)
 
-        # ── Shape loss: weighted log_cosh on demeaned error ───────────
-        loss_shape = (w * self._log_cosh(e_shape)).mean()
+        difficulty = 1.0 - torch.exp(-abs_e)
+        importance = 1.0 - torch.exp(-magnitude)
+        w_compound = 1.0 + difficulty * importance
+
+        # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
+        # Z-score log(cell_loss) for proportional outlier detection.
+        # Operates on raw cell_loss (before compound weighting).
+        # Flattened cross-series: event cells dominate the tail.
+        loss_flat = cell_loss.detach().flatten()
+        log_loss = torch.log(loss_flat + 1e-8)
+        log_std = log_loss.std()
+
+        dro_alpha = log_std / (log_std + 1.0)
+        z = (log_loss - log_loss.mean()) / log_std.clamp(min=1e-8)
+        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
+        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
+        w_dro = w_dro.view_as(cell_loss)
+        w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
+
+        # Combine compound × DRO, normalise jointly to mean=1
+        w_total = w_compound * w_dro
+        w_total = w_total / w_total.mean()
+
+        loss_shape = (w_total * cell_loss).mean()
 
         # ── Level anchor: T-scaled log_cosh on per-series mean error ──
+        # Only mechanism that can shift per-series means. Shape loss is
+        # structurally DC-blind. Not DRO-weighted — different dimension.
         loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
@@ -264,6 +302,6 @@ class SpotlightLoss(torch.nn.Module):
 
     def __repr__(self) -> str:
         return (
-            f"SpotlightLoss(alpha={self.alpha}, delta={self.delta}, "
+            f"SpotlightLoss(delta={self.delta}, "
             f"non_zero_threshold={self.non_zero_threshold})"
         )

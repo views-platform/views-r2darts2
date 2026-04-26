@@ -129,15 +129,7 @@ class PrismLoss(torch.nn.Module):
         self,
         delta: float,
         non_zero_threshold: float,
-        event_weight: float = 0.0,  # deprecated — ignored, kept for backward compat
     ):
-        if event_weight != 0.0:
-            logger.warning(
-                "PrismLoss v36: event_weight is deprecated and ignored. "
-                "χ²-DRO aggregation replaces balanced_mean. "
-                "Remove event_weight from your config. (received event_weight=%.4f)",
-                event_weight,
-            )
         if delta < 0.0:
             raise ValueError(f"PrismLoss: delta must be non-negative, got {delta}")
         if non_zero_threshold <= 0.0:

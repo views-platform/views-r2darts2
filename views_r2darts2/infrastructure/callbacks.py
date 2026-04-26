@@ -20,10 +20,19 @@ class _PatchedTrainingStep:
     Defined at module level (not as a local function) so that ``torch.save``
     can pickle it — pickle requires callables to be importable by module + name,
     which local/nested functions are not.
+
+    Exposes ``__code__`` (delegating to ``__call__.__code__``) so that
+    PyTorch Lightning's ``is_overridden`` check — which does
+    ``instance_attr.__code__ != parent_attr.__code__`` — sees this as a
+    genuinely overridden method rather than raising ``AttributeError``.
     """
 
     def __init__(self, pl_module):
         self.pl_module = pl_module
+
+    @property
+    def __code__(self):
+        return self.__call__.__code__
 
     def __call__(self, train_batch, batch_idx):
         pl_module = self.pl_module

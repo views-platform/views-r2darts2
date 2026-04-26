@@ -202,5 +202,5 @@ def apply_rinorm_compression_patch():
 
 def apply_all_patches():
     apply_torch_load_patch()
-    # apply_rinorm_compression_patch()
+    apply_rinorm_compression_patch()
     # apply_nbeats_patch()

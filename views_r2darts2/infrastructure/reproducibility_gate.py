@@ -281,7 +281,7 @@ class ReproducibilityGate:
                 "eps",
             ],
             "ShrinkageLoss": ["a", "c"],
-            "PrismLoss": ["beta", "non_zero_threshold", "delta", "event_weight"],
+            "PrismLoss": ["non_zero_threshold", "delta", "event_weight"],
             "SpotlightLoss": ["alpha", "delta", "non_zero_threshold"],
             "SpotlightFocalLoss": ["gamma", "delta", "non_zero_threshold"],
             "SentinelLoss": ["alpha", "beta", "kappa", "delta", "gamma"],

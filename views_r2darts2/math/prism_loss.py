@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class PrismLoss(torch.nn.Module):
     """
-    PrismLoss v34 — MSLE with magnitude-aware weighting.
+    PrismLoss v35 — MSLE with adaptive difficulty weighting.
 
     Built for UCDP GED conflict fatality forecasting where ~90% of data
     is zeros (peace) and the remaining 10% spans four orders of magnitude
@@ -30,20 +30,48 @@ class PrismLoss(torch.nn.Module):
     by 5 gets 5× the correction of a cell off by 1.
     MSLE penalises it 25× more (e²). The gradients are aligned.
 
-    ── Stage 2: magnitude-aware importance weighting ─────────────────
+    ── Stage 2: adaptive compound weighting ──────────────────────────
 
-    Continuous per-cell weight based on target/prediction magnitude::
+    Per-cell weight is the product of two bounded, parameter-free
+    signals — difficulty (how wrong) and importance (how consequential)::
 
-        w = 1 + β × max(|y|, |ŷ_sg|)
+        difficulty = 1 − exp(−|e|)                ∈ [0, 1)
+        importance = 1 − exp(−max(|y|, |ŷ_sg|))  ∈ [0, 1)
+        w = 1 + difficulty × importance           ∈ [1, 2)
 
-    - Symmetric: false alarms (y=0, ŷ>τ) weighted equally to misses
-      (y>τ, ŷ≈0) via max(|y|, |ŷ_sg|). Detached pred prevents
-      second-order gradient through the weight.
-    - Smooth, no hard thresholds, single parameter β.
-    - In log1p space: peace cells get w≈1, cells with 1000 deaths
-      get w = 1 + 6.9β ≈ 2.4 at β=0.2.
-    - Stacks multiplicatively with dual_mean: β handles within-class
-      priority, dual_mean handles between-class budget allocation.
+    Both signals must be present for high weight. A cell must be
+    **both hard AND important** to receive full emphasis.
+
+    Properties:
+    - **Curriculum**: cells the model predicts well (|e|→0)
+      get difficulty→0 → w→1 regardless of magnitude. Gradient
+      budget automatically migrates to remaining hard cells.
+    - **Magnitude-aware**: at equal error, high-magnitude cells
+      (importance≈1) get more weight than low-magnitude cells
+      (importance<1). A 50k-death miss at |e|=1 gets w≈1.63;
+      a 10-death miss at |e|=1 gets w≈1.57. Not a large gap,
+      but MSE quadratic (0.5×e²) provides the primary within-
+      event separation — the weight is a steering signal on top.
+    - **Bounded**: w ∈ [1, 2) always. No extrapolation risk.
+    - **No hyperparameter**: both difficulty and importance use
+      1−exp(−x), the maximum-entropy CDF for non-negative input.
+    - **Symmetric**: false alarms (y=0, ŷ=8) get high difficulty
+      AND high importance (via detached |ŷ|). Same weight as
+      misses (y=8, ŷ=0).
+    - **Normalised**: weights are divided by their batch mean
+      before application. This makes weights relative (mean=1),
+      so total gradient magnitude is independent of batch
+      composition. Only the gradient *direction* changes. Fixes
+      effective-LR drift between hard and easy batches.
+    - **Detached**: no gradient flows through the weight.
+
+    Comparison to v34 (β-based):
+        β=0.10, Ukraine |y|=11: w = 1 + 0.10×11 = 2.10 (always, even
+        if the model predicts Ukraine perfectly).
+        v35, Ukraine well-predicted (|e|=0.2): w ≈ 1.18. Poorly
+        predicted (|e|=3): w ≈ 1.95. Budget goes where it's needed.
+        At equal |e|=1: 50k-death cell gets w=1.63 vs 10-death
+        cell gets w=1.57 — magnitude awareness preserved.
 
     ── Stage 3: multi-resolution spectral (temporal coherence) ───────
 
@@ -54,9 +82,6 @@ class PrismLoss(torch.nn.Module):
     ─────────────────────────────────────────────────────────────────────
 
     Args:
-        beta: Magnitude weighting steepness. 0.0 = disabled (v33 behavior).
-            0.1 → max weight ≈ 2.1 at 50k deaths. 0.2 → max ≈ 3.2.
-            Range: 0.05–0.30.
         delta: Spectral loss weight. 0.0 = disable (pointwise only).
             0.10 = spectral is ~15% of gradient. Range: 0.05–0.20.
         event_weight: Class-balanced mean budget fraction for event cells.
@@ -67,7 +92,7 @@ class PrismLoss(torch.nn.Module):
             0.693 = log1p(1), 0.88 = asinh(1), 0.95 = lse(1, κ=10).
 
     Example:
-        >>> loss_fn = PrismLoss(beta=0.1, delta=0.10,
+        >>> loss_fn = PrismLoss(delta=0.10,
         ...                     event_weight=0.0, non_zero_threshold=0.693)
         >>> y_pred = torch.randn(8, 36)
         >>> y_true = torch.zeros(8, 36)
@@ -85,13 +110,10 @@ class PrismLoss(torch.nn.Module):
 
     def __init__(
         self,
-        beta: float,
         delta: float,
         event_weight: float,
         non_zero_threshold: float,
     ):
-        if beta < 0.0:
-            raise ValueError(f"PrismLoss: beta must be non-negative, got {beta}")
         if delta < 0.0:
             raise ValueError(f"PrismLoss: delta must be non-negative, got {delta}")
         if not (0.0 <= event_weight <= 0.5):
@@ -104,14 +126,13 @@ class PrismLoss(torch.nn.Module):
             )
 
         super().__init__()
-        self.beta = beta
         self.delta = delta
         self.event_weight = event_weight
         self.non_zero_threshold = non_zero_threshold
 
         logger.info(
-            "PrismLoss v34 | beta=%.3f delta=%.4f event_weight=%.4f threshold=%.4f",
-            beta, delta, event_weight, non_zero_threshold,
+            "PrismLoss v35 (adaptive) | delta=%.4f event_weight=%.4f threshold=%.4f",
+            delta, event_weight, non_zero_threshold,
         )
 
     # ------------------------------------------------------------------
@@ -285,14 +306,23 @@ class PrismLoss(torch.nn.Module):
         e = y_pred - y_true
         cell_loss = 0.5 * e * e
 
-        # ── Magnitude-aware importance weighting ──────────────────────
-        # w = 1 + β × max(|y|, |ŷ_sg|): symmetric so false alarms
-        # (y=0, ŷ>τ) get same weight as misses (y>τ, ŷ≈0).
-        # ŷ detached to prevent second-order gradient through weight.
+        # ── Adaptive compound weighting ────────────────────────────────
+        # difficulty = 1 − exp(−|e|) : how wrong the model is (curriculum)
+        # importance = 1 − exp(−mag) : how consequential the cell is
+        # w = 1 + difficulty × importance : both must be present
+        #
+        # Normalised by w.mean() so weights are relative (mean=1).
+        # Total gradient magnitude stays constant across batches;
+        # only direction changes (toward hard + important cells).
+        abs_e = torch.abs(e.detach())
         abs_y = torch.abs(y_true)
         abs_y_hat = torch.abs(y_pred.detach())
         magnitude = torch.max(abs_y, abs_y_hat)
-        w = 1.0 + self.beta * magnitude
+
+        difficulty = 1.0 - torch.exp(-abs_e)
+        importance = 1.0 - torch.exp(-magnitude)
+        w = 1.0 + difficulty * importance
+        w = w / w.mean()  # relative weights, mean=1
         cell_loss = w * cell_loss
 
         # ── Budget allocation ─────────────────────────────────────────
@@ -333,6 +363,6 @@ class PrismLoss(torch.nn.Module):
 
     def __repr__(self) -> str:
         return (
-            f"PrismLoss(beta={self.beta}, delta={self.delta}, "
+            f"PrismLoss(delta={self.delta}, "
             f"event_weight={self.event_weight}, non_zero_threshold={self.non_zero_threshold})"
         )

@@ -8,81 +8,67 @@ logger = logging.getLogger(__name__)
 
 class PrismLoss(torch.nn.Module):
     """
-    PrismLoss v33.
+    PrismLoss v34 — MSLE with magnitude-aware weighting.
 
     Built for UCDP GED conflict fatality forecasting where ~90% of data
     is zeros (peace) and the remaining 10% spans four orders of magnitude
     in raw deaths.
 
-    Two stages:
+    Three stages:
 
-    ── Stage 1: MSE in log1p space (= MSLE) + class-balanced mean ────
+    ── Stage 1: MSE in transformed space (= MSLE) ────────────────────
 
-    The model operates in log1p space (LogTransform target scaler).
+    The model operates in transformed space (log1p / asinh / LSE scaler).
     The base cell loss is plain MSE::
 
         L_cell = 0.5 × (ŷ − y)²
 
     In log1p space this is literally MSLE — direct optimisation of the
-    target metric, no proxy. Previous versions used log_cosh(e) which
-    approximates MSE near zero but caps gradient at tanh(e) → ±1 for
-    |e| > 2. This created a 10–16× gradient deficit on the hardest
-    cells (the ones MSLE penalises most), plateauing MSLE at ~0.5.
+    target metric, no proxy.
 
     MSE gradient = (ŷ − y), proportional to error. A cell that's off
-    by 5 in log1p space gets 5× the correction of a cell off by 1.
+    by 5 gets 5× the correction of a cell off by 1.
     MSLE penalises it 25× more (e²). The gradients are aligned.
 
-    Class balance comes from dual_mean: event and peace cells are
-    averaged separately, then combined with event_weight ratio. This
-    controls what fraction of gradient budget goes to events vs peace.
-    No per-cell alpha boost needed — MSE's quadratic scaling naturally
-    upweights large errors (which are events).
+    ── Stage 2: magnitude-aware importance weighting ─────────────────
 
-    In log1p space, values range from 0 (peace) to ~11 (50k deaths).
-    Max MSE gradient ≈ 11. Safe with gradient_clip_val=10.
+    Continuous per-cell weight based on target/prediction magnitude::
 
-    ── Stage 2: multi-resolution spectral (temporal coherence) ───────
+        w = 1 + β × max(|y|, |ŷ_sg|)
 
-    Problem: 36 output steps produced simultaneously from shared MLP
-    weights. No autoregressive coupling. Model has zero incentive to make
-    adjacent months look coherent. Result: hockey sticks, wild oscillation,
-    completely flat forecasts sometimes when there is clear seasonality.
+    - Symmetric: false alarms (y=0, ŷ>τ) weighted equally to misses
+      (y>τ, ŷ≈0) via max(|y|, |ŷ_sg|). Detached pred prevents
+      second-order gradient through the weight.
+    - Smooth, no hard thresholds, single parameter β.
+    - In log1p space: peace cells get w≈1, cells with 1000 deaths
+      get w = 1 + 6.9β ≈ 2.4 at β=0.2.
+    - Stacks multiplicatively with dual_mean: β handles within-class
+      priority, dual_mean handles between-class budget allocation.
 
-    Solution: compare STFT magnitude spectra at 3 resolutions::
+    ── Stage 3: multi-resolution spectral (temporal coherence) ───────
 
-        L_spec = (1/K) Σ_k mean[ log_cosh(|S_k(ŷ)| − |S_k(y)|) ]
-
-    Three resolutions capture different temporal scales:
-        n_fft=6,  hop=3  → spike/cessation sharpness    (4 bins × 11 frames)
-        n_fft=12, hop=6  → 12-month annual cycle         (7 bins × 5 frames)
-        n_fft=24, hop=12 → multi-year trend + fine detail (13 bins × 2 frames)
-
-    Phase-insensitive (magnitude only): predicting something 1 month
-    early → ~zero spectral penalty. DC bin masked — pointwise handles
-    level, spectral handles AC temporal structure only.
-
-    log_cosh is used for spectral (not MSE) because bounded gradients
-    prevent any single frequency bin from dominating the regulariser.
+    Unchanged from v33. Compares STFT magnitude spectra at 3
+    resolutions via log_cosh. DC bin masked — pointwise handles level,
+    spectral handles AC temporal structure only.
 
     ─────────────────────────────────────────────────────────────────────
 
     Args:
+        beta: Magnitude weighting steepness. 0.0 = disabled (v33 behavior).
+            0.1 → max weight ≈ 2.1 at 50k deaths. 0.2 → max ≈ 3.2.
+            Range: 0.05–0.30.
         delta: Spectral loss weight. 0.0 = disable (pointwise only).
             0.10 = spectral is ~15% of gradient. Range: 0.05–0.20.
-            Above 0.20: spectral dominates, pointwise accuracy suffers.
-        dual_mean: Whether to use the event/peace balanced mean.
-            True = split into event/peace buckets, combine with event_weight
-            ratio. False = plain per-cell mean (event_weight ignored).
-        event_weight: Fraction of gradient budget allocated to event cells
-            in the balanced mean. Only used when dual_mean=True.
-            0.50 = 50/50 split (5× per-cell boost over natural prevalence).
-            0.25 = moderate boost (2.85× per-cell). Range: 0.10–0.50.
-        non_zero_threshold: log1p-space cutoff for event vs peace.
-            0.693 = log1p(1) = "at least 1 battle death."
+        event_weight: Class-balanced mean budget fraction for event cells.
+            0.0 = plain per-cell mean (MSLE exactly, no class imbalance correction).
+            0.5 = 50/50 split (5× per-cell boost over natural 10% prevalence).
+            Range: 0.0–0.5.
+        non_zero_threshold: Transformed-space cutoff for event vs peace.
+            0.693 = log1p(1), 0.88 = asinh(1), 0.95 = lse(1, κ=10).
 
     Example:
-        >>> loss_fn = PrismLoss(delta=0.10, dual_mean=True, event_weight=0.25, non_zero_threshold=0.693)
+        >>> loss_fn = PrismLoss(beta=0.1, delta=0.10,
+        ...                     event_weight=0.0, non_zero_threshold=0.693)
         >>> y_pred = torch.randn(8, 36)
         >>> y_true = torch.zeros(8, 36)
         >>> y_true[:, 10:15] = 2.5
@@ -99,16 +85,18 @@ class PrismLoss(torch.nn.Module):
 
     def __init__(
         self,
+        beta: float,
         delta: float,
-        dual_mean: bool,
         event_weight: float,
         non_zero_threshold: float,
     ):
+        if beta < 0.0:
+            raise ValueError(f"PrismLoss: beta must be non-negative, got {beta}")
         if delta < 0.0:
             raise ValueError(f"PrismLoss: delta must be non-negative, got {delta}")
-        if dual_mean and not (0.0 < event_weight <= 0.5):
+        if not (0.0 <= event_weight <= 0.5):
             raise ValueError(
-                f"PrismLoss: event_weight must be in (0, 0.5], got {event_weight}"
+                f"PrismLoss: event_weight must be in [0, 0.5], got {event_weight}"
             )
         if non_zero_threshold <= 0.0:
             raise ValueError(
@@ -116,20 +104,14 @@ class PrismLoss(torch.nn.Module):
             )
 
         super().__init__()
+        self.beta = beta
         self.delta = delta
-        self.dual_mean = dual_mean
         self.event_weight = event_weight
         self.non_zero_threshold = non_zero_threshold
 
-        # NO register_buffer for Hann windows. Buffers enter state_dict,
-        # which causes checkpoint incompatibility when loss class changes
-        # (PL load_from_checkpoint strict=True → RuntimeError on unexpected
-        # or missing keys). Windows are created inline in _spectral_loss
-        # with device=pred.device instead. Cost: ~3µs per forward. Fine.
-
         logger.info(
-            "PrismLoss v33 (MSE-native) | delta=%.4f dual_mean=%s event_weight=%.4f threshold=%.4f",
-            delta, dual_mean, event_weight, non_zero_threshold,
+            "PrismLoss v34 | beta=%.3f delta=%.4f event_weight=%.4f threshold=%.4f",
+            beta, delta, event_weight, non_zero_threshold,
         )
 
     # ------------------------------------------------------------------
@@ -299,40 +281,23 @@ class PrismLoss(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
-        # ── Pointwise MSE in log1p space = MSLE ──────────────────────
-        # Model receives log1p-transformed targets (LogTransform scaler).
-        # 0.5 × (ŷ - y)² in log1p space IS MSLE — direct optimisation
-        # of the target metric, no proxy needed.
-        #
-        # Previous versions used log_cosh(e) which approximates MSE
-        # near zero but caps gradient at tanh(e) → ±1 for |e| > 2.
-        # This created a 10–16× gradient deficit on the hardest cells
-        # (the ones MSLE penalises most), causing MSLE to plateau.
-        #
-        # MSE gradient = (ŷ - y), proportional to error magnitude.
-        # In log1p space, max |e| ≈ 11 (log1p(50000)), so max gradient
-        # ≈ 11. Safe with gradient_clip_val=10.
+        # ── Pointwise MSE in transformed space ───────────────────────
         e = y_pred - y_true
         cell_loss = 0.5 * e * e
 
-        # ── Budget allocation ─────────────────────────────────────────
-        # is_active uses max(|y|, |ŷ_sg|) > τ so false alarms (y=0, ŷ>τ)
-        # share the priority bucket with misses (y>τ, ŷ≈0). Without the
-        # pred-side check, false alarms fall in the peace bucket and get
-        # ~3× less per-cell gradient budget than misses of equal magnitude
-        # (at event_weight=0.25, n_peace/n_event=9).
-        #
-        # Each cell's gradient direction is still correct regardless of bucket
-        # (miss → negative e → pushes ŷ up; false alarm → positive e → pushes
-        # ŷ down). Bucket membership only controls the scale factor 1/n_bucket.
-        # Both misses and false alarms are high-priority cells — they share the
-        # event_weight budget, ensuring equal per-cell correction scale.
-        #
-        # Detach pred: classification must not create a gradient path through w.
+        # ── Magnitude-aware importance weighting ──────────────────────
+        # w = 1 + β × max(|y|, |ŷ_sg|): symmetric so false alarms
+        # (y=0, ŷ>τ) get same weight as misses (y>τ, ŷ≈0).
+        # ŷ detached to prevent second-order gradient through weight.
         abs_y = torch.abs(y_true)
         abs_y_hat = torch.abs(y_pred.detach())
+        magnitude = torch.max(abs_y, abs_y_hat)
+        w = 1.0 + self.beta * magnitude
+        cell_loss = w * cell_loss
+
+        # ── Budget allocation ─────────────────────────────────────────
         is_active = (abs_y > self.non_zero_threshold) | (abs_y_hat > self.non_zero_threshold)
-        if self.dual_mean:
+        if self.event_weight > 0.0:
             loss_main = self._balanced_mean(cell_loss, is_active)
         else:
             loss_main = cell_loss.mean()
@@ -368,6 +333,6 @@ class PrismLoss(torch.nn.Module):
 
     def __repr__(self) -> str:
         return (
-            f"PrismLoss(delta={self.delta}, dual_mean={self.dual_mean}, "
+            f"PrismLoss(beta={self.beta}, delta={self.delta}, "
             f"event_weight={self.event_weight}, non_zero_threshold={self.non_zero_threshold})"
         )

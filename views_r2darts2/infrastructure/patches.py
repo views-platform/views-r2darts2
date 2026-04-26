@@ -139,11 +139,12 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm Compression Patch (σ → log(1+σ)) ---
+# --- 3. RINorm Mean-Only Patch (σ ≡ 1) ---
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm to use compressed σ = log(1+σ) instead of raw σ.
+    Patches Darts RINorm to mean-only mode: forward subtracts μ, inverse adds μ.
+    σ is set to 1, eliminating all scale amplification.
 
     Standard RevIN denormalizes as ŷ = ẑ·σ + μ. When σ is large (high-variance
     entities like Ukraine with σ≈4 in asinh space) and the inverse transform is
@@ -151,50 +152,46 @@ def apply_rinorm_compression_patch():
 
         ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
 
-    Compressed RevIN replaces σ with g(σ) = log(1+σ) in BOTH directions:
+    Mean-only RevIN sets σ ≡ 1 in BOTH directions:
 
-        forward:  z = (x − μ) / log(1+σ)
-        inverse:  ŷ = ẑ · log(1+σ) + μ
+        forward:  z = x − μ
+        inverse:  ŷ = ẑ + μ
 
-    This pair is still a perfect inverse (identity passes through). The
-    compression is:
+    No σ multiplication at all. Zero amplification factor:
 
-        σ=0.5 → g=0.41 (18% compression — most countries nearly unchanged)
-        σ=1.0 → g=0.69 (31% compression)
-        σ=2.0 → g=1.10 (45% compression)
-        σ=4.0 → g=1.61 (60% compression — Ukraine)
+        Ukraine (ẑ=2.5, μ=5): ŷ = 2.5 + 5 = 7.5  →  sinh(7.5) ≈ 905
+        Chad    (ẑ=2.5, μ=0.3): ŷ = 2.5 + 0.3 = 2.8  →  sinh(2.8) ≈ 8.2
 
-    With compression, Ukraine ẑ=2.5 → ŷ = 2.5×1.6+5 = 9.0 → sinh(9) ≈ 4,052.
-    The model also retains partial scale information: high-σ series have wider
-    normalized distributions, giving the FC stack an implicit signal about
-    magnitude that standard RevIN erases completely.
+    The model retains full per-entity scale information — Ukraine's input
+    has wider swings than Chad's. This is information, not noise. The FC
+    stack (512-wide, 3 layers) has ample capacity to handle scale diversity
+    in asinh space, which is already compressed.
+
+    Compatible with SpotlightLoss DC/AC decomposition: the shape loss
+    demeanes errors (e_shape = e − mean(e)), the level anchor handles
+    the mean. Mean-only RevIN aligns normalization with loss architecture.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
     if getattr(RINorm.forward, '_compressed', False):
         return  # Already patched
 
-    def _compressed_forward(self, x: torch.Tensor):
+    def _mean_only_forward(self, x: torch.Tensor):
         calc_dims = tuple(range(1, x.ndim - 1))
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-        raw_stdev = torch.sqrt(
-            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
-        ).detach()
-        # g(σ) = log(1+σ): concave compression. Inverse uses same compressed
-        # stdev (stored as self.stdev), so forward/inverse are exact inverses.
-        self.stdev = torch.log1p(raw_stdev)
+        # σ ≡ 1: no scale normalization, no scale amplification on inverse.
+        self.stdev = torch.ones_like(self.mean)
         x = x - self.mean
-        x = x / self.stdev
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    _compressed_forward._compressed = True
-    RINorm.forward = _compressed_forward
+    _mean_only_forward._compressed = True
+    RINorm.forward = _mean_only_forward
     logger.info(
-        "Patched RINorm: σ → log(1+σ) compression. "
-        "High-variance entities (σ>2) get 45-60%% denormalization compression."
+        "🐨 Patched RINorm: mean-only mode (σ≡1). "
+        "Zero scale amplification on denormalization."
     )
 
 

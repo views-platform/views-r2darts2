@@ -705,20 +705,42 @@ class YHatBarCallback(Callback):
 
     How it works:
         ``on_train_batch_end`` accumulates (prediction, truth) pairs in (B, T, C)
-        form. ``on_train_epoch_end`` applies the ``sinh`` inverse transform, then
+        form. ``on_train_epoch_end`` applies the appropriate inverse transform, then
         computes calibration statistics overall and per output channel.
+
+        When truth is available, also computes event/peace series split diagnostics
+        to detect Jensen's inequality bias amplification through sinh (or expm1)
+        on high-variance event series.
 
     Parameters
     ----------
+    target_scaler : str or None, default None
+        Name of the target scaler used by the model. Determines the inverse
+        transform applied to convert predictions back to raw space:
+        - ``"AsinhTransform"`` → ``torch.sinh``
+        - ``"LogTransform"`` or ``None`` → ``torch.expm1``
+    non_zero_threshold : float, default 0.88
+        Threshold in transformed space for classifying a series as "event"
+        vs "peace". Default 0.88 ≈ asinh(1). Use 0.693 for log1p space.
     log_every_n_epochs : int, default 1
         How often to compute and log calibration statistics.
     """
 
-    def __init__(self, log_every_n_epochs: int = 1):
+    def __init__(
+        self,
+        target_scaler: str | None = None,
+        non_zero_threshold: float = 0.88,
+        log_every_n_epochs: int = 1,
+    ):
         super().__init__()
         self.log_every_n_epochs = log_every_n_epochs
+        self.non_zero_threshold = non_zero_threshold
         self._preds: list[torch.Tensor] = []
         self._truths: list[torch.Tensor] = []
+        if target_scaler == "AsinhTransform":
+            self._inverse_fn = torch.sinh
+        else:
+            self._inverse_fn = torch.expm1
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         # Grab predictions from outputs dict or pl_module fallback
@@ -768,10 +790,9 @@ class YHatBarCallback(Callback):
         has_truth = len(self._truths) == len(self._preds)
         all_truths = torch.cat(self._truths, dim=0).cpu() if has_truth else None
 
-        # Convert from log1p space to raw space — keep (N, T, C)
-        # Models use LogTransform (log1p/expm1), not asinh/sinh.
-        raw_preds = torch.expm1(all_preds)
-        raw_truths = torch.expm1(all_truths) if all_truths is not None else None
+        # Convert from transformed space to raw space — keep (N, T, C)
+        raw_preds = self._inverse_fn(all_preds)
+        raw_truths = self._inverse_fn(all_truths) if all_truths is not None else None
 
         # ── Overall stats ──────────────────────────────────────────────
         y_hat_bar_mean = raw_preds.mean().item()
@@ -813,6 +834,49 @@ class YHatBarCallback(Callback):
 
         if n_channels > 1:
             log_parts.append("[" + " ".join(ch_parts) + "]")
+
+        # ── Event/peace split (Jensen's inequality diagnostic) ─────────
+        # Detect systematic raw-space bias on event series, which would
+        # indicate sinh (or expm1) convexity amplifying residual level
+        # error through RevIN denormalization.
+        if raw_truths is not None:
+            # A series is "event" if any timestep in truth exceeds threshold
+            # all_truths shape: (N, T, C) in transformed space
+            is_event_series = (
+                torch.abs(all_truths) > self.non_zero_threshold
+            ).any(dim=1).any(dim=1)  # (N,) bool
+
+            n_event = is_event_series.sum().item()
+            n_peace = (~is_event_series).sum().item()
+
+            if n_event > 0:
+                event_raw_pred_mean = raw_preds[is_event_series].mean().item()
+                event_raw_truth_mean = raw_truths[is_event_series].mean().item()
+                event_bias = event_raw_pred_mean - event_raw_truth_mean
+                event_ratio = (
+                    event_raw_pred_mean / event_raw_truth_mean
+                    if event_raw_truth_mean > 1e-6
+                    else float("nan")
+                )
+                # Per-series σ in transformed space (proxy for RevIN σ)
+                event_sigma = all_truths[is_event_series].std(dim=1).mean().item()
+
+                metrics["y_hat_bar/event_mean"] = event_raw_pred_mean
+                metrics["y_hat_bar/event_truth"] = event_raw_truth_mean
+                metrics["y_hat_bar/event_bias"] = event_bias
+                metrics["y_hat_bar/event_ratio"] = event_ratio
+                metrics["y_hat_bar/event_sigma"] = event_sigma
+                metrics["y_hat_bar/n_event_series"] = n_event
+
+                log_parts.append(
+                    f"event({n_event}): bias={event_bias:+.2f} "
+                    f"ratio={event_ratio:.2f}x σ={event_sigma:.2f}"
+                )
+
+            if n_peace > 0:
+                peace_raw_pred_mean = raw_preds[~is_event_series].mean().item()
+                metrics["y_hat_bar/peace_mean"] = peace_raw_pred_mean
+                metrics["y_hat_bar/n_peace_series"] = n_peace
 
         if trainer.logger is not None:
             trainer.logger.log_metrics(metrics, step=trainer.global_step)

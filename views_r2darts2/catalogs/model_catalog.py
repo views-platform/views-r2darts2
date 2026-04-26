@@ -95,7 +95,10 @@ class ModelCatalog:
             PredictionSanityCallback(),
             LossStabilityCallback(),
             EpochTimingCallback(),
-            YHatBarCallback(),
+            YHatBarCallback(
+                target_scaler=self.config.get("target_scaler"),
+                non_zero_threshold=self.config.get("non_zero_threshold", 0.88),
+            ),
         ]
         if extra_callbacks:
             callbacks.extend(extra_callbacks)

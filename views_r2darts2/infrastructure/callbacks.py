@@ -13,6 +13,47 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+class _PatchedTrainingStep:
+    """
+    Top-level callable that replaces ``pl_module.training_step``.
+
+    Defined at module level (not as a local function) so that ``torch.save``
+    can pickle it — pickle requires callables to be importable by module + name,
+    which local/nested functions are not.
+    """
+
+    def __init__(self, pl_module):
+        self.pl_module = pl_module
+
+    def __call__(self, train_batch, batch_idx):
+        pl_module = self.pl_module
+        # Darts convention: batch[-1] = future target, batch[-2] = sample weights
+        output = pl_module._produce_train_output(train_batch[:-2])
+        sample_weight = train_batch[-2]
+        target = train_batch[-1]
+        loss = pl_module._compute_loss(
+            output, target, pl_module.train_criterion, sample_weight
+        )
+        pl_module.log(
+            "train_loss",
+            loss,
+            batch_size=train_batch[0].shape[0],
+            prog_bar=True,
+            sync_dist=True,
+        )
+        pl_module._update_metrics(output, target, pl_module.train_metrics)
+
+        # ── Store predictions & truth for downstream callbacks ────
+        # Squeeze likelihood dimension: (B, T, C, n_params) → (B, T, C)
+        preds = output.detach()
+        if preds.dim() == 4:
+            preds = preds[..., 0]  # point forecast (first likelihood param)
+        pl_module.last_predictions = preds
+        pl_module.last_targets = target.detach()
+
+        return loss
+
+
 class TrainingStepPatchCallback(Callback):
     """
     Patches Darts' training_step to expose predictions to downstream callbacks.
@@ -37,37 +78,8 @@ class TrainingStepPatchCallback(Callback):
         if hasattr(pl_module, "_original_training_step"):
             return  # Already patched
 
-        original = pl_module.training_step
-
-        def patched_training_step(train_batch, batch_idx):
-            # Darts convention: batch[-1] = future target, batch[-2] = sample weights
-            output = pl_module._produce_train_output(train_batch[:-2])
-            sample_weight = train_batch[-2]
-            target = train_batch[-1]
-            loss = pl_module._compute_loss(
-                output, target, pl_module.train_criterion, sample_weight
-            )
-            pl_module.log(
-                "train_loss",
-                loss,
-                batch_size=train_batch[0].shape[0],
-                prog_bar=True,
-                sync_dist=True,
-            )
-            pl_module._update_metrics(output, target, pl_module.train_metrics)
-
-            # ── Store predictions & truth for downstream callbacks ────
-            # Squeeze likelihood dimension: (B, T, C, n_params) → (B, T, C)
-            preds = output.detach()
-            if preds.dim() == 4:
-                preds = preds[..., 0]  # point forecast (first likelihood param)
-            pl_module.last_predictions = preds
-            pl_module.last_targets = target.detach()
-
-            return loss
-
-        pl_module._original_training_step = original
-        pl_module.training_step = patched_training_step
+        pl_module._original_training_step = pl_module.training_step
+        pl_module.training_step = _PatchedTrainingStep(pl_module)
         logger.info("TrainingStepPatchCallback: patched training_step to expose predictions")
 
 

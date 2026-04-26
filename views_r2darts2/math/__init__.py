@@ -7,6 +7,8 @@ from .tweedie_loss import TweedieLoss
 from .asymmetric_quantile_loss import AsymmetricQuantileLoss
 from .zero_inflated_loss import ZeroInflatedLoss
 from .prism_loss import PrismLoss
+from .spotlight_loss import SpotlightLoss
+from .spotlight_focal_loss import SpotlightFocalLoss
 from .sentinel_loss import SentinelLoss
 
 __all__ = [
@@ -19,5 +21,7 @@ __all__ = [
     "AsymmetricQuantileLoss",
     "ZeroInflatedLoss",
     "PrismLoss",
+    "SpotlightLoss",
+    "SpotlightFocalLoss",
     "SentinelLoss",
 ]

@@ -110,13 +110,15 @@ class SpotlightLoss(torch.nn.Module):
         delta: Spectral loss weight. 0.0 = disable.
             0.10–0.15 = spectral is ~15–25% of gradient.
             Range: [0.05, 0.20].
-        non_zero_threshold: asinh-space cutoff for spectral signal
+        non_zero_threshold: Transformed-space cutoff for spectral signal
             filtering (which series get spectral comparison).
-            0.88 ≈ asinh(1) ≈ 1 battle death.
+            Value depends on target scaler:
+            - AsinhTransform: 0.88 ≈ asinh(1)
+            - FourthRootTransform: 0.19 ≈ (1+1)^0.25 − 1
 
     Example:
-        >>> loss_fn = SpotlightLoss(delta=0.10, non_zero_threshold=0.88)
-        >>> y_pred = torch.randn(8, 36)  # asinh-space predictions
+        >>> loss_fn = SpotlightLoss(delta=0.10, non_zero_threshold=0.19)
+        >>> y_pred = torch.randn(8, 36)  # transformed-space predictions
         >>> y_true = torch.zeros(8, 36)
         >>> y_true[:, 10:15] = 2.5
         >>> loss = loss_fn(y_pred, y_true)

@@ -138,8 +138,69 @@ def apply_nbeats_patch():
     except Exception as e:
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
+
+# --- 3. RINorm Compression Patch (σ → log(1+σ)) ---
+
+def apply_rinorm_compression_patch():
+    """
+    Patches Darts RINorm to use compressed σ = log(1+σ) instead of raw σ.
+
+    Standard RevIN denormalizes as ŷ = ẑ·σ + μ. When σ is large (high-variance
+    entities like Ukraine with σ≈4 in asinh space) and the inverse transform is
+    convex (sinh), small normalized-space outputs get exponentially amplified:
+
+        ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
+
+    Compressed RevIN replaces σ with g(σ) = log(1+σ) in BOTH directions:
+
+        forward:  z = (x − μ) / log(1+σ)
+        inverse:  ŷ = ẑ · log(1+σ) + μ
+
+    This pair is still a perfect inverse (identity passes through). The
+    compression is:
+
+        σ=0.5 → g=0.41 (18% compression — most countries nearly unchanged)
+        σ=1.0 → g=0.69 (31% compression)
+        σ=2.0 → g=1.10 (45% compression)
+        σ=4.0 → g=1.61 (60% compression — Ukraine)
+
+    With compression, Ukraine ẑ=2.5 → ŷ = 2.5×1.6+5 = 9.0 → sinh(9) ≈ 4,052.
+    The model also retains partial scale information: high-σ series have wider
+    normalized distributions, giving the FC stack an implicit signal about
+    magnitude that standard RevIN erases completely.
+    """
+    from darts.models.components.layer_norm_variants import RINorm
+
+    if getattr(RINorm.forward, '_compressed', False):
+        return  # Already patched
+
+    def _compressed_forward(self, x: torch.Tensor):
+        calc_dims = tuple(range(1, x.ndim - 1))
+        self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
+        raw_stdev = torch.sqrt(
+            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
+        ).detach()
+        # g(σ) = log(1+σ): concave compression. Inverse uses same compressed
+        # stdev (stored as self.stdev), so forward/inverse are exact inverses.
+        self.stdev = torch.log1p(raw_stdev)
+        x = x - self.mean
+        x = x / self.stdev
+        if self.affine:
+            x = x * self.affine_weight
+            x = x + self.affine_bias
+        return x
+
+    _compressed_forward._compressed = True
+    RINorm.forward = _compressed_forward
+    logger.info(
+        "Patched RINorm: σ → log(1+σ) compression. "
+        "High-variance entities (σ>2) get 45-60%% denormalization compression."
+    )
+
+
 # --- Initialize All Patches ---
 
 def apply_all_patches():
     apply_torch_load_patch()
+    # apply_rinorm_compression_patch()
     # apply_nbeats_patch()

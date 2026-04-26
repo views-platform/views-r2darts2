@@ -44,6 +44,29 @@ def _inverse_asinh_transform(x):
     return np.sinh(x)
 
 
+def _fourthroot_transform(x):
+    """Fourth-root power transform: (1+x)^0.25 - 1.
+
+    Same compression range as asinh (~[0,10] for [0,10000]) but with a
+    polynomial (quartic) inverse instead of exponential (sinh).
+
+    Comparison at model overshoot of 15 in transformed space:
+        sinh(15)              = 1,634,508  (exponential)
+        (1+15)^4 - 1         = 65,535     (polynomial)
+
+    25x less explosive. For in-range values the behavior is similar:
+        asinh(100)  = 5.3     fourthroot(100) = 2.16
+        asinh(1000) = 7.6     fourthroot(1000) = 4.62
+        asinh(5000) = 9.2     fourthroot(5000) = 7.41
+    """
+    return np.power(1.0 + np.maximum(x, 0.0), 0.25) - 1.0
+
+
+def _inverse_fourthroot_transform(x):
+    """Inverse fourth-root: (1+x)^4 - 1. Polynomial, not exponential."""
+    return np.power(1.0 + np.maximum(x, 0.0), 4.0) - 1.0
+
+
 class ScalerSelector:
     """
     Factory for selecting and instantiating data scalers.
@@ -75,6 +98,12 @@ class ScalerSelector:
                 FunctionTransformer,
                 func=_asinh_transform,
                 inverse_func=_inverse_asinh_transform,
+                validate=True,
+            ),
+            "FourthRootTransform": partial(
+                FunctionTransformer,
+                func=_fourthroot_transform,
+                inverse_func=_inverse_fourthroot_transform,
                 validate=True,
             ),
             "QuantileUniform": partial(

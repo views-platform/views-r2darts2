@@ -119,8 +119,14 @@ class DartsForecaster:
         self.target_scaler = self._instantiate_scaler(self._target_scaler_cfg)
 
         # Initialize feature scaler(s)
-        # feature_scaler_map takes precedence over feature_scaler
-        if self._feature_scaler_map_cfg:
+        if not self.dataset.features:
+            if self._feature_scaler_cfg or self._feature_scaler_map_cfg:
+                logger.info(
+                    "Dataset has no feature columns — disabling feature_scaler. "
+                    "This is expected for univariate models using datafactory."
+                )
+            self.feature_scaler = None
+        elif self._feature_scaler_map_cfg:
             self.feature_scaler = FeatureScalerManager(
                 feature_scaler_map=self._feature_scaler_map_cfg,
                 default_scaler=self._feature_scaler_cfg,  # fallback for unmapped features
@@ -132,14 +138,6 @@ class DartsForecaster:
             logger.info(f"Using feature scaler: {self._feature_scaler_cfg}")
 
         logger.info(f"Using target scaler: {self._target_scaler_cfg}")
-
-        if not self.dataset.features:
-            if self._feature_scaler_cfg or self._feature_scaler_map_cfg:
-                logger.info(
-                    "Dataset has no feature columns — disabling feature_scaler. "
-                    "This is expected for univariate models using datafactory."
-                )
-            self.feature_scaler = None
 
         self.device = self.get_device()
         logger.info(f"Using device: {self.device}")
@@ -368,76 +366,36 @@ class DartsForecaster:
 
         self.min_length = self.model.input_chunk_length + self.model.output_chunk_length
 
-        if not self.dataset.features:
-            if train_mode:
-                targets = [
-                    s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
-                    for s in timeseries_float
-                    if len(s) >= self.min_length
-                ]
-            else:
-                targets = [
-                    s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
-                    for s in timeseries_float
-                ]
-            targets = self._apply_log_to_targets(targets)
-            if train_mode:
-                ReproducibilityGate.Temporal.audit_boundary_integrity(targets, end)
-                for ts in targets:
-                    ReproducibilityGate.Temporal.audit_sequence_contiguity(
-                        ts.time_index.values.astype(int)
-                    )
-                if self.target_scaler:
-                    targets = self.target_scaler.fit_transform(targets)
-                self.scaler_fitted = True
-            else:
-                if self.target_scaler and self.scaler_fitted:
-                    targets = self.target_scaler.transform(targets)
-            targets = [ts.astype(np.float32) for ts in targets]
-            ReproducibilityGate.Data.audit_numerical_sanity(targets, "targets")
-            return targets, None
-
+        # Slice targets (end + 1 because Darts slice is exclusive for integer indices)
         if train_mode:
-            # We slice targets up to 'end + 1' because Darts slice is exclusive for integer indices.
-            # This ensures month 'end' (t) is included.
             targets = [
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
                 for s in timeseries_float
                 if len(s) >= self.min_length
-            ]
-            # We MUST slice past_cov up to 'end + 1' to prevent feature leakage.
-            past_cov = [
-                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(
-                    np.float32
-                )
-                for s in timeseries_float
             ]
         else:
             targets = [
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
                 for s in timeseries_float
             ]
+
+        # Slice past covariates (end + 1 to prevent feature leakage)
+        if self.dataset.features:
             past_cov = [
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(
                     np.float32
                 )
                 for s in timeseries_float
             ]
+            past_cov = self._apply_log_to_features(past_cov)
+        else:
+            past_cov = None
 
-        # Log transform selected feature components before scaling
-        past_cov = self._apply_log_to_features(past_cov)
-
-        # Log transform before scaling (can create float64)
         targets = self._apply_log_to_targets(targets)
 
         if train_mode:
             # GATE 3, 4, 5: The Fortress Firewall
-
-            # Check Boundary Integrity (Peeking and Starvation)
-            # This ensures we use all data up to 'end' and not a month more.
             ReproducibilityGate.Temporal.audit_boundary_integrity(targets, end)
-
-            # Check Sequence Contiguity (No Holes)
             for ts in targets:
                 ReproducibilityGate.Temporal.audit_sequence_contiguity(
                     ts.time_index.values.astype(int)
@@ -458,11 +416,12 @@ class DartsForecaster:
 
         # DOWNCAST after scaler/log (they yield float64)
         targets = [ts.astype(np.float32) for ts in targets]
-        past_cov = [pc.astype(np.float32) for pc in past_cov]
+        if past_cov is not None:
+            past_cov = [pc.astype(np.float32) for pc in past_cov]
 
-        # Data sanity check: detect extreme values, NaNs, Infs
         ReproducibilityGate.Data.audit_numerical_sanity(targets, "targets")
-        ReproducibilityGate.Data.audit_numerical_sanity(past_cov, "past_covariates")
+        if past_cov is not None:
+            ReproducibilityGate.Data.audit_numerical_sanity(past_cov, "past_covariates")
 
         return targets, past_cov
 

@@ -50,10 +50,10 @@ class _ViewsDatasetDarts(_ViewsDataset):
             file_path = str(cached_path)
         else:
             file_path = f"{path_raw}/{run_type}_viewser_df{PipelineConfig.dataframe_format}"
-        df_viewser = read_dataframe(file_path)
-        
+        df_source = read_dataframe(file_path)
+
         return _ViewsDatasetDarts(
-            source=df_viewser,
+            source=df_source,
             targets=config.get("targets"),
             broadcast_features=True,
         )

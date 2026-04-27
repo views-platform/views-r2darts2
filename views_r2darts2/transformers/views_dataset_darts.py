@@ -5,6 +5,7 @@ from typing import Optional, List, Union
 import logging
 import numpy as np
 from darts import TimeSeries
+from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 
 logger = logging.getLogger(__name__)
@@ -84,9 +85,28 @@ class _ViewsDatasetDarts(_ViewsDataset):
 
         df_reset = df_subset.reset_index(level=[1])
 
+        # --- Cyclic time encoders (past covariates) ---
+        # Infer temporal resolution from the index name (month_id → "m",
+        # week_id → "w", day_id → "d", year_id → "y") and inject the
+        # corresponding sin/cos encoders from encoders.py.
+        # Zero leakage — purely calendar-derived, known for all time steps.
+        # Values already in [-1, 1]; no scaling needed.
+        resolution = self._time_id.split("_")[0][0]  # "month_id" → "m", "week_id" → "w", etc.
+        cyclic_encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
+        if cyclic_encoders is not None:
+            for enc_fn in cyclic_encoders:
+                col_name = enc_fn.__name__
+                df_reset[col_name] = enc_fn(df_reset.index)
+                if col_name not in self.features:
+                    self.features.append(col_name)
+            logger.info(
+                f"Cyclic encoders: injected {[fn.__name__ for fn in cyclic_encoders]} "
+                f"for resolution '{resolution}' ({self._time_id})."
+            )
+
         # --- Per-entity static covariates (entity fingerprint) ---
         #
-        # LEAKAGE SAFETY: Statistics are computed from df_stat — a time-
+        # Statistics are computed from df_stat — a time-
         # filtered slice of df_reset restricted to stat_time_range (the
         # training partition). This guarantees that no test/forecast-period
         # target values contaminate the static covariates. The full df_reset

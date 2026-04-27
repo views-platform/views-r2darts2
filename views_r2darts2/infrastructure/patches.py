@@ -139,67 +139,99 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm log(1+σ) Compression Patch ---
+# --- 3. Statistics-Conditioned RevIN Patch ---
+#
+# Two-part patch for RINorm:
+#
+#   A) log(1+σ) compression — bounds scale amplification in the inverse pass.
+#      Without this, high-variance entities (Ukraine σ≈4 in asinh space) produce
+#      explosive predictions through the convex sinh inverse:
+#        Raw σ:  ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
+#        log1p:  ŷ = 2.5 × 1.61 + 5 = 9.025 →  sinh(9)  ≈ 4,143 deaths
+#
+#   B) Statistics conditioning — re-injects (μ, σ_raw) as a learnable additive
+#      signal into the normalized z-space. Standard RevIN strips per-series
+#      identity, causing "over-stationarization" (Liu et al. NeurIPS 2022):
+#      all entities produce an identical canonical temporal pattern, with only
+#      level/scale differing after the mechanical ẑ·σ+μ inverse. The model
+#      cannot learn entity-specific dynamics.
+#
+#      By projecting (μ, σ_raw) through a zero-initialized Linear layer and
+#      adding the result to z, the model can learn to differentiate series
+#      while still benefiting from normalized z-targets for stable training.
+#
+#      Zero-init ensures the model starts as standard RevIN (conditioning = 0)
+#      and gradually learns to use the statistics via gradient flow.
+#
+#   For n_targets=1 (VIEWS fatalities), this adds Linear(2→1) = 3 parameters.
+#
+#   Works with ALL Darts models (N-BEATS, Transformer, TFT, TiDE, TSMixer,
+#   BlockRNN, TCN, NHiTS) because input/output dimensions are unchanged —
+#   the conditioning is additive within existing target channels.
 
-def apply_rinorm_compression_patch():
+# Normalization constants for stat conditioning inputs.
+# These bring μ and σ_raw into roughly unit-scale ranges for the projection.
+# In asinh(fatalities) space: μ ∈ [0, ~12], σ_raw ∈ [0.1, ~6].
+_MU_SCALE = 6.0
+_SIGMA_SCALE = 3.0
+
+
+def apply_conditioned_rinorm_patch():
     """
-    Patches Darts RINorm to use log(1+σ) compressed standard deviation.
-
-    Standard RevIN denormalizes as ŷ = ẑ·σ + μ. When σ is large (high-variance
-    entities like Ukraine with σ≈4 in asinh space) and the inverse transform is
-    convex (sinh), small normalized-space outputs get exponentially amplified:
-
-        Raw σ:    ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
-
-    log(1+σ) compresses σ sublinearly, bounding amplification while preserving
-    the normalization that makes the learning task tractable:
-
-        σ_raw=0.5  →  σ_compressed=0.41    (peaceful: minimal change)
-        σ_raw=1.0  →  σ_compressed=0.69    (low-conflict: mild compression)
-        σ_raw=4.0  →  σ_compressed=1.61    (Ukraine-level: 2.5× reduction)
-        σ_raw=10   →  σ_compressed=2.40    (extreme: 4.2× reduction)
-
-    With log(1+σ), Ukraine at inference:
-
-        ŷ = 2.5 × 1.61 + 5 = 9.025  →  sinh(9.025) ≈ 4,143 deaths
-
-    Why not σ≡1 (mean-only)? Without ANY σ normalization, the model sees
-    multi-scale z-targets (Ukraine ±4, peaceful ±0.1). This makes learning
-    harder — many HP configurations produce outlier predictions (ẑ=6+)
-    that still explode through sinh. log(1+σ) keeps z-targets normalized
-    (similar σ across entities) so the model learns in a uniform-scale space.
-
-    Properties of log(1+σ):
-    - Monotonic, concave, ≥0 for σ≥0
-    - Preserves ordering (high-variance entities still have higher σ)
-    - Gradient: 1/(1+σ) — dampens large σ, passes small σ unchanged
-    - Inverse is exact: sinh inverse uses σ_compressed automatically
+    Patches Darts RINorm with log(1+σ) compression and statistics conditioning.
+    Patches both __init__ (to add stat_proj) and forward (to apply conditioning).
+    The inverse method is unchanged — output dimensions are identical.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm.forward, '_compressed', False):
+    if getattr(RINorm.forward, '_stat_conditioned', False):
         return  # Already patched
 
-    def _compressed_forward(self, x: torch.Tensor):
+    _orig_init = RINorm.__init__
+
+    def _conditioned_init(self, input_dim: int, eps=1e-5, affine=True):
+        _orig_init(self, input_dim, eps, affine)
+        # Learnable projection: (μ, σ_raw) → additive conditioning per target channel.
+        # Zero-initialized so the model starts as standard RevIN.
+        self.stat_proj = nn.Linear(2 * input_dim, input_dim, bias=True)
+        nn.init.zeros_(self.stat_proj.weight)
+        nn.init.zeros_(self.stat_proj.bias)
+
+    def _conditioned_forward(self, x: torch.Tensor):
+        # x: (B, T, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
+
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
         raw_stdev = torch.sqrt(
             torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + 1e-5
         ).detach()
-        # log(1+σ): sublinear compression. Bounds amplification while keeping
-        # z-targets normalized across entities of different variance.
-        self.stdev = torch.log1p(raw_stdev)
-        x = (x - self.mean) / self.stdev
-        if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
-        return x
 
-    _compressed_forward._compressed = True
-    RINorm.forward = _compressed_forward
+        # Part A: log(1+σ) compression for the normalization denominator.
+        self.stdev = torch.log1p(raw_stdev)
+        z = (x - self.mean) / self.stdev
+
+        if self.affine:
+            z = z * self.affine_weight
+            z = z + self.affine_bias
+
+        # Part B: statistics conditioning.
+        # Project raw (μ, σ) into an additive signal so the model can
+        # distinguish series identity in z-space.
+        stats = torch.cat([
+            self.mean.squeeze(1) / _MU_SCALE,      # (B, n_targets)
+            raw_stdev.squeeze(1) / _SIGMA_SCALE,    # (B, n_targets)
+        ], dim=-1)                                   # (B, 2 * n_targets)
+        conditioning = self.stat_proj(stats)         # (B, n_targets)
+        z = z + conditioning.unsqueeze(1)            # broadcast → (B, T, n_targets)
+
+        return z
+
+    _conditioned_forward._stat_conditioned = True
+    RINorm.__init__ = _conditioned_init
+    RINorm.forward = _conditioned_forward
     logger.info(
-        "🐨 Patched RINorm: log(1+σ) compression. "
-        "Bounds scale amplification while preserving normalized z-space."
+        "🐨 Patched RINorm: log(1+σ) compression + statistics conditioning. "
+        "Series identity (μ, σ) re-injected via zero-init learnable projection."
     )
 
 
@@ -207,5 +239,5 @@ def apply_rinorm_compression_patch():
 
 def apply_all_patches():
     apply_torch_load_patch()
-    apply_rinorm_compression_patch()
+    apply_conditioned_rinorm_patch()
     # apply_nbeats_patch()

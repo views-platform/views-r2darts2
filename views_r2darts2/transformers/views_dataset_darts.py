@@ -119,4 +119,6 @@ class _ViewsDatasetDarts(_ViewsDataset):
             group_cols=self._entity_id,
             value_cols=self.features + self.targets,
             static_cols=["target_mu", "target_sigma"],
+            n_jobs=-1,
+            verbose=True,
         )

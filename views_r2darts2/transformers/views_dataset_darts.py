@@ -31,19 +31,25 @@ class _ViewsDatasetDarts(_ViewsDataset):
         )
 
     @staticmethod
-    def from_views_path(path_raw: str, run_type: str, config: dict):
+    def from_views_path(path_raw: str, run_type: str, config: dict, cached_path=None):
         """
         Factory method to load a VIEWS dataset from a raw path and configuration.
-        
+
         Args:
             path_raw (str): Path to the directory containing the raw dataframes.
             run_type (str): The run type (e.g., 'validation', 'calibration').
             config (dict): The DNA manifest for the experiment.
-            
+            cached_path: Optional pre-resolved path to the cached data file.
+                If provided, this path is used directly instead of constructing
+                one from path_raw and run_type.
+
         Returns:
             _ViewsDatasetDarts: Initialized dataset object.
         """
-        file_path = f"{path_raw}/{run_type}_viewser_df{PipelineConfig.dataframe_format}"
+        if cached_path is not None:
+            file_path = str(cached_path)
+        else:
+            file_path = f"{path_raw}/{run_type}_viewser_df{PipelineConfig.dataframe_format}"
         df_viewser = read_dataframe(file_path)
         
         return _ViewsDatasetDarts(

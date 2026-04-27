@@ -141,188 +141,65 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. SC-RevIN: Statistics-Conditioned Reversible Instance Normalization ---
+# --- 3. RINorm log(1+log(1+σ)) Double-Log Compression Patch ---
 #
-# Combines three ideas to address both over-stationarization (canonical shapes)
-# and the sinh blowup (uncontrolled magnitude amplification):
+# Bounds scale amplification in RevIN's inverse pass.
 #
-#   A) log(1+σ) compression — sublinearly compresses σ in the normalization
-#      denominator, reducing how much the inverse denorm can amplify.
-#        σ_raw=0.5  →  0.41  (peaceful: minimal change)
-#        σ_raw=4.0  →  1.61  (Ukraine: 2.5× reduction)
+# Standard RevIN denormalizes as ŷ = ẑ·σ + μ. When σ is large (high-variance
+# entities like Ukraine with σ≈4 in asinh space) and the inverse transform is
+# convex (sinh), small normalized-space outputs get exponentially amplified:
 #
-#   B) FiLM conditioning (forward) — per-target Feature-wise Linear Modulation
-#      from (μ, σ_raw). Breaks canonical shapes: the backbone's nonlinearities
-#      (GELU/ReLU) see entity-specific magnitudes, producing different temporal
-#      dynamics instead of identical patterns for all countries. Symmetric FiLM
-#      cancels for linear models, but N-HiTS has O(9) GELU layers — γ scaling
-#      changes which neurons saturate, genuinely breaking shape uniformity.
+#   Raw σ:    ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
+#   log1p:    ŷ = 2.5 × 1.61 + 5 = 9.025 →  sinh(9)  ≈ 4,143 deaths
+#   log²:     ŷ = 2.5 × 0.96 + 5 = 7.40  →  sinh(7.4) ≈ 816 deaths
 #
-#      z_film = (1 + γ(μ,σ)) · z + β(μ,σ)
+# Double-log compresses σ more aggressively than single log1p, nearly
+# eliminating σ as an amplifier for high-variance entities while still
+# providing meaningful variance normalization for low-σ ones:
 #
-#      Zero-initialized: γ=0→scale=1, β=0→shift=0 (identity at init).
+#   σ_raw=0.5  →  σ_compressed=0.34    (peaceful: mild change)
+#   σ_raw=1.0  →  σ_compressed=0.52    (low-conflict: moderate)
+#   σ_raw=4.0  →  σ_compressed=0.96    (Ukraine-level: 4.2× reduction)
+#   σ_raw=10   →  σ_compressed=1.22    (extreme: 8.2× reduction)
 #
-#   C) Learned denorm scale τ (inverse) — Dish-TS-inspired (Fan et al. AAAI 2023)
-#      asymmetric denormalization. Instead of mechanically using σ_compressed,
-#      the inverse uses:
+# For the blowup case (ẑ=6.3, Ukraine μ=5):
+#   log1p:   ŷ = 6.3 × 1.61 + 5 = 15.14  →  sinh(15.1) ≈ 1,900,000
+#   log²:    ŷ = 6.3 × 0.96 + 5 = 11.05  →  sinh(11.0) ≈ 30,000
 #
-#        σ_denorm = σ_compressed × softplus(τ(μ, σ_raw)) / ln(2)
-#
-#      where τ is a small learned projection, zero-initialized so that
-#      softplus(0)/ln(2) = 1.0 → identity at init.
-#
-#      Key insight from Dish-TS: the right denormalization scale need not
-#      equal the normalization scale. The Non-stationary Transformers paper
-#      (Liu et al. NeurIPS 2022) similarly injects statistics asymmetrically
-#      into computation (via τ/δ on attention scores). Here, τ modulates the
-#      denorm scale — NOT undone in the forward pass.
-#
-#      During training, SpotlightLoss gradient flows through τ. For entities
-#      where the model overshoots (Ukraine), the gradient pushes τ negative
-#      → softplus(τ)/ln(2) < 1 → dampened denorm → reduced ŷ in asinh space
-#      → bounded sinh output. This is a data-driven, per-entity dampener:
-#
-#        τ=-2  →  softplus(-2)/ln(2) ≈ 0.18  (strong dampening)
-#        τ= 0  →  softplus(0)/ln(2)  = 1.00  (identity)
-#        τ=+2  →  softplus(+2)/ln(2) ≈ 3.00  (mild amplification)
-#
-# Integration: patches RINorm.__init__, .forward, .inverse.
-# Works with ALL Darts models via the io_processor decorator.
-# Adds 3×Linear(2,1) per target = 9 parameters per target (negligible).
+# Tradeoff: mid-range entities (σ≈1.5) see ~30% less amplification than
+# with single log1p. The model compensates by learning larger ẑ values
+# (training targets also scale up), but this widens the z-spread and
+# slightly reduces responsiveness to genuine mid-range spikes.
 
 
-def apply_conditioned_rinorm_patch():
+def apply_rinorm_compression_patch():
     """
-    Patches RINorm with:
-      - log(1+σ) compression (forward)
-      - FiLM conditioning from (μ, σ_raw) (forward)
-      - Learned denorm scale τ from (μ, σ_raw) (inverse, asymmetric)
+    Patches Darts RINorm with log(1+log(1+σ)) double-log compressed stdev.
+    Only modifies forward(). The inverse is unchanged.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm.forward, '_sc_revin', False):
+    if getattr(RINorm.forward, '_compressed', False):
         return  # Already patched
 
-    _orig_init = RINorm.__init__
-
-    def _sc_init(self, input_dim: int, eps=1e-5, affine=True):
-        _orig_init(self, input_dim, eps, affine)
-
-        # Per-target FiLM projections: (μ_i, σ_i) → (γ_i, β_i).
-        # Independent per target to avoid cross-target leakage.
-        self.film_scale = nn.ModuleList([
-            nn.Linear(2, 1, bias=True) for _ in range(input_dim)
-        ])
-        self.film_shift = nn.ModuleList([
-            nn.Linear(2, 1, bias=True) for _ in range(input_dim)
-        ])
-
-        # Per-target denorm scale projection: (μ_i, σ_i) → τ_i.
-        # τ modulates denorm σ via softplus(τ)/ln(2). Asymmetric: not undone.
-        self.denorm_tau = nn.ModuleList([
-            nn.Linear(2, 1, bias=True) for _ in range(input_dim)
-        ])
-
-        # Zero-init all projections → identity at init.
-        for proj in list(self.film_scale) + list(self.film_shift) + list(self.denorm_tau):
-            nn.init.zeros_(proj.weight)
-            nn.init.zeros_(proj.bias)
-
-    def _sc_forward(self, x: torch.Tensor):
-        # x: (B, T, n_targets)
+    def _compressed_forward(self, x: torch.Tensor):
         calc_dims = tuple(range(1, x.ndim - 1))
-
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
         raw_stdev = torch.sqrt(
             torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + 1e-5
         ).detach()
-
-        # Part A: log(1+σ) compression.
-        self.stdev = torch.log1p(raw_stdev)
-
-        # Store raw statistics for FiLM/τ projections.
-        self._raw_stdev = raw_stdev  # (B, 1, n_targets)
-
-        z = (x - self.mean) / self.stdev
-
+        self.stdev = torch.log1p(torch.log1p(raw_stdev))
+        x = (x - self.mean) / self.stdev
         if self.affine:
-            z = z * self.affine_weight
-            z = z + self.affine_bias
-
-        # Part B: FiLM conditioning.
-        mu_sq = self.mean.squeeze(1)      # (B, n_targets)
-        sig_sq = raw_stdev.squeeze(1)     # (B, n_targets)
-        n_targets = mu_sq.shape[-1]
-
-        # Build (γ, β) per target from (μ_i, σ_i).
-        gamma = torch.cat([
-            self.film_scale[i](torch.stack([mu_sq[:, i], sig_sq[:, i]], dim=-1))
-            for i in range(n_targets)
-        ], dim=-1)  # (B, n_targets)
-
-        beta = torch.cat([
-            self.film_shift[i](torch.stack([mu_sq[:, i], sig_sq[:, i]], dim=-1))
-            for i in range(n_targets)
-        ], dim=-1)  # (B, n_targets)
-
-        # Store for symmetric FiLM inverse.
-        self._film_gamma = gamma
-        self._film_beta = beta
-
-        # Apply FiLM: γ centered at 1 (zero-init → 1+0=1), β centered at 0.
-        # Clamp (1+γ) to prevent degenerate zero-scaling.
-        scale = (1.0 + gamma).clamp(min=0.1)
-        z = scale.unsqueeze(1) * z + beta.unsqueeze(1)
-
-        return z
-
-    def _sc_inverse(self, x: torch.Tensor):
-        # x: (B, T_out, n_targets, nr_params)
-
-        # Step 1: Undo FiLM (symmetric — same scale/shift as forward).
-        scale = (1.0 + self._film_gamma).clamp(min=0.1)
-        g = scale.unsqueeze(1).unsqueeze(-1)   # (B, 1, n_targets, 1)
-        b = self._film_beta.unsqueeze(1).unsqueeze(-1)
-        x = (x - b) / g
-
-        # Step 2: Undo affine.
-        if self.affine:
-            x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
-            x = x / (
-                self.affine_weight.view(self.affine_weight.shape + (1,))
-                + self.eps * self.eps
-            )
-
-        # Step 3: Learned denorm scale (asymmetric — NOT undone in forward).
-        # σ_denorm = σ_compressed × softplus(τ(μ, σ_raw)) / ln(2)
-        mu_sq = self.mean.squeeze(1)       # (B, n_targets)
-        sig_sq = self._raw_stdev.squeeze(1)
-        n_targets = mu_sq.shape[-1]
-
-        tau = torch.cat([
-            self.denorm_tau[i](torch.stack([mu_sq[:, i], sig_sq[:, i]], dim=-1))
-            for i in range(n_targets)
-        ], dim=-1)  # (B, n_targets)
-
-        # softplus(0)/ln(2) = 1.0 → identity at init.
-        denorm_factor = F.softplus(tau) / 0.6931471805599453  # ln(2)
-        # (B, n_targets) → (B, 1, n_targets, 1)
-        denorm_factor = denorm_factor.unsqueeze(1).unsqueeze(-1)
-
-        stdev_view = self.stdev.view(self.stdev.shape + (1,))
-        mean_view = self.mean.view(self.mean.shape + (1,))
-
-        x = x * (stdev_view * denorm_factor) + mean_view
-
+            x = x * self.affine_weight
+            x = x + self.affine_bias
         return x
 
-    _sc_forward._sc_revin = True
-    RINorm.__init__ = _sc_init
-    RINorm.forward = _sc_forward
-    RINorm.inverse = _sc_inverse
+    _compressed_forward._compressed = True
+    RINorm.forward = _compressed_forward
     logger.info(
-        "🐨 SC-RevIN: log(1+σ) compression + FiLM conditioning "
-        "+ learned denorm τ (softplus). Model-agnostic, asymmetric inverse."
+        "🐨 Patched RINorm: log(1+log(1+σ)) double-log compression. "
+        "Bounds scale amplification while preserving normalized z-space."
     )
 
 
@@ -330,96 +207,9 @@ def apply_conditioned_rinorm_patch():
 
 def apply_all_patches():
     apply_torch_load_patch()
-    apply_conditioned_rinorm_patch()
-    apply_nhits_theta_squash_patch()
+    apply_rinorm_compression_patch()
     apply_tide_mc_dropout_patch()
     # apply_nbeats_patch()
-
-
-# --- 3b. N-HiTS Expansion Coefficient Squash ---
-#
-# Belt-and-suspenders complement to SC-RevIN. The N-HiTS architecture
-# produces forecast via interpolated expansion coefficients:
-#
-#   θ_forecast = Linear(hidden)          ← UNBOUNDED
-#   y_hat = F.interpolate(θ_forecast)    ← linearly spreads θ to ocl steps
-#
-# A single extreme θ coefficient gets interpolated across multiple steps
-# (especially in coarse stacks with n_freq_downsample > 1), amplifying
-# its effect. After RevIN inverse + sinh, this causes the blowup.
-#
-# Fix: apply C·tanh(θ/C) to θ_forecast before interpolation.
-# This is identity-like for small values (tanh(x)≈x for |x|<<C) and
-# smoothly saturates for large values. It's not a hard clamp — it's
-# an architectural constraint saying "basis coefficients are bounded."
-#
-# C=6 is chosen so that:
-#   - Normal-range θ (|θ|<3) passes through nearly unchanged
-#     (tanh(3/6)×6 = 2.91 vs 3.0 — 3% compression)
-#   - Extreme θ (|θ|=10) gets compressed to ±5.97
-#   - The hard bound is ±C=±6, which after RevIN denorm + sinh
-#     produces reasonable values even for worst-case (μ, σ)
-
-
-def apply_nhits_theta_squash_patch():
-    """
-    Patches N-HiTS _Block.forward to apply tanh squashing on θ_forecast
-    before interpolation. Bounds expansion coefficients architecturally.
-    """
-    from darts.models.forecasting.nhits import _Block as NHiTSBlock
-
-    if getattr(NHiTSBlock.forward, '_theta_squashed', False):
-        return  # Already patched
-
-    _THETA_BOUND = 6.0
-
-    def _squashed_block_forward(self, x):
-        batch_size = x.shape[0]
-
-        # pooling
-        x = x.unsqueeze(1)
-        x = self.pooling_layer(x)
-        x = x.squeeze(1)
-
-        # fully connected layer stack
-        x = self.layers(x)
-
-        # forked linear layers producing waveform generator parameters
-        theta_backcast = self.backcast_linear_layer(x)
-        theta_forecast = self.forecast_linear_layer(x)
-
-        # Squash forecast expansion coefficients: C·tanh(θ/C).
-        # Identity-like for small θ, smoothly saturates for large θ.
-        theta_forecast = _THETA_BOUND * torch.tanh(theta_forecast / _THETA_BOUND)
-
-        # set the expansion coefs in last dimension for the forecasts
-        theta_forecast = theta_forecast.view(batch_size, self.nr_params, -1)
-
-        # interpolate function expects (batch, "channels", time)
-        theta_backcast = theta_backcast.unsqueeze(1)
-
-        # interpolate both backcast and forecast from the thetas
-        x_hat = F.interpolate(
-            theta_backcast, size=self.input_chunk_length, mode="linear"
-        )
-        y_hat = F.interpolate(
-            theta_forecast, size=self.output_chunk_length, mode="linear"
-        )
-
-        x_hat = x_hat.squeeze(1)
-
-        # Set the distribution parameters as the last dimension
-        y_hat = y_hat.reshape(x.shape[0], self.output_chunk_length, self.nr_params)
-
-        return x_hat, y_hat
-
-    _squashed_block_forward._theta_squashed = True
-    NHiTSBlock.forward = _squashed_block_forward
-    logger.info(
-        "🐨 N-HiTS θ squash: C·tanh(θ/C) with C=%.1f on forecast expansion "
-        "coefficients. Architectural bound on interpolation basis.",
-        _THETA_BOUND,
-    )
 
 
 # --- 4. TiDE MC Dropout Patch ---

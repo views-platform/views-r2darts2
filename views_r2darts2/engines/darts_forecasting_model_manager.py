@@ -477,8 +477,8 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
                 sniffer = CorePredictionSniffer(level=active_config["level"])
                 for i, df in enumerate(df_predictions):
-                    print(
-                        f"\nValidating evaluation dataframe of sequence {i + 1}/{len(df_predictions)}"
+                    logger.info(
+                        f"Validating evaluation dataframe of sequence {i + 1}/{len(df_predictions)}"
                     )
                     sniffer.sniff_predictions(df, targets=active_config["targets"])
 

@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import torch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
@@ -338,29 +338,23 @@ class DartsForecaster:
 
     def _preprocess_timeseries(
         self,
-        timeseries: TimeSeries,
+        timeseries: List[TimeSeries],
         start: int,
         end: int,
         train_mode: bool = False,
-    ) -> TimeSeries:
+    ) -> Tuple[List[TimeSeries], Optional[List[TimeSeries]]]:
         """
-        Preprocesses a list of time series for training or prediction.
-
-        Converts each time series to float32, slices the series according to the specified
-        start and end indices, and applies scaling if scalers are provided. Handles both
-        training and prediction modes by adjusting the slicing logic for targets and features.
+        Preprocesses time series for training or prediction.
 
         Args:
-            timeseries (TimeSeries): List of time series objects to preprocess.
-            start (int): Start timestamp for slicing the time series.
-            end (int): End timestamp for slicing the time series.
-            train_mode (bool, optional): If True, preprocesses for training by ensuring
-                full input and output window creation. If False, preprocesses for prediction.
-                Defaults to False.
+            timeseries: Time series collection to preprocess.
+            start: Start timestamp for slicing.
+            end: End timestamp for slicing.
+            train_mode: If True, fits scalers and enforces reproducibility gates.
 
         Returns:
-            Tuple[List[TimeSeries], List[TimeSeries]]: A tuple containing the preprocessed
-            targets and past covariates (features).
+            Tuple of (targets, past_covariates). past_covariates is None for
+            univariate models (features=[]).
         """
         timeseries_float = [s.astype(np.float32) for s in timeseries]
 
@@ -556,7 +550,6 @@ class DartsForecaster:
         # Get the input window for forecasting based on sequence_number
         target_series, past_covariates = self._preprocess_timeseries(
             timeseries=timeseries,
-            # start=self._test_start + sequence_number - output_length,
             start=self._test_start + sequence_number - self.model.input_chunk_length,
             end=self._test_start - 1 + sequence_number,  # origin = test_start - 1 + seq (base_origin convention)
         )
@@ -591,7 +584,7 @@ class DartsForecaster:
                 **predict_kwargs,
             )
         except Exception as e:
-            print(f"Error during prediction: {e}")
+            logger.error(f"Error during prediction: {e}")
             raise
 
         # Use sample-preserving inverse transform for probabilistic predictions

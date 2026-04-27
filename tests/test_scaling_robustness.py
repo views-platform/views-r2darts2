@@ -222,14 +222,9 @@ class TestScalingRobustness:
         # Check mean magnitude
         y_hat_bar = np.mean([ts.all_values().mean() for ts in bad_pred])
 
-        # In a real run, we want this to at least log a loud warning or raise
-        if y_hat_bar < 0.1:
-            # This is the condition that would have caught our 1.7 MSLE run
-            assert True
-        else:
-            pytest.fail(
-                f"Magnitude sanity check failed to identify near-zero predictions: {y_hat_bar}"
-            )
+        assert y_hat_bar < 0.1, (
+            f"Magnitude sanity check failed to identify near-zero predictions: {y_hat_bar}"
+        )
 
     def test_feature_leakage_prevention(self, multi_entity_ts):
         """

@@ -140,15 +140,6 @@ class _ViewsDatasetDarts(_ViewsDataset):
                 "the FULL dataframe. This may cause leakage if test-period data is present."
             )
 
-        target_col = self.targets[0]
-        grouped = df_stat.groupby(self._entity_id)[target_col]
-
-        stats = grouped.agg(
-            target_mu="mean",
-            target_sigma="std",
-            target_max="max",
-        ).fillna(0.0)
-
         # OLS slope: Σ(t - t̄)(y - ȳ) / Σ(t - t̄)² per entity
         # Uses integer time index position (0,1,2,...) to avoid scale issues
         def _ols_slope(s):
@@ -160,30 +151,46 @@ class _ViewsDatasetDarts(_ViewsDataset):
                 return 0.0
             return float((t_centered * y_centered).sum() / denom)
 
-        stats["target_trend"] = grouped.apply(_ols_slope)
+        # Compute fingerprint stats for every target and name them {target_col}_{stat}.
+        # This supports both single-target models (e.g. "lr_ged_sb_mu") and
+        # multi-target models (e.g. "lr_ged_sb_mu", "lr_ged_ns_mu", ...) without
+        # ambiguity. TFT's VSN treats these as plain feature names — the exact
+        # strings are irrelevant to the model, only their values matter.
+        stat_frames = []
+        for target_col in self.targets:
+            grouped = df_stat.groupby(self._entity_id)[target_col]
+            col_stats = grouped.agg(
+                **{
+                    f"{target_col}_mu": "mean",
+                    f"{target_col}_sigma": "std",
+                    f"{target_col}_max": "max",
+                }
+            ).fillna(0.0)
+            col_stats[f"{target_col}_trend"] = grouped.apply(_ols_slope)
+            # Sparsity: fraction of time steps with exactly zero target
+            col_stats[f"{target_col}_sparsity"] = grouped.apply(lambda s: (s == 0).mean())
+            stat_frames.append(col_stats)
 
-        # Sparsity: fraction of months with exactly zero target
-        stats["target_sparsity"] = grouped.apply(lambda s: (s == 0).mean())
-
+        # Merge per-target stat DataFrames on the shared entity_id index
+        stats = stat_frames[0]
+        for frame in stat_frames[1:]:
+            stats = stats.join(frame)
         stats = stats.astype(np.float32).reset_index()
 
         static_cov_names = [
-            "target_mu", "target_sigma", "target_max",
-            "target_trend", "target_sparsity",
+            f"{col}_{stat}"
+            for col in self.targets
+            for stat in ("mu", "sigma", "max", "trend", "sparsity")
         ]
 
         n_entities = len(stats)
         n_stat_rows = len(df_stat)
         n_stat_time_steps = df_stat.index.nunique()
         logger.info(
-            f"Static covariates: injecting {static_cov_names} for {n_entities} entities "
-            f"computed from {n_stat_rows} rows ({n_stat_time_steps} time steps). "
-            f"All values in raw (pre-transform) space — no test/forecast data used. "
-            f"μ ∈ [{stats['target_mu'].min():.2f}, {stats['target_mu'].max():.2f}], "
-            f"σ ∈ [{stats['target_sigma'].min():.2f}, {stats['target_sigma'].max():.2f}], "
-            f"max ∈ [{stats['target_max'].min():.2f}, {stats['target_max'].max():.2f}], "
-            f"trend ∈ [{stats['target_trend'].min():.4f}, {stats['target_trend'].max():.4f}], "
-            f"sparsity ∈ [{stats['target_sparsity'].min():.2f}, {stats['target_sparsity'].max():.2f}]."
+            f"Static covariates: injecting {static_cov_names} "
+            f"({len(self.targets)} target(s) × 5 stats = {len(static_cov_names)} cols) "
+            f"for {n_entities} entities computed from {n_stat_rows} rows "
+            f"({n_stat_time_steps} time steps, raw pre-transform space)."
         )
         df_reset = df_reset.join(stats.set_index(self._entity_id), on=self._entity_id)
 

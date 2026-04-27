@@ -288,8 +288,9 @@ def _patched_tide_module_forward(
     Uses F.dropout directly instead of a MonteCarloDropout module to avoid
     the lazy-init timing bug: on_predict_start() activates MC dropout on all
     existing MonteCarloDropout modules BEFORE the first forward() call, so a
-    lazily created module would never be activated. Reading self.pred_mc_dropout
-    (set by PL's set_predict_parameters) gives us the correct flag at call time.
+    lazily created module would never be activated. We detect MC dropout
+    activation by checking _mc_dropout_enabled on any child MonteCarloDropout
+    (set by set_mc_dropout() in on_predict_start).
     """
     import torch.nn.functional as F
 
@@ -355,7 +356,13 @@ def _patched_tide_module_forward(
 
     # lookback skip WITH MC dropout (direct F.dropout to avoid lazy-init timing bug)
     skip = self.lookback_skip(x_lookback.transpose(1, 2)).transpose(1, 2)
-    drop_active = self.training or getattr(self, 'pred_mc_dropout', False)
+    # Detect MC dropout from child MonteCarloDropout modules (set by set_mc_dropout)
+    mc_active = any(
+        getattr(m, '_mc_dropout_enabled', False)
+        for m in self.modules()
+        if isinstance(m, MonteCarloDropout)
+    )
+    drop_active = self.training or mc_active
     skip = F.dropout(skip, self.dropout * 0.25, drop_active)
 
     y = temporal_decoded + skip.reshape_as(temporal_decoded)
@@ -380,9 +387,9 @@ def apply_tide_mc_dropout_patch():
     _ResidualBlock.forward = _patched_residual_block_forward
 
     # Patch _TideModule.forward (replace with dropout-injected version)
-    # Uses direct F.dropout on lookback_skip, reading self.pred_mc_dropout
-    # at call time instead of relying on a MonteCarloDropout module
-    # (which would miss set_mc_dropout activation due to lazy-init timing).
+    # Uses direct F.dropout on lookback_skip, detecting MC dropout activation
+    # from child MonteCarloDropout modules (set by set_mc_dropout in on_predict_start)
+    # instead of relying on a lazily-init'd module that would miss activation.
     # Must re-apply @io_processor decorator for RevIN support.
     _TideModule.forward = io_processor(_patched_tide_module_forward)
 

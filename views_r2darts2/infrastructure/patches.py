@@ -280,21 +280,17 @@ def _patched_residual_block_forward(self, x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def _patched_tide_module_init(original_init):
-    """Wraps _TideModule.__init__ to add MC dropout on lookback_skip."""
-
-    def wrapper(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self.lookback_skip_dropout = MonteCarloDropout(self.dropout * 0.25)
-
-    return wrapper
-
-
 def _patched_tide_module_forward(
     self, x_in: Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
 ) -> torch.Tensor:
     """Patched _TideModule.forward with MC dropout on lookback skip path."""
-    from darts.models.forecasting.pl_forecasting_module import io_processor
+
+    # Lazy-init: create lookback_skip_dropout on first call to avoid
+    # wrapping __init__ (which breaks PL's save_hyperparameters frame walk)
+    if not hasattr(self, 'lookback_skip_dropout'):
+        self.lookback_skip_dropout = MonteCarloDropout(self.dropout * 0.25).to(
+            next(self.parameters()).device
+        )
 
     x, x_future_covariates, x_static_covariates = x_in
 
@@ -381,10 +377,8 @@ def apply_tide_mc_dropout_patch():
     _patched_residual_block_forward._mc_patched = True
     _ResidualBlock.forward = _patched_residual_block_forward
 
-    # Patch _TideModule.__init__ (wrap to preserve original + add dropout)
-    _TideModule.__init__ = _patched_tide_module_init(_TideModule.__init__)
-
     # Patch _TideModule.forward (replace with dropout-injected version)
+    # lookback_skip_dropout is lazy-initialized on first forward call
     # Must re-apply @io_processor decorator
     _TideModule.forward = io_processor(_patched_tide_module_forward)
 

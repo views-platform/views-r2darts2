@@ -78,39 +78,68 @@ class _ViewsDatasetDarts(_ViewsDataset):
 
         df_reset = df_subset.reset_index(level=[1])
 
-        # --- Per-entity target statistics as static covariates ---
-        # These give the model a semantically meaningful per-entity fingerprint
-        # (mean conflict level, variability) that static covariates like country_id
-        # (an arbitrary integer) cannot provide.
+        # --- Per-entity static covariates (entity fingerprint) ---
         #
-        # stats are computed exclusively from df_subset — the
-        # already time-filtered visible input window. The model sees every row
-        # in df_subset as input already; summarizing them as static covariates
-        # introduces no information beyond what is present in the input.
+        # LEAKAGE SAFETY: Every stat below is computed exclusively from
+        # df_subset — the already time-filtered visible input window.
+        # The model sees every row in df_subset as input already;
+        # summarizing them as static covariates introduces *no* information
+        # beyond what is present in the input series.
         #
-        # TRANSFORM NOTE: values are in raw (pre-transform) space. AsinhTransform
-        # (or whichever target_scaler is configured) is applied downstream by the
-        # forecaster on the TimeSeries objects after this method returns.
-        # The raw-space fingerprint is still geometrically meaningful:
-        # Ukraine (mean ~500 deaths) is far from Switzerland (mean ~0) in raw space.
+        # VALUES are in raw (pre-transform) space. AsinhTransform (or
+        # whichever target_scaler is configured) is applied downstream by
+        # the forecaster on the TimeSeries objects after this method returns.
+        #
+        # Features injected (all per-entity, all from visible window only):
+        #   target_mu      — mean target level
+        #   target_sigma   — std of target (spread / volatility)
+        #   target_max     — peak observed value (captures spike extremity)
+        #   target_trend   — OLS slope of target over time (regime change detector)
+        #   target_sparsity— fraction of zero-valued months (structural break signal)
         target_col = self.targets[0]
-        stats = (
-            df_reset.groupby(self._entity_id)[target_col]
-            .agg(target_mu="mean", target_sigma="std")
-            .fillna(0.0)
-            .astype(np.float32)
-            .reset_index()
-        )
+        grouped = df_reset.groupby(self._entity_id)[target_col]
+
+        stats = grouped.agg(
+            target_mu="mean",
+            target_sigma="std",
+            target_max="max",
+        ).fillna(0.0)
+
+        # OLS slope: Σ(t - t̄)(y - ȳ) / Σ(t - t̄)² per entity
+        # Uses integer time index position (0,1,2,...) to avoid scale issues
+        def _ols_slope(s):
+            t = np.arange(len(s), dtype=np.float64)
+            t_centered = t - t.mean()
+            y_centered = s.values - s.values.mean()
+            denom = (t_centered ** 2).sum()
+            if denom == 0:
+                return 0.0
+            return float((t_centered * y_centered).sum() / denom)
+
+        stats["target_trend"] = grouped.apply(_ols_slope)
+
+        # Sparsity: fraction of months with exactly zero target
+        stats["target_sparsity"] = grouped.apply(lambda s: (s == 0).mean())
+
+        stats = stats.astype(np.float32).reset_index()
+
+        static_cov_names = [
+            "target_mu", "target_sigma", "target_max",
+            "target_trend", "target_sparsity",
+        ]
+
         n_entities = len(stats)
-        mu_min, mu_max = stats["target_mu"].min(), stats["target_mu"].max()
-        sigma_min, sigma_max = stats["target_sigma"].min(), stats["target_sigma"].max()
         n_rows = len(df_reset)
         n_time_steps = df_reset.index.nunique()
         logger.info(
-            f"Static covariates: injecting target_mu and target_sigma for {n_entities} entities "
+            f"Static covariates: injecting {static_cov_names} for {n_entities} entities "
             f"computed from {n_rows} rows ({n_time_steps} time steps) in the visible input window. "
-            f"Values are in raw (pre-transform) space — no future target data used. "
-            f"μ ∈ [{mu_min:.2f}, {mu_max:.2f}], σ ∈ [{sigma_min:.2f}, {sigma_max:.2f}]."
+            f"All values in raw (pre-transform) space — no future target data used. "
+            f"μ ∈ [{stats['target_mu'].min():.2f}, {stats['target_mu'].max():.2f}], "
+            f"σ ∈ [{stats['target_sigma'].min():.2f}, {stats['target_sigma'].max():.2f}], "
+            f"max ∈ [{stats['target_max'].min():.2f}, {stats['target_max'].max():.2f}], "
+            f"trend ∈ [{stats['target_trend'].min():.4f}, {stats['target_trend'].max():.4f}], "
+            f"sparsity ∈ [{stats['target_sparsity'].min():.2f}, {stats['target_sparsity'].max():.2f}]."
         )
         df_reset = df_reset.join(stats.set_index(self._entity_id), on=self._entity_id)
 
@@ -118,7 +147,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
             df=df_reset,
             group_cols=self._entity_id,
             value_cols=self.features + self.targets,
-            static_cols=["target_mu", "target_sigma"],
+            static_cols=static_cov_names,
             n_jobs=-1,
             verbose=True,
         )

@@ -4,10 +4,10 @@
 |-------------------|--------------------------------------|
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
-| Last Updated      | 2026-04-11                           |
-| Total Concerns    | 4                                    |
+| Last Updated      | 2026-04-27                           |
+| Total Concerns    | 5                                    |
 | Open Concerns     | 0                                    |
-| Resolved Concerns | 4                                    |
+| Resolved Concerns | 5                                    |
 | Governed by       | ADR-014                              |
 
 ---
@@ -35,7 +35,7 @@
 
 ## Open Concerns
 
-(All concerns resolved as of 2026-04-11. See Resolved Concerns below.)
+(All concerns resolved as of 2026-04-27. See Resolved Concerns below.)
 
 ---
 
@@ -46,6 +46,16 @@
 ---
 
 ## Resolved Concerns
+
+### C-05: Feature scaler instantiated before empty-features guard in `DartsForecaster.__init__` — RESOLVED
+
+| Field | Value |
+|-------|-------|
+| ID | C-05 |
+| Resolved | 2026-04-27 |
+| Resolution | Restructured `__init__` feature-scaler block as an `if/elif/else`: the empty-features guard now runs first, so `FeatureScalerManager` and `_instantiate_scaler` are never called when `features=[]`. |
+
+---
 
 ### C-01 — No regression test for `DartsForecaster.predict()` rolling-origin end index *(resolved 2026-04-11)*
 

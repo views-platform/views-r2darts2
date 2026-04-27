@@ -534,6 +534,7 @@ class DartsForecaster:
             pd.DataFrame: A DataFrame containing the forecasted values, indexed by time and entity.
 
         Raises:
+            RuntimeError: If scalers are not fitted (call train() or load_model() first).
             Exception: If an error occurs during prediction.
         """
         if self.target_scaler and not self.scaler_fitted:

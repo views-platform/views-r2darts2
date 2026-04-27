@@ -83,7 +83,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         # (mean conflict level, variability) that static covariates like country_id
         # (an arbitrary integer) cannot provide.
         #
-        # LEAKAGE SAFETY: stats are computed exclusively from df_subset — the
+        # stats are computed exclusively from df_subset — the
         # already time-filtered visible input window. The model sees every row
         # in df_subset as input already; summarizing them as static covariates
         # introduces no information beyond what is present in the input.
@@ -112,7 +112,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
             f"Values are in raw (pre-transform) space — no future target data used. "
             f"μ ∈ [{mu_min:.2f}, {mu_max:.2f}], σ ∈ [{sigma_min:.2f}, {sigma_max:.2f}]."
         )
-        df_reset = df_reset.merge(stats, on=self._entity_id, how="left")
+        df_reset = df_reset.join(stats.set_index(self._entity_id), on=self._entity_id)
 
         return TimeSeries.from_group_dataframe(
             df=df_reset,

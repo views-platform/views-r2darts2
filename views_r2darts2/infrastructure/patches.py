@@ -283,14 +283,15 @@ def _patched_residual_block_forward(self, x: torch.Tensor) -> torch.Tensor:
 def _patched_tide_module_forward(
     self, x_in: Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
 ) -> torch.Tensor:
-    """Patched _TideModule.forward with MC dropout on lookback skip path."""
+    """Patched _TideModule.forward with MC dropout on lookback skip path.
 
-    # Lazy-init: create lookback_skip_dropout on first call to avoid
-    # wrapping __init__ (which breaks PL's save_hyperparameters frame walk)
-    if not hasattr(self, 'lookback_skip_dropout'):
-        self.lookback_skip_dropout = MonteCarloDropout(self.dropout * 0.25).to(
-            next(self.parameters()).device
-        )
+    Uses F.dropout directly instead of a MonteCarloDropout module to avoid
+    the lazy-init timing bug: on_predict_start() activates MC dropout on all
+    existing MonteCarloDropout modules BEFORE the first forward() call, so a
+    lazily created module would never be activated. Reading self.pred_mc_dropout
+    (set by PL's set_predict_parameters) gives us the correct flag at call time.
+    """
+    import torch.nn.functional as F
 
     x, x_future_covariates, x_static_covariates = x_in
 
@@ -352,9 +353,10 @@ def _patched_tide_module_forward(
     temporal_decoder_input = torch.cat(temporal_decoder_input, dim=2)
     temporal_decoded = self.temporal_decoder(temporal_decoder_input)
 
-    # lookback skip WITH MC dropout
+    # lookback skip WITH MC dropout (direct F.dropout to avoid lazy-init timing bug)
     skip = self.lookback_skip(x_lookback.transpose(1, 2)).transpose(1, 2)
-    skip = self.lookback_skip_dropout(skip)
+    drop_active = self.training or getattr(self, 'pred_mc_dropout', False)
+    skip = F.dropout(skip, self.dropout * 0.25, drop_active)
 
     y = temporal_decoded + skip.reshape_as(temporal_decoded)
     y = y.view(-1, self.output_chunk_length, self.output_dim, self.nr_params)
@@ -378,8 +380,10 @@ def apply_tide_mc_dropout_patch():
     _ResidualBlock.forward = _patched_residual_block_forward
 
     # Patch _TideModule.forward (replace with dropout-injected version)
-    # lookback_skip_dropout is lazy-initialized on first forward call
-    # Must re-apply @io_processor decorator
+    # Uses direct F.dropout on lookback_skip, reading self.pred_mc_dropout
+    # at call time instead of relying on a MonteCarloDropout module
+    # (which would miss set_mc_dropout activation due to lazy-init timing).
+    # Must re-apply @io_processor decorator for RevIN support.
     _TideModule.forward = io_processor(_patched_tide_module_forward)
 
     logger.info(

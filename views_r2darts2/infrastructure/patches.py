@@ -139,168 +139,74 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. Statistics-Conditioned RevIN Patch (FiLM) ---
+# --- 3. RINorm log(1+σ) Compression Patch ---
 #
-# Two-part patch for RINorm:
+# Bounds scale amplification in RevIN's inverse pass.
 #
-#   A) log(1+σ) compression — bounds scale amplification in the inverse pass.
-#      Without this, high-variance entities (Ukraine σ≈4 in asinh space) produce
-#      explosive predictions through the convex sinh inverse:
-#        Raw σ:  ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
-#        log1p:  ŷ = 2.5 × 1.61 + 5 = 9.025 →  sinh(9)  ≈ 4,143 deaths
+# Standard RevIN denormalizes as ŷ = ẑ·σ + μ. When σ is large (high-variance
+# entities like Ukraine with σ≈4 in asinh space) and the inverse transform is
+# convex (sinh), small normalized-space outputs get exponentially amplified:
 #
-#   B) FiLM conditioning (Feature-wise Linear Modulation) — re-injects (μ, σ_raw)
-#      as a learnable scale+shift on the normalized z-space. Standard RevIN
-#      strips per-series identity, causing "over-stationarization" (Liu et al.
-#      NeurIPS 2022): all entities produce an identical canonical temporal
-#      pattern, with only level/scale differing after the mechanical ẑ·σ+μ
-#      inverse. The model cannot learn entity-specific dynamics.
+#   Raw σ:    ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
+#   log1p:    ŷ = 2.5 × 1.61 + 5 = 9.025 →  sinh(9)  ≈ 4,143 deaths
 #
-#      Additive conditioning alone (z + β) only shifts the forecast level but
-#      cannot change temporal shape — all countries still get the same spike/dip
-#      pattern. FiLM uses both multiplicative (γ) and additive (β) modulation:
+# log(1+σ) compresses σ sublinearly, bounding amplification while preserving
+# the normalization that makes the learning task tractable:
 #
-#          z_final = γ · z + β      where (γ, β) = f(μ, σ) per target
+#   σ_raw=0.5  →  σ_compressed=0.41    (peaceful: minimal change)
+#   σ_raw=1.0  →  σ_compressed=0.69    (low-conflict: mild compression)
+#   σ_raw=4.0  →  σ_compressed=1.61    (Ukraine-level: 2.5× reduction)
+#   σ_raw=10   →  σ_compressed=2.40    (extreme: 4.2× reduction)
 #
-#      The multiplicative γ rescales normalized z differently per series.
-#      When this rescaled z hits nonlinearities in the backbone (ReLU in
-#      N-BEATS, softmax in Transformer attention), different scales produce
-#      genuinely different temporal dynamics — not just level-shifted copies.
+# Why not σ≡1 (mean-only)? Without ANY σ normalization, the model sees
+# multi-scale z-targets (Ukraine ±4, peaceful ±0.1). Many HP configurations
+# produce outlier predictions (ẑ=6+) that explode through sinh. log(1+σ)
+# keeps z-targets normalized across entities for stable training.
 #
-#      Zero-init ensures the model starts as standard RevIN:
-#      - γ = 1 + 0 = 1 (identity scaling)
-#      - β = 0 (no shift)
-#      Then learns to use statistics via gradient flow.
+# Note on the canonical shape problem: RevIN strips per-series identity,
+# causing all entities to produce identical temporal patterns ("over-
+# stationarization", Liu et al. NeurIPS 2022). This CANNOT be fixed at
+# the normalization layer because:
 #
-#      The inverse is SYMMETRIC: it undoes FiLM before undoing affine and
-#      denormalization. This means the model operates entirely in z_film
-#      space — it doesn't need to learn entity-dependent compensation for
-#      a forward/inverse mismatch. Without symmetric inverse, the model
-#      must internally "undo" FiLM on its output, which it can only
-#      approximate, leading to systematically muted forecasts.
+#   - Symmetric conditioning (undo in inverse): the model's task is
+#     equivalent regardless of conditioning — it's just a coordinate
+#     transform that cancels out.
+#   - Asymmetric conditioning (don't undo): shared backbone weights
+#     can't compensate for per-series modulation → muted magnitudes.
 #
-#   For n_targets=1 (VIEWS fatalities), adds 2× Linear(2, 1) = 6 parameters.
-#   For n_targets=K, adds 2K× Linear(2, 1) = 6K parameters.
-#
-#   Works with ALL Darts models (N-BEATS, Transformer, TFT, TiDE, TSMixer,
-#   BlockRNN, TCN, NHiTS) because input/output dimensions are unchanged —
-#   the conditioning modulates existing target channels in-place.
-#
-#   Per-target projections: each target i has its own scale and shift
-#   Linear(2, 1) mapped from (μ_i, σ_i). This prevents cross-target leakage
-#   when targets have heterogeneous scales.
+# The canonical shape problem must be addressed through richer covariates,
+# static covariates (country-level features), or architectural changes
+# that inject entity identity into the backbone itself.
 
 
-def apply_conditioned_rinorm_patch():
+def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with log(1+σ) compression and per-target FiLM conditioning.
-    Patches __init__ (scale/shift projections), forward (FiLM), and inverse (undo FiLM).
-    The forward/inverse pair is symmetric: forward applies FiLM, inverse undoes it.
-    The model operates entirely in FiLM-modulated z-space.
+    Patches Darts RINorm with log(1+σ) compressed standard deviation.
+    Only modifies forward(). The inverse is unchanged.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm.forward, '_stat_conditioned', False):
+    if getattr(RINorm.forward, '_compressed', False):
         return  # Already patched
 
-    _orig_init = RINorm.__init__
-
-    def _conditioned_init(self, input_dim: int, eps=1e-5, affine=True):
-        _orig_init(self, input_dim, eps, affine)
-        # Per-target FiLM: (μ_i, σ_i) → (γ_i, β_i) for scale and shift.
-        # Independent per target — no cross-target leakage.
-        # Zero-initialized so γ=1+0=1 (identity) and β=0 (no shift) at init.
-        self.film_scale = nn.ModuleList([
-            nn.Linear(2, 1, bias=True) for _ in range(input_dim)
-        ])
-        self.film_shift = nn.ModuleList([
-            nn.Linear(2, 1, bias=True) for _ in range(input_dim)
-        ])
-        for proj in list(self.film_scale) + list(self.film_shift):
-            nn.init.zeros_(proj.weight)
-            nn.init.zeros_(proj.bias)
-
-    def _conditioned_forward(self, x: torch.Tensor):
-        # x: (B, T, n_targets)
+    def _compressed_forward(self, x: torch.Tensor):
         calc_dims = tuple(range(1, x.ndim - 1))
-
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
         raw_stdev = torch.sqrt(
             torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + 1e-5
         ).detach()
-
-        # Part A: log(1+σ) compression for the normalization denominator.
         self.stdev = torch.log1p(raw_stdev)
-        z = (x - self.mean) / self.stdev
-
+        x = (x - self.mean) / self.stdev
         if self.affine:
-            z = z * self.affine_weight
-            z = z + self.affine_bias
-
-        # Part B: per-target FiLM conditioning.
-        # γ rescales z (amplifies/dampens temporal patterns per series).
-        # β shifts z level. Together they let the backbone see genuinely
-        # different inputs for different series, producing distinct temporal
-        # dynamics through its nonlinearities.
-        mu = self.mean.squeeze(1)        # (B, n_targets)
-        sigma = raw_stdev.squeeze(1)     # (B, n_targets)
-        n_targets = mu.shape[-1]
-
-        gamma = torch.cat([
-            self.film_scale[i](torch.stack([mu[:, i], sigma[:, i]], dim=-1))
-            for i in range(n_targets)
-        ], dim=-1)                       # (B, n_targets)
-
-        beta = torch.cat([
-            self.film_shift[i](torch.stack([mu[:, i], sigma[:, i]], dim=-1))
-            for i in range(n_targets)
-        ], dim=-1)                       # (B, n_targets)
-
-        # Store for symmetric inverse.
-        self._film_gamma = gamma         # (B, n_targets)
-        self._film_beta = beta           # (B, n_targets)
-
-        # γ centered at 1: identity when zero-init. β centered at 0.
-        # Clamp (1+γ) away from zero to prevent degenerate scaling.
-        # Same clamp used in both forward and inverse for exact symmetry.
-        scale = (1 + gamma).clamp(min=0.1)
-        z = scale.unsqueeze(1) * z + beta.unsqueeze(1)
-
-        return z
-
-    def _conditioned_inverse(self, x: torch.Tensor):
-        # x: (B, T_out, n_targets, nr_params)
-        # Symmetric inverse: undo FiLM → undo affine → denormalize.
-        # This ensures the model operates entirely in z_film space.
-        # Without this, the model must learn entity-dependent compensation
-        # for the FiLM asymmetry, leading to systematically muted forecasts.
-
-        # Step 1: Undo FiLM — (B, n_targets) → (B, 1, n_targets, 1)
-        scale = (1 + self._film_gamma).clamp(min=0.1)
-        g = scale.unsqueeze(1).unsqueeze(-1)
-        b = self._film_beta.unsqueeze(1).unsqueeze(-1)
-        x = (x - b) / g
-
-        # Step 2: Undo affine
-        if self.affine:
-            x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
-            x = x / (
-                self.affine_weight.view(self.affine_weight.shape + (1,))
-                + self.eps * self.eps
-            )
-
-        # Step 3: Denormalize
-        x = x * self.stdev.view(self.stdev.shape + (1,))
-        x = x + self.mean.view(self.mean.shape + (1,))
+            x = x * self.affine_weight
+            x = x + self.affine_bias
         return x
 
-    _conditioned_forward._stat_conditioned = True
-    RINorm.__init__ = _conditioned_init
-    RINorm.forward = _conditioned_forward
-    RINorm.inverse = _conditioned_inverse
+    _compressed_forward._compressed = True
+    RINorm.forward = _compressed_forward
     logger.info(
-        "🐨 Patched RINorm: log(1+σ) compression + per-target FiLM conditioning "
-        "with symmetric inverse. Model operates in z_film space end-to-end."
+        "🐨 Patched RINorm: log(1+σ) compression. "
+        "Bounds scale amplification while preserving normalized z-space."
     )
 
 
@@ -308,5 +214,5 @@ def apply_conditioned_rinorm_patch():
 
 def apply_all_patches():
     apply_torch_load_patch()
-    apply_conditioned_rinorm_patch()
+    apply_rinorm_compression_patch()
     # apply_nbeats_patch()

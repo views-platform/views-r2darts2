@@ -2,9 +2,12 @@ from views_pipeline_core.data.handlers import _ViewsDataset
 from views_pipeline_core.files.utils import read_dataframe
 from views_pipeline_core.configs.pipeline import PipelineConfig
 from typing import Optional, List, Union
+import logging
 import numpy as np
 from darts import TimeSeries
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+
+logger = logging.getLogger(__name__)
 
 
 class _ViewsDatasetDarts(_ViewsDataset):
@@ -74,8 +77,46 @@ class _ViewsDatasetDarts(_ViewsDataset):
         df_subset[cols_to_cast] = df_subset[cols_to_cast].astype(np.float32)
 
         df_reset = df_subset.reset_index(level=[1])
+
+        # --- Per-entity target statistics as static covariates ---
+        # These give the model a semantically meaningful per-entity fingerprint
+        # (mean conflict level, variability) that static covariates like country_id
+        # (an arbitrary integer) cannot provide.
+        #
+        # LEAKAGE SAFETY: stats are computed exclusively from df_subset — the
+        # already time-filtered visible input window. The model sees every row
+        # in df_subset as input already; summarizing them as static covariates
+        # introduces no information beyond what is present in the input.
+        #
+        # TRANSFORM NOTE: values are in raw (pre-transform) space. AsinhTransform
+        # (or whichever target_scaler is configured) is applied downstream by the
+        # forecaster on the TimeSeries objects after this method returns.
+        # The raw-space fingerprint is still geometrically meaningful:
+        # Ukraine (mean ~500 deaths) is far from Switzerland (mean ~0) in raw space.
+        target_col = self.targets[0]
+        stats = (
+            df_reset.groupby(self._entity_id)[target_col]
+            .agg(target_mu="mean", target_sigma="std")
+            .fillna(0.0)
+            .astype(np.float32)
+            .reset_index()
+        )
+        n_entities = len(stats)
+        mu_min, mu_max = stats["target_mu"].min(), stats["target_mu"].max()
+        sigma_min, sigma_max = stats["target_sigma"].min(), stats["target_sigma"].max()
+        n_rows = len(df_reset)
+        n_time_steps = df_reset.index.nunique()
+        logger.info(
+            f"Static covariates: injecting target_mu and target_sigma for {n_entities} entities "
+            f"computed from {n_rows} rows ({n_time_steps} time steps) in the visible input window. "
+            f"Values are in raw (pre-transform) space — no future target data used. "
+            f"μ ∈ [{mu_min:.2f}, {mu_max:.2f}], σ ∈ [{sigma_min:.2f}, {sigma_max:.2f}]."
+        )
+        df_reset = df_reset.merge(stats, on=self._entity_id, how="left")
+
         return TimeSeries.from_group_dataframe(
             df=df_reset,
             group_cols=self._entity_id,
             value_cols=self.features + self.targets,
+            static_cols=["target_mu", "target_sigma"],
         )

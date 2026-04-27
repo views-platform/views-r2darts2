@@ -542,6 +542,12 @@ class DartsForecaster:
         Raises:
             Exception: If an error occurs during prediction.
         """
+        if self.target_scaler and not self.scaler_fitted:
+            raise RuntimeError(
+                "predict() called before scalers were fitted. "
+                "Call train() or load_model() first."
+            )
+
         # LOCK ENTROPY: Guarantee bit-perfect identity for probabilistic samples
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 

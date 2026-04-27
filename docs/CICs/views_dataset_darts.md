@@ -19,7 +19,7 @@ The `_ViewsDatasetDarts` class acts as the **Data Airlock** for the repository. 
 
 - This class does **not** perform temporal slicing (delegated to `DartsForecaster`).
 - This class does **not** perform scaling or log-transformations (delegated to `DartsForecaster`).
-- This class does **not** handle file I/O or database queries.
+- This class does **not** handle file I/O or database queries (exception: the `from_views_path()` factory method delegates reading to `views_pipeline_core.files.utils.read_dataframe`).
 - This class does **not** modify the values of the data (e.g., no interpolation or gap-filling).
 
 ---
@@ -59,7 +59,7 @@ The `_ViewsDatasetDarts` class acts as the **Data Airlock** for the repository. 
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Consumes dataframes from `views_pipeline_core`.
-- **Physical Zen:** Lives in `views_r2darts2/data/views_dataset_darts.py`.
+- **Physical Zen:** Lives in `views_r2darts2/transformers/views_dataset_darts.py`.
 - **Downstream:** Provides data to `DartsForecaster`.
 - **Gatekeeper:** Invokes `ReproducibilityGate.Data` during initialization to verify the "Handshake" (ADR-009).
 

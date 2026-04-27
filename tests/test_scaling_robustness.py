@@ -147,24 +147,9 @@ class TestScalingRobustness:
         from views_r2darts2.transformers.views_dataset_darts import _ViewsDatasetDarts
         from unittest.mock import MagicMock
 
-        dataset = MagicMock(spec=_ViewsDatasetDarts)
-        dataset.features = []
-        dataset.targets = ["target"]
-
         catalog = ModelCatalog(config=config)
         model = catalog.get_model("NBEATSModel")
 
-        forecaster = DartsForecaster(
-            dataset=dataset,
-            model=model,
-            partition_dict={"train": (0, 100), "test": (100, 120)},
-            target_scaler="MinMaxScaler",
-            feature_scaler="StandardScaler",
-            random_state=42,
-        )
-
-        # Verify that instantiated scalers behave globally
-        # We need to fit them first to check the number of fitted parameters
         multi_ts = [
             TimeSeries.from_times_and_values(
                 pd.date_range("2000-01", periods=12, freq="MS"), np.random.randn(12, 1)
@@ -172,14 +157,50 @@ class TestScalingRobustness:
             for _ in range(3)
         ]
 
-        forecaster.target_scaler.fit(multi_ts)
-        # In Darts Scaler, _fitted_params is a tuple of params (one per series if False, length 1 if True)
-        assert len(forecaster.target_scaler._fitted_params) == 1, (
+        # --- Univariate case: features=[] → feature_scaler auto-disabled ---
+        dataset_no_feat = MagicMock(spec=_ViewsDatasetDarts)
+        dataset_no_feat.features = []
+        dataset_no_feat.targets = ["target"]
+
+        forecaster_no_feat = DartsForecaster(
+            dataset=dataset_no_feat,
+            model=model,
+            partition_dict={"train": (0, 100), "test": (100, 120)},
+            target_scaler="MinMaxScaler",
+            feature_scaler="StandardScaler",
+            random_state=42,
+        )
+
+        assert forecaster_no_feat.feature_scaler is None, (
+            "feature_scaler must be None when dataset has no features!"
+        )
+
+        forecaster_no_feat.target_scaler.fit(multi_ts)
+        assert len(forecaster_no_feat.target_scaler._fitted_params) == 1, (
             "Target scaler must have 1 set of params (global_fit=True)!"
         )
 
-        forecaster.feature_scaler.fit(multi_ts)
-        assert len(forecaster.feature_scaler._fitted_params) == 1, (
+        # --- Multivariate case: features present → both scalers use global_fit ---
+        dataset_with_feat = MagicMock(spec=_ViewsDatasetDarts)
+        dataset_with_feat.features = ["feat_a", "feat_b"]
+        dataset_with_feat.targets = ["target"]
+
+        forecaster_with_feat = DartsForecaster(
+            dataset=dataset_with_feat,
+            model=model,
+            partition_dict={"train": (0, 100), "test": (100, 120)},
+            target_scaler="MinMaxScaler",
+            feature_scaler="StandardScaler",
+            random_state=42,
+        )
+
+        forecaster_with_feat.target_scaler.fit(multi_ts)
+        assert len(forecaster_with_feat.target_scaler._fitted_params) == 1, (
+            "Target scaler must have 1 set of params (global_fit=True)!"
+        )
+
+        forecaster_with_feat.feature_scaler.fit(multi_ts)
+        assert len(forecaster_with_feat.feature_scaler._fitted_params) == 1, (
             "Feature scaler must have 1 set of params (global_fit=True)!"
         )
 

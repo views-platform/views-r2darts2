@@ -133,6 +133,14 @@ class DartsForecaster:
 
         logger.info(f"Using target scaler: {self._target_scaler_cfg}")
 
+        if not self.dataset.features:
+            if self._feature_scaler_cfg or self._feature_scaler_map_cfg:
+                logger.info(
+                    "Dataset has no feature columns — disabling feature_scaler. "
+                    "This is expected for univariate models using datafactory."
+                )
+            self.feature_scaler = None
+
         self.device = self.get_device()
         logger.info(f"Using device: {self.device}")
         if hasattr(self.model, "to_device"):
@@ -359,6 +367,36 @@ class DartsForecaster:
         timeseries_float = [s.astype(np.float32) for s in timeseries]
 
         self.min_length = self.model.input_chunk_length + self.model.output_chunk_length
+
+        if not self.dataset.features:
+            if train_mode:
+                targets = [
+                    s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
+                    for s in timeseries_float
+                    if len(s) >= self.min_length
+                ]
+            else:
+                targets = [
+                    s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
+                    for s in timeseries_float
+                ]
+            targets = self._apply_log_to_targets(targets)
+            if train_mode:
+                ReproducibilityGate.Temporal.audit_boundary_integrity(targets, end)
+                for ts in targets:
+                    ReproducibilityGate.Temporal.audit_sequence_contiguity(
+                        ts.time_index.values.astype(int)
+                    )
+                if self.target_scaler:
+                    targets = self.target_scaler.fit_transform(targets)
+                self.scaler_fitted = True
+            else:
+                if self.target_scaler and self.scaler_fitted:
+                    targets = self.target_scaler.transform(targets)
+            targets = [ts.astype(np.float32) for ts in targets]
+            ReproducibilityGate.Data.audit_numerical_sanity(targets, "targets")
+            return targets, None
+
         if train_mode:
             # We slice targets up to 'end + 1' because Darts slice is exclusive for integer indices.
             # This ensures month 'end' (t) is included.

@@ -79,8 +79,12 @@ class _ViewsDatasetDarts(_ViewsDataset):
         """
         df_subset = self.get_subset_dataframe(time_ids=time_ids, entity_ids=entity_ids)
 
-        # Enforce float32 precision at the Data Airlock boundary (ADR-010)
-        cols_to_cast = self.features + self.targets
+        # Enforce float32 precision at the Data Airlock boundary (ADR-010).
+        # Only cast columns already present in the raw dataframe — cyclic
+        # encoder columns (month_sin, month_cos, etc.) are appended to
+        # self.features by prior calls but don't exist in df_subset yet;
+        # they are injected below on df_reset and cast there.
+        cols_to_cast = [c for c in self.features + self.targets if c in df_subset.columns]
         df_subset[cols_to_cast] = df_subset[cols_to_cast].astype(np.float32)
 
         df_reset = df_subset.reset_index(level=[1])
@@ -96,7 +100,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         if cyclic_encoders is not None:
             for enc_fn in cyclic_encoders:
                 col_name = enc_fn.__name__
-                df_reset[col_name] = enc_fn(df_reset.index)
+                df_reset[col_name] = enc_fn(df_reset.index).astype(np.float32)
                 if col_name not in self.features:
                     self.features.append(col_name)
             logger.info(

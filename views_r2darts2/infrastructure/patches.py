@@ -163,23 +163,24 @@ def apply_nbeats_patch():
 #      Zero-init ensures the model starts as standard RevIN (conditioning = 0)
 #      and gradually learns to use the statistics via gradient flow.
 #
-#   For n_targets=1 (VIEWS fatalities), this adds Linear(2→1) = 3 parameters.
+#   For n_targets=1 (VIEWS fatalities), this adds 1× Linear(2, 1) = 3 parameters.
+#   For n_targets=K, this adds K× Linear(2, 1) = 3K parameters.
 #
 #   Works with ALL Darts models (N-BEATS, Transformer, TFT, TiDE, TSMixer,
 #   BlockRNN, TCN, NHiTS) because input/output dimensions are unchanged —
 #   the conditioning is additive within existing target channels.
-
-# Normalization constants for stat conditioning inputs.
-# These bring μ and σ_raw into roughly unit-scale ranges for the projection.
-# In asinh(fatalities) space: μ ∈ [0, ~12], σ_raw ∈ [0.1, ~6].
-_MU_SCALE = 6.0
-_SIGMA_SCALE = 3.0
+#
+#   Per-target projections: each target i has its own Linear(2, 1) mapping
+#   (μ_i, σ_i) → scalar conditioning. This prevents cross-target leakage
+#   when targets have heterogeneous scales (e.g., fatalities + covariates).
+#   AdamW's per-parameter adaptive learning rate handles (μ, σ) scale
+#   differences, so no manual normalization of inputs is needed.
 
 
 def apply_conditioned_rinorm_patch():
     """
-    Patches Darts RINorm with log(1+σ) compression and statistics conditioning.
-    Patches both __init__ (to add stat_proj) and forward (to apply conditioning).
+    Patches Darts RINorm with log(1+σ) compression and per-target statistics conditioning.
+    Patches both __init__ (to add stat_projs) and forward (to apply conditioning).
     The inverse method is unchanged — output dimensions are identical.
     """
     from darts.models.components.layer_norm_variants import RINorm
@@ -191,11 +192,15 @@ def apply_conditioned_rinorm_patch():
 
     def _conditioned_init(self, input_dim: int, eps=1e-5, affine=True):
         _orig_init(self, input_dim, eps, affine)
-        # Learnable projection: (μ, σ_raw) → additive conditioning per target channel.
+        # Per-target learnable projection: (μ_i, σ_i) → scalar conditioning offset.
+        # Independent per target — no cross-target leakage.
         # Zero-initialized so the model starts as standard RevIN.
-        self.stat_proj = nn.Linear(2 * input_dim, input_dim, bias=True)
-        nn.init.zeros_(self.stat_proj.weight)
-        nn.init.zeros_(self.stat_proj.bias)
+        self.stat_projs = nn.ModuleList([
+            nn.Linear(2, 1, bias=True) for _ in range(input_dim)
+        ])
+        for proj in self.stat_projs:
+            nn.init.zeros_(proj.weight)
+            nn.init.zeros_(proj.bias)
 
     def _conditioned_forward(self, x: torch.Tensor):
         # x: (B, T, n_targets)
@@ -214,15 +219,16 @@ def apply_conditioned_rinorm_patch():
             z = z * self.affine_weight
             z = z + self.affine_bias
 
-        # Part B: statistics conditioning.
-        # Project raw (μ, σ) into an additive signal so the model can
-        # distinguish series identity in z-space.
-        stats = torch.cat([
-            self.mean.squeeze(1) / _MU_SCALE,      # (B, n_targets)
-            raw_stdev.squeeze(1) / _SIGMA_SCALE,    # (B, n_targets)
-        ], dim=-1)                                   # (B, 2 * n_targets)
-        conditioning = self.stat_proj(stats)         # (B, n_targets)
-        z = z + conditioning.unsqueeze(1)            # broadcast → (B, T, n_targets)
+        # Part B: per-target statistics conditioning.
+        # Each target independently maps its own (μ_i, σ_i) to an additive
+        # offset so the model can distinguish series identity in z-space.
+        mu = self.mean.squeeze(1)        # (B, n_targets)
+        sigma = raw_stdev.squeeze(1)     # (B, n_targets)
+        conditioning = torch.cat([
+            proj(torch.stack([mu[:, i], sigma[:, i]], dim=-1))  # (B, 1)
+            for i, proj in enumerate(self.stat_projs)
+        ], dim=-1)                       # (B, n_targets)
+        z = z + conditioning.unsqueeze(1)  # broadcast → (B, T, n_targets)
 
         return z
 
@@ -230,8 +236,8 @@ def apply_conditioned_rinorm_patch():
     RINorm.__init__ = _conditioned_init
     RINorm.forward = _conditioned_forward
     logger.info(
-        "🐨 Patched RINorm: log(1+σ) compression + statistics conditioning. "
-        "Series identity (μ, σ) re-injected via zero-init learnable projection."
+        "🐨 Patched RINorm: log(1+σ) compression + per-target statistics conditioning. "
+        "Series identity (μ, σ) re-injected via independent zero-init projections."
     )
 
 

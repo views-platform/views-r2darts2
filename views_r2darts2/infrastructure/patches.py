@@ -139,7 +139,7 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. Statistics-Conditioned RevIN Patch ---
+# --- 3. Statistics-Conditioned RevIN Patch (FiLM) ---
 #
 # Two-part patch for RINorm:
 #
@@ -149,38 +149,45 @@ def apply_nbeats_patch():
 #        Raw σ:  ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
 #        log1p:  ŷ = 2.5 × 1.61 + 5 = 9.025 →  sinh(9)  ≈ 4,143 deaths
 #
-#   B) Statistics conditioning — re-injects (μ, σ_raw) as a learnable additive
-#      signal into the normalized z-space. Standard RevIN strips per-series
-#      identity, causing "over-stationarization" (Liu et al. NeurIPS 2022):
-#      all entities produce an identical canonical temporal pattern, with only
-#      level/scale differing after the mechanical ẑ·σ+μ inverse. The model
-#      cannot learn entity-specific dynamics.
+#   B) FiLM conditioning (Feature-wise Linear Modulation) — re-injects (μ, σ_raw)
+#      as a learnable scale+shift on the normalized z-space. Standard RevIN
+#      strips per-series identity, causing "over-stationarization" (Liu et al.
+#      NeurIPS 2022): all entities produce an identical canonical temporal
+#      pattern, with only level/scale differing after the mechanical ẑ·σ+μ
+#      inverse. The model cannot learn entity-specific dynamics.
 #
-#      By projecting (μ, σ_raw) through a zero-initialized Linear layer and
-#      adding the result to z, the model can learn to differentiate series
-#      while still benefiting from normalized z-targets for stable training.
+#      Additive conditioning alone (z + β) only shifts the forecast level but
+#      cannot change temporal shape — all countries still get the same spike/dip
+#      pattern. FiLM uses both multiplicative (γ) and additive (β) modulation:
 #
-#      Zero-init ensures the model starts as standard RevIN (conditioning = 0)
-#      and gradually learns to use the statistics via gradient flow.
+#          z_final = γ · z + β      where (γ, β) = f(μ, σ) per target
 #
-#   For n_targets=1 (VIEWS fatalities), this adds 1× Linear(2, 1) = 3 parameters.
-#   For n_targets=K, this adds K× Linear(2, 1) = 3K parameters.
+#      The multiplicative γ rescales normalized z differently per series.
+#      When this rescaled z hits nonlinearities in the backbone (ReLU in
+#      N-BEATS, softmax in Transformer attention), different scales produce
+#      genuinely different temporal dynamics — not just level-shifted copies.
+#
+#      Zero-init ensures the model starts as standard RevIN:
+#      - γ = 1 + 0 = 1 (identity scaling)
+#      - β = 0 (no shift)
+#      Then learns to use statistics via gradient flow.
+#
+#   For n_targets=1 (VIEWS fatalities), adds 2× Linear(2, 1) = 6 parameters.
+#   For n_targets=K, adds 2K× Linear(2, 1) = 6K parameters.
 #
 #   Works with ALL Darts models (N-BEATS, Transformer, TFT, TiDE, TSMixer,
 #   BlockRNN, TCN, NHiTS) because input/output dimensions are unchanged —
-#   the conditioning is additive within existing target channels.
+#   the conditioning modulates existing target channels in-place.
 #
-#   Per-target projections: each target i has its own Linear(2, 1) mapping
-#   (μ_i, σ_i) → scalar conditioning. This prevents cross-target leakage
-#   when targets have heterogeneous scales (e.g., fatalities + covariates).
-#   AdamW's per-parameter adaptive learning rate handles (μ, σ) scale
-#   differences, so no manual normalization of inputs is needed.
+#   Per-target projections: each target i has its own scale and shift
+#   Linear(2, 1) mapped from (μ_i, σ_i). This prevents cross-target leakage
+#   when targets have heterogeneous scales.
 
 
 def apply_conditioned_rinorm_patch():
     """
-    Patches Darts RINorm with log(1+σ) compression and per-target statistics conditioning.
-    Patches both __init__ (to add stat_projs) and forward (to apply conditioning).
+    Patches Darts RINorm with log(1+σ) compression and per-target FiLM conditioning.
+    Patches both __init__ (to add scale/shift projections) and forward (to apply FiLM).
     The inverse method is unchanged — output dimensions are identical.
     """
     from darts.models.components.layer_norm_variants import RINorm
@@ -192,13 +199,16 @@ def apply_conditioned_rinorm_patch():
 
     def _conditioned_init(self, input_dim: int, eps=1e-5, affine=True):
         _orig_init(self, input_dim, eps, affine)
-        # Per-target learnable projection: (μ_i, σ_i) → scalar conditioning offset.
+        # Per-target FiLM: (μ_i, σ_i) → (γ_i, β_i) for scale and shift.
         # Independent per target — no cross-target leakage.
-        # Zero-initialized so the model starts as standard RevIN.
-        self.stat_projs = nn.ModuleList([
+        # Zero-initialized so γ=1+0=1 (identity) and β=0 (no shift) at init.
+        self.film_scale = nn.ModuleList([
             nn.Linear(2, 1, bias=True) for _ in range(input_dim)
         ])
-        for proj in self.stat_projs:
+        self.film_shift = nn.ModuleList([
+            nn.Linear(2, 1, bias=True) for _ in range(input_dim)
+        ])
+        for proj in list(self.film_scale) + list(self.film_shift):
             nn.init.zeros_(proj.weight)
             nn.init.zeros_(proj.bias)
 
@@ -219,16 +229,27 @@ def apply_conditioned_rinorm_patch():
             z = z * self.affine_weight
             z = z + self.affine_bias
 
-        # Part B: per-target statistics conditioning.
-        # Each target independently maps its own (μ_i, σ_i) to an additive
-        # offset so the model can distinguish series identity in z-space.
+        # Part B: per-target FiLM conditioning.
+        # γ rescales z (amplifies/dampens temporal patterns per series).
+        # β shifts z level. Together they let the backbone see genuinely
+        # different inputs for different series, producing distinct temporal
+        # dynamics through its nonlinearities.
         mu = self.mean.squeeze(1)        # (B, n_targets)
         sigma = raw_stdev.squeeze(1)     # (B, n_targets)
-        conditioning = torch.cat([
-            proj(torch.stack([mu[:, i], sigma[:, i]], dim=-1))  # (B, 1)
-            for i, proj in enumerate(self.stat_projs)
+        n_targets = mu.shape[-1]
+
+        gamma = torch.cat([
+            self.film_scale[i](torch.stack([mu[:, i], sigma[:, i]], dim=-1))
+            for i in range(n_targets)
         ], dim=-1)                       # (B, n_targets)
-        z = z + conditioning.unsqueeze(1)  # broadcast → (B, T, n_targets)
+
+        beta = torch.cat([
+            self.film_shift[i](torch.stack([mu[:, i], sigma[:, i]], dim=-1))
+            for i in range(n_targets)
+        ], dim=-1)                       # (B, n_targets)
+
+        # γ centered at 1: identity when zero-init. β centered at 0.
+        z = (1 + gamma.unsqueeze(1)) * z + beta.unsqueeze(1)
 
         return z
 
@@ -236,8 +257,8 @@ def apply_conditioned_rinorm_patch():
     RINorm.__init__ = _conditioned_init
     RINorm.forward = _conditioned_forward
     logger.info(
-        "🐨 Patched RINorm: log(1+σ) compression + per-target statistics conditioning. "
-        "Series identity (μ, σ) re-injected via independent zero-init projections."
+        "🐨 Patched RINorm: log(1+σ) compression + per-target FiLM conditioning. "
+        "Series identity (μ, σ) re-injected as learnable scale+shift on z-space."
     )
 
 

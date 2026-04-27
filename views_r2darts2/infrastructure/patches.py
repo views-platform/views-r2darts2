@@ -172,6 +172,13 @@ def apply_nbeats_patch():
 #      - β = 0 (no shift)
 #      Then learns to use statistics via gradient flow.
 #
+#      The inverse is SYMMETRIC: it undoes FiLM before undoing affine and
+#      denormalization. This means the model operates entirely in z_film
+#      space — it doesn't need to learn entity-dependent compensation for
+#      a forward/inverse mismatch. Without symmetric inverse, the model
+#      must internally "undo" FiLM on its output, which it can only
+#      approximate, leading to systematically muted forecasts.
+#
 #   For n_targets=1 (VIEWS fatalities), adds 2× Linear(2, 1) = 6 parameters.
 #   For n_targets=K, adds 2K× Linear(2, 1) = 6K parameters.
 #
@@ -187,8 +194,9 @@ def apply_nbeats_patch():
 def apply_conditioned_rinorm_patch():
     """
     Patches Darts RINorm with log(1+σ) compression and per-target FiLM conditioning.
-    Patches both __init__ (to add scale/shift projections) and forward (to apply FiLM).
-    The inverse method is unchanged — output dimensions are identical.
+    Patches __init__ (scale/shift projections), forward (FiLM), and inverse (undo FiLM).
+    The forward/inverse pair is symmetric: forward applies FiLM, inverse undoes it.
+    The model operates entirely in FiLM-modulated z-space.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
@@ -248,17 +256,47 @@ def apply_conditioned_rinorm_patch():
             for i in range(n_targets)
         ], dim=-1)                       # (B, n_targets)
 
+        # Store for symmetric inverse.
+        self._film_gamma = gamma         # (B, n_targets)
+        self._film_beta = beta           # (B, n_targets)
+
         # γ centered at 1: identity when zero-init. β centered at 0.
         z = (1 + gamma.unsqueeze(1)) * z + beta.unsqueeze(1)
 
         return z
 
+    def _conditioned_inverse(self, x: torch.Tensor):
+        # x: (B, T_out, n_targets, nr_params)
+        # Symmetric inverse: undo FiLM → undo affine → denormalize.
+        # This ensures the model operates entirely in z_film space.
+        # Without this, the model must learn entity-dependent compensation
+        # for the FiLM asymmetry, leading to systematically muted forecasts.
+
+        # Step 1: Undo FiLM — (B, n_targets) → (B, 1, n_targets, 1)
+        g = self._film_gamma.unsqueeze(1).unsqueeze(-1)
+        b = self._film_beta.unsqueeze(1).unsqueeze(-1)
+        x = (x - b) / (1 + g).clamp(min=0.1)
+
+        # Step 2: Undo affine
+        if self.affine:
+            x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
+            x = x / (
+                self.affine_weight.view(self.affine_weight.shape + (1,))
+                + self.eps * self.eps
+            )
+
+        # Step 3: Denormalize
+        x = x * self.stdev.view(self.stdev.shape + (1,))
+        x = x + self.mean.view(self.mean.shape + (1,))
+        return x
+
     _conditioned_forward._stat_conditioned = True
     RINorm.__init__ = _conditioned_init
     RINorm.forward = _conditioned_forward
+    RINorm.inverse = _conditioned_inverse
     logger.info(
-        "🐨 Patched RINorm: log(1+σ) compression + per-target FiLM conditioning. "
-        "Series identity (μ, σ) re-injected as learnable scale+shift on z-space."
+        "🐨 Patched RINorm: log(1+σ) compression + per-target FiLM conditioning "
+        "with symmetric inverse. Model operates in z_film space end-to-end."
     )
 
 

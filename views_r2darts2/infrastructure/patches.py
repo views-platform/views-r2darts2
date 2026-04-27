@@ -261,7 +261,10 @@ def apply_conditioned_rinorm_patch():
         self._film_beta = beta           # (B, n_targets)
 
         # γ centered at 1: identity when zero-init. β centered at 0.
-        z = (1 + gamma.unsqueeze(1)) * z + beta.unsqueeze(1)
+        # Clamp (1+γ) away from zero to prevent degenerate scaling.
+        # Same clamp used in both forward and inverse for exact symmetry.
+        scale = (1 + gamma).clamp(min=0.1)
+        z = scale.unsqueeze(1) * z + beta.unsqueeze(1)
 
         return z
 
@@ -273,9 +276,10 @@ def apply_conditioned_rinorm_patch():
         # for the FiLM asymmetry, leading to systematically muted forecasts.
 
         # Step 1: Undo FiLM — (B, n_targets) → (B, 1, n_targets, 1)
-        g = self._film_gamma.unsqueeze(1).unsqueeze(-1)
+        scale = (1 + self._film_gamma).clamp(min=0.1)
+        g = scale.unsqueeze(1).unsqueeze(-1)
         b = self._film_beta.unsqueeze(1).unsqueeze(-1)
-        x = (x - b) / (1 + g).clamp(min=0.1)
+        x = (x - b) / g
 
         # Step 2: Undo affine
         if self.affine:

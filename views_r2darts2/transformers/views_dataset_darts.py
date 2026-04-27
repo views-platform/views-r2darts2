@@ -59,6 +59,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         self,
         time_ids: Optional[Union[int, List[int]]] = None,
         entity_ids: Optional[Union[int, List[int]]] = None,
+        stat_time_range: Optional[tuple] = None,
     ):
         """
         Converts the internal data subset into a Darts TimeSeries object.
@@ -66,6 +67,11 @@ class _ViewsDatasetDarts(_ViewsDataset):
         Parameters:
             time_ids (Optional[Union[int, List[int]]]): Specific time indices or list of time indices to filter the data. If None, all time indices are included.
             entity_ids (Optional[Union[int, List[int]]]): Specific entity indices or list of entity indices to filter the data. If None, all entity indices are included.
+            stat_time_range (Optional[tuple]): A (start, end) tuple of time_id boundaries
+                (inclusive) for computing static covariate statistics. If None, statistics
+                are computed from the entire df_subset — which may leak test-period data
+                if df_subset is unfiltered. Callers should always pass the training
+                partition boundaries here to prevent leakage.
 
         Returns:
             TimeSeries: A Darts TimeSeries object constructed from the filtered dataframe, grouped by entity and containing the specified features and targets.
@@ -80,24 +86,42 @@ class _ViewsDatasetDarts(_ViewsDataset):
 
         # --- Per-entity static covariates (entity fingerprint) ---
         #
-        # LEAKAGE SAFETY: Every stat below is computed exclusively from
-        # df_subset — the already time-filtered visible input window.
-        # The model sees every row in df_subset as input already;
-        # summarizing them as static covariates introduces *no* information
-        # beyond what is present in the input series.
+        # LEAKAGE SAFETY: Statistics are computed from df_stat — a time-
+        # filtered slice of df_reset restricted to stat_time_range (the
+        # training partition). This guarantees that no test/forecast-period
+        # target values contaminate the static covariates. The full df_reset
+        # (including test rows) still gets the stats joined and is returned
+        # as TimeSeries — but the stats themselves only reflect training data.
         #
         # VALUES are in raw (pre-transform) space. AsinhTransform (or
         # whichever target_scaler is configured) is applied downstream by
         # the forecaster on the TimeSeries objects after this method returns.
         #
-        # Features injected (all per-entity, all from visible window only):
+        # Features injected (all per-entity, all from stat_time_range only):
         #   target_mu      — mean target level
         #   target_sigma   — std of target (spread / volatility)
         #   target_max     — peak observed value (captures spike extremity)
         #   target_trend   — OLS slope of target over time (regime change detector)
         #   target_sparsity— fraction of zero-valued months (structural break signal)
+        if stat_time_range is not None:
+            stat_start, stat_end = stat_time_range
+            df_stat = df_reset.loc[
+                (df_reset.index >= stat_start) & (df_reset.index <= stat_end)
+            ]
+            logger.info(
+                f"Static covariate stats restricted to time range [{stat_start}, {stat_end}] "
+                f"({df_stat.index.nunique()} time steps, {len(df_stat)} rows). "
+                f"Full dataframe has {df_reset.index.nunique()} time steps."
+            )
+        else:
+            df_stat = df_reset
+            logger.warning(
+                "stat_time_range not provided — static covariate stats computed from "
+                "the FULL dataframe. This may cause leakage if test-period data is present."
+            )
+
         target_col = self.targets[0]
-        grouped = df_reset.groupby(self._entity_id)[target_col]
+        grouped = df_stat.groupby(self._entity_id)[target_col]
 
         stats = grouped.agg(
             target_mu="mean",
@@ -129,12 +153,12 @@ class _ViewsDatasetDarts(_ViewsDataset):
         ]
 
         n_entities = len(stats)
-        n_rows = len(df_reset)
-        n_time_steps = df_reset.index.nunique()
+        n_stat_rows = len(df_stat)
+        n_stat_time_steps = df_stat.index.nunique()
         logger.info(
             f"Static covariates: injecting {static_cov_names} for {n_entities} entities "
-            f"computed from {n_rows} rows ({n_time_steps} time steps) in the visible input window. "
-            f"All values in raw (pre-transform) space — no future target data used. "
+            f"computed from {n_stat_rows} rows ({n_stat_time_steps} time steps). "
+            f"All values in raw (pre-transform) space — no test/forecast data used. "
             f"μ ∈ [{stats['target_mu'].min():.2f}, {stats['target_mu'].max():.2f}], "
             f"σ ∈ [{stats['target_sigma'].min():.2f}, {stats['target_sigma'].max():.2f}], "
             f"max ∈ [{stats['target_max'].min():.2f}, {stats['target_max'].max():.2f}], "

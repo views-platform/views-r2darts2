@@ -492,7 +492,9 @@ class DartsForecaster:
         Returns:
             None
         """
-        timeseries = self.dataset.as_darts_timeseries()
+        timeseries = self.dataset.as_darts_timeseries(
+            stat_time_range=(self._train_start, self._train_end),
+        )
 
         target_series, past_covariates = self._preprocess_timeseries(
             timeseries=timeseries,
@@ -548,7 +550,9 @@ class DartsForecaster:
         # LOCK ENTROPY: Guarantee bit-perfect identity for probabilistic samples
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
-        timeseries = self.dataset.as_darts_timeseries()
+        timeseries = self.dataset.as_darts_timeseries(
+            stat_time_range=(self._train_start, self._train_end),
+        )
 
         # Get the input window for forecasting based on sequence_number
         target_series, past_covariates = self._preprocess_timeseries(

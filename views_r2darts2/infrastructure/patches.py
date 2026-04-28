@@ -214,25 +214,35 @@ def apply_all_patches():
 
 # --- 4. TiDE MC Dropout Patch ---
 #
-# TiDE's architecture has two layers of skip connections that bypass dropout:
+# TiDE architecture has two deterministic skip paths that dominate the output:
 #
 #   1. _ResidualBlock: out = dense(x) + skip(x)
-#      where dense = Linear→ReLU→Linear→MCDropout, skip = Linear (no dropout)
+#      dense = Linear→ReLU→Linear→MCDropout  (stochastic, ~10% of signal)
+#      skip  = Linear                        (deterministic, ~90% of signal)
 #
-#   2. _TideModule.forward: y = temporal_decoded + lookback_skip(x_lookback)
-#      where lookback_skip = Linear (no dropout, norm=48, dominates output)
+#   2. _TideModule: y = temporal_decoded + lookback_skip(x_lookback)
+#      temporal_decoded = through all encoders/decoders   (stochastic after fix)
+#      lookback_skip    = Linear(icl, ocl)                (deterministic, dominates)
 #
-# With dropout=0.15 and skip paths carrying >90% of signal, MC dropout
-# produces negligible (or zero) variation across samples because:
-#   - The stochastic path (encoder→decoder) contributes ~10% of output
-#   - Its dropout-induced variation is dwarfed by the deterministic skip
-#   - After lookback_skip addition, variation is below float32 precision
+# Without the fix, MC dropout produces negligible variation:
+#   - The stochastic dense path contributes ~10% of each residual block output
+#   - lookback_skip carries raw target history directly to output, no dropout
+#   - Sum of deterministic skip paths overwhelms stochastic dense path
+#   - Result: samples are effectively identical
 #
-# Fix: add MonteCarloDropout to both skip paths so the ENTIRE output
-# is stochastic under MC dropout, not just a small residual correction.
-# The skip dropout uses a reduced rate (dropout * 0.5) to avoid excessive
-# noise on the primary signal path. The lookback skip uses (dropout * 0.25)
-# since it carries the majority of the signal.
+# Fix: register MonteCarloDropout on BOTH skip paths as proper nn.Module instances.
+# set_mc_dropout(active=True) — called by on_predict_start — iterates
+# _get_mc_dropout_modules() which finds ALL MonteCarloDropout children recursively.
+# Registered modules are picked up automatically; F.dropout with manual
+# mc_active detection is NOT used (fragile, missed by set_mc_dropout).
+#
+# Dropout rates:
+#   _ResidualBlock.skip_dropout     = p × 0.5  (half base rate — skip carries residual)
+#   _TideModule.lookback_skip_dropout = p × 0.5 (half base rate — primary signal path)
+#
+# State dict safety: MonteCarloDropout (nn.Dropout subclass) has no parameters or
+# buffers → contributes no keys to state_dict → loading existing checkpoints with
+# strict=True is safe.
 
 
 def _patched_residual_block_init(
@@ -243,7 +253,7 @@ def _patched_residual_block_init(
     dropout: float,
     use_layer_norm: bool,
 ):
-    """Patched _ResidualBlock.__init__ with MC dropout on skip connection."""
+    """Patched _ResidualBlock.__init__: adds MonteCarloDropout to skip connection."""
     nn.Module.__init__(self)
 
     self.dense = nn.Sequential(
@@ -254,6 +264,7 @@ def _patched_residual_block_init(
     )
 
     self.skip = nn.Linear(input_dim, output_dim)
+    # Registered module — picked up by set_mc_dropout() automatically.
     self.skip_dropout = MonteCarloDropout(dropout * 0.5)
 
     if use_layer_norm:
@@ -263,29 +274,42 @@ def _patched_residual_block_init(
 
 
 def _patched_residual_block_forward(self, x: torch.Tensor) -> torch.Tensor:
-    """Patched _ResidualBlock.forward with MC dropout on skip connection."""
+    """Patched _ResidualBlock.forward: applies skip_dropout on skip connection."""
     x = self.dense(x) + self.skip_dropout(self.skip(x))
-
     if self.layer_norm is not None:
         x = self.layer_norm(x)
-
     return x
+
+
+_original_tide_module_init = None  # set in apply_tide_mc_dropout_patch
+
+
+def _patched_tide_module_init(self, *args, **kwargs):
+    """Patched _TideModule.__init__: registers lookback_skip_dropout as a module.
+
+    Calls the original __init__ first (builds all layers including lookback_skip),
+    then registers lookback_skip_dropout so it is found by _get_mc_dropout_modules()
+    and activated by set_mc_dropout(True) during on_predict_start.
+    """
+    _original_tide_module_init(self, *args, **kwargs)
+    # self.dropout is set by the original __init__
+    self.lookback_skip_dropout = MonteCarloDropout(self.dropout * 0.5)
+    logger.debug(
+        f"[TiDE patch] __init__: registered lookback_skip_dropout "
+        f"(p={self.dropout * 0.5:.4f}), skip_dropout on {sum(1 for m in self.modules() if isinstance(m, MonteCarloDropout))} "
+        f"MonteCarloDropout modules total."
+    )
 
 
 def _patched_tide_module_forward(
     self, x_in: Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
 ) -> torch.Tensor:
-    """Patched _TideModule.forward with MC dropout on lookback skip path.
+    """Patched _TideModule.forward: applies lookback_skip_dropout on skip path.
 
-    Uses F.dropout directly instead of a MonteCarloDropout module to avoid
-    the lazy-init timing bug: on_predict_start() activates MC dropout on all
-    existing MonteCarloDropout modules BEFORE the first forward() call, so a
-    lazily created module would never be activated. We detect MC dropout
-    activation by checking _mc_dropout_enabled on any child MonteCarloDropout
-    (set by set_mc_dropout() in on_predict_start).
+    lookback_skip_dropout is a registered MonteCarloDropout module — it is activated
+    by set_mc_dropout(True) automatically, same as all other MCDropout modules.
+    No manual _mc_dropout_enabled detection is needed.
     """
-    import torch.nn.functional as F
-
     x, x_future_covariates, x_static_covariates = x_in
 
     x_lookback = x[:, :, : self.output_dim]
@@ -333,7 +357,7 @@ def _patched_tide_module_forward(
     decoded = self.decoders(encoded)
     decoded = decoded.view(x.shape[0], self.output_chunk_length, -1)
 
-    # temporal decoder with future covariates
+    # temporal decoder
     temporal_decoder_input = [
         decoded,
         (
@@ -346,16 +370,10 @@ def _patched_tide_module_forward(
     temporal_decoder_input = torch.cat(temporal_decoder_input, dim=2)
     temporal_decoded = self.temporal_decoder(temporal_decoder_input)
 
-    # lookback skip WITH MC dropout (direct F.dropout to avoid lazy-init timing bug)
+    # lookback skip — apply registered lookback_skip_dropout
+    # activated automatically by set_mc_dropout(True) during on_predict_start
     skip = self.lookback_skip(x_lookback.transpose(1, 2)).transpose(1, 2)
-    # Detect MC dropout from child MonteCarloDropout modules (set by set_mc_dropout)
-    mc_active = any(
-        getattr(m, '_mc_dropout_enabled', False)
-        for m in self.modules()
-        if isinstance(m, MonteCarloDropout)
-    )
-    drop_active = self.training or mc_active
-    skip = F.dropout(skip, self.dropout * 0.25, drop_active)
+    skip = self.lookback_skip_dropout(skip)
 
     y = temporal_decoded + skip.reshape_as(temporal_decoded)
     y = y.view(-1, self.output_chunk_length, self.output_dim, self.nr_params)
@@ -364,29 +382,40 @@ def _patched_tide_module_forward(
 
 def apply_tide_mc_dropout_patch():
     """
-    Patches TiDE's _ResidualBlock and _TideModule to inject MonteCarloDropout
-    into skip connections, making MC dropout produce meaningful sample variation.
+    Patches TiDE to produce meaningful MC dropout sample variation.
+
+    Root cause: TiDE skip connections (ResidualBlock.skip, lookback_skip) are
+    deterministic and dominate output. The original MCDropout in dense paths
+    contributes <10% of signal — insufficient variation across samples.
+
+    Fix: register MonteCarloDropout on both skip paths as proper nn.Module
+    instances so set_mc_dropout(True) activates them alongside dense dropout.
     """
+    global _original_tide_module_init
+
     from darts.models.forecasting.tide_model import _ResidualBlock, _TideModule
     from darts.models.forecasting.pl_forecasting_module import io_processor
 
     if getattr(_ResidualBlock.forward, '_mc_patched', False):
-        return  # Already patched
+        logger.debug("[TiDE patch] already applied, skipping.")
+        return
 
-    # Patch _ResidualBlock
+    # --- Patch _ResidualBlock ---
     _ResidualBlock.__init__ = _patched_residual_block_init
     _patched_residual_block_forward._mc_patched = True
     _ResidualBlock.forward = _patched_residual_block_forward
 
-    # Patch _TideModule.forward (replace with dropout-injected version)
-    # Uses direct F.dropout on lookback_skip, detecting MC dropout activation
-    # from child MonteCarloDropout modules (set by set_mc_dropout in on_predict_start)
-    # instead of relying on a lazily-init'd module that would miss activation.
-    # Must re-apply @io_processor decorator for RevIN support.
+    # --- Patch _TideModule.__init__ to register lookback_skip_dropout ---
+    _original_tide_module_init = _TideModule.__init__
+    _TideModule.__init__ = _patched_tide_module_init
+
+    # --- Patch _TideModule.forward to use lookback_skip_dropout ---
     _TideModule.forward = io_processor(_patched_tide_module_forward)
 
     logger.info(
-        "Successfully patched TiDE for MC dropout: "
-        "skip dropout (p×0.5) on _ResidualBlock, "
-        "lookback skip dropout (p×0.25) on _TideModule."
+        "[TiDE patch] ✅ installed: "
+        "_ResidualBlock.skip_dropout (p×0.5), "
+        "_TideModule.lookback_skip_dropout (p×0.5). "
+        "Both registered as MonteCarloDropout modules — activated by "
+        "set_mc_dropout(True) during on_predict_start."
     )

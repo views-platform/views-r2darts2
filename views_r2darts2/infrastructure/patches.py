@@ -378,8 +378,12 @@ def _patched_tide_module_forward(
     temporal_decoded = self.temporal_decoder(temporal_decoder_input)
 
     # lookback skip — apply registered lookback_skip_dropout
-    # activated automatically by set_mc_dropout(True) during on_predict_start
+    # Lazily register if missing (happens when model is loaded from checkpoint
+    # rather than created via _create_model during fit())
     skip = self.lookback_skip(x_lookback.transpose(1, 2)).transpose(1, 2)
+    if not hasattr(self, "lookback_skip_dropout"):
+        self.lookback_skip_dropout = MonteCarloDropout(self.dropout * 0.5)
+        self.lookback_skip_dropout.to(skip.device)
     skip = self.lookback_skip_dropout(skip)
 
     y = temporal_decoded + skip.reshape_as(temporal_decoded)

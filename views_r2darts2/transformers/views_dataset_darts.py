@@ -61,6 +61,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         time_ids: Optional[Union[int, List[int]]] = None,
         entity_ids: Optional[Union[int, List[int]]] = None,
         stat_time_range: Optional[tuple] = None,
+        static_cov_transform: Optional[str] = None,
     ):
         """
         Converts the internal data subset into a Darts TimeSeries object.
@@ -73,6 +74,11 @@ class _ViewsDatasetDarts(_ViewsDataset):
                 are computed from the entire df_subset — which may leak test-period data
                 if df_subset is unfiltered. Callers should always pass the training
                 partition boundaries here to prevent leakage.
+            static_cov_transform (Optional[str]): Name of a transform to apply to the
+                computed static covariate statistics (mu, sigma, max, trend) before
+                injection. Supported: 'AsinhTransform', 'LogTransform', 'SqrtTransform',
+                'FourthRootTransform'. When None, stats are injected in raw space.
+                Sparsity (already in [0, 1]) is never transformed.
 
         Returns:
             TimeSeries: A Darts TimeSeries object constructed from the filtered dataframe, grouped by entity and containing the specified features and targets.
@@ -117,9 +123,10 @@ class _ViewsDatasetDarts(_ViewsDataset):
         # (including test rows) still gets the stats joined and is returned
         # as TimeSeries — but the stats themselves only reflect training data.
         #
-        # VALUES are in raw (pre-transform) space. AsinhTransform (or
-        # whichever target_scaler is configured) is applied downstream by
-        # the forecaster on the TimeSeries objects after this method returns.
+        # When static_cov_transform is provided (e.g. 'AsinhTransform'), mu,
+        # sigma, max, and trend are transformed before injection so that their
+        # scale matches the model's internal representation space. Sparsity
+        # (fraction in [0, 1]) is never transformed.
         #
         # Features injected (all per-entity, all from stat_time_range only):
         #   target_mu      — mean target level
@@ -155,6 +162,24 @@ class _ViewsDatasetDarts(_ViewsDataset):
                 return 0.0
             return float((t_centered * y_centered).sum() / denom)
 
+        # Resolve the element-wise transform function for static cov stats.
+        # These are numpy-level (not Darts Scaler) because static covariates
+        # are scalars per entity, not time series.
+        _STATIC_COV_TRANSFORMS = {
+            "AsinhTransform": np.arcsinh,
+            "LogTransform": np.log1p,
+            "SqrtTransform": lambda x: np.sqrt(np.maximum(x, 0)),
+            "FourthRootTransform": lambda x: np.power(1.0 + np.maximum(x, 0.0), 0.25) - 1.0,
+        }
+        transform_fn = None
+        if static_cov_transform is not None:
+            if static_cov_transform not in _STATIC_COV_TRANSFORMS:
+                raise ValueError(
+                    f"Unknown static_cov_transform '{static_cov_transform}'. "
+                    f"Available: {list(_STATIC_COV_TRANSFORMS.keys())}"
+                )
+            transform_fn = _STATIC_COV_TRANSFORMS[static_cov_transform]
+
         # Compute fingerprint stats for every target and name them {target_col}_{stat}.
         # This supports both single-target models (e.g. "lr_ged_sb_mu") and
         # multi-target models (e.g. "lr_ged_sb_mu", "lr_ged_ns_mu", ...) without
@@ -173,6 +198,14 @@ class _ViewsDatasetDarts(_ViewsDataset):
             col_stats[f"{target_col}_trend"] = grouped.apply(_ols_slope)
             # Sparsity: fraction of time steps with exactly zero target
             col_stats[f"{target_col}_sparsity"] = grouped.apply(lambda s: (s == 0).mean())
+
+            # Apply element-wise transform to scale-sensitive stats.
+            # Sparsity is already in [0, 1] — never transformed.
+            if transform_fn is not None:
+                for stat in ("mu", "sigma", "max", "trend"):
+                    col_name = f"{target_col}_{stat}"
+                    col_stats[col_name] = transform_fn(col_stats[col_name].values).astype(np.float32)
+
             stat_frames.append(col_stats)
 
         # Merge per-target stat DataFrames on the shared entity_id index
@@ -190,11 +223,12 @@ class _ViewsDatasetDarts(_ViewsDataset):
         n_entities = len(stats)
         n_stat_rows = len(df_stat)
         n_stat_time_steps = df_stat.index.nunique()
+        transform_label = static_cov_transform or "raw"
         logger.info(
             f"Static covariates: injecting {static_cov_names} "
             f"({len(self.targets)} target(s) × 5 stats = {len(static_cov_names)} cols) "
             f"for {n_entities} entities computed from {n_stat_rows} rows "
-            f"({n_stat_time_steps} time steps, raw pre-transform space)."
+            f"({n_stat_time_steps} time steps, {transform_label} space)."
         )
         df_reset = df_reset.join(stats.set_index(self._entity_id), on=self._entity_id)
 

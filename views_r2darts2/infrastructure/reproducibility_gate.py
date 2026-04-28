@@ -68,6 +68,7 @@ class ReproducibilityGate:
             "categorical_embedding_sizes",  # TFTModel: None = no categorical embeddings
             "temporal_hidden_size_past",    # TiDEModel: None = defaults to hidden_size
             "temporal_hidden_size_future",  # TiDEModel: None = defaults to hidden_size
+            "static_covariate_stats",       # All models: None = inject stats in raw space (backward compat)
         }
 
         # Algorithm-specific genes (Only audited if the algorithm matches)

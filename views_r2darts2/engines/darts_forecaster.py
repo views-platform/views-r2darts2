@@ -45,6 +45,7 @@ class DartsForecaster:
         log_features: list[str] | None = None,
         feature_scaler_map: Optional[Dict[str, Any]] = None,
         random_state: int = None,
+        static_covariate_stats: Optional[Dict[str, Any]] = None,
     ):
         """
         Initializes the forecaster with dataset, model, partition information, and optional scalers.
@@ -61,6 +62,14 @@ class DartsForecaster:
             feature_scaler_map (dict, optional): Mapping of scalers to specific feature groups.
                 When provided, this takes precedence over feature_scaler.
             random_state (int): Random seed for reproducibility. Mandatory.
+            static_covariate_stats (dict, optional): Configuration for per-entity
+                static covariate statistics injection. When provided, must contain:
+                  - 'transform' (str or None): Name of the element-wise transform to apply
+                    to mu, sigma, max, trend stats before injection. Supported:
+                    'AsinhTransform', 'LogTransform', 'SqrtTransform', 'FourthRootTransform'.
+                    When None, stats are injected in raw space.
+                When this parameter is None, static covariate stats are still injected
+                (backward compatible) in raw space.
 ...
         Attributes:
             dataset (_ViewsDatasetDarts): The provided dataset.
@@ -76,6 +85,7 @@ class DartsForecaster:
             feature_scaler (Scaler, FeatureScalerManager, or None): Feature scaler instance.
             device (torch.device): Device used for model computation.
             random_state (int): Captured random seed for entropy locking.
+            _static_cov_transform (str or None): Transform name for static covariate stats.
 
         Logs:
             Information about selected scalers and device.
@@ -90,6 +100,11 @@ class DartsForecaster:
                 "MANDATORY PARAMETER MISSING: random_state must be provided to DartsForecaster."
             )
         self.random_state = random_state
+
+        # Static covariate stats transform (e.g. 'AsinhTransform' or None for raw)
+        self._static_cov_transform = (
+            static_covariate_stats.get("transform") if static_covariate_stats else None
+        )
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler
@@ -494,6 +509,7 @@ class DartsForecaster:
         """
         timeseries = self.dataset.as_darts_timeseries(
             stat_time_range=(self._train_start, self._train_end),
+            static_cov_transform=self._static_cov_transform,
         )
 
         target_series, past_covariates = self._preprocess_timeseries(
@@ -552,6 +568,7 @@ class DartsForecaster:
 
         timeseries = self.dataset.as_darts_timeseries(
             stat_time_range=(self._train_start, self._train_end),
+            static_cov_transform=self._static_cov_transform,
         )
 
         # Get the input window for forecasting based on sequence_number

@@ -102,9 +102,14 @@ class DartsForecaster:
         self.random_state = random_state
 
         # Static covariate stats transform (e.g. 'AsinhTransform' or None for raw)
+        logger.info(
+            f"static_covariate_stats received: {static_covariate_stats!r} "
+            f"(type={type(static_covariate_stats).__name__})"
+        )
         self._static_cov_transform = (
             static_covariate_stats.get("transform") if static_covariate_stats else None
         )
+        logger.info(f"_static_cov_transform resolved to: {self._static_cov_transform!r}")
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler

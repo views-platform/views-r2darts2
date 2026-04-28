@@ -282,24 +282,30 @@ def _patched_residual_block_forward(self, x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-_original_tide_module_init = None  # set in apply_tide_mc_dropout_patch
+_original_tide_create_model = None  # set in apply_tide_mc_dropout_patch
 
 
-def _patched_tide_module_init(self, *args, **kwargs):
-    """Patched _TideModule.__init__: registers lookback_skip_dropout as a module.
+def _patched_tide_create_model(self, train_sample):
+    """Patched TiDEModel._create_model: registers lookback_skip_dropout on the module.
 
-    Calls the original __init__ first (builds all layers including lookback_skip),
-    then registers lookback_skip_dropout so it is found by _get_mc_dropout_modules()
-    and activated by set_mc_dropout(True) during on_predict_start.
+    Calls the original _create_model (which constructs _TideModule and triggers
+    Lightning's save_hyperparameters with no wrapper in the stack), then adds
+    lookback_skip_dropout as a registered nn.Module on the fully-built object.
+
+    Avoids patching _TideModule.__init__ entirely, which previously caused
+    Lightning's save_hyperparameters() to walk the wrapper frame and crash with
+    KeyError: 'args' when trying to resolve named parameters from frame locals.
     """
-    _original_tide_module_init(self, *args, **kwargs)
-    # self.dropout is set by the original __init__
-    self.lookback_skip_dropout = MonteCarloDropout(self.dropout * 0.5)
+    module = _original_tide_create_model(self, train_sample)
+    # module.dropout is set by the original _TideModule.__init__
+    module.lookback_skip_dropout = MonteCarloDropout(module.dropout * 0.5)
     logger.debug(
-        f"[TiDE patch] __init__: registered lookback_skip_dropout "
-        f"(p={self.dropout * 0.5:.4f}), skip_dropout on {sum(1 for m in self.modules() if isinstance(m, MonteCarloDropout))} "
+        f"[TiDE patch] _create_model: registered lookback_skip_dropout "
+        f"(p={module.dropout * 0.5:.4f}), "
+        f"{sum(1 for m in module.modules() if isinstance(m, MonteCarloDropout))} "
         f"MonteCarloDropout modules total."
     )
+    return module
 
 
 def _patched_tide_module_forward(
@@ -391,10 +397,17 @@ def apply_tide_mc_dropout_patch():
 
     Fix: register MonteCarloDropout on both skip paths as proper nn.Module
     instances so set_mc_dropout(True) activates them alongside dense dropout.
-    """
-    global _original_tide_module_init
 
-    from darts.models.forecasting.tide_model import _ResidualBlock, _TideModule
+    Implementation note: lookback_skip_dropout is injected via a _create_model
+    patch rather than a _TideModule.__init__ patch. Patching __init__ caused
+    Lightning's save_hyperparameters() to walk the wrapper frame and crash with
+    KeyError: 'args' because frame locals had *args/**kwargs, not named params.
+    _create_model receives the fully-built module — no Lightning introspection
+    occurs at that level.
+    """
+    global _original_tide_create_model
+
+    from darts.models.forecasting.tide_model import _ResidualBlock, _TideModule, TiDEModel
     from darts.models.forecasting.pl_forecasting_module import io_processor
 
     if getattr(_ResidualBlock.forward, '_mc_patched', False):
@@ -406,13 +419,9 @@ def apply_tide_mc_dropout_patch():
     _patched_residual_block_forward._mc_patched = True
     _ResidualBlock.forward = _patched_residual_block_forward
 
-    # --- Patch _TideModule.__init__ to register lookback_skip_dropout ---
-    _original_tide_module_init = _TideModule.__init__
-    # Copy original signature so Lightning's save_hyperparameters() can
-    # inspect the frame locals by named parameter. Without this, Lightning
-    # sees *args/**kwargs and throws KeyError when looking up named params.
-    functools.update_wrapper(_patched_tide_module_init, _original_tide_module_init)
-    _TideModule.__init__ = _patched_tide_module_init
+    # --- Patch TiDEModel._create_model to register lookback_skip_dropout ---
+    _original_tide_create_model = TiDEModel._create_model
+    TiDEModel._create_model = _patched_tide_create_model
 
     # --- Patch _TideModule.forward to use lookback_skip_dropout ---
     _TideModule.forward = io_processor(_patched_tide_module_forward)

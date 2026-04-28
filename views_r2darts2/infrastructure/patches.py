@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+import functools
 from typing import Optional, Tuple
 from darts.logging import raise_if_not, raise_log, get_logger
 from darts.models.forecasting.nbeats import (
@@ -407,6 +408,10 @@ def apply_tide_mc_dropout_patch():
 
     # --- Patch _TideModule.__init__ to register lookback_skip_dropout ---
     _original_tide_module_init = _TideModule.__init__
+    # Copy original signature so Lightning's save_hyperparameters() can
+    # inspect the frame locals by named parameter. Without this, Lightning
+    # sees *args/**kwargs and throws KeyError when looking up named params.
+    functools.update_wrapper(_patched_tide_module_init, _original_tide_module_init)
     _TideModule.__init__ = _patched_tide_module_init
 
     # --- Patch _TideModule.forward to use lookback_skip_dropout ---

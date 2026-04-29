@@ -142,65 +142,92 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm log(1+log(1+σ)) Double-Log Compression Patch ---
+# --- 3. RINorm Balanced Conditioning Patch ---
 #
-# Bounds scale amplification in RevIN's inverse pass.
+# Addresses the structural interaction between RevIN σ-scaling and the
+# downstream sinh inverse transform (AsinhTransform scaler).
 #
-# Standard RevIN denormalizes as ŷ = ẑ·σ + μ. When σ is large (high-variance
-# entities like Ukraine with σ≈4 in asinh space) and the inverse transform is
-# convex (sinh), small normalized-space outputs get exponentially amplified:
+# Problem: standard RevIN denormalizes as ŷ = ẑ·σ + μ. The downstream
+# inverse transform sinh(ŷ) has sensitivity cosh(ŷ) which grows
+# exponentially with |ŷ|. For high-variance entities (Ukraine: μ≈5, σ≈4),
+# even modest model outputs produce catastrophic raw-space predictions:
 #
-#   Raw σ:    ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15) ≈ 1,634,508 deaths
-#   log1p:    ŷ = 2.5 × 1.61 + 5 = 9.025 →  sinh(9)  ≈ 4,143 deaths
-#   log²:     ŷ = 2.5 × 0.96 + 5 = 7.40  →  sinh(7.4) ≈ 816 deaths
+#   Raw σ:   ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15)  ≈ 1,634,508
+#   Raw σ:   ŷ = 6.3 × 4.0 + 5 = 30.2  →  sinh(30)  ≈ 5.3 × 10^12
 #
-# Double-log compresses σ more aggressively than single log1p, nearly
-# eliminating σ as an amplifier for high-variance entities while still
-# providing meaningful variance normalization for low-σ ones:
+# Fix: σ_eff = σ / √cosh(μ)  — balanced conditioning.
 #
-#   σ_raw=0.5  →  σ_compressed=0.34    (peaceful: mild change)
-#   σ_raw=1.0  →  σ_compressed=0.52    (low-conflict: moderate)
-#   σ_raw=4.0  →  σ_compressed=0.96    (Ukraine-level: 4.2× reduction)
-#   σ_raw=10   →  σ_compressed=1.22    (extreme: 8.2× reduction)
+# This is the geometric mean of two extremes:
+#   α=0 (no correction):  σ_eff = σ       → forward z ∈ ±2, inverse S = σ·cosh²(μ)
+#   α=1 (full correction): σ_eff = σ/cosh(μ) → forward z ∈ ±2·cosh(μ), inverse S = σ
+#   α=½ (balanced):        σ_eff = σ/√cosh(μ) → forward z ∈ ±2√cosh(μ), inverse S = σ√cosh(μ)
 #
-# For the blowup case (ẑ=6.3, Ukraine μ=5):
-#   log1p:   ŷ = 6.3 × 1.61 + 5 = 15.14  →  sinh(15.1) ≈ 1,900,000
-#   log²:    ŷ = 6.3 × 0.96 + 5 = 11.05  →  sinh(11.0) ≈ 30,000
+# Balanced minimizes max(log|z|, log S), distributing the curvature cost
+# equally between forward input range and inverse sensitivity.
 #
-# Tradeoff: mid-range entities (σ≈1.5) see ~30% less amplification than
-# with single log1p. The model compensates by learning larger ẑ values
-# (training targets also scale up), but this widens the z-spread and
-# slightly reduces responsiveness to genuine mid-range spikes.
+# Derivation (delta method / Anscombe variance stabilization):
+#   Var[sinh(μ + σ·Z)] ≈ σ² · cosh²(μ)  — exponential in μ
+#   With σ_eff = σ/√cosh(μ):
+#   Var[sinh(μ + σ_eff·Z)] ≈ σ² · cosh(μ)  — square root of original
+#
+# Jensen amplification E[sinh(μ+σ·Z)]/sinh(μ) ≈ exp(σ_eff²/2):
+#   Standard RevIN:  σ_eff=4.0 → Jensen=2981×
+#   Balanced:        σ_eff=0.47 → Jensen=12%
+#
+# Comparison at Ukraine (μ=5, σ_raw=4):
+#                    σ_eff   ẑ=3→sinh(ŷ)   ẑ=6→sinh(ŷ)
+#   Standard:        4.0     ∞ (overflow)   ∞ (overflow)
+#   Balanced:        0.47    300            1,200
+#
+# For peaceful entities (μ≈0): cosh(0)=1, σ_eff=σ. Unchanged.
+# For medium conflict (μ=2): cosh(2)=3.76, σ_eff=σ/1.94. Mild compression.
+#
+# No clamping: √cosh(μ) grows smoothly and monotonically. For any μ in
+# [0, 8] (the full range of asinh-transformed UCDP data), √cosh(μ) ∈
+# [1, 38.6]. The resulting z-range (±2√cosh(μ) ≈ ±17 for Ukraine) is
+# handled by internal LayerNorm + gradient clipping without issue.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with log(1+log(1+σ)) double-log compressed stdev.
-    Only modifies forward(). The inverse is unchanged.
+    Patches Darts RINorm with balanced conditioning: σ_eff = σ / √cosh(μ).
+
+    Geometric mean of forward-stable (α=0) and inverse-stable (α=1)
+    scalings. Minimizes worst-case scaling across both directions.
+
+    No clamping — √cosh(μ) ≥ 1 always, grows smoothly. Modern
+    architectures (LayerNorm, GELU, gradient clipping) handle the
+    resulting z-range without issue.
+
+    Only modifies forward(). The inverse uses the same stored σ_eff,
+    preserving the forward-inverse identity for perfect predictions.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm.forward, '_compressed', False):
+    if getattr(RINorm.forward, '_balanced_conditioned', False):
         return  # Already patched
 
-    def _compressed_forward(self, x: torch.Tensor):
+    def _balanced_forward(self, x: torch.Tensor):
         calc_dims = tuple(range(1, x.ndim - 1))
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
         raw_stdev = torch.sqrt(
             torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + 1e-5
         ).detach()
-        self.stdev = torch.log1p(torch.log1p(raw_stdev))
+
+        # Balanced conditioning: σ_eff = σ / √cosh(μ)
+        # √cosh(μ) ≥ 1 always
+        self.stdev = raw_stdev / torch.cosh(self.mean).sqrt()
+
         x = (x - self.mean) / self.stdev
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    _compressed_forward._compressed = True
-    RINorm.forward = _compressed_forward
+    _balanced_forward._balanced_conditioned = True
+    RINorm.forward = _balanced_forward
     logger.info(
-        "🐨 Patched RINorm: log(1+log(1+σ)) double-log compression. "
-        "Bounds scale amplification while preserving normalized z-space."
+        "🐨 Patched RINorm: balanced conditioning σ/√cosh(μ)."
     )
 
 

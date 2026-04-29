@@ -88,7 +88,7 @@ class ModelCatalog:
                 min_delta=self.config.get("early_stopping_min_delta"),
                 mode="min",
             ),
-            LearningRateMonitor(log_momentum=True),
+            LearningRateMonitor(log_momentum=True, log_weight_decay=True),
             GradientHealthCallback(),
             NaNDetectionCallback(),
             WeightNormCallback(),

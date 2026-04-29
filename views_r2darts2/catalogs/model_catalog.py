@@ -128,6 +128,10 @@ class ModelCatalog:
             "model_name": self.config.get("name"),
             "random_state": self.config.get("random_state"),
             "force_reset": True,
+            "save_checkpoints": False,  # Use final epoch weights, not best checkpoint.
+            # Checkpointing picks the lowest val-loss epoch, which can be a CAWR restart spike
+            # rather than a genuinely converged state. Final epoch is more representative of
+            # where the model actually settled after all scheduled training.
             "pl_trainer_kwargs": self._get_common_pl_trainer_kwargs(),
             "optimizer_cls": self.opt_catalog.get_optimizer_cls(),
             "optimizer_kwargs": self.opt_catalog.get_optimizer_kwargs(),

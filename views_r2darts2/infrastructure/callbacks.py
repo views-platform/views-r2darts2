@@ -354,6 +354,109 @@ class WeightNormCallback(Callback):
 
 
 # ---------------------------------------------------------------------------
+# RevIN Monitor
+# ---------------------------------------------------------------------------
+
+
+class RevINMonitorCallback(Callback):
+    """
+    Epoch-level RevIN statistics monitor.
+
+    Intent Contract:
+        - Purpose: Track the per-series μ and σ_eff values computed by the
+          (potentially patched) RINorm module. Surfaces whether the balanced
+          conditioning patch is working as expected — σ_eff should be small
+          for high-μ entities and ≈ σ_raw for low-μ entities.
+        - Guarantees: Logs per-epoch RevIN statistics (μ range, σ_eff range,
+          max z-magnitude, compression ratio) to the PL logger (wandb).
+          Silently no-ops if RevIN is disabled (pl_module.rin is None).
+        - Non-Goals: Does not modify RevIN behavior or stop training.
+
+    Parameters
+    ----------
+    log_every_n_epochs : int, default 5
+        How often to log RevIN statistics.
+    """
+
+    def __init__(self, log_every_n_epochs: int = 5):
+        super().__init__()
+        self.log_every_n_epochs = log_every_n_epochs
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Only capture on the last batch of the epoch to avoid overhead.
+        # We store the most recent batch's RevIN state for epoch-end logging.
+        rin = getattr(pl_module, "rin", None)
+        if rin is None:
+            return
+
+        mean = getattr(rin, "mean", None)
+        stdev = getattr(rin, "stdev", None)
+        if mean is not None and stdev is not None:
+            self._last_mean = mean.detach()
+            self._last_stdev = stdev.detach()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+
+        rin = getattr(pl_module, "rin", None)
+        if rin is None:
+            return
+
+        mean = getattr(self, "_last_mean", None)
+        stdev = getattr(self, "_last_stdev", None)
+        if mean is None or stdev is None:
+            return
+
+        # Flatten across batch and targets for summary statistics
+        mu_flat = mean.flatten()
+        sigma_flat = stdev.flatten()
+
+        mu_min = mu_flat.min().item()
+        mu_max = mu_flat.max().item()
+        mu_mean = mu_flat.mean().item()
+
+        sigma_min = sigma_flat.min().item()
+        sigma_max = sigma_flat.max().item()
+        sigma_mean = sigma_flat.mean().item()
+
+        # Estimate z-range: for the last batch, z = (x-μ)/σ_eff
+        # The stored stdev IS σ_eff (after patching), so max |z| ≈ max_dev/σ_eff
+        # Approximate max |z| from the ratio of data range to σ_eff
+        # Simpler: cosh(μ) / σ_eff gives the effective amplification at ẑ=1
+        import math
+        cosh_mu_max = math.cosh(min(abs(mu_max), 20.0))  # cap for log safety
+        cosh_mu_min = math.cosh(min(abs(mu_min), 20.0))
+        # Compression ratio: how much σ was reduced by the patch
+        # For balanced conditioning: ratio = √cosh(μ) at the extreme
+        compression_at_max = cosh_mu_max ** 0.5 if mu_max > 0.5 else 1.0
+
+        # Jensen amplification estimate at the maximum σ_eff
+        jensen_max = math.exp(sigma_max**2 / 2) - 1.0  # fractional bias
+
+        metrics = {
+            "revin/mu_min": mu_min,
+            "revin/mu_max": mu_max,
+            "revin/mu_mean": mu_mean,
+            "revin/sigma_eff_min": sigma_min,
+            "revin/sigma_eff_max": sigma_max,
+            "revin/sigma_eff_mean": sigma_mean,
+            "revin/compression_ratio": compression_at_max,
+            "revin/jensen_bias_pct": jensen_max * 100,
+        }
+
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        logger.info(
+            f"[Epoch {trainer.current_epoch}] RevIN | "
+            f"μ∈[{mu_min:.2f}, {mu_max:.2f}] mean={mu_mean:.2f} | "
+            f"σ_eff∈[{sigma_min:.3f}, {sigma_max:.3f}] mean={sigma_mean:.3f} | "
+            f"compression={compression_at_max:.1f}× Jensen={jensen_max*100:.1f}%"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Prediction Sanity (Mode-Collapse Detector)
 # ---------------------------------------------------------------------------
 

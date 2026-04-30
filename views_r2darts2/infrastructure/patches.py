@@ -142,134 +142,145 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm Curvature-Aware Conditioning Patch ---
-#
-# Addresses the structural interaction between RevIN σ-scaling and the
-# downstream sinh inverse transform (AsinhTransform scaler).
+# --- 3. RINorm Raw-Space Normalization Patch ---
 #
 # ═══════════════════════════════════════════════════════════════════════
 # PROBLEM
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Standard RevIN: z = (x - μ)/σ (forward), ŷ = ẑ·σ + μ (inverse).
-# Downstream inverse scaler: counts = sinh(ŷ).
+# Pipeline: raw counts → asinh → RevIN → model → RevIN⁻¹ → sinh → counts
 #
-# sinh is convex for positive arguments: cosh(ŷ) = sinh'(ŷ) grows
-# exponentially. This creates two pathologies:
+# Standard RevIN operates in asinh-space: z = (x_asinh - μ_asinh) / σ_asinh.
+# The inverse is ŷ_asinh = ẑ·σ_asinh + μ_asinh, then downstream: counts = sinh(ŷ).
 #
-#   1. Sensitivity explosion: ∂sinh/∂ẑ = σ·cosh(ẑ·σ + μ). For
-#      high-conflict entities (Ukraine: μ≈5, σ≈4), a ẑ error of ±0.5
-#      maps to counts ∈ [193, 842] — 4.4× range. For peaceful entities
-#      (μ≈0): same error maps to ±0.5 counts. Training treats both
-#      equally in z-space.
+# Because sinh is convex for positive arguments, three pathologies arise:
 #
-#   2. Jensen bias: E[sinh(μ + σ·Z)] = sinh(μ)·exp(σ²/2) for Z~N(0,1).
-#      Any prediction variance in z-space inflates count-space predictions
-#      by exp(σ_eff²/2). With σ_eff=1.48: Jensen factor = 2.98×.
+#   1. Jensen amplification: E[sinh(μ + σ·Z)] = sinh(μ)·exp(σ²/2).
+#      Any prediction variance (MC dropout, mini-batch noise) inflates counts.
+#      With σ_asinh=4 (Ukraine), Jensen factor = exp(8) ≈ 2981×.
 #
-# ═══════════════════════════════════════════════════════════════════════
-# FIX: TWO LEARNABLE CORRECTIONS
-# ═══════════════════════════════════════════════════════════════════════
+#   2. Sensitivity explosion: ∂counts/∂ẑ = σ_asinh·cosh(ẑ·σ + μ) grows
+#      exponentially with |ẑ|. Gradient magnitude is entity-dependent
+#      by orders of magnitude.
 #
-# --- Correction 1: Learnable-α curvature conditioning (forward) ---
-#
-# σ_eff = σ / cosh(μ)^α, where α ∈ [0, 1] is a learnable parameter.
-#
-# α parametrizes a family of normalizations:
-#   α=0:   σ_eff = σ           (standard RevIN, no correction)
-#   α=0.5: σ_eff = σ/√cosh(μ)  (balanced, previous patch)
-#   α=1:   σ_eff = σ/cosh(μ)   (full variance-stabilizing)
-#
-# The optimal α depends on the architecture's capacity to handle
-# expanded z-ranges vs. the inverse sensitivity explosion. Making α
-# learnable lets the model discover the right trade-off via gradient
-# descent. Initialized at α=0.5 (balanced conditioning).
-#
-# --- Correction 2: Duan smearing correction (inverse) ---
-#
-# After denormalization ŷ = ẑ·σ_eff + μ, applies:
-#
-#   ŷ_corrected = ŷ - c · σ_eff² · tanh(ŷ)
-#
-# where c ≥ 0 is a learnable scalar (constrained via softplus).
-#
-# Derivation: for residuals with z-space variance σ_z²,
-#   E[sinh(μ + σ_eff·(ẑ + ε))] ≈ sinh(ŷ) · exp(σ_z²·σ_eff²/2)
-# The correction pre-compensates by shifting ŷ toward zero:
-#   sinh(ŷ - c·σ²·tanh(ŷ)) ≈ sinh(ŷ)·exp(-c·σ²) for large |ŷ|
-# tanh(ŷ) ensures: correction → 0 for peaceful entities (ŷ≈0),
-# correction → c·σ² for conflict entities (|ŷ| >> 1).
-#
-# c replaces the unknown σ_z²/2. The model learns c end-to-end.
-# Initialized near zero (softplus(-3) ≈ 0.05) — starts conservative.
-#
-# The training loss in asinh space drives the model to predict slightly
-# above the target to compensate for the downward shift, which exactly
-# counteracts the Jensen expansion when sinh is applied downstream.
+#   3. Asymmetric errors: +ε and -ε in asinh-space map to vastly different
+#      count-space errors. Logcosh loss can't distinguish them.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# COMBINED EFFECT
+# FIX: RAW-SPACE REVIN
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Forward:  z = (x - μ) / (σ / cosh(μ)^α)         [curvature-aware]
-# Inverse:  ŷ = ẑ·σ_eff + μ - c·σ_eff²·tanh(ŷ)  [bias-corrected]
+# Key insight: normalize in raw count space (where the data naturally
+# lives), then compress back to asinh. The sinh/asinh pair commutes
+# through the normalization correctly because the affine transform
+# happens OUTSIDE the convex function.
 #
-# Option 1 (α) stabilizes the training gradient landscape.
-# Option 2 (c) corrects the retransformation bias at denormalization.
-# Both are learnable scalars: 2 extra parameters. Backwards-compatible
-# with old checkpoints (missing keys default to α=0.5, c≈0.05).
+# Forward:
+#   x_raw = sinh(x_asinh)                    — convert to raw counts
+#   μ_raw = mean(x_raw, dim=time)            — raw-space mean
+#   σ_raw = std(x_raw, dim=time)             — raw-space std
+#   z = asinh((x_raw - μ_raw) / σ_raw)       — normalize in raw, compress
+#
+# Inverse:
+#   ŷ_raw = sinh(ẑ) · σ_raw + μ_raw          — expand, denormalize in raw
+#   ŷ_asinh = asinh(ŷ_raw)                   — compress back for loss
 #
 # ═══════════════════════════════════════════════════════════════════════
+# WHY THIS ELIMINATES JENSEN BIAS
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The inverse is: sinh(ẑ)·σ_raw + μ_raw. The sinh acts on ẑ directly
+# (the model's compact, zero-centered output), and the affine shift
+# ·σ_raw + μ_raw happens AFTER sinh.
+#
+# For zero-mean model output: E[sinh(ẑ)] = 0 by odd symmetry when
+# E[ẑ] = 0. No Jensen amplification regardless of σ_raw or μ_raw.
+#
+# MC dropout variance σ_ẑ ≈ 0.3 gives Jensen factor exp(0.09/2) ≈ 1.05×
+# vs. exp(16/2) ≈ 2981× for standard RevIN on Ukraine.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# Z-RANGE ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+#
+# For Ukraine (μ_raw≈74, σ_raw≈297):
+#   z = asinh((x_raw - 74) / 297) → z ∈ [-0.25, 4.3] (compact!)
+#
+# For peaceful (μ_raw≈0.1, σ_raw≈0.3):
+#   z = asinh((x_raw - 0.1) / 0.3) → z ∈ [-0.3, 2.0]
+#
+# Both series types produce similar z-ranges. The model sees a nearly
+# uniform input distribution — no sensitivity mismatch.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# GRADIENT ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+#
+# ∂ŷ_asinh/∂ẑ = σ_raw·cosh(ẑ) / √(1 + (sinh(ẑ)·σ_raw + μ_raw)²)
+#
+# At ẑ=0: ≈ σ_raw / √(1 + μ_raw²) = σ_raw / cosh(asinh(μ_raw)) ≈ σ_asinh
+# At ẑ=2: ≈ σ_raw·3.76 / √(1 + (3.63·σ_raw + μ_raw)²) ≈ 1.0
+# At ẑ→∞: → 1.0 (asinh and sinh cancel for large arguments)
+#
+# Gradient is bounded and approximately constant ≈ 1 for large |ẑ|.
+# The outer asinh exactly cancels the sinh curvature explosion.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# IMPLEMENTATION NOTES
+# ═══════════════════════════════════════════════════════════════════════
+#
+# - No learnable parameters. Fully deterministic.
+# - No checkpoint compatibility issue (no new state_dict keys).
+# - Stores self.mean and self.stdev as raw-space statistics.
+# - Inverse patches the shape broadcasting for Darts' 4D output tensor.
+# - Adds 2 element-wise ops (sinh, asinh) per forward and inverse.
+#   Negligible cost vs. model forward pass.
+# - eps=1e-5 in stdev prevents division by zero for all-zero series.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with learnable curvature-aware conditioning
-    and Duan-style smearing correction.
+    Patches Darts RINorm with raw-space normalization.
 
-    Two learnable scalars added to each RINorm instance:
-      - alpha_raw → α = sigmoid(alpha_raw) ∈ [0, 1]
-        Controls σ_eff = σ / cosh(μ)^α. Init: α=0.5.
-      - smear_raw → c = softplus(smear_raw) ≥ 0
-        Controls Jensen correction ŷ -= c·σ²·tanh(ŷ). Init: c≈0.05.
+    Instead of normalizing in asinh-space (where the downstream sinh
+    creates Jensen bias), normalizes in raw count space where the
+    affine transform is outside the convex sinh function.
 
-    Backwards-compatible: old checkpoints without these keys load with
-    defaults via _load_from_state_dict override.
+    Forward:  z = asinh((sinh(x) - μ_raw) / σ_raw)
+    Inverse:  ŷ = asinh(sinh(ẑ) · σ_raw + μ_raw)
+
+    Zero learnable parameters. Eliminates Jensen bias structurally.
+    Backwards-compatible: no new state_dict keys.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm, '_curvature_patched', False):
+    if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
 
-    _original_init = RINorm.__init__
-
-    def _patched_init(self, input_dim: int, eps=1e-5, affine=True):
-        _original_init(self, input_dim, eps=eps, affine=affine)
-        # Learnable curvature exponent: α = sigmoid(alpha_raw)
-        # sigmoid(0.0) = 0.5 → starts at balanced conditioning
-        self.alpha_raw = nn.Parameter(torch.tensor(0.0))
-        # Learnable smearing coefficient: c = softplus(smear_raw)
-        # softplus(-3.0) ≈ 0.049 → starts with minimal correction
-        self.smear_raw = nn.Parameter(torch.tensor(-3.0))
-
-    def _patched_forward(self, x: torch.Tensor):
+    def _raw_space_forward(self, x: torch.Tensor):
+        # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
-        self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-        raw_stdev = torch.sqrt(
-            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
+
+        # Convert to raw count space
+        x_raw = torch.sinh(x)
+
+        # Compute raw-space statistics
+        self.mean = torch.mean(x_raw, dim=calc_dims, keepdim=True).detach()
+        self.stdev = torch.sqrt(
+            torch.var(x_raw, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
         ).detach()
 
-        # Learnable curvature conditioning: σ_eff = σ / cosh(μ)^α
-        alpha = torch.sigmoid(self.alpha_raw)
-        self.stdev = raw_stdev / torch.cosh(self.mean).pow(alpha)
+        # Normalize in raw space, then compress back via asinh
+        x_norm_raw = (x_raw - self.mean) / self.stdev
+        x = torch.asinh(x_norm_raw)
 
-        x = (x - self.mean) / self.stdev
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    def _patched_inverse(self, x: torch.Tensor):
+    def _raw_space_inverse(self, x: torch.Tensor):
+        # x shape: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
             x = x / (
@@ -280,41 +291,17 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Standard RevIN denormalization
-        x = x * sigma + mu
-
-        # Duan smearing correction: pre-compensate for Jensen bias
-        # ŷ_corrected = ŷ - c · σ_eff² · tanh(ŷ)
-        # tanh gates the correction: ~0 for peaceful (ŷ≈0), ~±1 for conflict
-        c = F.softplus(self.smear_raw)
-        x = x - c * sigma.pow(2) * torch.tanh(x)
+        # Expand from asinh-space to raw, denormalize, compress back
+        x = torch.asinh(torch.sinh(x) * sigma + mu)
 
         return x
 
-    # Backwards-compatible checkpoint loading: inject defaults for missing keys
-    def _patched_load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys,
-        unexpected_keys, error_msgs
-    ):
-        alpha_key = prefix + 'alpha_raw'
-        smear_key = prefix + 'smear_raw'
-        if alpha_key not in state_dict:
-            state_dict[alpha_key] = torch.tensor(0.0)   # α=0.5
-        if smear_key not in state_dict:
-            state_dict[smear_key] = torch.tensor(-3.0)  # c≈0.05
-        nn.Module._load_from_state_dict(
-            self, state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs
-        )
-
-    RINorm.__init__ = _patched_init
-    RINorm.forward = _patched_forward
-    RINorm.inverse = _patched_inverse
-    RINorm._load_from_state_dict = _patched_load_from_state_dict
-    RINorm._curvature_patched = True
+    RINorm.forward = _raw_space_forward
+    RINorm.inverse = _raw_space_inverse
+    RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: learnable-α curvature conditioning + "
-        "Duan smearing correction (2 learnable params)."
+        "🐨 Patched RINorm: raw-space normalization "
+        "(zero Jensen bias, no learnable params)."
     )
 
 

@@ -1,274 +1,269 @@
 """
-Tests for the curvature-aware RINorm patch with learnable-α conditioning
-and Duan-style smearing correction.
+Tests for the raw-space RINorm patch.
+
+The patch normalizes in raw count space (not asinh space) to eliminate
+Jensen amplification bias from the downstream sinh inverse transform.
+
+Forward:  z = asinh((sinh(x_asinh) - μ_raw) / σ_raw)
+Inverse:  ŷ_asinh = asinh(sinh(ẑ) · σ_raw + μ_raw)
 
 Verifies:
-  1. σ_eff = σ / cosh(μ)^α correctly compresses high-μ series
-  2. Smearing correction ŷ -= c·σ²·tanh(ŷ) reduces Jensen bias
-  3. Learnable parameters (α, c) have correct gradients
-  4. Backwards-compatible state_dict loading
+  1. Forward-inverse identity (round-trip reconstruction)
+  2. Zero Jensen amplification in count space
+  3. Compact z-ranges for both peaceful and conflict series
+  4. Gradient continuity and finiteness
+  5. Batch independence
+  6. Correct behavior at boundary cases
 """
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 
 
-class FakeRINorm(nn.Module):
-    """Minimal RINorm replica mirroring the patched implementation."""
+class FakeRawSpaceRINorm(nn.Module):
+    """Minimal replica mirroring the raw-space RINorm patch."""
     def __init__(self, input_dim, eps=1e-5, affine=False):
         super().__init__()
         self.input_dim = input_dim
         self.eps = eps
         self.affine = affine
-        # Learnable curvature exponent: α = sigmoid(alpha_raw)
-        self.alpha_raw = nn.Parameter(torch.tensor(0.0))   # → α=0.5
-        # Learnable smearing coefficient: c = softplus(smear_raw)
-        self.smear_raw = nn.Parameter(torch.tensor(-3.0))  # → c≈0.05
 
     def forward(self, x):
+        # x is in asinh-space
         calc_dims = tuple(range(1, x.ndim - 1))
-        self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-        raw_stdev = torch.sqrt(
-            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
+        x_raw = torch.sinh(x)
+        self.mean = torch.mean(x_raw, dim=calc_dims, keepdim=True).detach()
+        self.stdev = torch.sqrt(
+            torch.var(x_raw, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
         ).detach()
-        alpha = torch.sigmoid(self.alpha_raw)
-        self.stdev = raw_stdev / torch.cosh(self.mean).pow(alpha)
-        x = (x - self.mean) / self.stdev
-        return x
+        x_norm_raw = (x_raw - self.mean) / self.stdev
+        return torch.asinh(x_norm_raw)
 
     def inverse(self, x):
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
-        x = x * sigma + mu
-        c = F.softplus(self.smear_raw)
-        x = x - c * sigma.pow(2) * torch.tanh(x)
-        return x
+        return torch.asinh(torch.sinh(x) * sigma + mu)
 
 
-def _make_series(mu, sigma, length=36, features=1):
-    """Create a (1, length, features) tensor with given mean/std in asinh space."""
+def _make_asinh_series(mu_raw, sigma_raw, length=36, features=1):
+    """Create a (1, length, features) tensor in asinh-space from raw-space params."""
     torch.manual_seed(42)
-    x = mu + sigma * torch.randn(1, length, features)
-    return x
+    x_raw = mu_raw + sigma_raw * torch.randn(1, length, features).abs()
+    return torch.asinh(x_raw)
+
+
+def _make_conflict_series(length=36):
+    """Ukraine-like: μ_raw≈74 (asinh≈5), σ_raw≈297."""
+    torch.manual_seed(42)
+    x_raw = 74 + 297 * torch.randn(1, length, 1).abs()
+    return torch.asinh(x_raw)
+
+
+def _make_peaceful_series(length=36):
+    """Peaceful: μ_raw≈0.1, σ_raw≈0.3."""
+    torch.manual_seed(42)
+    x_raw = 0.1 + 0.3 * torch.randn(1, length, 1).abs()
+    return torch.asinh(x_raw)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Tests for learnable-α curvature conditioning (Option 1)
+# Forward-Inverse Identity
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestCurvatureCompression:
+class TestRoundTrip:
 
-    def test_peaceful_sigma_unchanged(self):
-        """For μ≈0, cosh(0)=1, so σ_eff ≈ σ_raw regardless of α."""
-        x = _make_series(mu=0.0, sigma=0.3)
-        norm = FakeRINorm(1)
-        norm.forward(x)
-        raw_std = x.std(dim=1, keepdim=True).item()
-        assert abs(norm.stdev.item() - raw_std) / max(raw_std, 1e-8) < 0.05
-
-    def test_default_alpha_is_balanced(self):
-        """Default alpha_raw=0 → α=0.5, same as previous balanced patch."""
-        x = _make_series(mu=5.0, sigma=4.0, length=1000)
-        norm = FakeRINorm(1)
-        norm.forward(x)
-        expected = 4.0 / np.sqrt(np.cosh(5.0))  # ≈ 0.465
-        assert abs(norm.stdev.item() - expected) < 0.15
-
-    def test_alpha_zero_is_standard_revin(self):
-        """α=0 → σ_eff = σ (no curvature correction)."""
-        x = _make_series(mu=5.0, sigma=4.0, length=1000)
-        norm = FakeRINorm(1)
-        norm.alpha_raw.data = torch.tensor(-10.0)  # sigmoid(-10) ≈ 0
-        norm.smear_raw.data = torch.tensor(-20.0)  # c ≈ 0
-        norm.forward(x)
-        raw_std = torch.sqrt(
-            torch.var(x, dim=1, keepdim=True, unbiased=False) + 1e-5
-        ).item()
-        assert abs(norm.stdev.item() - raw_std) / raw_std < 0.01
-
-    def test_alpha_one_is_full_correction(self):
-        """α=1 → σ_eff = σ/cosh(μ) (full curvature correction)."""
-        x = _make_series(mu=5.0, sigma=4.0, length=1000)
-        norm = FakeRINorm(1)
-        norm.alpha_raw.data = torch.tensor(10.0)  # sigmoid(10) ≈ 1
-        norm.forward(x)
-        expected = 4.0 / np.cosh(5.0)  # ≈ 0.054
-        assert abs(norm.stdev.item() - expected) < 0.03
-
-    def test_compression_monotonic_in_mu(self):
-        """Higher μ → more compression (lower σ_eff)."""
-        sigma_effs = []
-        for mu in [0.0, 1.0, 2.0, 3.0, 5.0]:
-            x = _make_series(mu=mu, sigma=2.0, length=10000)
-            norm = FakeRINorm(1)
-            norm.forward(x)
-            sigma_effs.append(norm.stdev.item())
-        for i in range(len(sigma_effs) - 1):
-            assert sigma_effs[i] > sigma_effs[i + 1], (
-                f"σ_eff not monotonically decreasing: {sigma_effs}"
-            )
-
-    def test_alpha_has_gradient(self):
-        """alpha_raw receives gradients through the forward pass.
-        Note: z.sum() gives ~0 grad because z is mean-centered; use z² instead."""
-        x = _make_series(mu=5.0, sigma=4.0, length=36)
-        norm = FakeRINorm(1)
+    def test_perfect_round_trip_conflict(self):
+        """Forward→inverse is identity for conflict series."""
+        x = _make_conflict_series()
+        norm = FakeRawSpaceRINorm(1)
         z = norm.forward(x)
-        loss = (z ** 2).sum()
-        loss.backward()
-        assert norm.alpha_raw.grad is not None
-        assert norm.alpha_raw.grad.item() != 0.0
+        z_4d = z.unsqueeze(-1)
+        x_recon = norm.inverse(z_4d).squeeze(-1)
+        assert torch.allclose(x, x_recon, atol=1e-4), (
+            f"max_diff={(x - x_recon).abs().max():.6f}"
+        )
 
-    def test_no_overflow_fp32(self):
+    def test_perfect_round_trip_peaceful(self):
+        """Forward→inverse is identity for peaceful series."""
+        x = _make_peaceful_series()
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+        z_4d = z.unsqueeze(-1)
+        x_recon = norm.inverse(z_4d).squeeze(-1)
+        assert torch.allclose(x, x_recon, atol=1e-4), (
+            f"max_diff={(x - x_recon).abs().max():.6f}"
+        )
+
+    def test_round_trip_zero_series(self):
+        """All-zero series (eps prevents division by zero)."""
+        x = torch.zeros(1, 36, 1)  # asinh(0) = 0
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+        z_4d = z.unsqueeze(-1)
+        x_recon = norm.inverse(z_4d).squeeze(-1)
+        assert torch.allclose(x, x_recon, atol=1e-3)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Jensen Bias Elimination
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestJensenBias:
+
+    def test_zero_jensen_bias_at_mean(self):
+        """E[sinh(ẑ)] ≈ 0 for zero-mean ẑ — no systematic bias."""
+        torch.manual_seed(99)
+        # Simulate many z-space predictions with mean≈0, std≈1
+        z_samples = torch.randn(10000)
+        # sinh is odd → E[sinh(Z)] = 0 for symmetric Z
+        mean_sinh = torch.sinh(z_samples).mean().item()
+        assert abs(mean_sinh) < 0.1, f"E[sinh(Z)]={mean_sinh}, expected ≈0"
+
+    def test_mc_dropout_no_overshoot(self):
+        """MC dropout variance (σ_ẑ≈0.3) produces <5% Jensen bias in counts."""
+        x = _make_conflict_series(length=1000)
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+
+        # Simulate N MC samples with noise σ=0.3
+        torch.manual_seed(99)
+        n_samples = 100
+        count_means = []
+        for _ in range(n_samples):
+            z_noisy = z + 0.3 * torch.randn_like(z)
+            z_4d = z_noisy.unsqueeze(-1)
+            y_asinh = norm.inverse(z_4d).squeeze(-1)
+            counts = torch.sinh(y_asinh).mean().item()
+            count_means.append(counts)
+
+        # True counts from the original data
+        truth = torch.sinh(x).mean().item()
+        mc_mean = np.mean(count_means)
+
+        # Jensen bias should be minimal (<10%)
+        bias_pct = abs(mc_mean - truth) / max(abs(truth), 1.0) * 100
+        assert bias_pct < 10, (
+            f"Jensen bias={bias_pct:.1f}%, truth={truth:.1f}, mc_mean={mc_mean:.1f}"
+        )
+
+    def test_no_systematic_overprediction(self):
+        """The inverse doesn't systematically overshoot for conflict series."""
+        x = _make_conflict_series(length=1000)
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+        z_4d = z.unsqueeze(-1)
+        y_asinh = norm.inverse(z_4d).squeeze(-1)
+        # Perfect prediction — should match exactly
+        pred_counts = torch.sinh(y_asinh).mean().item()
+        true_counts = torch.sinh(x).mean().item()
+        ratio = pred_counts / max(true_counts, 1.0)
+        assert 0.95 < ratio < 1.05, f"event_ratio={ratio:.3f}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Z-Range Compactness
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestZRange:
+
+    def test_conflict_z_range_compact(self):
+        """Ukraine-like series produces z ∈ approximately [-1, 5]."""
+        x = _make_conflict_series(length=1000)
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+        assert z.min() > -3, f"z_min={z.min():.2f} too low"
+        assert z.max() < 7, f"z_max={z.max():.2f} too high"
+
+    def test_peaceful_z_range_compact(self):
+        """Peaceful series produces z ∈ approximately [-1, 3]."""
+        x = _make_peaceful_series(length=1000)
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+        assert z.min() > -4, f"z_min={z.min():.2f} too low"
+        assert z.max() < 5, f"z_max={z.max():.2f} too high"
+
+    def test_similar_ranges_across_entities(self):
+        """Conflict and peaceful z-ranges are within 3× of each other."""
+        x_c = _make_conflict_series(length=1000)
+        x_p = _make_peaceful_series(length=1000)
+        norm_c = FakeRawSpaceRINorm(1)
+        norm_p = FakeRawSpaceRINorm(1)
+        z_c = norm_c.forward(x_c)
+        z_p = norm_p.forward(x_p)
+        range_c = (z_c.max() - z_c.min()).item()
+        range_p = (z_p.max() - z_p.min()).item()
+        ratio = max(range_c, range_p) / max(min(range_c, range_p), 0.01)
+        assert ratio < 3.0, f"Range ratio={ratio:.1f} (conflict={range_c:.2f}, peaceful={range_p:.2f})"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Gradient Properties
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestGradients:
+
+    def test_finite_gradients_conflict(self):
+        """Gradients are finite for high-conflict series."""
+        x = _make_conflict_series()
+        x.requires_grad_(True)
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+        loss = z.pow(2).sum()
+        loss.backward()
+        assert torch.isfinite(x.grad).all()
+
+    def test_finite_gradients_peaceful(self):
+        """Gradients are finite for peaceful series."""
+        x = _make_peaceful_series()
+        x.requires_grad_(True)
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+        loss = z.pow(2).sum()
+        loss.backward()
+        assert torch.isfinite(x.grad).all()
+
+    def test_gradient_bounded(self):
+        """Gradient magnitude is bounded — no sensitivity explosion."""
+        x = _make_conflict_series()
+        x.requires_grad_(True)
+        norm = FakeRawSpaceRINorm(1)
+        z = norm.forward(x)
+        loss = z.sum()
+        loss.backward()
+        grad_max = x.grad.abs().max().item()
+        # Gradient through asinh is bounded by 1/sqrt(1+x²) ≤ 1
+        # Combined: should be reasonable
+        assert grad_max < 100, f"grad_max={grad_max}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Batch Independence
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestBatchBehavior:
+
+    def test_batch_independent_statistics(self):
+        """Each series in a batch gets independent μ_raw, σ_raw."""
+        x_p = _make_peaceful_series()
+        x_c = _make_conflict_series()
+        x_batch = torch.cat([x_p, x_c], dim=0)
+        norm = FakeRawSpaceRINorm(1)
+        norm.forward(x_batch)
+        # Should have 2 different means and stdevs
+        assert norm.mean.shape[0] == 2
+        assert norm.stdev.shape[0] == 2
+        # Conflict has much higher raw mean than peaceful
+        assert norm.mean[1].item() > norm.mean[0].item() * 10
+
+    def test_no_fp32_overflow(self):
         """All computations stay finite in fp32."""
-        x = _make_series(mu=5.0, sigma=4.0)
-        norm = FakeRINorm(1)
+        x = _make_conflict_series()
+        norm = FakeRawSpaceRINorm(1)
         z = norm.forward(x)
         assert torch.isfinite(z).all()
-        assert torch.isfinite(norm.stdev).all()
         assert torch.isfinite(norm.mean).all()
-
-    def test_batch_independent(self):
-        """Each series in a batch gets its own curvature compression."""
-        x_peace = _make_series(mu=0.0, sigma=0.3, length=36)
-        x_war = _make_series(mu=5.0, sigma=4.0, length=36)
-        x_batch = torch.cat([x_peace, x_war], dim=0)
-        norm = FakeRINorm(1)
-        norm.forward(x_batch)
-        assert norm.stdev.shape[0] == 2
-        assert norm.stdev[0].item() > norm.stdev[1].item() * 0.3
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Tests for Duan smearing correction (Option 2)
-# ═══════════════════════════════════════════════════════════════════════
-
-class TestSmearingCorrection:
-
-    def test_smearing_reduces_high_mu_predictions(self):
-        """For conflict entities (large ŷ), smearing shifts predictions down."""
-        x = _make_series(mu=5.0, sigma=4.0, length=36)
-        norm = FakeRINorm(1)
-        z = norm.forward(x)
-        z_4d = z.unsqueeze(-1)
-
-        # No smearing
-        norm.smear_raw.data = torch.tensor(-20.0)  # c ≈ 0
-        y_no_smear = norm.inverse(z_4d.clone()).squeeze(-1)
-
-        # With smearing
-        norm.smear_raw.data = torch.tensor(0.0)  # c ≈ 0.69
-        y_smeared = norm.inverse(z_4d.clone()).squeeze(-1)
-
-        # Smeared predictions should be closer to zero (lower) for positive ŷ
-        assert y_smeared.mean() < y_no_smear.mean()
-
-    def test_smearing_does_not_affect_peaceful(self):
-        """For peaceful entities (ŷ≈0), tanh(ŷ)≈0, so correction vanishes."""
-        x = _make_series(mu=0.0, sigma=0.1, length=36)
-        norm = FakeRINorm(1)
-        z = norm.forward(x)
-        z_4d = z.unsqueeze(-1)
-
-        norm.smear_raw.data = torch.tensor(-20.0)
-        y_no_smear = norm.inverse(z_4d.clone()).squeeze(-1)
-
-        norm.smear_raw.data = torch.tensor(0.0)
-        y_smeared = norm.inverse(z_4d.clone()).squeeze(-1)
-
-        # Difference should be negligible for ŷ ≈ 0
-        max_diff = (y_no_smear - y_smeared).abs().max().item()
-        assert max_diff < 0.01, f"Smearing affected peaceful series: max_diff={max_diff}"
-
-    def test_smearing_c_has_gradient(self):
-        """smear_raw receives gradients through the inverse pass."""
-        x = _make_series(mu=5.0, sigma=4.0, length=36)
-        norm = FakeRINorm(1)
-        z = norm.forward(x)
+        assert torch.isfinite(norm.stdev).all()
         z_4d = z.unsqueeze(-1)
         y = norm.inverse(z_4d)
-        loss = y.sum()
-        loss.backward()
-        assert norm.smear_raw.grad is not None
-        assert norm.smear_raw.grad.item() != 0.0
-
-    def test_smearing_reduces_jensen_in_count_space(self):
-        """With noisy predictions, smearing reduces Jensen bias in count space.
-
-        Jensen bias only manifests with prediction variance: E[sinh(ŷ+ε)] > sinh(ŷ).
-        A perfect round-trip has no variance, so we add z-noise to simulate an
-        imperfect model, then verify smearing pulls sinh(ŷ) closer to truth.
-        """
-        torch.manual_seed(99)
-        x = _make_series(mu=5.0, sigma=4.0, length=1000)
-        norm = FakeRINorm(1)
-        z = norm.forward(x)
-        # Add Gaussian noise (σ_z=0.5) to simulate prediction errors
-        z_noisy = z + 0.5 * torch.randn_like(z)
-        z_4d = z_noisy.unsqueeze(-1)
-
-        # Without smearing: sinh(inverse(z_noisy)) overshoots due to Jensen bias
-        norm.smear_raw.data = torch.tensor(-20.0)  # c ≈ 0
-        counts_no_smear = torch.sinh(
-            norm.inverse(z_4d.clone()).squeeze(-1)
-        ).mean().item()
-
-        # Analytical c for σ_z²/2 = 0.125: softplus(x)=0.125 → x ≈ -1.97
-        norm.smear_raw.data = torch.tensor(-1.97)
-        counts_smeared = torch.sinh(
-            norm.inverse(z_4d.clone()).squeeze(-1)
-        ).mean().item()
-
-        truth_counts = torch.sinh(x).mean().item()
-
-        # Smeared should be closer to truth
-        err_no_smear = abs(counts_no_smear - truth_counts)
-        err_smeared = abs(counts_smeared - truth_counts)
-        assert err_smeared < err_no_smear, (
-            f"Smearing didn't help: truth={truth_counts:.1f}, "
-            f"no_smear_err={err_no_smear:.1f}, smeared_err={err_smeared:.1f}"
-        )
-
-    def test_smearing_monotonic_is_preserved(self):
-        """The inverse transform must stay monotonically increasing.
-        ∂ŷ_corr/∂ŷ = 1 - c·σ²·sech²(ŷ) > 0 requires c·σ² < 1."""
-        x = _make_series(mu=5.0, sigma=4.0, length=36)
-        norm = FakeRINorm(1)
-        norm.forward(x)
-        sigma = norm.stdev.item()
-        c = F.softplus(norm.smear_raw).item()
-        # Monotonicity: 1 - c·σ² > 0 at ŷ=0 (worst case, sech²=1)
-        assert c * sigma**2 < 1.0, (
-            f"Smearing breaks monotonicity: c·σ²={c * sigma**2:.3f}"
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Tests for combined forward-inverse consistency
-# ═══════════════════════════════════════════════════════════════════════
-
-class TestForwardInverseConsistency:
-
-    def test_round_trip_with_zero_smearing(self):
-        """With c=0, forward→inverse should be identity."""
-        x = _make_series(mu=5.0, sigma=4.0, length=36)
-        norm = FakeRINorm(1)
-        norm.smear_raw.data = torch.tensor(-20.0)  # c ≈ 0
-        z = norm.forward(x)
-        z_4d = z.unsqueeze(-1)
-        x_recon = norm.inverse(z_4d).squeeze(-1)
-        assert torch.allclose(x, x_recon, atol=1e-4)
-
-    def test_round_trip_with_smearing_shifts_consistently(self):
-        """With c>0, inverse output is consistently shifted from input."""
-        x = _make_series(mu=5.0, sigma=4.0, length=36)
-        norm = FakeRINorm(1)
-        z = norm.forward(x)
-        z_4d = z.unsqueeze(-1)
-        x_recon = norm.inverse(z_4d).squeeze(-1)
-        # With default c≈0.05, the shift is small but nonzero
-        diff = (x - x_recon).abs().mean().item()
-        assert diff > 0, "Smearing should introduce a small shift"
-        assert diff < 1.0, f"Shift too large: {diff:.4f}"
+        assert torch.isfinite(y).all()

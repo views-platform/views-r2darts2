@@ -408,7 +408,7 @@ class RevINMonitorCallback(Callback):
         if mean is None or stdev is None:
             return
 
-        # Flatten across batch and targets for summary statistics
+        # Raw-space RevIN: self.mean and self.stdev are in raw count space
         mu_flat = mean.flatten()
         sigma_flat = stdev.flatten()
 
@@ -420,59 +420,31 @@ class RevINMonitorCallback(Callback):
         sigma_max = sigma_flat.max().item()
         sigma_mean = sigma_flat.mean().item()
 
-        # Estimate z-range: for the last batch, z = (x-μ)/σ_eff
-        # The stored stdev IS σ_eff (after patching), so max |z| ≈ max_dev/σ_eff
-        # Approximate max |z| from the ratio of data range to σ_eff
-        # Simpler: cosh(μ) / σ_eff gives the effective amplification at ẑ=1
+        # For raw-space RevIN, Jensen bias ≈ exp(σ_ẑ²/2) where σ_ẑ is
+        # the z-space prediction variance (MC dropout, ~0.3). This is
+        # independent of σ_raw/μ_raw — structurally eliminated.
+        # Log sigma_raw/mu_raw ratio as a diagnostic for data distribution.
         import math
-        cosh_mu_max = math.cosh(min(abs(mu_max), 20.0))  # cap for log safety
-        cosh_mu_min = math.cosh(min(abs(mu_min), 20.0))
-        # Compression ratio: how much σ was reduced by the patch
-        # For balanced conditioning: ratio = √cosh(μ) at the extreme
-        compression_at_max = cosh_mu_max ** 0.5 if mu_max > 0.5 else 1.0
-
-        # Jensen amplification estimate at the maximum σ_eff
-        jensen_max = math.exp(sigma_max**2 / 2) - 1.0  # fractional bias
+        ratio_max = sigma_max / max(abs(mu_max), 1.0)
 
         metrics = {
-            "revin/mu_min": mu_min,
-            "revin/mu_max": mu_max,
-            "revin/mu_mean": mu_mean,
-            "revin/sigma_eff_min": sigma_min,
-            "revin/sigma_eff_max": sigma_max,
-            "revin/sigma_eff_mean": sigma_mean,
-            "revin/compression_ratio": compression_at_max,
-            "revin/jensen_bias_pct": jensen_max * 100,
+            "revin/mu_raw_min": mu_min,
+            "revin/mu_raw_max": mu_max,
+            "revin/mu_raw_mean": mu_mean,
+            "revin/sigma_raw_min": sigma_min,
+            "revin/sigma_raw_max": sigma_max,
+            "revin/sigma_raw_mean": sigma_mean,
+            "revin/cv_max": ratio_max,
         }
-
-        # Log learned curvature parameters if present (learnable-α patch)
-        alpha_raw = getattr(rin, "alpha_raw", None)
-        smear_raw = getattr(rin, "smear_raw", None)
-        if alpha_raw is not None:
-            alpha_val = torch.sigmoid(alpha_raw).item()
-            metrics["revin/alpha"] = alpha_val
-        if smear_raw is not None:
-            import torch.nn.functional as _F
-            c_val = _F.softplus(smear_raw).item()
-            metrics["revin/smearing_c"] = c_val
 
         if trainer.logger is not None:
             trainer.logger.log_metrics(metrics, step=trainer.global_step)
 
-        # Build log message with optional α/c
-        extra = ""
-        if alpha_raw is not None:
-            extra += f" α={torch.sigmoid(alpha_raw).item():.3f}"
-        if smear_raw is not None:
-            import torch.nn.functional as _F
-            extra += f" c={_F.softplus(smear_raw).item():.4f}"
-
         logger.info(
-            f"[Epoch {trainer.current_epoch}] RevIN | "
-            f"μ∈[{mu_min:.2f}, {mu_max:.2f}] mean={mu_mean:.2f} | "
-            f"σ_eff∈[{sigma_min:.3f}, {sigma_max:.3f}] mean={sigma_mean:.3f} | "
-            f"compression={compression_at_max:.1f}× Jensen={jensen_max*100:.1f}%"
-            f"{extra}"
+            f"[Epoch {trainer.current_epoch}] RevIN (raw-space) | "
+            f"μ_raw∈[{mu_min:.1f}, {mu_max:.1f}] mean={mu_mean:.1f} | "
+            f"σ_raw∈[{sigma_min:.3f}, {sigma_max:.1f}] mean={sigma_mean:.2f} | "
+            f"CV_max={ratio_max:.2f}"
         )
 
 

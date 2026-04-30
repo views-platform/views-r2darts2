@@ -159,7 +159,7 @@ class GradientHealthCallback(Callback):
         self,
         log_every_n_epochs: int = 1,
         warn_threshold: float = 1e-7,
-        explode_threshold: float = 100.0,
+        explode_threshold: float = 500.0,
     ):
         super().__init__()
         self.log_every_n_epochs = log_every_n_epochs

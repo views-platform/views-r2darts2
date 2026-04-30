@@ -165,8 +165,18 @@ class GradientHealthCallback(Callback):
         self.log_every_n_epochs = log_every_n_epochs
         self.warn_threshold = warn_threshold
         self.explode_threshold = explode_threshold
+        self._last_logged_epoch = -1
+        self._last_grad_stats = None
 
-    def on_train_epoch_end(self, trainer, pl_module):
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        """Capture gradient norms BEFORE optimizer.step() zeroes them.
+
+        PyTorch Lightning's execution order is:
+            backward → on_before_optimizer_step → optimizer.step → zero_grad
+        So this is the only hook where param.grad is populated.
+        We snapshot the stats here and log them later in on_train_epoch_end.
+        """
+        # Only snapshot on the last batch of each logged epoch
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
             return
 
@@ -187,16 +197,9 @@ class GradientHealthCallback(Callback):
                 elif np.isinf(norm):
                     inf_count += 1
                 elif norm == 0 and not name.endswith(".bias"):
-                    # Skip bias parameters: LayerNorm/Linear biases are zero-initialized
-                    # by PyTorch, and on zero-inflated data (90% peace cells) their
-                    # gradients underflow to exactly 0.0 in early training — same false
-                    # alarm as the collapsed-bias fix in WeightNormCallback.
                     zero_count += 1
                 else:
                     grad_norms.append(norm)
-
-        if not grad_norms and total_params == 0:
-            return
 
         if grad_norms:
             grad_norms = np.array(grad_norms)
@@ -208,6 +211,28 @@ class GradientHealthCallback(Callback):
             }
         else:
             stats = {"min": 0, "max": 0, "mean": 0, "median": 0}
+
+        # Overwrite each batch — the last batch of the epoch wins
+        self._last_grad_stats = {
+            "stats": stats,
+            "nan_count": nan_count,
+            "inf_count": inf_count,
+            "zero_count": zero_count,
+            "total_params": total_params,
+        }
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+        if self._last_grad_stats is None:
+            return
+
+        s = self._last_grad_stats
+        stats = s["stats"]
+        nan_count = s["nan_count"]
+        inf_count = s["inf_count"]
+        zero_count = s["zero_count"]
+        total_params = s["total_params"]
 
         status = "✅ healthy"
         if nan_count > 0:

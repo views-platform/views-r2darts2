@@ -32,6 +32,7 @@ class FakeRawSpaceRINorm(nn.Module):
     def forward(self, x):
         # x is in asinh-space
         calc_dims = tuple(range(1, x.ndim - 1))
+        x = torch.clamp(x, -88.0, 88.0)
         x_raw = torch.sinh(x)
         self.mean = torch.mean(x_raw, dim=calc_dims, keepdim=True).detach()
         self.stdev = torch.sqrt(
@@ -43,6 +44,7 @@ class FakeRawSpaceRINorm(nn.Module):
     def inverse(self, x):
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
+        x = torch.clamp(x, -20.0, 20.0)
         return torch.asinh(torch.sinh(x) * sigma + mu)
 
 

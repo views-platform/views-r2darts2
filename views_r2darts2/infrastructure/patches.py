@@ -295,11 +295,14 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Clamp before sinh: float32 sinh overflows at |x|>88.7. Any |x|>20 is
-        # already a degenerate prediction (sinh(20)≈2.4e8 × σ_raw); clamping
-        # keeps the inverse finite during early training without touching real
-        # predictions, whose normalized values stay in roughly ±5.
-        x = torch.clamp(x, -20.0, 20.0)
+        # Clamp before sinh to prevent float32 overflow (sinh overflows at |x|>88.7).
+        # ±50 is the safe ceiling: sinh(50)≈2.59e21; for the most extreme σ_raw seen
+        # in conflict data (~150K for Syria peak), sinh(50)*150K≈3.9e26 << float32 max
+        # (3.4e38). The original ±20 was too tight — early training produces outputs of
+        # ±25 to ±30 that exceed ±20, killing gradients for ~40-50% of sequences and
+        # causing a gradient dead zone / loss plateau. ±50 allows those sequences to
+        # carry gradient while still protecting against genuine overflow at ±88.7.
+        x = torch.clamp(x, -50.0, 50.0)
 
         # Expand from asinh-space to raw, denormalize, compress back
         x = torch.asinh(torch.sinh(x) * sigma + mu)

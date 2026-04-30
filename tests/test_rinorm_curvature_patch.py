@@ -44,7 +44,7 @@ class FakeRawSpaceRINorm(nn.Module):
     def inverse(self, x):
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
-        x = torch.clamp(x, -20.0, 20.0)
+        x = torch.clamp(x, -50.0, 50.0)  # matches patches.py ±50 (raised from ±20)
         return torch.asinh(torch.sinh(x) * sigma + mu)
 
 

@@ -291,6 +291,12 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
+        # Clamp before sinh: float32 sinh overflows at |x|>88.7. Any |x|>20 is
+        # already a degenerate prediction (sinh(20)≈2.4e8 × σ_raw); clamping
+        # keeps the inverse finite during early training without touching real
+        # predictions, whose normalized values stay in roughly ±5.
+        x = torch.clamp(x, -20.0, 20.0)
+
         # Expand from asinh-space to raw, denormalize, compress back
         x = torch.asinh(torch.sinh(x) * sigma + mu)
 

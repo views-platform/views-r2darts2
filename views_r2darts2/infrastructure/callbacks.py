@@ -445,14 +445,34 @@ class RevINMonitorCallback(Callback):
             "revin/jensen_bias_pct": jensen_max * 100,
         }
 
+        # Log learned curvature parameters if present (learnable-α patch)
+        alpha_raw = getattr(rin, "alpha_raw", None)
+        smear_raw = getattr(rin, "smear_raw", None)
+        if alpha_raw is not None:
+            alpha_val = torch.sigmoid(alpha_raw).item()
+            metrics["revin/alpha"] = alpha_val
+        if smear_raw is not None:
+            import torch.nn.functional as _F
+            c_val = _F.softplus(smear_raw).item()
+            metrics["revin/smearing_c"] = c_val
+
         if trainer.logger is not None:
             trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        # Build log message with optional α/c
+        extra = ""
+        if alpha_raw is not None:
+            extra += f" α={torch.sigmoid(alpha_raw).item():.3f}"
+        if smear_raw is not None:
+            import torch.nn.functional as _F
+            extra += f" c={_F.softplus(smear_raw).item():.4f}"
 
         logger.info(
             f"[Epoch {trainer.current_epoch}] RevIN | "
             f"μ∈[{mu_min:.2f}, {mu_max:.2f}] mean={mu_mean:.2f} | "
             f"σ_eff∈[{sigma_min:.3f}, {sigma_max:.3f}] mean={sigma_mean:.3f} | "
             f"compression={compression_at_max:.1f}× Jensen={jensen_max*100:.1f}%"
+            f"{extra}"
         )
 
 

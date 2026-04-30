@@ -142,81 +142,126 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm Balanced Conditioning Patch ---
+# --- 3. RINorm Curvature-Aware Conditioning Patch ---
 #
 # Addresses the structural interaction between RevIN σ-scaling and the
 # downstream sinh inverse transform (AsinhTransform scaler).
 #
-# Problem: standard RevIN denormalizes as ŷ = ẑ·σ + μ. The downstream
-# inverse transform sinh(ŷ) has sensitivity cosh(ŷ) which grows
-# exponentially with |ŷ|. For high-variance entities (Ukraine: μ≈5, σ≈4),
-# even modest model outputs produce catastrophic raw-space predictions:
+# ═══════════════════════════════════════════════════════════════════════
+# PROBLEM
+# ═══════════════════════════════════════════════════════════════════════
 #
-#   Raw σ:   ŷ = 2.5 × 4.0 + 5 = 15.0  →  sinh(15)  ≈ 1,634,508
-#   Raw σ:   ŷ = 6.3 × 4.0 + 5 = 30.2  →  sinh(30)  ≈ 5.3 × 10^12
+# Standard RevIN: z = (x - μ)/σ (forward), ŷ = ẑ·σ + μ (inverse).
+# Downstream inverse scaler: counts = sinh(ŷ).
 #
-# Fix: σ_eff = σ / √cosh(μ)  — balanced conditioning.
+# sinh is convex for positive arguments: cosh(ŷ) = sinh'(ŷ) grows
+# exponentially. This creates two pathologies:
 #
-# This is the geometric mean of two extremes:
-#   α=0 (no correction):  σ_eff = σ       → forward z ∈ ±2, inverse S = σ·cosh²(μ)
-#   α=1 (full correction): σ_eff = σ/cosh(μ) → forward z ∈ ±2·cosh(μ), inverse S = σ
-#   α=½ (balanced):        σ_eff = σ/√cosh(μ) → forward z ∈ ±2√cosh(μ), inverse S = σ√cosh(μ)
+#   1. Sensitivity explosion: ∂sinh/∂ẑ = σ·cosh(ẑ·σ + μ). For
+#      high-conflict entities (Ukraine: μ≈5, σ≈4), a ẑ error of ±0.5
+#      maps to counts ∈ [193, 842] — 4.4× range. For peaceful entities
+#      (μ≈0): same error maps to ±0.5 counts. Training treats both
+#      equally in z-space.
 #
-# Balanced minimizes max(log|z|, log S), distributing the curvature cost
-# equally between forward input range and inverse sensitivity.
+#   2. Jensen bias: E[sinh(μ + σ·Z)] = sinh(μ)·exp(σ²/2) for Z~N(0,1).
+#      Any prediction variance in z-space inflates count-space predictions
+#      by exp(σ_eff²/2). With σ_eff=1.48: Jensen factor = 2.98×.
 #
-# Derivation (delta method / Anscombe variance stabilization):
-#   Var[sinh(μ + σ·Z)] ≈ σ² · cosh²(μ)  — exponential in μ
-#   With σ_eff = σ/√cosh(μ):
-#   Var[sinh(μ + σ_eff·Z)] ≈ σ² · cosh(μ)  — square root of original
+# ═══════════════════════════════════════════════════════════════════════
+# FIX: TWO LEARNABLE CORRECTIONS
+# ═══════════════════════════════════════════════════════════════════════
 #
-# Jensen amplification E[sinh(μ+σ·Z)]/sinh(μ) ≈ exp(σ_eff²/2):
-#   Standard RevIN:  σ_eff=4.0 → Jensen=2981×
-#   Balanced:        σ_eff=0.47 → Jensen=12%
+# --- Correction 1: Learnable-α curvature conditioning (forward) ---
 #
-# Comparison at Ukraine (μ=5, σ_raw=4):
-#                    σ_eff   ẑ=3→sinh(ŷ)   ẑ=6→sinh(ŷ)
-#   Standard:        4.0     ∞ (overflow)   ∞ (overflow)
-#   Balanced:        0.47    300            1,200
+# σ_eff = σ / cosh(μ)^α, where α ∈ [0, 1] is a learnable parameter.
 #
-# For peaceful entities (μ≈0): cosh(0)=1, σ_eff=σ. Unchanged.
-# For medium conflict (μ=2): cosh(2)=3.76, σ_eff=σ/1.94. Mild compression.
+# α parametrizes a family of normalizations:
+#   α=0:   σ_eff = σ           (standard RevIN, no correction)
+#   α=0.5: σ_eff = σ/√cosh(μ)  (balanced, previous patch)
+#   α=1:   σ_eff = σ/cosh(μ)   (full variance-stabilizing)
 #
-# No clamping: √cosh(μ) grows smoothly and monotonically. For any μ in
-# [0, 8] (the full range of asinh-transformed UCDP data), √cosh(μ) ∈
-# [1, 38.6]. The resulting z-range (±2√cosh(μ) ≈ ±17 for Ukraine) is
-# handled by internal LayerNorm + gradient clipping without issue.
+# The optimal α depends on the architecture's capacity to handle
+# expanded z-ranges vs. the inverse sensitivity explosion. Making α
+# learnable lets the model discover the right trade-off via gradient
+# descent. Initialized at α=0.5 (balanced conditioning).
+#
+# --- Correction 2: Duan smearing correction (inverse) ---
+#
+# After denormalization ŷ = ẑ·σ_eff + μ, applies:
+#
+#   ŷ_corrected = ŷ - c · σ_eff² · tanh(ŷ)
+#
+# where c ≥ 0 is a learnable scalar (constrained via softplus).
+#
+# Derivation: for residuals with z-space variance σ_z²,
+#   E[sinh(μ + σ_eff·(ẑ + ε))] ≈ sinh(ŷ) · exp(σ_z²·σ_eff²/2)
+# The correction pre-compensates by shifting ŷ toward zero:
+#   sinh(ŷ - c·σ²·tanh(ŷ)) ≈ sinh(ŷ)·exp(-c·σ²) for large |ŷ|
+# tanh(ŷ) ensures: correction → 0 for peaceful entities (ŷ≈0),
+# correction → c·σ² for conflict entities (|ŷ| >> 1).
+#
+# c replaces the unknown σ_z²/2. The model learns c end-to-end.
+# Initialized near zero (softplus(-3) ≈ 0.05) — starts conservative.
+#
+# The training loss in asinh space drives the model to predict slightly
+# above the target to compensate for the downward shift, which exactly
+# counteracts the Jensen expansion when sinh is applied downstream.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# COMBINED EFFECT
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Forward:  z = (x - μ) / (σ / cosh(μ)^α)         [curvature-aware]
+# Inverse:  ŷ = ẑ·σ_eff + μ - c·σ_eff²·tanh(ŷ)  [bias-corrected]
+#
+# Option 1 (α) stabilizes the training gradient landscape.
+# Option 2 (c) corrects the retransformation bias at denormalization.
+# Both are learnable scalars: 2 extra parameters. Backwards-compatible
+# with old checkpoints (missing keys default to α=0.5, c≈0.05).
+#
+# ═══════════════════════════════════════════════════════════════════════
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with balanced conditioning: σ_eff = σ / √cosh(μ).
+    Patches Darts RINorm with learnable curvature-aware conditioning
+    and Duan-style smearing correction.
 
-    Geometric mean of forward-stable (α=0) and inverse-stable (α=1)
-    scalings. Minimizes worst-case scaling across both directions.
+    Two learnable scalars added to each RINorm instance:
+      - alpha_raw → α = sigmoid(alpha_raw) ∈ [0, 1]
+        Controls σ_eff = σ / cosh(μ)^α. Init: α=0.5.
+      - smear_raw → c = softplus(smear_raw) ≥ 0
+        Controls Jensen correction ŷ -= c·σ²·tanh(ŷ). Init: c≈0.05.
 
-    No clamping — √cosh(μ) ≥ 1 always, grows smoothly. Modern
-    architectures (LayerNorm, GELU, gradient clipping) handle the
-    resulting z-range without issue.
-
-    Only modifies forward(). The inverse uses the same stored σ_eff,
-    preserving the forward-inverse identity for perfect predictions.
+    Backwards-compatible: old checkpoints without these keys load with
+    defaults via _load_from_state_dict override.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm.forward, '_balanced_conditioned', False):
+    if getattr(RINorm, '_curvature_patched', False):
         return  # Already patched
 
-    def _balanced_forward(self, x: torch.Tensor):
+    _original_init = RINorm.__init__
+
+    def _patched_init(self, input_dim: int, eps=1e-5, affine=True):
+        _original_init(self, input_dim, eps=eps, affine=affine)
+        # Learnable curvature exponent: α = sigmoid(alpha_raw)
+        # sigmoid(0.0) = 0.5 → starts at balanced conditioning
+        self.alpha_raw = nn.Parameter(torch.tensor(0.0))
+        # Learnable smearing coefficient: c = softplus(smear_raw)
+        # softplus(-3.0) ≈ 0.049 → starts with minimal correction
+        self.smear_raw = nn.Parameter(torch.tensor(-3.0))
+
+    def _patched_forward(self, x: torch.Tensor):
         calc_dims = tuple(range(1, x.ndim - 1))
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
         raw_stdev = torch.sqrt(
-            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + 1e-5
+            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
         ).detach()
 
-        # Balanced conditioning: σ_eff = σ / √cosh(μ)
-        # √cosh(μ) ≥ 1 always
-        self.stdev = raw_stdev / torch.cosh(self.mean).sqrt()
+        # Learnable curvature conditioning: σ_eff = σ / cosh(μ)^α
+        alpha = torch.sigmoid(self.alpha_raw)
+        self.stdev = raw_stdev / torch.cosh(self.mean).pow(alpha)
 
         x = (x - self.mean) / self.stdev
         if self.affine:
@@ -224,10 +269,52 @@ def apply_rinorm_compression_patch():
             x = x + self.affine_bias
         return x
 
-    _balanced_forward._balanced_conditioned = True
-    RINorm.forward = _balanced_forward
+    def _patched_inverse(self, x: torch.Tensor):
+        if self.affine:
+            x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
+            x = x / (
+                self.affine_weight.view(self.affine_weight.shape + (1,))
+                + self.eps * self.eps
+            )
+
+        sigma = self.stdev.view(self.stdev.shape + (1,))
+        mu = self.mean.view(self.mean.shape + (1,))
+
+        # Standard RevIN denormalization
+        x = x * sigma + mu
+
+        # Duan smearing correction: pre-compensate for Jensen bias
+        # ŷ_corrected = ŷ - c · σ_eff² · tanh(ŷ)
+        # tanh gates the correction: ~0 for peaceful (ŷ≈0), ~±1 for conflict
+        c = F.softplus(self.smear_raw)
+        x = x - c * sigma.pow(2) * torch.tanh(x)
+
+        return x
+
+    # Backwards-compatible checkpoint loading: inject defaults for missing keys
+    def _patched_load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys,
+        unexpected_keys, error_msgs
+    ):
+        alpha_key = prefix + 'alpha_raw'
+        smear_key = prefix + 'smear_raw'
+        if alpha_key not in state_dict:
+            state_dict[alpha_key] = torch.tensor(0.0)   # α=0.5
+        if smear_key not in state_dict:
+            state_dict[smear_key] = torch.tensor(-3.0)  # c≈0.05
+        nn.Module._load_from_state_dict(
+            self, state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+        )
+
+    RINorm.__init__ = _patched_init
+    RINorm.forward = _patched_forward
+    RINorm.inverse = _patched_inverse
+    RINorm._load_from_state_dict = _patched_load_from_state_dict
+    RINorm._curvature_patched = True
     logger.info(
-        "🐨 Patched RINorm: balanced conditioning σ/√cosh(μ)."
+        "🐨 Patched RINorm: learnable-α curvature conditioning + "
+        "Duan smearing correction (2 learnable params)."
     )
 
 

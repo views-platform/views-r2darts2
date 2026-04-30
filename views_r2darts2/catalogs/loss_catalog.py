@@ -10,6 +10,7 @@ from views_r2darts2.math.asymmetric_quantile_loss import AsymmetricQuantileLoss
 from views_r2darts2.math.zero_inflated_loss import ZeroInflatedLoss
 from views_r2darts2.math.prism_loss import PrismLoss
 from views_r2darts2.math.spotlight_loss import SpotlightLoss
+from views_r2darts2.math.spotlight_loss_logcosh import SpotlightLossLogcosh
 from views_r2darts2.math.spotlight_focal_loss import SpotlightFocalLoss
 from views_r2darts2.math.sentinel_loss import SentinelLoss
 
@@ -64,6 +65,7 @@ class LossCatalog:
             "ShrinkageLoss": ShrinkageLoss,
             "PrismLoss": PrismLoss,
             "SpotlightLoss": SpotlightLoss,
+            "SpotlightLossLogcosh": SpotlightLossLogcosh,
             "SpotlightFocalLoss": SpotlightFocalLoss,
             "SentinelLoss": SentinelLoss,
             "MSELoss": torch.nn.MSELoss,

@@ -261,6 +261,10 @@ def apply_rinorm_compression_patch():
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
 
+        # Guard against any upstream numeric accident before sinh.
+        # Real data is bounded: asinh(500k deaths) ≈ 13.4, well within ±88.7.
+        x = torch.clamp(x, -88.0, 88.0)
+
         # Convert to raw count space
         x_raw = torch.sinh(x)
 

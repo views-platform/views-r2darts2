@@ -267,3 +267,20 @@ class TestBatchBehavior:
         z_4d = z.unsqueeze(-1)
         y = norm.inverse(z_4d)
         assert torch.isfinite(y).all()
+
+    def test_inverse_finite_for_large_model_outputs(self):
+        """Inverse stays finite even when model outputs |z|>88 (sinh overflow threshold).
+
+        Early training with random-init TSMixer / N-HiTS can produce arbitrarily
+        large normalized outputs before the first gradient step settles weights.
+        The ±20 clamp in inverse must absorb these without producing inf/nan.
+        """
+        x = _make_conflict_series()
+        norm = FakeRawSpaceRINorm(1)
+        norm.forward(x)  # populate mean/stdev
+
+        # Simulate a degenerate early-training model output with |z| >> 88
+        z_large = torch.tensor([[[100.0], [50.0], [-90.0], [200.0]]])  # (1, 4, 1, 1)
+        y = norm.inverse(z_large)
+        assert torch.isfinite(y).all(), f"inverse produced non-finite values: {y}"
+        assert not torch.isnan(y).any(), f"inverse produced NaN: {y}"

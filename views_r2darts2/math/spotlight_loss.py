@@ -191,6 +191,7 @@ class SpotlightLoss(torch.nn.Module):
         super().__init__()
         self.delta = delta
         self.non_zero_threshold = non_zero_threshold
+        self.register_buffer('_ema_ratio', torch.tensor(1.0))
 
         logger.info(
             "SpotlightLoss v37 (DRO+Barron) | delta=%.4f threshold=%.4f",
@@ -348,7 +349,16 @@ class SpotlightLoss(torch.nn.Module):
         if self.delta > 0.0 and T >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + self.delta * loss_spectral
+        # ── Dynamic level balancing (EMA-smoothed) ───────────────────
+        # Scale level_anchor so its gradient budget matches shape,
+        # preventing gradient clipping from drowning DC correction.
+        # EMA (τ≈14 batches) eliminates batch-to-batch oscillation.
+        batch_ratio = (loss_shape / (loss_level + 1e-8)).detach()
+        if self.training:
+            self._ema_ratio.lerp_(batch_ratio, 0.05)
+        alpha_level = self._ema_ratio.clamp(max=50.0)
+
+        total_loss = loss_shape + alpha_level * loss_level + self.delta * loss_spectral
 
         if torch.isnan(total_loss):
             raise RuntimeError(
@@ -357,9 +367,10 @@ class SpotlightLoss(torch.nn.Module):
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f level=%.6f spec=%.6f total=%.6f",
+            "SpotlightLoss | shape=%.6f level=%.6f \u03b1_lvl=%.2f spec=%.6f total=%.6f",
             loss_shape.item(),
             loss_level.item(),
+            alpha_level.item(),
             loss_spectral.item(),
             total_loss.item(),
         )

@@ -191,10 +191,6 @@ class SpotlightLoss(torch.nn.Module):
         super().__init__()
         self.delta = delta
         self.non_zero_threshold = non_zero_threshold
-        # Competitive level balancing buffers (0.0 = uninitialized sentinel)
-        self.register_buffer('_ema_alpha', torch.tensor(1.0))
-        self.register_buffer('_ema_shape', torch.tensor(0.0))
-        self.register_buffer('_ema_level', torch.tensor(0.0))
 
         logger.info(
             "SpotlightLoss v37 (DRO+Barron) | delta=%.4f threshold=%.4f",
@@ -342,44 +338,21 @@ class SpotlightLoss(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
+        # ── Level anchor: √T-scaled log_cosh on per-series mean error ──
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
+        # √T scaling: level gradient L2 norm = √T·|tanh(ē)|, matching
+        # shape gradient norm ~ √T·avg|ρ'(e_shape)|. Preserves natural
+        # curriculum: large |ē| → saturated tanh → strong level signal;
+        # small |ē| → tanh ≈ ē → level fades, shape takes over.
+        loss_level = math.sqrt(T) * self._log_cosh(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)
         if self.delta > 0.0 and T >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        # ── Competitive level balancing ─────────────────────────────
-        # Equalizer: match gradient magnitudes so clipping splits budget fairly.
-        # loss_level = T * log_cosh(e_mean): T already cancels in backprop
-        # (d/dy: T * tanh(e_mean) * 1/T = tanh(e_mean)), so equalizer must
-        # compare against loss_level/T to avoid dividing out T-compensation.
-        ls = loss_shape.detach()
-        ll = loss_level.detach()
-        ll_norm = ll / T  # T-independent level loss for gradient-space comparison
-        if self.training:
-            if self._ema_shape == 0.0:  # first batch: instant warm-start
-                self._ema_shape.copy_(ls)
-                self._ema_level.copy_(ll_norm)
-            else:
-                self._ema_shape.lerp_(ls, 0.05)
-                self._ema_level.lerp_(ll_norm, 0.05)
-        # Convergence rate: >1 = stagnant/worsening, <1 = improving
-        # Floor at 1e-4 prevents noise-dominated ratios when losses are tiny
-        r_shape = ls / self._ema_shape.clamp(min=1e-4)
-        r_level = ll_norm / self._ema_level.clamp(min=1e-4)
-        # Tilt toward the struggler, bounded [0.5, 2.0]
-        compete = (r_level / r_shape.clamp(min=1e-4)).clamp(0.5, 2.0)
-        # Full alpha: gradient-space equalizer × competitive tilt
-        batch_alpha = (ls / ll_norm.clamp(min=1e-8)) * compete
-        if self.training:
-            self._ema_alpha.lerp_(batch_alpha, 0.05)
-        alpha_level = self._ema_alpha.clamp(max=50.0)
-
-        total_loss = loss_shape + alpha_level * loss_level + self.delta * loss_spectral
+        total_loss = loss_shape + loss_level + self.delta * loss_spectral
 
         if torch.isnan(total_loss):
             raise RuntimeError(
@@ -388,14 +361,9 @@ class SpotlightLoss(torch.nn.Module):
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f level=%.6f α=%.2f compete=%.2f "
-            "r_shape=%.2f r_level=%.2f spec=%.6f total=%.6f",
+            "SpotlightLoss | shape=%.6f level=%.6f spec=%.6f total=%.6f",
             loss_shape.item(),
             loss_level.item(),
-            alpha_level.item(),
-            compete.item(),
-            r_shape.item(),
-            r_level.item(),
             loss_spectral.item(),
             total_loss.item(),
         )

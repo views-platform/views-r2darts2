@@ -386,10 +386,14 @@ class SpotlightLoss(torch.nn.Module):
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f level=%.6f \u03b1_lvl=%.2f spec=%.6f total=%.6f",
+            "SpotlightLoss | shape=%.6f level=%.6f α=%.2f compete=%.2f "
+            "r_shape=%.2f r_level=%.2f spec=%.6f total=%.6f",
             loss_shape.item(),
             loss_level.item(),
             alpha_level.item(),
+            compete.item(),
+            r_shape.item(),
+            r_level.item(),
             loss_spectral.item(),
             total_loss.item(),
         )

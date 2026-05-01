@@ -255,17 +255,24 @@ class GradientHealthCallback(Callback):
             "grad_norm/zero_count": zero_count,
         }
 
-        # Surface SpotlightLoss dynamic level balancing ratio
+        # Surface SpotlightLoss competitive balancing state
         criterion = getattr(pl_module, "train_criterion", None)
         alpha_lvl = None
         if criterion is not None and hasattr(criterion, "_ema_alpha"):
             alpha_lvl = criterion._ema_alpha.item()
+            ema_shape = criterion._ema_shape.item()
+            ema_level = criterion._ema_level.item()
             metrics["loss/alpha_level"] = alpha_lvl
+            metrics["loss/ema_shape"] = ema_shape
+            metrics["loss/ema_level"] = ema_level
 
         if trainer.logger is not None:
             trainer.logger.log_metrics(metrics, step=trainer.global_step)
 
-        alpha_str = f" | α_lvl={alpha_lvl:.2f}" if alpha_lvl is not None else ""
+        alpha_str = (
+            f" | α={alpha_lvl:.2f} ema_s={ema_shape:.4f} ema_l={ema_level:.4f}"
+            if alpha_lvl is not None else ""
+        )
         logger.info(
             f"[Epoch {trainer.current_epoch}] Gradients {status} | "
             f"norm: min={stats['min']:.2e}, max={stats['max']:.2e}, "

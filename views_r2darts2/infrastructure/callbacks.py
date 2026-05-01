@@ -258,8 +258,8 @@ class GradientHealthCallback(Callback):
         # Surface SpotlightLoss dynamic level balancing ratio
         criterion = getattr(pl_module, "train_criterion", None)
         alpha_lvl = None
-        if criterion is not None and hasattr(criterion, "_ema_ratio"):
-            alpha_lvl = criterion._ema_ratio.item()
+        if criterion is not None and hasattr(criterion, "_ema_alpha"):
+            alpha_lvl = criterion._ema_alpha.item()
             metrics["loss/alpha_level"] = alpha_lvl
 
         if trainer.logger is not None:

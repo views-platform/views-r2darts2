@@ -150,7 +150,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.delta = delta
         self.non_zero_threshold = non_zero_threshold
-        self.register_buffer('_ema_ratio', torch.tensor(1.0))
+        # Competitive level balancing buffers
+        self.register_buffer('_ema_alpha', torch.tensor(1.0))
+        self.register_buffer('_ema_shape', torch.tensor(1.0))
+        self.register_buffer('_ema_level', torch.tensor(1.0))
 
         logger.info(
             "SpotlightLoss v36 (DRO) | delta=%.4f threshold=%.4f",
@@ -290,14 +293,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if self.delta > 0.0 and T >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        # ── Dynamic level balancing (EMA-smoothed) ───────────────────
-        # Scale level_anchor so its gradient budget matches shape,
-        # preventing gradient clipping from drowning DC correction.
-        # EMA (τ≈14 batches) eliminates batch-to-batch oscillation.
-        batch_ratio = (loss_shape / (loss_level + 1e-8)).detach()
+        # ── Competitive level balancing ─────────────────────────────
+        # Equalizer: match magnitudes so clipping splits budget fairly.
+        # Competitive tilt: whoever is stagnating gets more budget.
+        # Architecture-agnostic — adapts to N-BEATS/TSMixer/TFT/etc.
+        ls = loss_shape.detach()
+        ll = loss_level.detach()
         if self.training:
-            self._ema_ratio.lerp_(batch_ratio, 0.05)
-        alpha_level = self._ema_ratio.clamp(max=50.0)
+            self._ema_shape.lerp_(ls, 0.05)
+            self._ema_level.lerp_(ll, 0.05)
+        # Convergence rate: >1 = stagnant/worsening, <1 = improving
+        r_shape = ls / (self._ema_shape + 1e-8)
+        r_level = ll / (self._ema_level + 1e-8)
+        # Tilt toward the struggler, bounded [0.5, 2.0]
+        compete = (r_level / (r_shape + 1e-8)).clamp(0.5, 2.0)
+        # Full alpha: magnitude equalizer × competitive tilt
+        batch_alpha = (ls / (ll + 1e-8)) * compete
+        if self.training:
+            self._ema_alpha.lerp_(batch_alpha, 0.05)
+        alpha_level = self._ema_alpha.clamp(max=50.0)
 
         total_loss = loss_shape + alpha_level * loss_level + self.delta * loss_spectral
 

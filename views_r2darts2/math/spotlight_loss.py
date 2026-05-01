@@ -353,26 +353,28 @@ class SpotlightLoss(torch.nn.Module):
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
         # ── Competitive level balancing ─────────────────────────────
-        # Equalizer: match magnitudes so clipping splits budget fairly.
-        # Competitive tilt: whoever is stagnating gets more budget.
-        # Architecture-agnostic — adapts to N-BEATS/TSMixer/TFT/etc.
+        # Equalizer: match gradient magnitudes so clipping splits budget fairly.
+        # loss_level = T * log_cosh(e_mean): T already cancels in backprop
+        # (d/dy: T * tanh(e_mean) * 1/T = tanh(e_mean)), so equalizer must
+        # compare against loss_level/T to avoid dividing out T-compensation.
         ls = loss_shape.detach()
         ll = loss_level.detach()
+        ll_norm = ll / T  # T-independent level loss for gradient-space comparison
         if self.training:
             if self._ema_shape == 0.0:  # first batch: instant warm-start
                 self._ema_shape.copy_(ls)
-                self._ema_level.copy_(ll)
+                self._ema_level.copy_(ll_norm)
             else:
                 self._ema_shape.lerp_(ls, 0.05)
-                self._ema_level.lerp_(ll, 0.05)
+                self._ema_level.lerp_(ll_norm, 0.05)
         # Convergence rate: >1 = stagnant/worsening, <1 = improving
         # Floor at 1e-4 prevents noise-dominated ratios when losses are tiny
         r_shape = ls / self._ema_shape.clamp(min=1e-4)
-        r_level = ll / self._ema_level.clamp(min=1e-4)
+        r_level = ll_norm / self._ema_level.clamp(min=1e-4)
         # Tilt toward the struggler, bounded [0.5, 2.0]
         compete = (r_level / r_shape.clamp(min=1e-4)).clamp(0.5, 2.0)
-        # Full alpha: magnitude equalizer × competitive tilt
-        batch_alpha = (ls / ll.clamp(min=1e-8)) * compete
+        # Full alpha: gradient-space equalizer × competitive tilt
+        batch_alpha = (ls / ll_norm.clamp(min=1e-8)) * compete
         if self.training:
             self._ema_alpha.lerp_(batch_alpha, 0.05)
         alpha_level = self._ema_alpha.clamp(max=50.0)

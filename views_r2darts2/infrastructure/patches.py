@@ -142,88 +142,130 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm Raw-Space Normalization Patch ---
+# --- 3. RINorm Hybrid-Space Normalization Patch ---
 #
 # ═══════════════════════════════════════════════════════════════════════
-# PROBLEM
+# PROBLEM (v1: standard RevIN in asinh-space)
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Pipeline: raw counts → asinh → RevIN → model → RevIN⁻¹ → sinh → counts
 #
-# Standard RevIN operates in asinh-space: z = (x_asinh - μ_asinh) / σ_asinh.
-# The inverse is ŷ_asinh = ẑ·σ_asinh + μ_asinh, then downstream: counts = sinh(ŷ).
+# Standard RevIN: z = (x_asinh - μ_asinh) / σ_asinh.
+# Inverse: ŷ_asinh = ẑ·σ_asinh + μ_asinh → counts = sinh(ŷ_asinh).
 #
-# Because sinh is convex for positive arguments, three pathologies arise:
-#
+# Three pathologies:
 #   1. Jensen amplification: E[sinh(μ + σ·Z)] = sinh(μ)·exp(σ²/2).
-#      Any prediction variance (MC dropout, mini-batch noise) inflates counts.
-#      With σ_asinh=4 (Ukraine), Jensen factor = exp(8) ≈ 2981×.
-#
-#   2. Sensitivity explosion: ∂counts/∂ẑ = σ_asinh·cosh(ẑ·σ + μ) grows
-#      exponentially with |ẑ|. Gradient magnitude is entity-dependent
-#      by orders of magnitude.
-#
-#   3. Asymmetric errors: +ε and -ε in asinh-space map to vastly different
-#      count-space errors. Logcosh loss can't distinguish them.
+#   2. Sensitivity explosion: ∂counts/∂ẑ = σ·cosh(ẑ·σ+μ) → exponential.
+#   3. Asymmetric errors in count space.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# FIX: RAW-SPACE REVIN
+# PROBLEM (v2: pure raw-space RevIN — PREVIOUS IMPLEMENTATION)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Key insight: normalize in raw count space (where the data naturally
-# lives), then compress back to asinh. The sinh/asinh pair commutes
-# through the normalization correctly because the affine transform
-# happens OUTSIDE the convex function.
+# Pure raw-space centering: z = asinh((sinh(x) - μ_raw) / σ_raw)
+# Inverse: ŷ = asinh(sinh(ẑ)·σ_raw + μ_raw)
+#
+# Gradient-safe (bounded ≈1 for large |ẑ|): ✓
+# Jensen-safe for MC dropout (E[sinh(ẑ)]=0): ✓
+#
+# BUT: systematic positive mean bias.
+#
+# At ẑ=0 (model's "neutral" output):
+#   ŷ_asinh = asinh(0·σ + μ_raw) = asinh(μ_raw)
+#
+# Meanwhile the true asinh-space mean is μ_asinh = E[x_asinh].
+# Since sinh is convex for x>0:
+#   μ_raw = E[sinh(x_asinh)] ≥ sinh(E[x_asinh]) = sinh(μ_asinh)
+#   ⟹ asinh(μ_raw) ≥ μ_asinh
+#
+# The "neutral" prediction overshoots in asinh-space by:
+#   bias = asinh(μ_raw) − μ_asinh = asinh(E[sinh(X)]) − E[X]
+#
+# For Gaussian X~N(μ,σ²): μ_raw = sinh(μ)·exp(σ²/2), so:
+#   bias = asinh(sinh(μ)·exp(σ²/2)) − μ
+#
+#   | Series         | μ_asinh | σ_asinh | bias    |
+#   |----------------|---------|---------|---------|
+#   | Peaceful       | 0.10    | 0.30    | +0.00   |
+#   | Low conflict   | 1.50    | 1.00    | +0.89   |
+#   | Medium         | 3.00    | 2.00    | +1.71   |
+#   | High           | 5.00    | 3.00    | +2.60   |
+#   | Extreme (UKR)  | 5.00    | 4.00    | +7.70   |
+#
+# The level anchor partially compensates but requires the model to
+# learn a per-series negative DC shift from context. Limited capacity
+# → chronic overprediction across all series and all architectures.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# FIX: HYBRID-SPACE REVIN (v3)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Key insight: center in asinh-space (bias-free), normalize variance in
+# raw-space (gradient-safe). Best of both worlds.
 #
 # Forward:
-#   x_raw = sinh(x_asinh)                    — convert to raw counts
-#   μ_raw = mean(x_raw, dim=time)            — raw-space mean
-#   σ_raw = std(x_raw, dim=time)             — raw-space std
-#   z = asinh((x_raw - μ_raw) / σ_raw)       — normalize in raw, compress
+#   μ_asinh = mean(x, dim=time)              — asinh-space mean
+#   x_c = sinh(x − μ_asinh)                  — center in asinh, then to raw
+#   σ_c = std(x_c, dim=time)                 — centered-raw std
+#   z = asinh(x_c / σ_c)                     — normalize, compress
 #
 # Inverse:
-#   ŷ_raw = sinh(ẑ) · σ_raw + μ_raw          — expand, denormalize in raw
-#   ŷ_asinh = asinh(ŷ_raw)                   — compress back for loss
+#   ŷ_asinh = asinh(sinh(ẑ) · σ_c) + μ_asinh — expand, shift back
 #
 # ═══════════════════════════════════════════════════════════════════════
-# WHY THIS ELIMINATES JENSEN BIAS
+# WHY THIS ELIMINATES THE MEAN BIAS
 # ═══════════════════════════════════════════════════════════════════════
 #
-# The inverse is: sinh(ẑ)·σ_raw + μ_raw. The sinh acts on ẑ directly
-# (the model's compact, zero-centered output), and the affine shift
-# ·σ_raw + μ_raw happens AFTER sinh.
+# At ẑ=0: ŷ = asinh(sinh(0)·σ_c) + μ_asinh = asinh(0) + μ_asinh = μ_asinh
 #
-# For zero-mean model output: E[sinh(ẑ)] = 0 by odd symmetry when
-# E[ẑ] = 0. No Jensen amplification regardless of σ_raw or μ_raw.
+# The model's neutral output maps EXACTLY to the asinh-space mean.
+# No Jensen gap. No per-series DC correction needed.
 #
-# MC dropout variance σ_ẑ ≈ 0.3 gives Jensen factor exp(0.09/2) ≈ 1.05×
-# vs. exp(16/2) ≈ 2981× for standard RevIN on Ukraine.
+# ═══════════════════════════════════════════════════════════════════════
+# WHY GRADIENTS REMAIN BOUNDED
+# ═══════════════════════════════════════════════════════════════════════
+#
+# ∂ŷ/∂ẑ = σ_c · cosh(ẑ) / √(1 + (sinh(ẑ)·σ_c)²)
+#
+# At ẑ=0: = σ_c (moderate — similar to σ_asinh)
+# At ẑ→∞: cosh(ẑ) ≈ sinh(ẑ) → σ_c·sinh(ẑ) / (σ_c·sinh(ẑ)) = 1
+#
+# Bounded ∈ [1, σ_c]. No exponential explosion.
+# The outer asinh cancels the inner sinh curvature.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# MC DROPOUT SAFETY
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The inverse is: asinh(sinh(ẑ)·σ_c) + μ_asinh.  The μ_asinh term is
+# additive (constant, no amplification). The sinh(ẑ)·σ_c term:
+#   E[sinh(ẑ)] = 0 when E[ẑ]=0 (odd symmetry)
+#   Jensen factor for σ_ẑ≈0.3: exp(0.09/2)≈1.05× (negligible)
 #
 # ═══════════════════════════════════════════════════════════════════════
 # Z-RANGE ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════
 #
-# For Ukraine (μ_raw≈74, σ_raw≈297):
-#   z = asinh((x_raw - 74) / 297) → z ∈ [-0.25, 4.3] (compact!)
+# For Ukraine (μ_asinh≈5, σ_asinh≈4):
+#   x − μ ∈ [−5, +2], sinh(x−μ) ∈ [−74, +3.6]
+#   σ_c ≈ 20 (dominated by the positive tail)
+#   z = asinh(sinh(x−μ)/20) → z ∈ [−2.0, 0.18] (compact!)
 #
-# For peaceful (μ_raw≈0.1, σ_raw≈0.3):
-#   z = asinh((x_raw - 0.1) / 0.3) → z ∈ [-0.3, 2.0]
-#
-# Both series types produce similar z-ranges. The model sees a nearly
-# uniform input distribution — no sensitivity mismatch.
+# For peaceful (μ_asinh≈0.1):
+#   x − μ ≈ 0 for all t → z ≈ 0 (even more compact)
 #
 # ═══════════════════════════════════════════════════════════════════════
-# GRADIENT ANALYSIS
+# ROUND-TRIP VERIFICATION
 # ═══════════════════════════════════════════════════════════════════════
 #
-# ∂ŷ_asinh/∂ẑ = σ_raw·cosh(ẑ) / √(1 + (sinh(ẑ)·σ_raw + μ_raw)²)
+# Forward: z = asinh(sinh(x − μ) / σ_c)
+# Inverse: ŷ = asinh(sinh(z) · σ_c) + μ
 #
-# At ẑ=0: ≈ σ_raw / √(1 + μ_raw²) = σ_raw / cosh(asinh(μ_raw)) ≈ σ_asinh
-# At ẑ=2: ≈ σ_raw·3.76 / √(1 + (3.63·σ_raw + μ_raw)²) ≈ 1.0
-# At ẑ→∞: → 1.0 (asinh and sinh cancel for large arguments)
-#
-# Gradient is bounded and approximately constant ≈ 1 for large |ẑ|.
-# The outer asinh exactly cancels the sinh curvature explosion.
+# Compose: asinh(sinh(asinh(sinh(x−μ)/σ_c)) · σ_c) + μ
+#         = asinh((sinh(x−μ)/σ_c) · σ_c) + μ    [sinh(asinh(a)) = a]
+#         = asinh(sinh(x−μ)) + μ
+#         = (x − μ) + μ
+#         = x  ✓  (exact reconstruction)
 #
 # ═══════════════════════════════════════════════════════════════════════
 # IMPLEMENTATION NOTES
@@ -231,26 +273,30 @@ def apply_nbeats_patch():
 #
 # - No learnable parameters. Fully deterministic.
 # - No checkpoint compatibility issue (no new state_dict keys).
-# - Stores self.mean and self.stdev as raw-space statistics.
-# - Inverse patches the shape broadcasting for Darts' 4D output tensor.
-# - Adds 2 element-wise ops (sinh, asinh) per forward and inverse.
-#   Negligible cost vs. model forward pass.
-# - eps=1e-5 in stdev prevents division by zero for all-zero series.
+# - self.mean stores μ_asinh. self.stdev stores σ_c (centered-raw std).
+# - Inverse patches shape broadcasting for Darts' 4D output tensor.
+# - σ_c is computed from sinh(x − μ_asinh), NOT from sinh(x).
+#   These differ enormously — std(sinh(x)) is dominated by the
+#   raw-space mean offset; std(sinh(x−μ)) reflects actual variability.
+# - eps=1e-5 prevents division by zero for all-zero series.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with raw-space normalization.
+    Patches Darts RINorm with hybrid-space normalization (v3).
 
-    Instead of normalizing in asinh-space (where the downstream sinh
-    creates Jensen bias), normalizes in raw count space where the
-    affine transform is outside the convex sinh function.
+    Centers in asinh-space (zero mean bias), normalizes variance in
+    raw-space (bounded gradients). Eliminates both the gradient
+    explosion of standard RevIN AND the systematic positive bias of
+    pure raw-space RevIN.
 
-    Forward:  z = asinh((sinh(x) - μ_raw) / σ_raw)
-    Inverse:  ŷ = asinh(sinh(ẑ) · σ_raw + μ_raw)
+    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
+    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
 
-    Zero learnable parameters. Eliminates Jensen bias structurally.
-    Backwards-compatible: no new state_dict keys.
+    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
+    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
+    Round-trip: exact (forward ∘ inverse = identity).
+    Zero learnable parameters. Backwards-compatible state_dict.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
@@ -262,21 +308,25 @@ def apply_rinorm_compression_patch():
         calc_dims = tuple(range(1, x.ndim - 1))
 
         # Guard against any upstream numeric accident before sinh.
-        # Real data is bounded: asinh(500k deaths) ≈ 13.4, well within ±88.7.
         x = torch.clamp(x, -88.0, 88.0)
 
-        # Convert to raw count space
-        x_raw = torch.sinh(x)
+        # Compute asinh-space mean (bias-free centering point)
+        self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
 
-        # Compute raw-space statistics
-        self.mean = torch.mean(x_raw, dim=calc_dims, keepdim=True).detach()
+        # Center in asinh space, convert to raw
+        x_centered_raw = torch.sinh(x - self.mean)
+
+        # Compute variance of the centered-raw signal
+        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
+        # These differ enormously — std(sinh(x)) is inflated by the
+        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
-            torch.var(x_raw, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
+            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
+            + self.eps
         ).detach()
 
-        # Normalize in raw space, then compress back via asinh
-        x_norm_raw = (x_raw - self.mean) / self.stdev
-        x = torch.asinh(x_norm_raw)
+        # Normalize by centered-raw std, compress back via asinh
+        x = torch.asinh(x_centered_raw / self.stdev)
 
         if self.affine:
             x = x * self.affine_weight
@@ -295,17 +345,15 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Clamp before sinh to prevent float32 overflow (sinh overflows at |x|>88.7).
-        # ±50 is the safe ceiling: sinh(50)≈2.59e21; for the most extreme σ_raw seen
-        # in conflict data (~150K for Syria peak), sinh(50)*150K≈3.9e26 << float32 max
-        # (3.4e38). The original ±20 was too tight — early training produces outputs of
-        # ±25 to ±30 that exceed ±20, killing gradients for ~40-50% of sequences and
-        # causing a gradient dead zone / loss plateau. ±50 allows those sequences to
-        # carry gradient while still protecting against genuine overflow at ±88.7.
+        # Clamp before sinh to prevent float32 overflow.
+        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
+        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
         x = torch.clamp(x, -50.0, 50.0)
 
-        # Expand from asinh-space to raw, denormalize, compress back
-        x = torch.asinh(torch.sinh(x) * sigma + mu)
+        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
+        # Compress: asinh wraps it back into asinh-space
+        # Shift: + μ_asinh re-centers (additive, no amplification)
+        x = torch.asinh(torch.sinh(x) * sigma) + mu
 
         return x
 
@@ -313,8 +361,8 @@ def apply_rinorm_compression_patch():
     RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: raw-space normalization "
-        "(zero Jensen bias, no learnable params)."
+        "🐨 Patched RINorm: hybrid-space normalization v3 "
+        "(asinh centering + raw-space σ, zero mean bias)."
     )
 
 

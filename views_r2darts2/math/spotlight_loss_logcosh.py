@@ -279,14 +279,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: √T-scaled log_cosh on per-series mean error ──
+        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
-        # √T scaling: level gradient L2 norm = √T·|tanh(ē)|, matching
-        # shape gradient norm ~ √T·avg|ρ'(e_shape)|. Preserves natural
-        # curriculum: large |ē| → saturated tanh → strong level signal;
+        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
+        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
+        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
+        # large |ē| → saturated tanh → strong level signal;
         # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        loss_level = math.sqrt(T) * self._log_cosh(e_mean.squeeze(1)).mean()
+        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

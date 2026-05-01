@@ -245,25 +245,32 @@ class GradientHealthCallback(Callback):
             status = f"🚨 vanishing (max={stats['max']:.2e})"
 
         # Push scalars to PL logger (wandb) if available
-        if trainer.logger is not None:
-            trainer.logger.log_metrics(
-                {
-                    "grad_norm/min": stats["min"],
-                    "grad_norm/max": stats["max"],
-                    "grad_norm/mean": stats["mean"],
-                    "grad_norm/median": stats["median"],
-                    "grad_norm/nan_count": nan_count,
-                    "grad_norm/inf_count": inf_count,
-                    "grad_norm/zero_count": zero_count,
-                },
-                step=trainer.global_step,
-            )
+        metrics = {
+            "grad_norm/min": stats["min"],
+            "grad_norm/max": stats["max"],
+            "grad_norm/mean": stats["mean"],
+            "grad_norm/median": stats["median"],
+            "grad_norm/nan_count": nan_count,
+            "grad_norm/inf_count": inf_count,
+            "grad_norm/zero_count": zero_count,
+        }
 
+        # Surface SpotlightLoss dynamic level balancing ratio
+        criterion = getattr(pl_module, "train_criterion", None)
+        alpha_lvl = None
+        if criterion is not None and hasattr(criterion, "_ema_ratio"):
+            alpha_lvl = criterion._ema_ratio.item()
+            metrics["loss/alpha_level"] = alpha_lvl
+
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        alpha_str = f" | α_lvl={alpha_lvl:.2f}" if alpha_lvl is not None else ""
         logger.info(
             f"[Epoch {trainer.current_epoch}] Gradients {status} | "
             f"norm: min={stats['min']:.2e}, max={stats['max']:.2e}, "
             f"mean={stats['mean']:.2e}, median={stats['median']:.2e} | "
-            f"zero={zero_count}/{total_params}"
+            f"zero={zero_count}/{total_params}{alpha_str}"
         )
 
 

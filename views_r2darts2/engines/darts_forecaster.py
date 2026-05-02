@@ -380,20 +380,35 @@ class DartsForecaster:
 
         self.min_length = self.model.input_chunk_length + self.model.output_chunk_length
         if train_mode:
-            # We slice targets up to 'end + 1' because Darts slice is exclusive for integer indices.
-            # This ensures month 'end' (t) is included.
-            targets = [
-                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
-                for s in timeseries_float
-                if len(s) >= self.min_length
-            ]
+            # Build aligned (target, past_cov) pairs and filter together.
+            #
+            # BUG FIXED: Previously targets was filtered by len(s) >= min_length but
+            # past_cov had no filter. This caused entity misalignment: targets[i] and
+            # past_cov[i] came from DIFFERENT entities whenever any shorter series was
+            # excluded. model.fit(series=targets, past_covariates=past_cov) pairs by
+            # list index, so every entity after the first filtered-out one was trained
+            # on the wrong covariate history.
+            #
+            # The filter now uses len(sliced_target) not len(s): the full series
+            # length includes the test partition, so a series with 10 training months
+            # and 74 test months would pass the old len(s)>=84 check while its
+            # training slice is far too short for a 48+36 window.
+            #
             # We MUST slice past_cov up to 'end + 1' to prevent feature leakage.
-            past_cov = [
-                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(
-                    np.float32
+            paired = [
+                (
+                    s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets],
+                    s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(np.float32),
                 )
                 for s in timeseries_float
+                if len(s.slice(start_ts=start, end_ts=end + 1)) >= self.min_length
             ]
+            targets = [p[0] for p in paired]
+            past_cov = [p[1] for p in paired]
+            logger.info(
+                f"Training filter: {len(paired)}/{len(timeseries_float)} entities "
+                f"passed minimum length >= {self.min_length}."
+            )
         else:
             targets = [
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
@@ -571,6 +586,25 @@ class DartsForecaster:
         # LOCK ENTROPY: Guarantee bit-perfect identity for probabilistic samples
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
+        # Scaler provenance log: confirms whether scalers are in-memory (sweep path,
+        # freshly fitted during train()) or disk-loaded (eval path, loaded via
+        # load_model()). For stateless transforms (AsinhTransform), both are
+        # functionally identical. For stateful scalers, divergence is silent if the
+        # disk artifact was saved from a different training run.
+        #
+        # NOTE (structural): the sweep path never calls save_model() — _train_model_artifact()
+        # skips save when config["sweep"]=True. Sweep eval always uses in-memory scalers.
+        # Regular eval always loads from the latest on-disk artifact. These are DIFFERENT
+        # scaler instances even if they produce identical outputs for stateless transforms.
+        # Any time you switch to a stateful scaler (StandardScaler, MinMaxScaler, etc.),
+        # verify that both paths load from the same artifact or retrain to refresh the disk scaler.
+        logger.info(
+            f"predict() scaler state: "
+            f"target_scaler='{self._target_scaler_cfg}' (fitted={self.target_scaler is not None}), "
+            f"feature_scaler='{self._feature_scaler_cfg}' (fitted={self.feature_scaler is not None}), "
+            f"scaler_fitted={self.scaler_fitted}."
+        )
+
         timeseries = self.dataset.as_darts_timeseries(
             stat_time_range=(self._train_start, self._train_end),
             static_cov_transform=self._static_cov_transform,
@@ -660,6 +694,10 @@ class DartsForecaster:
                 "using_feature_scaler_map": using_feature_scaler_map,
                 "feature_scaler_map_cfg": self._feature_scaler_map_cfg,
                 "feature_scaler_cfg": self._feature_scaler_cfg,
+                # _target_scaler_cfg was previously missing from this dict, causing
+                # self._target_scaler_cfg to reflect the current config rather than
+                # the one used during training after a load_model() call.
+                "target_scaler_cfg": self._target_scaler_cfg,
             },
             scaler_path,
         )
@@ -679,6 +717,26 @@ class DartsForecaster:
             self._log_features = set(scaler_data.get("log_features", []))
             self._feature_scaler_map_cfg = scaler_data.get("feature_scaler_map_cfg")
             self._feature_scaler_cfg = scaler_data.get("feature_scaler_cfg")
+            # Restore target_scaler_cfg from the saved artifact so that
+            # self._target_scaler_cfg reflects what was used during training,
+            # not whatever the current config says.
+            saved_target_scaler_cfg = scaler_data.get("target_scaler_cfg")
+            if saved_target_scaler_cfg is not None:
+                if saved_target_scaler_cfg != self._target_scaler_cfg:
+                    logger.warning(
+                        f"SCALER CONFIG MISMATCH: artifact was saved with "
+                        f"target_scaler='{saved_target_scaler_cfg}' but current "
+                        f"config has target_scaler='{self._target_scaler_cfg}'. "
+                        "Using the artifact's scaler object — eval results may "
+                        "differ from a fresh training run under the current config."
+                    )
+                self._target_scaler_cfg = saved_target_scaler_cfg
+            logger.info(
+                f"Scalers loaded from {scaler_path}. "
+                f"target_scaler='{self._target_scaler_cfg}', "
+                f"feature_scaler='{self._feature_scaler_cfg}', "
+                f"scaler_fitted={self.scaler_fitted}."
+            )
         except FileNotFoundError:
             logger.error("Scaler state not found. Please retrain the model.")
             raise

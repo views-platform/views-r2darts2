@@ -723,12 +723,11 @@ class DartsForecaster:
             saved_target_scaler_cfg = scaler_data.get("target_scaler_cfg")
             if saved_target_scaler_cfg is not None:
                 if saved_target_scaler_cfg != self._target_scaler_cfg:
-                    logger.warning(
+                    raise ValueError(
                         f"SCALER CONFIG MISMATCH: artifact was saved with "
                         f"target_scaler='{saved_target_scaler_cfg}' but current "
                         f"config has target_scaler='{self._target_scaler_cfg}'. "
-                        "Using the artifact's scaler object — eval results may "
-                        "differ from a fresh training run under the current config."
+                        "Retrain the model or align the config before loading this artifact."
                     )
                 self._target_scaler_cfg = saved_target_scaler_cfg
             logger.info(

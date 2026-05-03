@@ -313,11 +313,14 @@ class SpotlightLoss(torch.nn.Module):
         w_compound = 1.0 + difficulty * importance
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
-        # Z-score log(cell_loss) for proportional outlier detection.
-        # Operates on raw cell_loss (before compound weighting).
-        # Flattened cross-series: event cells dominate the tail.
-        loss_flat = cell_loss.detach().flatten()
-        log_loss = torch.log(loss_flat + 1e-8)
+        # Z-score log(|e_shape|) for proportional outlier detection.
+        # Previous: z-scored log(cell_loss) — but Barron(1.5) compresses
+        # differently near zero (~x²) vs tails (~|x|^1.5), distorting
+        # proportional comparisons in log-space. Using |e_shape| directly
+        # gives undistorted log-space z-scores: DRO identifies true tail
+        # cells independent of the loss function's curvature.
+        error_flat = torch.abs(e_shape).detach().flatten()
+        log_loss = torch.log(error_flat + 1e-8)
         log_std = log_loss.std()
 
         dro_alpha = log_std / (log_std + 1.0)

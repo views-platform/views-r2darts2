@@ -162,23 +162,35 @@ class _ViewsDatasetDarts(_ViewsDataset):
                 return 0.0
             return float((t_centered * y_centered).sum() / denom)
 
-        # Resolve the element-wise transform function for static cov stats.
-        # These are numpy-level (not Darts Scaler) because static covariates
-        # are scalars per entity, not time series.
-        _STATIC_COV_TRANSFORMS = {
+        # Resolve the transform chain for static cov stats.
+        # Supports single transforms ("AsinhTransform") or chains
+        # ("AsinhTransform->MaxAbsScaler"). Element-wise transforms are
+        # numpy-level (not Darts Scaler) because static covariates are
+        # scalars per entity, not time series. Cross-entity scalers
+        # (MaxAbsScaler, StandardScaler) normalize across countries.
+        _STATIC_COV_ELEMENTWISE = {
             "AsinhTransform": np.arcsinh,
             "LogTransform": np.log1p,
             "SqrtTransform": lambda x: np.sqrt(np.maximum(x, 0)),
             "FourthRootTransform": lambda x: np.power(1.0 + np.maximum(x, 0.0), 0.25) - 1.0,
         }
+        _STATIC_COV_CROSS_ENTITY = {"MaxAbsScaler", "StandardScaler"}
+
         transform_fn = None
+        cross_entity_scaler = None
         if static_cov_transform is not None:
-            if static_cov_transform not in _STATIC_COV_TRANSFORMS:
-                raise ValueError(
-                    f"Unknown static_cov_transform '{static_cov_transform}'. "
-                    f"Available: {list(_STATIC_COV_TRANSFORMS.keys())}"
-                )
-            transform_fn = _STATIC_COV_TRANSFORMS[static_cov_transform]
+            steps = [s.strip() for s in static_cov_transform.split("->")]
+            for step in steps:
+                if step in _STATIC_COV_ELEMENTWISE:
+                    transform_fn = _STATIC_COV_ELEMENTWISE[step]
+                elif step in _STATIC_COV_CROSS_ENTITY:
+                    cross_entity_scaler = step
+                else:
+                    raise ValueError(
+                        f"Unknown static_cov_transform step '{step}'. "
+                        f"Available elementwise: {list(_STATIC_COV_ELEMENTWISE.keys())}. "
+                        f"Available cross-entity: {sorted(_STATIC_COV_CROSS_ENTITY)}."
+                    )
 
         # Compute fingerprint stats for every target and name them {target_col}_{stat}.
         # This supports both single-target models (e.g. "lr_ged_sb_mu") and
@@ -205,6 +217,21 @@ class _ViewsDatasetDarts(_ViewsDataset):
                 for stat in ("mu", "sigma", "max", "trend"):
                     col_name = f"{target_col}_{stat}"
                     col_stats[col_name] = transform_fn(col_stats[col_name].values).astype(np.float32)
+
+            # Apply cross-entity scaler if specified in the chain.
+            if cross_entity_scaler == "MaxAbsScaler":
+                for stat in ("mu", "sigma", "max", "trend"):
+                    col_name = f"{target_col}_{stat}"
+                    abs_max = col_stats[col_name].abs().max()
+                    if abs_max > 0:
+                        col_stats[col_name] = (col_stats[col_name] / abs_max).astype(np.float32)
+            elif cross_entity_scaler == "StandardScaler":
+                for stat in ("mu", "sigma", "max", "trend"):
+                    col_name = f"{target_col}_{stat}"
+                    mean = col_stats[col_name].mean()
+                    std = col_stats[col_name].std()
+                    if std > 0:
+                        col_stats[col_name] = ((col_stats[col_name] - mean) / std).astype(np.float32)
 
             stat_frames.append(col_stats)
 

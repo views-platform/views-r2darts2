@@ -42,7 +42,7 @@ class SchedulerCatalog:
 
     # Extra static kwargs injected per scheduler (not part of the DNA genome).
     _STATIC_KWARGS = {
-        "ReduceLROnPlateau": {"mode": "min", "monitor": "train_loss"},
+        "ReduceLROnPlateau": {"mode": "min", "monitor": "val_loss"},
     }
 
     def __init__(self, config: dict):

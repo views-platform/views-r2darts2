@@ -520,9 +520,9 @@ class DartsForecaster:
         """
         Trains the forecasting model using the dataset provided.
 
-        This method preprocesses the time series data and any associated features,
-        converts them to the appropriate data type, and fits the model using the
-        processed target series and past covariates.
+        Preprocesses training data, fits scalers, then prepares a validation set
+        from the test partition (transformed with train-fitted scalers, no leakage).
+        Val loss is computed every epoch for early stopping and monitoring.
 
         Returns:
             None
@@ -546,6 +546,30 @@ class DartsForecaster:
                 for pc in past_covariates
             ]
 
+        # --- Validation set: test partition, transformed with train-fitted scalers ---
+        # No leakage: scalers were fit above on train only; val is .transform()'ed.
+        # Static cov stats use train range (passed to as_darts_timeseries above).
+        # Val needs icl steps of history before test_start for context window.
+        val_start = self._test_start - self.model.input_chunk_length
+        val_end = self._test_end
+        val_targets, val_past_cov = self._preprocess_timeseries(
+            timeseries=timeseries,
+            start=val_start,
+            end=val_end,
+            train_mode=False,
+        )
+        val_targets = [ts.astype(np.float32) for ts in val_targets]
+        if self.dataset.features:
+            val_past_cov = [
+                pc.astype(np.float32) if pc is not None else None
+                for pc in val_past_cov
+            ]
+        logger.info(
+            f"Validation set: {len(val_targets)} entities, "
+            f"range [{val_start}, {val_end}] "
+            f"(test partition with {self.model.input_chunk_length} steps of context)."
+        )
+
         # Train the model
         # Auto-detect num_workers: use half of available CPUs, capped at 8, minimum 0
         num_workers = min(max((os.cpu_count() or 1) // 2, 0), 8)
@@ -559,6 +583,8 @@ class DartsForecaster:
         self.model.fit(
             series=target_series,
             past_covariates=past_covariates,
+            val_series=val_targets,
+            val_past_covariates=val_past_cov,
             dataloader_kwargs=dataloader_kwargs,
             verbose=True,
         )

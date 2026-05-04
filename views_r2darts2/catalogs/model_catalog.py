@@ -84,7 +84,7 @@ class ModelCatalog:
         callbacks = [
             TrainingStepPatchCallback(),  # MUST be first: patches training_step to expose predictions
             EarlyStopping(
-                monitor="train_loss",
+                monitor="val_loss",
                 patience=self.config.get("early_stopping_patience"),
                 min_delta=self.config.get("early_stopping_min_delta"),
                 mode="min",

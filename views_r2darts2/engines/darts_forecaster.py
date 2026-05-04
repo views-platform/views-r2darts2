@@ -566,10 +566,69 @@ class DartsForecaster:
                 pc.astype(np.float32) if pc is not None else None
                 for pc in val_past_cov
             ]
+
+        # Guard: if the test partition has no ground-truth output steps (e.g.
+        # run_type="forecasting" where test_start = train_end + 1), val series
+        # will be exactly icl steps long — too short for Darts to build even one
+        # sample (needs icl + ocl).
+        #
+        # Forecasting-mode fix: carve the last ocl steps from the training window
+        # as a holdout val set. Scalers are refit on the trimmed window to prevent
+        # leakage from holdout targets into the scaler statistics.
+        #
+        # The holdout months are still used at inference time: predict() slices up
+        # to self._train_end as context, so the model sees them as encoder input
+        # even though they never appeared in a gradient update.
+        _min_val_len = self.model.input_chunk_length + self.model.output_chunk_length
+        _max_val_len = max((len(ts) for ts in val_targets), default=0)
+        if _max_val_len < _min_val_len:
+            _ocl = self.model.output_chunk_length
+            _icl = self.model.input_chunk_length
+            trimmed_train_end = self._train_end - _ocl
+            carved_val_start = self._train_end - _ocl - _icl + 1
+
+            logger.info(
+                f"Forecasting mode: val partition too short ({_max_val_len} < {_min_val_len}). "
+                f"Carving holdout val [{carved_val_start}, {self._train_end}] ({_icl + _ocl} steps). "
+                f"Refitting scalers on trimmed train [{self._train_start}, {trimmed_train_end}]."
+            )
+
+            # Refit on trimmed window — overwrites scaler fit from the full-range call above.
+            target_series, past_covariates = self._preprocess_timeseries(
+                timeseries=timeseries,
+                start=self._train_start,
+                end=trimmed_train_end,
+                train_mode=True,
+            )
+            target_series = [ts.astype(np.float32) for ts in target_series]
+            if self.dataset.features:
+                past_covariates = [
+                    pc.astype(np.float32) if pc is not None else None
+                    for pc in past_covariates
+                ]
+
+            # Build carved val (scalers already refitted above; transform only, no leakage).
+            val_targets, val_past_cov = self._preprocess_timeseries(
+                timeseries=timeseries,
+                start=carved_val_start,
+                end=self._train_end,
+                train_mode=False,
+            )
+            val_targets = [ts.astype(np.float32) for ts in val_targets]
+            if self.dataset.features:
+                val_past_cov = [
+                    pc.astype(np.float32) if pc is not None else None
+                    for pc in val_past_cov
+                ]
+
+        _used_carved_val = _max_val_len < _min_val_len
+        _log_val_start = carved_val_start if _used_carved_val else val_start
+        _log_val_end = self._train_end if _used_carved_val else val_end
         logger.info(
-            f"Validation set: {len(val_targets)} entities, "
-            f"range [{val_start}, {val_end}] "
-            f"(test partition with {self.model.input_chunk_length} steps of context)."
+            f"Validation set: {len(val_targets) if val_targets is not None else 0} entities, "
+            f"range [{_log_val_start}, {_log_val_end}] "
+            f"({'carved from train end' if _used_carved_val else 'test partition'} "
+            f"with {self.model.input_chunk_length} steps of context)."
         )
 
         # Train the model

@@ -500,9 +500,11 @@ class DartsForecaster:
             if pred_values.ndim == 2:
                 pred_values = pred_values[..., np.newaxis]
 
-            # Floor: raw count predictions below 1 are not meaningful — clip to 0.
-            # Handles negatives and sub-unit fractional counts simultaneously.
-            pred_values = np.where(pred_values < 1.0, 0.0, pred_values).astype(np.float32)
+            # Clamp: raw count predictions cannot be negative (deaths have a physical floor of 0).
+            # Sub-unit fractional counts (0 < pred < 1) are kept as-is; zeroing them
+            # collapses the [0, 0.88] asinh range and catastrophically inflates MSLE
+            # for low-conflict countries (1–5 deaths/month).
+            pred_values = np.maximum(pred_values, 0.0).astype(np.float32)
             for time_idx in range(pred_values.shape[0]):
                 time_stamp = pred.start_time() + time_idx * pred.freq
                 row_data = {

@@ -489,7 +489,6 @@ class DartsForecaster:
 
         # Process predictions into list format
         results = []
-        eps = 1e-8
         for pred in timeseries_pred:
             if pred.static_covariates is None:
                 raise ValueError(
@@ -501,8 +500,9 @@ class DartsForecaster:
             if pred_values.ndim == 2:
                 pred_values = pred_values[..., np.newaxis]
 
-            # Enforce raw numerical stability (clipping only for epsilon floor)
-            pred_values = np.clip(pred_values, a_min=eps, a_max=None).astype(np.float32)
+            # Floor: raw count predictions below 1 are not meaningful — clip to 0.
+            # Handles negatives and sub-unit fractional counts simultaneously.
+            pred_values = np.where(pred_values < 1.0, 0.0, pred_values).astype(np.float32)
             for time_idx in range(pred_values.shape[0]):
                 time_stamp = pred.start_time() + time_idx * pred.freq
                 row_data = {

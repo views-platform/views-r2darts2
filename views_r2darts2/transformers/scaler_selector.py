@@ -81,6 +81,7 @@ class ScalerSelector:
             "RobustScaler": RobustScaler,
             "MinMaxScaler": MinMaxScaler,
             "MaxAbsScaler": MaxAbsScaler,
+            "PassThrough": partial(FunctionTransformer, func=None, inverse_func=None, validate=False),
             "YeoJohnsonTransform": partial(PowerTransformer, method="yeo-johnson"),
             "LogTransform": partial(
                 FunctionTransformer,

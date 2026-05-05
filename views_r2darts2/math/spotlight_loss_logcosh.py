@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v36 — asinh + RevIN compatible, with DRO aggregation.
+    SpotlightLoss v36.2 — asinh + RevIN compatible, level-DRO architecture.
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -52,28 +52,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
        weighting achieves this automatically — cells the model already
        predicts well get difficulty→0 → w→1 regardless of magnitude.
 
-    3. **KL-DRO tail aggregation (log-space)** — parameter-free.
+    3. **KL-DRO tail aggregation on LEVEL anchor (log-space)** —
 
-       Instead of a plain mean over weighted shape losses, z-score
-       log(cell_loss) and apply concave-compressed DRO weights:
+       Applied to the per-series mean error (level loss), NOT cell-level
+       shape loss. DRO on level creates negative feedback:
 
-           log_l = log(l + ε)
-           z = (log_l − mean(log_l)) / std(log_l)
-           dro_w = log1p(clamp(1+z, min=0))
-           dro_w = dro_w / mean(dro_w)
+           Series drifts → |ē| grows → DRO upweights → stronger
+           correction (tanh points toward fix) → ē shrinks → equilibrium.
 
-       KL-DRO detects *proportional* outliers, not absolute. A
-       5-death miss at 10× the median loss gets the same DRO emphasis
-       as a 1000-death miss at 10× the median. Aligned with the
-       proportional error sensitivity of asinh-space prediction.
+       DRO on shape was unsafe: amplified conflict cells at high ẑ where
+       the RevIN Jacobian → 1, creating ẑ-space DC drift through the
+       asymmetry (shape gradient zero-sum in ŷ-space but NOT in ẑ-space).
+       Moving DRO to level exploits that the level gradient is inherently
+       self-correcting — amplifying it accelerates mean convergence.
 
        Soft activation α = log_std/(log_std + 1.0) blends toward
        uniform when log-loss variance is small (early training).
-
-       Compound weight and DRO are combined independently (product,
-       normalised jointly to mean=1) — they address orthogonal concerns:
-       compound steers *which cells matter*, DRO steers *how losses
-       are aggregated* across the 90/10 peace/event split.
+       Max per-cell gradient from level DRO: w·tanh(ē)/T ≤ 4/36 ≈ 0.11
+       versus shape gradient per-cell ≤ 2. Cannot destabilize.
 
     4. **Level anchor** — T-scaled log_cosh on per-series mean error.
 
@@ -99,10 +95,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
     ── Changes from v35 ─────────────────────────────────────────────────
 
     - `alpha` parameter removed. Compound weighting is parameter-free.
-    - KL-DRO aggregation replaces simple weighted mean on shape loss.
+    - KL-DRO moved from shape to level anchor (v36.2). DRO on shape
+      caused ẑ-space DC drift via Jacobian asymmetry; on level it
+      creates self-correcting negative feedback.
     - Compound weight (difficulty × importance) replaces alpha-scaled
       log_cosh importance weight.
-    - Level anchor unchanged. Spectral unchanged.
+    - Shape: compound-only (no DRO). Level: DRO-weighted. Spectral unchanged.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -152,7 +150,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.non_zero_threshold = non_zero_threshold
 
         logger.info(
-            "SpotlightLoss v36 (DRO) | delta=%.4f threshold=%.4f",
+            "SpotlightLoss v36.2 (level-DRO) | delta=%.4f threshold=%.4f",
             delta, non_zero_threshold,
         )
 
@@ -253,40 +251,43 @@ class SpotlightLossLogcosh(torch.nn.Module):
         importance = 1.0 - torch.exp(-magnitude)
         w_compound = 1.0 + difficulty * importance
 
-        # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
-        # Z-score log(cell_loss) for proportional outlier detection.
-        # Operates on raw cell_loss (before compound weighting).
-        # Flattened cross-series: event cells dominate the tail.
-        #
-        # ⚠️ DRO DISABLED (v36.1):
-        # DRO amplifies conflict cells which sit at high ẑ where the
-        # RevIN inverse Jacobian ∂ŷ/∂ẑ → 1. The DC/AC zero-sum holds
-        # in ŷ-space, but through the nonlinear Jacobian, compensating
-        # gradients on peace cells (ẑ≈0, Jacobian≈σ_c >> 1) get amplified
-        # in ẑ-space by σ_c. Net: persistent positive DC drift in
-        # parameter space despite ŷ-space sum-to-zero. DRO × Jacobian
-        # asymmetry creates an unstoppable positive feedback spiral.
-        # Compound weighting alone (max 2×) is weak enough that the
-        # Jacobian asymmetry stays manageable.
-        w_dro = torch.ones_like(cell_loss)
-
-        # Combine compound × DRO, normalise jointly to mean=1
-        w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean()
-        # Safety: any residual NaN from degenerate batches → weight=1
+        # ── Shape aggregation: compound weighting only ────────────────
+        # DRO on shape is unsafe: amplifies conflict cells at high ẑ
+        # where Jacobian ∂ŷ/∂ẑ → 1, creating ẑ-space DC drift through
+        # the Jacobian asymmetry (positive feedback spiral). Compound
+        # weighting alone (max 2×) keeps drift manageable.
+        w_total = w_compound / w_compound.mean()
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
+        # ── Level anchor: T-scaled log_cosh with DRO ─────────────────
         # Only mechanism that can shift per-series means. Shape loss is
-        # structurally DC-blind. Not DRO-weighted — different dimension.
-        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
-        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
-        # large |ē| → saturated tanh → strong level signal;
-        # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
+        # structurally DC-blind.
+        #
+        # DRO on level creates NEGATIVE feedback (self-correcting):
+        #   Series drifts → |ē| grows → DRO upweights → stronger
+        #   correction → mean error shrinks → DRO decreases → equilibrium.
+        # Safe: level gradient = tanh(ē) always points toward the fix.
+        # Max per-cell magnitude: w_dro·tanh(ē)/T ≤ 4/36 ≈ 0.11
+        # (shape gradient per-cell ≤ 2×tanh — level DRO cannot dominate).
+        #
+        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T)·w = w·tanh(ē) per cell.
+        # Natural curriculum preserved: large |ē| early → level dominates.
+        level_loss = self._log_cosh(e_mean.squeeze(1))  # (B,)
+
+        # DRO: z-score log(level_loss) across series in batch.
+        # Soft activation α → 0 when log-loss variance is low (early
+        # training or homogeneous batches) → graceful uniform fallback.
+        log_level = torch.log(level_loss.detach() + 1e-8)
+        log_level_std = log_level.std()
+        dro_alpha = log_level_std / (log_level_std + 1.0)
+        z_level = (log_level - log_level.mean()) / log_level_std.clamp(min=0.1)
+        w_level_dro = torch.log1p((1.0 + z_level).clamp(min=0.0))
+        w_level_dro = w_level_dro / w_level_dro.mean().clamp(min=1e-8)
+        w_level_dro = dro_alpha * w_level_dro + (1.0 - dro_alpha)
+
+        loss_level = T * (w_level_dro * level_loss).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

@@ -231,20 +231,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── DC/AC decomposition ───────────────────────────────────────
-        # e_shape sums to zero per series → shape gradient is DC-free.
-        # This is the structural RevIN safety mechanism.
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
-
-        # ── Base cell loss: log_cosh on demeaned error ────────────────
-        cell_loss = self._log_cosh(e_shape)
+        # ── Direct per-cell loss: log_cosh on raw error ───────────────
+        # NO DC/AC decomposition. Each cell gets independent gradient:
+        #   ∂L/∂ŷ_j = w_j · tanh(e_j)
+        # Self-correcting: overpredict → positive gradient pushes down,
+        # underpredict → negative gradient pushes up. No zero-sum
+        # constraint → no Jacobian interaction → no structural drift.
+        cell_loss = self._log_cosh(e)
 
         # ── Adaptive compound weighting ───────────────────────────────
-        # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
+        # difficulty = 1 − exp(−|e|) : how wrong (curriculum)
         # importance = 1 − exp(−mag) : how consequential
         # w_compound = 1 + difficulty × importance ∈ [1, 2)
-        abs_e = torch.abs(e_shape.detach())
+        # Safe without DC/AC: no zero-sum → weighting modulates per-cell
+        # learning speed, not direction. No cross-cell redistribution.
+        abs_e = torch.abs(e.detach())
         abs_y = torch.abs(y_true)
         abs_y_hat = torch.abs(y_pred.detach())
         magnitude = torch.max(abs_y, abs_y_hat)
@@ -255,16 +256,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
         # Z-score log(cell_loss) for proportional outlier detection.
-        # Operates on raw cell_loss (before compound weighting).
-        # Flattened cross-series: event cells dominate the tail.
+        # Safe without DC/AC: upweighting a cell just makes it learn
+        # faster in its own self-correcting direction. No redistribution.
         loss_flat = cell_loss.detach().flatten()
         log_loss = torch.log(loss_flat + 1e-8)
         log_std = log_loss.std()
 
         dro_alpha = log_std / (log_std + 1.0)
-        # Clamp at 0.1, not 1e-8: std<0.1 means losses span <1.1×,
-        # too little variation for meaningful z-scores. At 1e-8, z can
-        # reach 1e8 → log1p(1e8) ≈ 18.4 → NaN after normalisation × 0.
         z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
         w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
         w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
@@ -274,38 +272,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Combine compound × DRO, normalise jointly to mean=1
         w_total = w_compound * w_dro
         w_total = w_total / w_total.mean()
-        # Safety: any residual NaN from degenerate batches → weight=1
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
-        loss_shape = (w_total * cell_loss).mean()
+        loss_main = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
-        # Only mechanism that can shift per-series means. Shape loss is
-        # structurally DC-blind. Not DRO-weighted — different dimension.
-        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
-        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
-        # large |ē| → saturated tanh → strong level signal;
-        # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
-
-        # ── Spectral: AC bins only ────────────────────────────────────
+        # ── Spectral ─────────────────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)
         if self.delta > 0.0 and T >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + self.delta * loss_spectral
+        total_loss = loss_main + self.delta * loss_spectral
 
         if torch.isnan(total_loss):
             raise RuntimeError(
-                f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} spectral={loss_spectral.item():.6f}"
+                f"NaN in SpotlightLoss: main={loss_main.item():.6f} "
+                f"spectral={loss_spectral.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f level=%.6f spec=%.6f total=%.6f",
-            loss_shape.item(),
-            loss_level.item(),
+            "SpotlightLoss | main=%.6f spec=%.6f total=%.6f",
+            loss_main.item(),
             loss_spectral.item(),
             total_loss.item(),
         )

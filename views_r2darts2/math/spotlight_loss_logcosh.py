@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v36.2 — asinh + RevIN compatible, level-DRO architecture.
+    SpotlightLoss v36.3 — asinh + RevIN compatible, uniform shape + level-DRO.
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -35,22 +35,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
        in raw counts. The DC/AC split makes it structurally impossible
        for the shape loss to accumulate any DC bias, period.
 
-    2. **Adaptive compound weighting** — parameter-free, replaces alpha.
+    2. **Uniform shape weighting** — no per-cell weights.
 
-       Per-cell weight is the product of two bounded signals:
+       log_cosh gradient = tanh(e_shape) ∈ (−1, +1) provides natural
+       curriculum: large errors get bounded gradients, small errors get
+       proportional gradients. Explicit weighting is unnecessary AND
+       harmful: any weight correlated with asinh magnitude creates
+       systematic DC drift in ẑ-space through the RevIN Jacobian
+       asymmetry (∂ŷ/∂ẑ ≈ σ_c at ẑ≈0, →1 at ẑ>>1).
 
-           difficulty  = 1 − exp(−|e_shape|)            ∈ [0, 1)
-           importance  = 1 − exp(−max(|y|, |ŷ_sg|))    ∈ [0, 1)
-           w_compound  = 1 + difficulty × importance     ∈ [1, 2)
-
-       Both must be present for high weight: a cell must be **both hard
-       AND important**. Detached — no gradient coupling. Normalised to
-       mean=1 jointly with DRO weights.
-
-       Replaces the alpha-tuned `w = 1 + log_cosh(α · mag)` from v35.
-       Alpha was a hyperparameter controlling event budget; compound
-       weighting achieves this automatically — cells the model already
-       predicts well get difficulty→0 → w→1 regardless of magnitude.
+       v36-36.2 used compound weighting (difficulty × importance) but
+       importance = 1−exp(−|y|) correlates with Jacobian position →
+       ~13%/epoch calibration drift on TCN. Removing all cell weights
+       eliminates the correlation, leaving only residual drift from
+       tanh saturation asymmetry (~0.01/epoch, manageable by level).
 
     3. **KL-DRO tail aggregation on LEVEL anchor (log-space)** —
 
@@ -94,13 +92,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Changes from v35 ─────────────────────────────────────────────────
 
-    - `alpha` parameter removed. Compound weighting is parameter-free.
-    - KL-DRO moved from shape to level anchor (v36.2). DRO on shape
-      caused ẑ-space DC drift via Jacobian asymmetry; on level it
-      creates self-correcting negative feedback.
-    - Compound weight (difficulty × importance) replaces alpha-scaled
-      log_cosh importance weight.
-    - Shape: compound-only (no DRO). Level: DRO-weighted. Spectral unchanged.
+    - `alpha` parameter removed.
+    - All per-cell shape weighting removed (v36.3). compound/DRO/importance
+      all correlate with Jacobian position → DC drift. Uniform mean
+      on log_cosh(e_shape) eliminates the correlation entirely.
+    - KL-DRO moved to level anchor (v36.2+). Self-correcting negative
+      feedback on per-series mean error.
+    - Shape: uniform mean. Level: DRO-weighted. Spectral unchanged.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -150,7 +148,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.non_zero_threshold = non_zero_threshold
 
         logger.info(
-            "SpotlightLoss v36.2 (level-DRO) | delta=%.4f threshold=%.4f",
+            "SpotlightLoss v36.3 (uniform shape + level-DRO) | delta=%.4f threshold=%.4f",
             delta, non_zero_threshold,
         )
 
@@ -238,28 +236,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Base cell loss: log_cosh on demeaned error ────────────────
         cell_loss = self._log_cosh(e_shape)
 
-        # ── Adaptive compound weighting ───────────────────────────────
-        # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
-        # importance = 1 − exp(−mag) : how consequential
-        # w_compound = 1 + difficulty × importance ∈ [1, 2)
-        abs_e = torch.abs(e_shape.detach())
-        abs_y = torch.abs(y_true)
-        abs_y_hat = torch.abs(y_pred.detach())
-        magnitude = torch.max(abs_y, abs_y_hat)
-
-        difficulty = 1.0 - torch.exp(-abs_e)
-        importance = 1.0 - torch.exp(-magnitude)
-        w_compound = 1.0 + difficulty * importance
-
-        # ── Shape aggregation: compound weighting only ────────────────
-        # DRO on shape is unsafe: amplifies conflict cells at high ẑ
-        # where Jacobian ∂ŷ/∂ẑ → 1, creating ẑ-space DC drift through
-        # the Jacobian asymmetry (positive feedback spiral). Compound
-        # weighting alone (max 2×) keeps drift manageable.
-        w_total = w_compound / w_compound.mean()
-        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-
-        loss_shape = (w_total * cell_loss).mean()
+        # ── Shape aggregation: uniform (no cell weighting) ────────────
+        # Compound weighting's `importance` term (1−exp(−|y|)) correlates
+        # directly with asinh magnitude → Jacobian position. This creates
+        # systematic upweighting of high-ẑ conflict cells where J→1,
+        # while peace cells (J≈σ_c >> 1) get the compensating push
+        # amplified by σ_c in ẑ-space. Net: persistent DC drift.
+        #
+        # With uniform weights, log_cosh already provides natural
+        # curriculum: gradient = tanh(e_shape) ∈ (-1,+1). Large errors
+        # get saturated (bounded) gradients, small errors get proportional
+        # gradients. No explicit weighting needed.
+        #
+        # The centering matrix still guarantees Σ ∂L/∂ŷ = 0 (DC-free).
+        # Residual ẑ-space drift from tanh saturation × Jacobian is
+        # weak (~0.01/epoch) because it has no weight-magnitude correlation.
+        loss_shape = cell_loss.mean()
 
         # ── Level anchor: T-scaled log_cosh with DRO ─────────────────
         # Only mechanism that can shift per-series means. Shape loss is

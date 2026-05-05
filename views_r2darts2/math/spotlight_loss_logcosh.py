@@ -279,13 +279,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # DRO: z-score log(level_loss) across series in batch.
         # Soft activation α → 0 when log-loss variance is low (early
         # training or homogeneous batches) → graceful uniform fallback.
-        log_level = torch.log(level_loss.detach() + 1e-8)
-        log_level_std = log_level.std()
-        dro_alpha = log_level_std / (log_level_std + 1.0)
-        z_level = (log_level - log_level.mean()) / log_level_std.clamp(min=0.1)
-        w_level_dro = torch.log1p((1.0 + z_level).clamp(min=0.0))
-        w_level_dro = w_level_dro / w_level_dro.mean().clamp(min=1e-8)
-        w_level_dro = dro_alpha * w_level_dro + (1.0 - dro_alpha)
+        # Guard: B=1 (last batch) → std is undefined → skip DRO.
+        B = level_loss.size(0)
+        if B > 1:
+            log_level = torch.log(level_loss.detach() + 1e-8)
+            log_level_std = log_level.std(unbiased=False)
+            dro_alpha = log_level_std / (log_level_std + 1.0)
+            z_level = (log_level - log_level.mean()) / log_level_std.clamp(min=0.1)
+            w_level_dro = torch.log1p((1.0 + z_level).clamp(min=0.0))
+            w_level_dro = w_level_dro / w_level_dro.mean().clamp(min=1e-8)
+            w_level_dro = dro_alpha * w_level_dro + (1.0 - dro_alpha)
+        else:
+            w_level_dro = torch.ones_like(level_loss)
 
         loss_level = T * (w_level_dro * level_loss).mean()
 

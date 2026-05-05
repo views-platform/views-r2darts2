@@ -254,20 +254,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         importance = 1.0 - torch.exp(-magnitude)
         w_compound = 1.0 + difficulty * importance
 
-        # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
-        # Z-score log(cell_loss) for proportional outlier detection.
-        # Safe without DC/AC: upweighting a cell just makes it learn
-        # faster in its own self-correcting direction. No redistribution.
-        loss_flat = cell_loss.detach().flatten()
-        log_loss = torch.log(loss_flat + 1e-8)
-        log_std = log_loss.std()
-
-        dro_alpha = log_std / (log_std + 1.0)
-        z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
-        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
-        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
-        w_dro = w_dro.view_as(cell_loss)
-        w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
+        # ── KL-DRO disabled ───────────────────────────────────────────
+        # Without DC/AC, DRO operates on raw log_cosh(e). In a 90/10
+        # zero/conflict split, log_cosh(6) / log_cosh(0.7) ≈ 24×.
+        # DRO log-z-scores this ratio → ~20× relative upweighting of
+        # conflict cells. Per batch, oscillates: conflict-heavy batch →
+        # DRO spikes conflict gradient → RevIN sinh amplifies → mean
+        # overshoots → peace-heavy batch corrects → etc.
+        # Compound weighting alone (max ~2×) is well within the stable
+        # range. DRO's 20× cross-batch feedback is not.
+        w_dro = torch.ones_like(cell_loss)
 
         # Combine compound × DRO, normalise jointly to mean=1
         w_total = w_compound * w_dro

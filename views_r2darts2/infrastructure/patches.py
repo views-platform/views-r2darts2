@@ -310,8 +310,34 @@ def apply_rinorm_compression_patch():
         # Guard against any upstream numeric accident before sinh.
         x = torch.clamp(x, -88.0, 88.0)
 
-        # Compute asinh-space mean (bias-free centering point)
-        self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
+        # ── Exponentially-weighted mean (adaptive centering point) ─────
+        #
+        # PROBLEM: full-window mean is inflated by stale conflict history.
+        # At ẑ=0 the inverse maps ŷ = μ_asinh, so a stale μ causes
+        # systematic overprediction for peace-transitioned series.
+        #
+        # FIX: exponential weighting with span = √T (half-life ≈ 0.35√T).
+        #
+        # WHY √T: For a piecewise-stationary process with O(1) regime
+        # changes in T observations, the minimax-optimal smoothing bandwidth
+        # scales as √T (bias–variance tradeoff for non-parametric level
+        # estimation under structural breaks; cf. Goldenshluger & Nemirovski
+        # 1997, "On spatially adaptive estimation of nonparametric regression").
+        # - Adapts to ICL automatically (no hardcoded window)
+        # - After ~3 half-lives of peace, μ → 0 (stale bias eliminated)
+        # - For stable series, all values ≈ constant → weighting irrelevant
+        # - Variance cost: eff. N ≈ √T — symmetric, creates no directional bias
+        #
+        # σ_c is still computed from the full window so that historical
+        # variance keeps the normalization well-conditioned.
+        T = x.shape[1]
+        alpha = 2.0 / (T ** 0.5 + 1.0)
+        # Weights: newest=1, decaying into the past. w[t] = (1-α)^(T-1-t)
+        positions = torch.arange(T, device=x.device, dtype=x.dtype)
+        weights = (1.0 - alpha) ** (T - 1 - positions)
+        weights = weights / weights.sum()
+        weights = weights.view(1, T, 1)  # (1, T, 1) broadcasts over (B, T, C)
+        self.mean = (weights * x).sum(dim=1, keepdim=True).detach()
 
         # Center in asinh space, convert to raw
         x_centered_raw = torch.sinh(x - self.mean)
@@ -361,8 +387,8 @@ def apply_rinorm_compression_patch():
     RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3 "
-        "(asinh centering + raw-space σ, zero mean bias)."
+        "🐨 Patched RINorm: hybrid-space normalization v3.1 "
+        "(EMA centering, span=√T + full-window raw-space σ)."
     )
 
 

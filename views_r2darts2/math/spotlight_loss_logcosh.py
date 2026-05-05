@@ -257,19 +257,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Z-score log(cell_loss) for proportional outlier detection.
         # Operates on raw cell_loss (before compound weighting).
         # Flattened cross-series: event cells dominate the tail.
-        loss_flat = cell_loss.detach().flatten()
-        log_loss = torch.log(loss_flat + 1e-8)
-        log_std = log_loss.std()
-
-        dro_alpha = log_std / (log_std + 1.0)
-        # Clamp at 0.1, not 1e-8: std<0.1 means losses span <1.1×,
-        # too little variation for meaningful z-scores. At 1e-8, z can
-        # reach 1e8 → log1p(1e8) ≈ 18.4 → NaN after normalisation × 0.
-        z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
-        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
-        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
-        w_dro = w_dro.view_as(cell_loss)
-        w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
+        #
+        # ⚠️ DRO DISABLED (v36.1):
+        # DRO amplifies conflict cells which sit at high ẑ where the
+        # RevIN inverse Jacobian ∂ŷ/∂ẑ → 1. The DC/AC zero-sum holds
+        # in ŷ-space, but through the nonlinear Jacobian, compensating
+        # gradients on peace cells (ẑ≈0, Jacobian≈σ_c >> 1) get amplified
+        # in ẑ-space by σ_c. Net: persistent positive DC drift in
+        # parameter space despite ŷ-space sum-to-zero. DRO × Jacobian
+        # asymmetry creates an unstoppable positive feedback spiral.
+        # Compound weighting alone (max 2×) is weak enough that the
+        # Jacobian asymmetry stays manageable.
+        w_dro = torch.ones_like(cell_loss)
 
         # Combine compound × DRO, normalise jointly to mean=1
         w_total = w_compound * w_dro
@@ -279,24 +278,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled MSE on per-series mean error ───────
+        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
-        #
-        # WHY MSE (not log_cosh):
-        # log_cosh has gradient tanh(ē) which saturates at ±1. When DRO
-        # amplifies shape gradients to 2-3× per cell, the level anchor
-        # cannot outrun the positive feedback. At ē=3 asinh-units:
-        #   tanh(3) = 0.995 (ceiling)  vs  DRO-shape ≈ 2.0 → spiral.
-        #
-        # MSE gradient = ē (unbounded, grows linearly with bias):
-        #   At ē=0.1: gradient = 0.1 (same curriculum as log_cosh)
-        #   At ē=1.0: gradient = 1.0 (same as tanh ceiling)
-        #   At ē=3.0: gradient = 3.0 (3× log_cosh — breaks the spiral)
-        #
-        # T-scaling preserved: ∂L/∂ŷⱼ = T·ē·(1/T) = ē per cell.
-        # The restoring force now grows proportionally with bias magnitude.
-        loss_level = T * 0.5 * (e_mean.squeeze(1) ** 2).mean()
+        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
+        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
+        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
+        # large |ē| → saturated tanh → strong level signal;
+        # small |ē| → tanh ≈ ē → level fades, shape takes over.
+        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

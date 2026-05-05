@@ -310,49 +310,23 @@ def apply_rinorm_compression_patch():
         # Guard against any upstream numeric accident before sinh.
         x = torch.clamp(x, -88.0, 88.0)
 
-        # ── DECOUPLED ANCHOR + SCALE (v3.1) ───────────────────────────
-        #
-        # μ (anchor): last observation x[:, -1:, :].
-        #   - At ẑ=0 the inverse outputs the naive forecast (last observed
-        #     value). This is the minimax-optimal point estimator for a
-        #     random walk and the correct uninformative baseline for
-        #     piecewise-stationary processes (M-competition, Makridakis 2018).
-        #   - For peace-transitioned series: x[-1]≈0 → ŷ@ẑ=0≈0.
-        #   - For ongoing conflict: x[-1]≈current level → ŷ@ẑ=0≈level.
-        #   - No hyperparameters.
-        #
-        # σ_c (scale): std(sinh(x − mean(x))) over the FULL window,
-        #   centered at the full-window mean.
-        #   - Residuals are zero-mean by construction → no variance
-        #     inflation from mean-shift (critical for well-conditioned
-        #     normalization; see v3 notes above).
-        #   - Full window keeps σ_c stable even for recently-transitioned
-        #     series (historical variance is informative for scale).
-        #
-        # WHY DECOUPLING IS VALID:
-        #   Round-trip: σ_c appears in both forward (÷) and inverse (×),
-        #   cancelling exactly. The identity depends only on μ being the
-        #   same in forward and inverse — which it is (self.mean).
-        #   Proof: ŷ = asinh(sinh(asinh(sinh(x−μ)/σ)) · σ) + μ
-        #        = asinh(sinh(x−μ)/σ · σ) + μ = asinh(sinh(x−μ)) + μ = x. ✓
-        #
-        self.mean = x[:, -1:, :].detach()
+        # Compute asinh-space mean (bias-free centering point)
+        self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
 
-        # σ_c: from full-window-mean-centered residuals (zero-mean guaranteed)
-        mu_full = torch.mean(x, dim=calc_dims, keepdim=True)
-        x_centered_raw = torch.sinh(x - mu_full)
+        # Center in asinh space, convert to raw
+        x_centered_raw = torch.sinh(x - self.mean)
 
         # Compute variance of the centered-raw signal
-        # NOTE: this is std(sinh(x - μ_full)), NOT std(sinh(x)).
-        # Residuals are zero-mean (centered at full-window mean), so
-        # var = E[(sinh(x-μ_full))²] with no mean-offset inflation.
+        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
+        # These differ enormously — std(sinh(x)) is inflated by the
+        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
             torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        # Normalize: center at LAST-OBS anchor (self.mean), scale by σ_c
-        x = torch.asinh(torch.sinh(x - self.mean) / self.stdev)
+        # Normalize by centered-raw std, compress back via asinh
+        x = torch.asinh(x_centered_raw / self.stdev)
 
         if self.affine:
             x = x * self.affine_weight
@@ -387,8 +361,8 @@ def apply_rinorm_compression_patch():
     RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3.1 "
-        "(last-obs anchor + full-window σ_c, naive-forecast neutral)."
+        "🐨 Patched RINorm: hybrid-space normalization v3 "
+        "(asinh centering + raw-space σ, zero mean bias)."
     )
 
 

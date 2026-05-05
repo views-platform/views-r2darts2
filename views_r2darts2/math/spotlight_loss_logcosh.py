@@ -241,17 +241,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Adaptive compound weighting ───────────────────────────────
         # difficulty = 1 − exp(−|e|) : how wrong (curriculum)
-        # importance = 1 − exp(−mag) : how consequential
+        # importance = 1 − exp(−|y|) : how consequential (ground truth only)
         # w_compound = 1 + difficulty × importance ∈ [1, 2)
-        # Safe without DC/AC: no zero-sum → weighting modulates per-cell
-        # learning speed, not direction. No cross-cell redistribution.
+        #
+        # NOTE: importance uses |y_true| only, NOT max(|y|, |ŷ|).
+        # Including |ŷ| created a positive feedback loop on overshoot:
+        # overpredicting a peace cell → large |ŷ| → importance→1 →
+        # w_compound→2 → amplifies the overshoot gradient further.
+        # |y_true| is fixed per batch — no prediction feedback, no loop.
+        # When the model overshoots, the base gradient tanh(e)≈1 already
+        # provides maximum corrective pressure; importance amplification
+        # is only meaningful where the ground truth confirms the cell matters.
         abs_e = torch.abs(e.detach())
         abs_y = torch.abs(y_true)
-        abs_y_hat = torch.abs(y_pred.detach())
-        magnitude = torch.max(abs_y, abs_y_hat)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        importance = 1.0 - torch.exp(-magnitude)
+        importance = 1.0 - torch.exp(-abs_y)
         w_compound = 1.0 + difficulty * importance
 
         # ── KL-DRO disabled ───────────────────────────────────────────

@@ -170,8 +170,8 @@ class ModelCatalog:
                 return None
             return {
                 "custom": {"past": encoders, "future": encoders},  # sin/cos disabled
-                # "position": {"past": ["relative"], "future": ["relative"]},
-                # "transformer": Scaler(MinMaxScaler()),
+                "position": {"past": ["relative"], "future": ["relative"]},
+                "transformer": Scaler(MinMaxScaler()),
             }
 
         return None

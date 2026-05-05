@@ -279,15 +279,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
+        # ── Level anchor: T-scaled MSE on per-series mean error ───────
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
-        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
-        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
-        # large |ē| → saturated tanh → strong level signal;
-        # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
+        #
+        # WHY MSE (not log_cosh):
+        # log_cosh has gradient tanh(ē) which saturates at ±1. When DRO
+        # amplifies shape gradients to 2-3× per cell, the level anchor
+        # cannot outrun the positive feedback. At ē=3 asinh-units:
+        #   tanh(3) = 0.995 (ceiling)  vs  DRO-shape ≈ 2.0 → spiral.
+        #
+        # MSE gradient = ē (unbounded, grows linearly with bias):
+        #   At ē=0.1: gradient = 0.1 (same curriculum as log_cosh)
+        #   At ē=1.0: gradient = 1.0 (same as tanh ceiling)
+        #   At ē=3.0: gradient = 3.0 (3× log_cosh — breaks the spiral)
+        #
+        # T-scaling preserved: ∂L/∂ŷⱼ = T·ē·(1/T) = ē per cell.
+        # The restoring force now grows proportionally with bias magnitude.
+        loss_level = T * 0.5 * (e_mean.squeeze(1) ** 2).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

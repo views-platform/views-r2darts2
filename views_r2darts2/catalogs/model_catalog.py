@@ -8,6 +8,8 @@ from darts.models.forecasting.tsmixer_model import TSMixerModel
 from darts.models.forecasting.nlinear import NLinearModel
 from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
+from darts.dataprocessing.transformers import Scaler
+from sklearn.preprocessing import MinMaxScaler
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
@@ -167,8 +169,9 @@ class ModelCatalog:
             if not encoders:
                 return None
             return {
-                "custom": {"past": encoders, "future": encoders},
+                "custom": {"past": encoders, "future": encoders},  # sin/cos disabled
                 "position": {"past": ["relative"], "future": ["relative"]},
+                "transformer": Scaler(MinMaxScaler()),
             }
 
         return None

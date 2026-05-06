@@ -6,9 +6,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class SpotlightLoss(torch.nn.Module):
+class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v37 — asinh + RevIN compatible, with DRO aggregation.
+    SpotlightLoss v36 — asinh + RevIN compatible, with DRO aggregation.
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -91,53 +91,12 @@ class SpotlightLoss(torch.nn.Module):
        Multi-resolution STFT magnitude comparison with DC bin masked.
        Unchanged from v35. Phase-invariant; log_cosh on magnitude diffs.
 
-    ── Base cell loss: Barron(α=1.5) ───────────────────────────────────
+    ── Base cell loss: log_cosh ─────────────────────────────────────────
 
-    From "A General and Adaptive Robust Loss Function" (Barron, CVPR 2019,
-    arXiv:1701.03077). At α=1.5, c=1 the general form reduces to:
+    log_cosh(x) ≈ 0.5x² for |x| < 1, ≈ |x| − ln2 for |x| > 2.
+    Gradient = tanh(x) ∈ (−1, +1). Bounded by construction.
 
-        ρ(x) = (1/3) · ((2x² + 1)^(3/4) − 1)
-
-    Near zero: ≈ x²/2 (smooth quadratic, same as log_cosh and MSE).
-    Large |x|: ~ 0.56·|x|^1.5 (super-linear growth).
-
-    Gradient: x · (2x² + 1)^(−1/4)  — grows as √|x|, never saturates.
-
-    Comparison with log_cosh at key error magnitudes:
-
-        |x|   log_cosh'(x)   soft_power'(x)
-         1      0.76            0.76          (identical)
-         3      0.995           1.44          (+45%)
-         5      1.000           1.87          (+87%)
-         7      1.000           2.22          (+122%)
-        10      1.000           2.66          (+166%)
-
-    Why this matters: in asinh-space, a unit error at location x maps to
-    cosh(x) raw-space units through the sinh inverse.  log_cosh gradient
-    saturates at ±1, providing bounded pushback regardless of how
-    catastrophic the error is in raw space.  Architectures with bounded
-    output (N-BEATS basis projection) never produce large |e_shape|, so
-    saturation is irrelevant. Architectures with unconstrained output
-    (TSMixer fc_out, N-HiTS interpolation) can push cells beyond where
-    log_cosh provides meaningful correction — the saturated gradient
-    cannot train the model to tighten its predictions.
-
-    Barron(1.5) fixes this: the √|x| gradient growth provides
-    correction proportional to the overshoot without saturating.
-    Perfectly symmetric — no bias toward over- or underprediction.
-
-    Level anchor and spectral loss retain log_cosh: the level anchor's
-    saturating gradient is desirable (natural curriculum), and spectral
-    magnitudes are bounded in practice.
-
-    ── Changes from v36 ─────────────────────────────────────────────────
-
-    - Base cell loss changed from log_cosh to Barron(α=1.5).
-      No new hyperparameters — α=1.5 and c=1 are fixed design choices.
-    - Level anchor unchanged (log_cosh). Spectral unchanged (log_cosh).
-    - Weighting, DRO, DC/AC decomposition all unchanged.
-
-    ── Changes from v35 → v36 ───────────────────────────────────────────
+    ── Changes from v35 ─────────────────────────────────────────────────
 
     - `alpha` parameter removed. Compound weighting is parameter-free.
     - KL-DRO aggregation replaces simple weighted mean on shape loss.
@@ -193,7 +152,7 @@ class SpotlightLoss(torch.nn.Module):
         self.non_zero_threshold = non_zero_threshold
 
         logger.info(
-            "SpotlightLoss v37 (DRO+Barron) | delta=%.4f threshold=%.4f",
+            "SpotlightLoss v36 (DRO) | delta=%.4f threshold=%.4f",
             delta, non_zero_threshold,
         )
 
@@ -203,27 +162,9 @@ class SpotlightLoss(torch.nn.Module):
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
-        """log(cosh(x)), numerically stable: |x| + softplus(−2|x|) − ln2.
-
-        Used by level anchor and spectral loss (NOT shape loss).
-        """
+        """log(cosh(x)), numerically stable: |x| + softplus(−2|x|) − ln2."""
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
-
-    @staticmethod
-    def _soft_power(x: torch.Tensor) -> torch.Tensor:
-        """Barron's general loss at α=1.5, c=1 (CVPR 2019).
-
-        ρ(x) = (1/3) · ((2x² + 1)^(3/4) − 1)
-
-        Near zero: ≈ x²/2 (smooth quadratic).
-        Large |x|: ~ 0.56·|x|^1.5 (super-linear, gradient never saturates).
-        Gradient: x · (2x² + 1)^(-1/4) — grows as √|x|.
-
-        Reference: "A General and Adaptive Robust Loss Function",
-        Jonathan T. Barron, CVPR 2019. arXiv:1701.03077
-        """
-        return ((2.0 * x * x + 1.0).pow(0.75) - 1.0) / 3.0
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only)."""
@@ -296,8 +237,8 @@ class SpotlightLoss(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Base cell loss: Barron(1.5) on demeaned error ─────────────
-        cell_loss = self._soft_power(e_shape)
+        # ── Base cell loss: log_cosh on demeaned error ────────────────
+        cell_loss = self._log_cosh(e_shape)
 
         # ── Adaptive compound weighting ───────────────────────────────
         # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
@@ -305,20 +246,20 @@ class SpotlightLoss(torch.nn.Module):
         # w_compound = 1 + difficulty × importance ∈ [1, 2)
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
+        abs_y_hat = torch.abs(y_pred.detach())
+        # magnitude = torch.max(abs_y, abs_y_hat)
+        magnitude = torch.max(abs_y)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        importance = 1.0 - torch.exp(-abs_y)
+        importance = 1.0 - torch.exp(-magnitude)
         w_compound = 1.0 + difficulty * importance
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
-        # Z-score log(|e_shape|) for proportional outlier detection.
-        # Previous: z-scored log(cell_loss) — but Barron(1.5) compresses
-        # differently near zero (~x²) vs tails (~|x|^1.5), distorting
-        # proportional comparisons in log-space. Using |e_shape| directly
-        # gives undistorted log-space z-scores: DRO identifies true tail
-        # cells independent of the loss function's curvature.
-        error_flat = torch.abs(e_shape).detach().flatten()
-        log_loss = torch.log(error_flat + 1e-8)
+        # Z-score log(cell_loss) for proportional outlier detection.
+        # Operates on raw cell_loss (before compound weighting).
+        # Flattened cross-series: event cells dominate the tail.
+        loss_flat = cell_loss.detach().flatten()
+        log_loss = torch.log(loss_flat + 1e-8)
         log_std = log_loss.std()
 
         dro_alpha = log_std / (log_std + 1.0)
@@ -374,6 +315,6 @@ class SpotlightLoss(torch.nn.Module):
 
     def __repr__(self) -> str:
         return (
-            f"SpotlightLoss(delta={self.delta}, "
+            f"SpotlightLossLogcosh(delta={self.delta}, "
             f"non_zero_threshold={self.non_zero_threshold})"
         )

@@ -171,7 +171,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=self._get_cached_data_path(),
+            cached_path=None,
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
@@ -263,7 +263,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=self._get_cached_data_path(),
+            cached_path=None,
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
@@ -391,7 +391,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=self._get_cached_data_path(),
+            cached_path=None,
         )
 
         model_object = ModelCatalog(config=active_config).get_model(

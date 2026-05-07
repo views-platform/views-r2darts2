@@ -248,10 +248,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_y = torch.abs(y_true)
         abs_y_hat = torch.abs(y_pred.detach())
         # magnitude = torch.max(abs_y, abs_y_hat)
-        magnitude = torch.max(abs_y)
+        # magnitude = torch.max(abs_y)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        importance = 1.0 - torch.exp(-magnitude)
+        importance = 1.0 - torch.exp(-abs_y)
         w_compound = 1.0 + difficulty * importance
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────

@@ -240,19 +240,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Base cell loss: log_cosh on demeaned error ────────────────
         cell_loss = self._log_cosh(e_shape)
 
-        # ── Adaptive compound weighting ───────────────────────────────
+        # ── Adaptive compound weighting (dynamic, self-correcting) ─────
         # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
-        # importance = 1 − exp(−mag) : how consequential
+        # importance = difficulty × magnitude : consequential AND wrong
         # w_compound = 1 + difficulty × importance ∈ [1, 2)
+        # Self-correcting: as |e|→0, w→1 quadratically regardless of |y|.
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
-        abs_y_hat = torch.abs(y_pred.detach())
-        # magnitude = torch.max(abs_y, abs_y_hat)
-        # magnitude = torch.max(abs_y)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        importance = 1.0 - torch.exp(-abs_y)
-        w_compound = 1.0 + difficulty * importance
+        magnitude = 1.0 - torch.exp(-abs_y)
+        importance = difficulty * magnitude
+        w_compound = 1.0 + importance
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
         # Z-score log(cell_loss) for proportional outlier detection.

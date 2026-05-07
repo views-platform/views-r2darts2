@@ -306,7 +306,8 @@ class SpotlightLoss(torch.nn.Module):
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
         abs_y_hat = torch.abs(y_pred.detach())
-        magnitude = torch.max(abs_y, abs_y_hat)
+        # magnitude = torch.max(abs_y, abs_y_hat)
+        magnitude = torch.max(abs_y)
 
         difficulty = 1.0 - torch.exp(-abs_e)
         importance = 1.0 - torch.exp(-magnitude)

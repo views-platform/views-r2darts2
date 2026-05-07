@@ -62,12 +62,15 @@ class _ViewsDatasetDarts(_ViewsDataset):
             broadcast_features=True,
         )
 
+    _ALL_STAT_NAMES = ("mu", "sigma", "max", "trend", "sparsity")
+
     def as_darts_timeseries(
         self,
         time_ids: Optional[Union[int, List[int]]] = None,
         entity_ids: Optional[Union[int, List[int]]] = None,
         stat_time_range: Optional[tuple] = None,
         static_cov_transform: Optional[str] = None,
+        static_cov_stats: Optional[List[str]] = None,
     ):
         """
         Converts the internal data subset into a Darts TimeSeries object.
@@ -85,6 +88,9 @@ class _ViewsDatasetDarts(_ViewsDataset):
                 injection. Supported: 'AsinhTransform', 'LogTransform', 'SqrtTransform',
                 'FourthRootTransform'. When None, stats are injected in raw space.
                 Sparsity (already in [0, 1]) is never transformed.
+            static_cov_stats (Optional[List[str]]): Subset of stat names to inject.
+                Must be a subset of ('mu', 'sigma', 'max', 'trend', 'sparsity').
+                When None, all five stats are injected (backward compatible).
 
         Returns:
             TimeSeries: A Darts TimeSeries object constructed from the filtered dataframe, grouped by entity and containing the specified features and targets.
@@ -198,6 +204,15 @@ class _ViewsDatasetDarts(_ViewsDataset):
                         f"Available cross-entity: {sorted(_STATIC_COV_CROSS_ENTITY)}."
                     )
 
+        # Resolve which stats to compute. Default: all five.
+        requested_stats = tuple(static_cov_stats) if static_cov_stats else self._ALL_STAT_NAMES
+        unknown = set(requested_stats) - set(self._ALL_STAT_NAMES)
+        if unknown:
+            raise ValueError(
+                f"Unknown static_cov_stats: {unknown}. "
+                f"Allowed: {self._ALL_STAT_NAMES}"
+            )
+
         # Compute fingerprint stats for every target and name them {target_col}_{stat}.
         # This supports both single-target models (e.g. "lr_ged_sb_mu") and
         # multi-target models (e.g. "lr_ged_sb_mu", "lr_ged_ns_mu", ...) without
@@ -206,33 +221,41 @@ class _ViewsDatasetDarts(_ViewsDataset):
         stat_frames = []
         for target_col in self.targets:
             grouped = df_stat.groupby(self._entity_id)[target_col]
-            col_stats = grouped.agg(
-                **{
-                    f"{target_col}_mu": "mean",
-                    f"{target_col}_sigma": "std",
-                    f"{target_col}_max": "max",
-                }
-            ).fillna(0.0)
-            col_stats[f"{target_col}_trend"] = grouped.apply(_ols_slope)
-            # Sparsity: fraction of time steps with exactly zero target
-            col_stats[f"{target_col}_sparsity"] = grouped.apply(lambda s: (s == 0).mean())
+
+            # Only compute requested agg stats (mu/sigma/max are pandas agg-able)
+            _agg_map = {"mu": "mean", "sigma": "std", "max": "max"}
+            agg_kwargs = {
+                f"{target_col}_{stat}": _agg_map[stat]
+                for stat in requested_stats if stat in _agg_map
+            }
+            if agg_kwargs:
+                col_stats = grouped.agg(**agg_kwargs).fillna(0.0)
+            else:
+                # No agg stats requested — seed with entity-indexed frame
+                col_stats = pd.DataFrame(index=grouped.first().index)
+
+            if "trend" in requested_stats:
+                col_stats[f"{target_col}_trend"] = grouped.apply(_ols_slope)
+            if "sparsity" in requested_stats:
+                col_stats[f"{target_col}_sparsity"] = grouped.apply(lambda s: (s == 0).mean())
 
             # Apply element-wise transform to scale-sensitive stats.
             # Sparsity is already in [0, 1] — never transformed.
+            _transformable = [s for s in ("mu", "sigma", "max", "trend") if s in requested_stats]
             if transform_fn is not None:
-                for stat in ("mu", "sigma", "max", "trend"):
+                for stat in _transformable:
                     col_name = f"{target_col}_{stat}"
                     col_stats[col_name] = transform_fn(col_stats[col_name].values).astype(np.float32)
 
             # Apply cross-entity scaler if specified in the chain.
             if cross_entity_scaler == "MaxAbsScaler":
-                for stat in ("mu", "sigma", "max", "trend"):
+                for stat in _transformable:
                     col_name = f"{target_col}_{stat}"
                     abs_max = col_stats[col_name].abs().max()
                     if abs_max > 0:
                         col_stats[col_name] = (col_stats[col_name] / abs_max).astype(np.float32)
             elif cross_entity_scaler == "StandardScaler":
-                for stat in ("mu", "sigma", "max", "trend"):
+                for stat in _transformable:
                     col_name = f"{target_col}_{stat}"
                     mean = col_stats[col_name].mean()
                     std = col_stats[col_name].std()
@@ -250,7 +273,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         static_cov_names = [
             f"{col}_{stat}"
             for col in self.targets
-            for stat in ("mu", "sigma", "max", "trend", "sparsity")
+            for stat in requested_stats
         ]
 
         n_entities = len(stats)

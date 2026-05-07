@@ -102,6 +102,7 @@ class DartsForecaster:
         self.random_state = random_state
 
         # Static covariate stats transform (e.g. 'AsinhTransform' or None for raw)
+        # and optional stat subset (e.g. ['trend', 'sparsity'] for lightweight injection).
         logger.info(
             f"static_covariate_stats received: {static_covariate_stats!r} "
             f"(type={type(static_covariate_stats).__name__})"
@@ -109,7 +110,13 @@ class DartsForecaster:
         self._static_cov_transform = (
             static_covariate_stats.get("transform") if static_covariate_stats else None
         )
-        logger.info(f"_static_cov_transform resolved to: {self._static_cov_transform!r}")
+        self._static_cov_stats = (
+            static_covariate_stats.get("stats") if static_covariate_stats else None
+        )
+        logger.info(
+            f"_static_cov_transform resolved to: {self._static_cov_transform!r}, "
+            f"_static_cov_stats: {self._static_cov_stats!r}"
+        )
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler
@@ -532,6 +539,7 @@ class DartsForecaster:
         timeseries = self.dataset.as_darts_timeseries(
             stat_time_range=(self._train_start, self._train_end),
             static_cov_transform=self._static_cov_transform,
+            static_cov_stats=self._static_cov_stats,
         )
 
         target_series, past_covariates = self._preprocess_timeseries(
@@ -702,6 +710,7 @@ class DartsForecaster:
         timeseries = self.dataset.as_darts_timeseries(
             stat_time_range=(self._train_start, self._train_end),
             static_cov_transform=self._static_cov_transform,
+            static_cov_stats=self._static_cov_stats,
         )
 
         # Get the input window for forecasting based on sequence_number

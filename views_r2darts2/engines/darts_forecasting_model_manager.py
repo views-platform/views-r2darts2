@@ -193,6 +193,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             feature_scaler_map=active_config.get("feature_scaler_map", None),
             random_state=active_config["random_state"],
             static_covariate_stats=active_config.get("static_covariate_stats", None),
+            checkpoint_mode=active_config.get("checkpoint_mode", "best"),
         )
         forecaster.train()
 

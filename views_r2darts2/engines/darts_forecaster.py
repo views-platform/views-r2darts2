@@ -46,6 +46,7 @@ class DartsForecaster:
         feature_scaler_map: Optional[Dict[str, Any]] = None,
         random_state: int = None,
         static_covariate_stats: Optional[Dict[str, Any]] = None,
+        checkpoint_mode: str = "best",
     ):
         """
         Initializes the forecaster with dataset, model, partition information, and optional scalers.
@@ -117,6 +118,11 @@ class DartsForecaster:
             f"_static_cov_transform resolved to: {self._static_cov_transform!r}, "
             f"_static_cov_stats: {self._static_cov_stats!r}"
         )
+
+        if checkpoint_mode not in ("best", "last"):
+            raise ValueError(f"checkpoint_mode must be 'best' or 'last', got {checkpoint_mode!r}")
+        self._checkpoint_mode = checkpoint_mode
+        logger.info(f"checkpoint_mode: {self._checkpoint_mode!r}")
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler
@@ -657,6 +663,21 @@ class DartsForecaster:
             dataloader_kwargs=dataloader_kwargs,
             verbose=True,
         )
+
+        # After fit(), Darts automatically reloads the best val_loss checkpoint.
+        # When checkpoint_mode='last', explicitly reload the final epoch weights
+        # instead — useful when the training objective diverges from val_loss
+        # (e.g. SpotlightLoss DRO shifts improve event_ratio late in training
+        # but don't reduce val_loss).
+        if self._checkpoint_mode == "last":
+            try:
+                self.model.load_weights_from_checkpoint(best=False)
+                logger.info("checkpoint_mode='last': reloaded final epoch weights.")
+            except Exception as e:
+                logger.warning(
+                    f"checkpoint_mode='last': failed to reload last checkpoint ({e}). "
+                    "Keeping best val_loss checkpoint."
+                )
 
     def predict(
         self,

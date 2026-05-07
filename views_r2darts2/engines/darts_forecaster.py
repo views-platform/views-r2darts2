@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import torch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
@@ -139,8 +139,14 @@ class DartsForecaster:
         self.target_scaler = self._instantiate_scaler(self._target_scaler_cfg)
 
         # Initialize feature scaler(s)
-        # feature_scaler_map takes precedence over feature_scaler
-        if self._feature_scaler_map_cfg:
+        if not self.dataset.features:
+            if self._feature_scaler_cfg or self._feature_scaler_map_cfg:
+                logger.info(
+                    "Dataset has no feature columns — disabling feature_scaler. "
+                    "This is expected for univariate models using datafactory."
+                )
+            self.feature_scaler = None
+        elif self._feature_scaler_map_cfg:
             self.feature_scaler = FeatureScalerManager(
                 feature_scaler_map=self._feature_scaler_map_cfg,
                 default_scaler=self._feature_scaler_cfg,  # fallback for unmapped features
@@ -352,33 +358,29 @@ class DartsForecaster:
 
     def _preprocess_timeseries(
         self,
-        timeseries: TimeSeries,
+        timeseries: List[TimeSeries],
         start: int,
         end: int,
         train_mode: bool = False,
-    ) -> TimeSeries:
+    ) -> Tuple[List[TimeSeries], Optional[List[TimeSeries]]]:
         """
-        Preprocesses a list of time series for training or prediction.
-
-        Converts each time series to float32, slices the series according to the specified
-        start and end indices, and applies scaling if scalers are provided. Handles both
-        training and prediction modes by adjusting the slicing logic for targets and features.
+        Preprocesses time series for training or prediction.
 
         Args:
-            timeseries (TimeSeries): List of time series objects to preprocess.
-            start (int): Start timestamp for slicing the time series.
-            end (int): End timestamp for slicing the time series.
-            train_mode (bool, optional): If True, preprocesses for training by ensuring
-                full input and output window creation. If False, preprocesses for prediction.
-                Defaults to False.
+            timeseries: Time series collection to preprocess.
+            start: Start timestamp for slicing.
+            end: End timestamp for slicing.
+            train_mode: If True, fits scalers and enforces reproducibility gates.
 
         Returns:
-            Tuple[List[TimeSeries], List[TimeSeries]]: A tuple containing the preprocessed
-            targets and past covariates (features).
+            Tuple of (targets, past_covariates). past_covariates is None for
+            univariate models (features=[]).
         """
         timeseries_float = [s.astype(np.float32) for s in timeseries]
 
         self.min_length = self.model.input_chunk_length + self.model.output_chunk_length
+
+        # Slice targets (end + 1 because Darts slice is exclusive for integer indices)
         if train_mode:
             # Build aligned (target, past_cov) pairs and filter together.
             #
@@ -414,27 +416,24 @@ class DartsForecaster:
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
                 for s in timeseries_float
             ]
+
+        # Slice past covariates (end + 1 to prevent feature leakage)
+        if self.dataset.features:
             past_cov = [
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(
                     np.float32
                 )
                 for s in timeseries_float
             ]
+            past_cov = self._apply_log_to_features(past_cov)
+        else:
+            past_cov = None
 
-        # Log transform selected feature components before scaling
-        past_cov = self._apply_log_to_features(past_cov)
-
-        # Log transform before scaling (can create float64)
         targets = self._apply_log_to_targets(targets)
 
         if train_mode:
             # GATE 3, 4, 5: The Fortress Firewall
-
-            # Check Boundary Integrity (Peeking and Starvation)
-            # This ensures we use all data up to 'end' and not a month more.
             ReproducibilityGate.Temporal.audit_boundary_integrity(targets, end)
-
-            # Check Sequence Contiguity (No Holes)
             for ts in targets:
                 ReproducibilityGate.Temporal.audit_sequence_contiguity(
                     ts.time_index.values.astype(int)
@@ -455,11 +454,12 @@ class DartsForecaster:
 
         # DOWNCAST after scaler/log (they yield float64)
         targets = [ts.astype(np.float32) for ts in targets]
-        past_cov = [pc.astype(np.float32) for pc in past_cov]
+        if past_cov is not None:
+            past_cov = [pc.astype(np.float32) for pc in past_cov]
 
-        # Data sanity check: detect extreme values, NaNs, Infs
         ReproducibilityGate.Data.audit_numerical_sanity(targets, "targets")
-        ReproducibilityGate.Data.audit_numerical_sanity(past_cov, "past_covariates")
+        if past_cov is not None:
+            ReproducibilityGate.Data.audit_numerical_sanity(past_cov, "past_covariates")
 
         return targets, past_cov
 
@@ -668,8 +668,15 @@ class DartsForecaster:
             pd.DataFrame: A DataFrame containing the forecasted values, indexed by time and entity.
 
         Raises:
+            RuntimeError: If scalers are not fitted (call train() or load_model() first).
             Exception: If an error occurs during prediction.
         """
+        if self.target_scaler and not self.scaler_fitted:
+            raise RuntimeError(
+                "predict() called before scalers were fitted. "
+                "Call train() or load_model() first."
+            )
+
         # LOCK ENTROPY: Guarantee bit-perfect identity for probabilistic samples
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
@@ -700,7 +707,6 @@ class DartsForecaster:
         # Get the input window for forecasting based on sequence_number
         target_series, past_covariates = self._preprocess_timeseries(
             timeseries=timeseries,
-            # start=self._test_start + sequence_number - output_length,
             start=self._test_start + sequence_number - self.model.input_chunk_length,
             end=self._test_start - 1 + sequence_number,  # origin = test_start - 1 + seq (base_origin convention)
         )
@@ -735,7 +741,7 @@ class DartsForecaster:
                 **predict_kwargs,
             )
         except Exception as e:
-            print(f"Error during prediction: {e}")
+            logger.error(f"Error during prediction: {e}")
             raise
 
         # Use sample-preserving inverse transform for probabilistic predictions

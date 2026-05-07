@@ -231,8 +231,9 @@ class _ViewsDatasetDarts(_ViewsDataset):
             if agg_kwargs:
                 col_stats = grouped.agg(**agg_kwargs).fillna(0.0)
             else:
-                # No agg stats requested — seed with entity-indexed frame
-                col_stats = pd.DataFrame(index=grouped.first().index)
+                # No agg stats requested (only trend/sparsity) — seed with entity-indexed frame
+                import pandas as _pd
+                col_stats = _pd.DataFrame(index=grouped.first().index)
 
             if "trend" in requested_stats:
                 col_stats[f"{target_col}_trend"] = grouped.apply(_ols_slope)

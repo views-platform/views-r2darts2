@@ -192,7 +192,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
             target_scaler=active_config.get("target_scaler", None),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
             random_state=active_config["random_state"],
-            static_covariate_stats=active_config.get("static_covariate_stats", None),
+            static_covariate_stats=(
+                active_config.get("static_covariate_stats", None)
+                if active_config.get("use_static_covariates", False)
+                else None
+            ),
             checkpoint_mode=active_config.get("checkpoint_mode", "best"),
         )
         forecaster.train()
@@ -280,7 +284,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
             log_features=active_config.get("log_features", []),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
             random_state=active_config["random_state"],
-            static_covariate_stats=active_config.get("static_covariate_stats", None),
+            static_covariate_stats=(
+                active_config.get("static_covariate_stats", None)
+                if active_config.get("use_static_covariates", False)
+                else None
+            ),
         )
         forecaster.load_model(path=path_artifact)
 
@@ -408,7 +416,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
             log_features=active_config.get("log_features", []),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
             random_state=active_config["random_state"],
-            static_covariate_stats=active_config.get("static_covariate_stats", None),
+            static_covariate_stats=(
+                active_config.get("static_covariate_stats", None)
+                if active_config.get("use_static_covariates", False)
+                else None
+            ),
         )
         forecaster.load_model(path=path_artifact)
 

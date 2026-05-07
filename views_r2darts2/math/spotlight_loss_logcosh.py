@@ -262,7 +262,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         log_loss = torch.log(loss_flat + 1e-8)
         log_std = log_loss.std()
 
-        dro_alpha = log_std / (log_std + 1.0)
+        # CV-based alpha: self-normalizing, naturally bounded.
+        # CV=2→α≈0.52, CV=5→α≈0.64, CV=10→α≈0.71. Cannot saturate to 1.
+        log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
+        dro_alpha = log_cv / (log_cv + 1.0)
         # Clamp at 0.1, not 1e-8: std<0.1 means losses span <1.1×,
         # too little variation for meaningful z-scores. At 1e-8, z can
         # reach 1e8 → log1p(1e8) ≈ 18.4 → NaN after normalisation × 0.

@@ -115,7 +115,7 @@ class DartsForecaster:
             static_covariate_stats.get("stats") if static_covariate_stats else None
         )
         self._static_cov_inject = (
-            static_covariate_stats.get("inject", True) if static_covariate_stats else True
+            static_covariate_stats.get("inject", False) if static_covariate_stats else False
         )
         logger.info(
             f"_static_cov_transform resolved to: {self._static_cov_transform!r}, "

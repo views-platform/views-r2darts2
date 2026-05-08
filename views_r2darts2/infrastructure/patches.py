@@ -197,7 +197,7 @@ def apply_nbeats_patch():
 # → chronic overprediction across all series and all architectures.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# FIX: HYBRID-SPACE REVIN (v3)
+# FIX: HYBRID-SPACE REVIN (v4)
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Key insight: center in asinh-space (bias-free), normalize variance in
@@ -345,17 +345,21 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Cap per-series sigma to 5× the batch-mean sigma.
-        # Prevents RevIN denorm from amplifying extreme-conflict series
-        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
-        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
-
-        # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
-        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
-        x = torch.clamp(x, -50.0, 50.0)
+        # No sigma cap. The outer asinh in the inverse self-limits sensitivity:
+        #   ∂ŷ/∂ẑ = σ_c · cosh(ẑ) / √(1 + (sinh(ẑ)·σ_c)²)
+        # At ẑ→large: numerator ≈ σ_c·sinh(ẑ), denominator ≈ σ_c·sinh(ẑ) → 1.
+        # Bounded ∈ [1, σ_c]. No cap needed — asinh cancels sinh curvature.
+        #
+        # A batch-relative cap (v3: 5×batch_mean) caused partition-dependent
+        # inconsistency: the same Syria window got capped differently depending
+        # on which other countries were in the batch. This is the root cause
+        # of the train→eval catastrophe. Removing it gives consistent σ_c
+        # across all batch compositions and between train and eval.
+        #
+        # Clamp ẑ before sinh to prevent float32 overflow only.
+        # sinh(12) * 1000 ≈ 8.1e7 << 3.4e38 (float32 max), so ±12 is safe
+        # for any real σ_c. Use ±15 for margin.
+        x = torch.clamp(x, -15.0, 15.0)
 
         # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
         # Compress: asinh wraps it back into asinh-space
@@ -368,8 +372,8 @@ def apply_rinorm_compression_patch():
     RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3 "
-        "(asinh centering + raw-space σ, zero mean bias)."
+        "🐨 Patched RINorm: hybrid-space normalization v4 "
+        "(asinh centering + raw-space σ, zero mean bias, no sigma cap)."
     )
 
 

@@ -114,9 +114,13 @@ class DartsForecaster:
         self._static_cov_stats = (
             static_covariate_stats.get("stats") if static_covariate_stats else None
         )
+        self._static_cov_inject = (
+            static_covariate_stats.get("inject", True) if static_covariate_stats else True
+        )
         logger.info(
             f"_static_cov_transform resolved to: {self._static_cov_transform!r}, "
-            f"_static_cov_stats: {self._static_cov_stats!r}"
+            f"_static_cov_stats: {self._static_cov_stats!r}, "
+            f"_static_cov_inject: {self._static_cov_inject!r}"
         )
 
         if checkpoint_mode not in ("best", "last"):
@@ -546,6 +550,7 @@ class DartsForecaster:
             stat_time_range=(self._train_start, self._train_end),
             static_cov_transform=self._static_cov_transform,
             static_cov_stats=self._static_cov_stats,
+            inject_static_covariates=self._static_cov_inject,
         )
 
         target_series, past_covariates = self._preprocess_timeseries(
@@ -732,6 +737,7 @@ class DartsForecaster:
             stat_time_range=(self._train_start, self._train_end),
             static_cov_transform=self._static_cov_transform,
             static_cov_stats=self._static_cov_stats,
+            inject_static_covariates=self._static_cov_inject,
         )
 
         # Get the input window for forecasting based on sequence_number

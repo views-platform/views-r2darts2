@@ -71,6 +71,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         stat_time_range: Optional[tuple] = None,
         static_cov_transform: Optional[str] = None,
         static_cov_stats: Optional[List[str]] = None,
+        inject_static_covariates: bool = False,
     ):
         """
         Converts the internal data subset into a Darts TimeSeries object.
@@ -124,6 +125,16 @@ class _ViewsDatasetDarts(_ViewsDataset):
             logger.info(
                 f"Cyclic encoders: injected {[fn.__name__ for fn in cyclic_encoders]} "
                 f"for resolution '{resolution}' ({self._time_id})."
+            )
+
+        if not inject_static_covariates:
+            logger.info("inject_static_covariates=False — skipping static covariate stat injection.")
+            return TimeSeries.from_group_dataframe(
+                df=df_reset,
+                group_cols=self._entity_id,
+                value_cols=self.features + self.targets,
+                n_jobs=-1,
+                verbose=True,
             )
 
         # --- Per-entity static covariates (entity fingerprint) ---

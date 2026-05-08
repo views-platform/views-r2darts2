@@ -39,9 +39,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
        Per-cell weight is the product of two bounded signals:
 
-           difficulty  = 1 − exp(−|e_shape|)            ∈ [0, 1)
-           importance  = 1 − exp(−max(|y|, |ŷ_sg|))    ∈ [0, 1)
-           w_compound  = 1 + difficulty × importance     ∈ [1, 2)
+difficulty  = 1 − exp(−|e_shape|)                      ∈ [0, 1)
+       magnitude   = 1 − exp(−max(|y_true|, |ŷ|_sg))        ∈ [0, 1)
+       w_compound  = 1 + difficulty × magnitude              ∈ [1, 2)
 
        Both must be present for high weight: a cell must be **both hard
        AND important**. Detached — no gradient coupling. Normalised to
@@ -242,14 +242,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Adaptive compound weighting (dynamic, self-correcting) ─────
         # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
-        # importance = difficulty × magnitude : consequential AND wrong
-        # w_compound = 1 + difficulty × importance ∈ [1, 2)
+        # magnitude uses max(|y_true|, |y_pred_sg|): catches both missed
+        # events (y_true high, y_pred low) AND hallucinations (y_true≈0,
+        # y_pred high). y_pred must be stop-gradient: without detach, the
+        # model reduces w_compound by predicting toward zero, masking its
+        # own error — same adversarial loop as BYOL without stop-gradient.
+        # w_compound = 1 + difficulty × magnitude ∈ [1, 2)
         # Self-correcting: as |e|→0, w→1 quadratically regardless of |y|.
         abs_e = torch.abs(e_shape.detach())
-        abs_y = torch.abs(y_true)
+        abs_y_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        magnitude = 1.0 - torch.exp(-abs_y)
+        magnitude = 1.0 - torch.exp(-abs_y_max)
         importance = difficulty * magnitude
         w_compound = 1.0 + importance
 

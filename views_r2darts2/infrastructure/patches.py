@@ -283,99 +283,49 @@ def apply_nbeats_patch():
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with hybrid-space normalization (v6).
+    Patches Darts RINorm with hybrid-space normalization (v3).
 
-    Centers in asinh-space, normalizes variance using σ_asinh through
-    sinh/asinh compression. Combines the best of all prior attempts:
+    Centers in asinh-space (zero mean bias), normalizes variance in
+    raw-space (bounded gradients). Eliminates both the gradient
+    explosion of standard RevIN AND the systematic positive bias of
+    pure raw-space RevIN.
 
-    Forward:  z = asinh(sinh(x − μ_asinh) / σ_asinh)
-    Inverse:  ŷ = asinh(sinh(ẑ) · σ_asinh) + μ_asinh
+    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
+    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
 
-    ═══════════════════════════════════════════════════════════════
-    PRIOR ATTEMPTS AND WHY THEY FAILED
-    ═══════════════════════════════════════════════════════════════
-
-    v3 (hybrid, σ_c = std(sinh(x-μ)), with batch-relative cap):
-      σ_c ∈ [0.003, 400+]. Cap: 5× batch_mean.
-      FAILED: cap is batch-composition-dependent → partition-dependent
-      → train→eval catastrophe. Same series gets different effective σ
-      depending on which other countries share the batch.
-
-    v4 (hybrid, σ_c, no cap):
-      FAILED: 133,000× gradient imbalance between Syria (σ_c=400)
-      and peaceful (σ_c=0.3). All series converge to same temporal
-      pattern at different magnitudes. Model can't differentiate.
-
-    v5 (standard RevIN, linear denorm ŷ = ẑ·σ+μ):
-      FAILED: sensitivity explosion. ŷ = ẑ·σ_asinh + μ means even
-      small ẑ=3 produces ŷ=3×3+6=15 → sinh(15)=1.6M counts.
-      No compression → 13-26× overprediction by epoch 15.
-
-    ═══════════════════════════════════════════════════════════════
-    V6: σ_ASINH WITH SINH/ASINH COMPRESSION
-    ═══════════════════════════════════════════════════════════════
-
-    Key insight: the v3 sinh/asinh compression was essential (prevents
-    sensitivity explosion), but σ_c was the wrong normalizer (creates
-    unbounded range requiring a cap). Use σ_asinh instead:
-
-      σ_asinh ∈ [0.1, 4]    — bounded by the range of asinh-space
-      No cap needed          — σ cannot reach extreme values
-      Gradient imbalance     — max 4× (vs 133,000× with σ_c)
-      Sensitivity            — bounded by outer asinh self-limiting
-      Partition invariance   — σ_asinh is per-sample, no batch dep.
-      At ẑ=0                 — ŷ = μ_asinh (zero bias, identical to v3)
-      Roundtrip              — exact (σ cancels in composition)
-      Constants              — zero
-      MC dropout             — E[sinh(ẑ)]=0 at E[ẑ]=0 (odd symmetry)
-
-    ═══════════════════════════════════════════════════════════════
-    GRADIENT ANALYSIS
-    ═══════════════════════════════════════════════════════════════
-
-    ∂ŷ/∂ẑ = σ_asinh · cosh(ẑ) / √(1 + (sinh(ẑ)·σ_asinh)²)
-
-    At ẑ=0: = σ_asinh ∈ [0.1, 4] (bounded, uniform across series)
-    At ẑ→∞: → 1 (outer asinh cancels inner sinh)
-    Bounded ∈ [1, σ_asinh] ⊂ [1, 4]
-
-    ═══════════════════════════════════════════════════════════════
-    ROUND-TRIP VERIFICATION
-    ═══════════════════════════════════════════════════════════════
-
-    Forward: z = asinh(sinh(x − μ) / σ)
-    Inverse: ŷ = asinh(sinh(z) · σ) + μ
-    Compose: asinh(sinh(asinh(sinh(x−μ)/σ)) · σ) + μ
-           = asinh((sinh(x−μ)/σ) · σ) + μ    [sinh(asinh(a)) = a]
-           = asinh(sinh(x−μ)) + μ = (x−μ) + μ = x  ✓
+    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
+    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
+    Round-trip: exact (forward ∘ inverse = identity).
+    Zero learnable parameters. Backwards-compatible state_dict.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
     if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
 
-    def _hybrid_forward(self, x: torch.Tensor):
+    def _raw_space_forward(self, x: torch.Tensor):
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Guard against upstream numeric accidents before sinh.
+        # Guard against any upstream numeric accident before sinh.
         x = torch.clamp(x, -88.0, 88.0)
 
         # Compute asinh-space mean (bias-free centering point)
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
 
-        # Compute σ_asinh: standard deviation in asinh-space.
-        # Bounded ∈ [0.1, 4] by the range of the asinh transform.
-        # Unlike σ_c = std(sinh(x-μ)) which reaches 400+, σ_asinh
-        # needs no cap because the space itself is compressed.
+        # Center in asinh space, convert to raw
+        x_centered_raw = torch.sinh(x - self.mean)
+
+        # Compute variance of the centered-raw signal
+        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
+        # These differ enormously — std(sinh(x)) is inflated by the
+        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
-            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False)
+            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        # Center in asinh-space, convert to raw-space,
-        # normalize by σ_asinh, compress back via asinh
-        x_centered_raw = torch.sinh(x - self.mean)
+        # Normalize by centered-raw std, compress back via asinh
         x = torch.asinh(x_centered_raw / self.stdev)
 
         if self.affine:
@@ -383,7 +333,7 @@ def apply_rinorm_compression_patch():
             x = x + self.affine_bias
         return x
 
-    def _hybrid_inverse(self, x: torch.Tensor):
+    def _raw_space_inverse(self, x: torch.Tensor):
         # x shape: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
@@ -395,25 +345,31 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # No sigma cap needed. σ_asinh ∈ [0.1, 4] by the range of
-        # the asinh transform — structurally bounded, no patch needed.
-        #
-        # Clamp ẑ before sinh for float32 safety only.
-        # sinh(15) * 4 ≈ 6.5e6; asinh(6.5e6) ≈ 16.4. Fine.
-        x = torch.clamp(x, -15.0, 15.0)
+        # Cap per-series sigma to 5× the batch-mean sigma.
+        # Prevents RevIN denorm from amplifying extreme-conflict series
+        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
+        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
+        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
+        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
 
-        # sinh(ẑ) · σ_asinh → compressed denorm in raw-space
-        # asinh(...) → back to asinh-space (self-limiting)
-        # + μ → re-center (additive, no amplification)
+        # Clamp before sinh to prevent float32 overflow.
+        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
+        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
+        x = torch.clamp(x, -50.0, 50.0)
+
+        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
+        # Compress: asinh wraps it back into asinh-space
+        # Shift: + μ_asinh re-centers (additive, no amplification)
         x = torch.asinh(torch.sinh(x) * sigma) + mu
 
         return x
 
-    RINorm.forward = _hybrid_forward
-    RINorm.inverse = _hybrid_inverse
+    RINorm.forward = _raw_space_forward
+    RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v6"
+        "🐨 Patched RINorm: hybrid-space normalization v3 "
+        "(asinh centering + raw-space σ, zero mean bias)."
     )
 
 

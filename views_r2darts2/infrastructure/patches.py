@@ -142,198 +142,159 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm Hybrid-Space Normalization Patch ---
+# --- 3. RINorm Scale-Only Normalization Patch ---
 #
 # ═══════════════════════════════════════════════════════════════════════
-# PROBLEM (v1: standard RevIN in asinh-space)
+# PROBLEM (v1–v3: mean-shift RevIN → over-stationarization)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Pipeline: raw counts → asinh → RevIN → model → RevIN⁻¹ → sinh → counts
+# All previous variants subtract the instance mean in the forward pass
+# and add it back in the inverse:
 #
-# Standard RevIN: z = (x_asinh - μ_asinh) / σ_asinh.
-# Inverse: ŷ_asinh = ẑ·σ_asinh + μ_asinh → counts = sinh(ŷ_asinh).
+#   v1: z = (x − μ) / σ          → ŷ = ẑ·σ + μ
+#   v2: z = asinh((sinh(x)−μ_r)/σ_r) → ŷ = asinh(sinh(ẑ)·σ_r + μ_r)
+#   v3: z = asinh(sinh(x−μ)/σ_c) → ŷ = asinh(sinh(ẑ)·σ_c) + μ
 #
-# Three pathologies:
-#   1. Jensen amplification: E[sinh(μ + σ·Z)] = sinh(μ)·exp(σ²/2).
-#   2. Sensitivity explosion: ∂counts/∂ẑ = σ·cosh(ẑ·σ+μ) → exponential.
-#   3. Asymmetric errors in count space.
+# In all cases, at ẑ=0 the model gets a FREE mean prediction:
+#   v1: ŷ = μ        v2: ŷ = asinh(μ_r)      v3: ŷ = μ_asinh
 #
-# ═══════════════════════════════════════════════════════════════════════
-# PROBLEM (v2: pure raw-space RevIN — PREVIOUS IMPLEMENTATION)
-# ═══════════════════════════════════════════════════════════════════════
+# Liu et al. (NeurIPS 2022, "Non-stationary Transformers") term this
+# OVER-STATIONARIZATION: "the stationarized series deprived of inherent
+# non-stationarity can be less instructive for real-world bursty events
+# forecasting."
 #
-# Pure raw-space centering: z = asinh((sinh(x) - μ_raw) / σ_raw)
-# Inverse: ŷ = asinh(sinh(ẑ)·σ_raw + μ_raw)
-#
-# Gradient-safe (bounded ≈1 for large |ẑ|): ✓
-# Jensen-safe for MC dropout (E[sinh(ẑ)]=0): ✓
-#
-# BUT: systematic positive mean bias.
-#
-# At ẑ=0 (model's "neutral" output):
-#   ŷ_asinh = asinh(0·σ + μ_raw) = asinh(μ_raw)
-#
-# Meanwhile the true asinh-space mean is μ_asinh = E[x_asinh].
-# Since sinh is convex for x>0:
-#   μ_raw = E[sinh(x_asinh)] ≥ sinh(E[x_asinh]) = sinh(μ_asinh)
-#   ⟹ asinh(μ_raw) ≥ μ_asinh
-#
-# The "neutral" prediction overshoots in asinh-space by:
-#   bias = asinh(μ_raw) − μ_asinh = asinh(E[sinh(X)]) − E[X]
-#
-# For Gaussian X~N(μ,σ²): μ_raw = sinh(μ)·exp(σ²/2), so:
-#   bias = asinh(sinh(μ)·exp(σ²/2)) − μ
-#
-#   | Series         | μ_asinh | σ_asinh | bias    |
-#   |----------------|---------|---------|---------|
-#   | Peaceful       | 0.10    | 0.30    | +0.00   |
-#   | Low conflict   | 1.50    | 1.00    | +0.89   |
-#   | Medium         | 3.00    | 2.00    | +1.71   |
-#   | High           | 5.00    | 3.00    | +2.60   |
-#   | Extreme (UKR)  | 5.00    | 4.00    | +7.70   |
-#
-# The level anchor partially compensates but requires the model to
-# learn a per-series negative DC shift from context. Limited capacity
-# → chronic overprediction across all series and all architectures.
+# For 90% zero-inflated conflict data, this produces SMOOTHED forecasts:
+# the model learns ẑ≈0 is "good enough" (free mean covers most of the
+# loss), and never develops the capacity to predict actual conflict
+# dynamics. The temporal structure is erased.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# FIX: HYBRID-SPACE REVIN (v3)
+# FIX: TEMPORAL RMS INSTANCE NORMALIZATION (v4)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Key insight: center in asinh-space (bias-free), normalize variance in
-# raw-space (gradient-safe). Best of both worlds.
+# Inspired by RMSNorm (Zhang & Sennrich, 2019 — used in LLaMA, Gemma):
+# mean subtraction is unnecessary; scale-only normalization works as
+# well as or better than full LayerNorm.
 #
 # Forward:
-#   μ_asinh = mean(x, dim=time)              — asinh-space mean
-#   x_c = sinh(x − μ_asinh)                  — center in asinh, then to raw
-#   σ_c = std(x_c, dim=time)                 — centered-raw std
-#   z = asinh(x_c / σ_c)                     — normalize, compress
+#   RMS = √(E_t[x²] + ε)          — root mean square over time
+#   z = x / RMS                    — scale-only normalization
 #
 # Inverse:
-#   ŷ_asinh = asinh(sinh(ẑ) · σ_c) + μ_asinh — expand, shift back
+#   ŷ = ẑ · RMS                    — rescale to original magnitude
 #
 # ═══════════════════════════════════════════════════════════════════════
-# WHY THIS ELIMINATES THE MEAN BIAS
+# WHY RMS, NOT STD
 # ═══════════════════════════════════════════════════════════════════════
 #
-# At ẑ=0: ŷ = asinh(sinh(0)·σ_c) + μ_asinh = asinh(0) + μ_asinh = μ_asinh
+# std(x) measures spread around the mean. For a flat-but-nonzero series
+# (sustained conflict at x≈3.0±0.01), std≈0.01 → z=3.0/0.01=300.
+# Catastrophic scale mismatch between flat and variable series.
 #
-# The model's neutral output maps EXACTLY to the asinh-space mean.
-# No Jensen gap. No per-series DC correction needed.
-#
-# ═══════════════════════════════════════════════════════════════════════
-# WHY GRADIENTS REMAIN BOUNDED
-# ═══════════════════════════════════════════════════════════════════════
-#
-# ∂ŷ/∂ẑ = σ_c · cosh(ẑ) / √(1 + (sinh(ẑ)·σ_c)²)
-#
-# At ẑ=0: = σ_c (moderate — similar to σ_asinh)
-# At ẑ→∞: cosh(ẑ) ≈ sinh(ẑ) → σ_c·sinh(ẑ) / (σ_c·sinh(ẑ)) = 1
-#
-# Bounded ∈ [1, σ_c]. No exponential explosion.
-# The outer asinh cancels the inner sinh curvature.
+# RMS = √(μ² + σ²) captures BOTH level and variability:
+#   - Flat conflict (x≈3):   RMS≈3.0  → z≈1.0     ✓
+#   - Variable conflict:     RMS≈√(μ²+σ²) → z∈[-1,3]  ✓
+#   - All-zero (peace):      RMS≈√ε   → z≈0, ŷ≈0   ✓
 #
 # ═══════════════════════════════════════════════════════════════════════
-# MC DROPOUT SAFETY
+# KEY PROPERTIES
 # ═══════════════════════════════════════════════════════════════════════
 #
-# The inverse is: asinh(sinh(ẑ)·σ_c) + μ_asinh.  The μ_asinh term is
-# additive (constant, no amplification). The sinh(ẑ)·σ_c term:
-#   E[sinh(ẑ)] = 0 when E[ẑ]=0 (odd symmetry)
-#   Jensen factor for σ_ẑ≈0.3: exp(0.09/2)≈1.05× (negligible)
+# 1. NO FREE MEAN: at ẑ=0, ŷ=0 (not μ). The model must predict actual
+#    conflict levels — no lazy equilibrium at the instance mean.
+#
+# 2. LEVEL PRESERVATION: z retains the sign and relative magnitude of x.
+#    A conflict country (z≈1) looks different from a peace country (z≈0).
+#    The model can discriminate without needing separate statistics.
+#
+# 3. GRADIENT: ∂ŷ/∂ẑ = RMS — constant per series, bounded by data
+#    magnitude. No exponential growth, no sinh/cosh in the computation.
+#    In asinh-space, max x≈10 → max RMS≈10 → max gradient=10.
+#
+# 4. NO CLIPPING/CAPPING: purely linear scaling. No hardcoded thresholds.
+#    ε is the standard numerical stability constant (1e-5 from Darts).
+#
+# 5. ROUND-TRIP: z = x/RMS → ẑ·RMS = x (exact when ẑ=z).
+#
+# 6. MC DROPOUT: ŷ = ẑ·RMS. E[ŷ] = E[ẑ]·RMS. No Jensen bias
+#    (linear function of the stochastic variable ẑ).
 #
 # ═══════════════════════════════════════════════════════════════════════
 # Z-RANGE ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════
 #
-# For Ukraine (μ_asinh≈5, σ_asinh≈4):
-#   x − μ ∈ [−5, +2], sinh(x−μ) ∈ [−74, +3.6]
-#   σ_c ≈ 20 (dominated by the positive tail)
-#   z = asinh(sinh(x−μ)/20) → z ∈ [−2.0, 0.18] (compact!)
+# For Ukraine (x_asinh∈[1, 8], μ≈5, σ≈2):
+#   RMS ≈ √(25+4) ≈ 5.4
+#   z = x/5.4 ∈ [0.19, 1.48]  — compact, centered around 1
 #
-# For peaceful (μ_asinh≈0.1):
-#   x − μ ≈ 0 for all t → z ≈ 0 (even more compact)
+# For low conflict (x_asinh∈[0, 2], rare spikes):
+#   RMS ≈ 0.5
+#   z = x/0.5 ∈ [0, 4]  — spikes visible, zeros preserved
 #
-# ═══════════════════════════════════════════════════════════════════════
-# ROUND-TRIP VERIFICATION
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Forward: z = asinh(sinh(x − μ) / σ_c)
-# Inverse: ŷ = asinh(sinh(z) · σ_c) + μ
-#
-# Compose: asinh(sinh(asinh(sinh(x−μ)/σ_c)) · σ_c) + μ
-#         = asinh((sinh(x−μ)/σ_c) · σ_c) + μ    [sinh(asinh(a)) = a]
-#         = asinh(sinh(x−μ)) + μ
-#         = (x − μ) + μ
-#         = x  ✓  (exact reconstruction)
+# For peaceful (x_asinh≈0 for all t):
+#   RMS ≈ √ε ≈ 0.003
+#   z = 0/0.003 = 0, ŷ = 0·0.003 = 0  — exact zero preservation
 #
 # ═══════════════════════════════════════════════════════════════════════
 # IMPLEMENTATION NOTES
 # ═══════════════════════════════════════════════════════════════════════
 #
-# - No learnable parameters. Fully deterministic.
-# - No checkpoint compatibility issue (no new state_dict keys).
-# - self.mean stores μ_asinh. self.stdev stores σ_c (centered-raw std).
-# - Inverse patches shape broadcasting for Darts' 4D output tensor.
-# - σ_c is computed from sinh(x − μ_asinh), NOT from sinh(x).
-#   These differ enormously — std(sinh(x)) is dominated by the
-#   raw-space mean offset; std(sinh(x−μ)) reflects actual variability.
-# - eps=1e-5 prevents division by zero for all-zero series.
+# - self.mean stores zeros (for Darts state_dict API compatibility).
+# - self.stdev stores RMS (temporal root mean square).
+# - No sinh/cosh/asinh operations → no overflow risk → no clamps.
+# - Backwards-compatible: no new state_dict keys.
+# - Affine γ/β are per-channel (shared across batch), cannot learn
+#   per-instance levels, so no risk of re-introducing the mean shortcut.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with hybrid-space normalization (v3).
+    Patches Darts RINorm with temporal RMS instance normalization (v4).
 
-    Centers in asinh-space (zero mean bias), normalizes variance in
-    raw-space (bounded gradients). Eliminates both the gradient
-    explosion of standard RevIN AND the systematic positive bias of
-    pure raw-space RevIN.
+    Scale-only normalization using root mean square over time. No mean
+    subtraction — preserves the absolute level that distinguishes
+    conflict series from peace baselines.
 
-    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
-    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
+    Addresses the over-stationarization problem (Liu et al., NeurIPS 2022)
+    by retaining non-stationary level information in the normalized
+    representation. Uses RMS instead of std following RMSNorm
+    (Zhang & Sennrich, 2019) to handle flat-but-nonzero series cleanly.
 
-    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
-    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
-    Round-trip: exact (forward ∘ inverse = identity).
-    Zero learnable parameters. Backwards-compatible state_dict.
+    Forward:  z = x / RMS(x)       RMS = √(mean_t(x²) + ε)
+    Inverse:  ŷ = ẑ · RMS(x)
+
+    At ẑ=0: ŷ = 0 (not μ). No forecast smoothing.
+    Gradient: ∂ŷ/∂ẑ = RMS — constant, bounded, no exponential growth.
+    Round-trip: exact (z·RMS = x).
+    No hardcoded values. No clipping. Backwards-compatible state_dict.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
     if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
 
-    def _raw_space_forward(self, x: torch.Tensor):
+    def _rms_forward(self, x: torch.Tensor):
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Guard against any upstream numeric accident before sinh.
-        x = torch.clamp(x, -88.0, 88.0)
-
-        # Compute asinh-space mean (bias-free centering point)
-        self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-
-        # Center in asinh space, convert to raw
-        x_centered_raw = torch.sinh(x - self.mean)
-
-        # Compute variance of the centered-raw signal
-        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
-        # These differ enormously — std(sinh(x)) is inflated by the
-        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
+        # Root mean square over time dimensions.
+        # RMS = √(E_t[x²] + ε) captures both level and variability.
         self.stdev = torch.sqrt(
-            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
-            + self.eps
+            torch.mean(x * x, dim=calc_dims, keepdim=True) + self.eps
         ).detach()
 
-        # Normalize by centered-raw std, compress back via asinh
-        x = torch.asinh(x_centered_raw / self.stdev)
+        # Zero mean for Darts API compatibility (inverse expects self.mean).
+        self.mean = torch.zeros_like(self.stdev)
+
+        # Scale-only normalization — level information preserved in z.
+        x = x / self.stdev
 
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    def _raw_space_inverse(self, x: torch.Tensor):
+    def _rms_inverse(self, x: torch.Tensor):
         # x shape: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
@@ -343,33 +304,18 @@ def apply_rinorm_compression_patch():
             )
 
         sigma = self.stdev.view(self.stdev.shape + (1,))
-        mu = self.mean.view(self.mean.shape + (1,))
 
-        # Cap per-series sigma to 5× the batch-mean sigma.
-        # Prevents RevIN denorm from amplifying extreme-conflict series
-        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
-        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
-
-        # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
-        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
-        x = torch.clamp(x, -50.0, 50.0)
-
-        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
-        # Compress: asinh wraps it back into asinh-space
-        # Shift: + μ_asinh re-centers (additive, no amplification)
-        x = torch.asinh(torch.sinh(x) * sigma) + mu
+        # Rescale to original magnitude. No mean addition — ẑ=0 maps to 0.
+        x = x * sigma
 
         return x
 
-    RINorm.forward = _raw_space_forward
-    RINorm.inverse = _raw_space_inverse
+    RINorm.forward = _rms_forward
+    RINorm.inverse = _rms_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3 "
-        "(asinh centering + raw-space σ, zero mean bias)."
+        "🐨 Patched RINorm: temporal RMS instance normalization v4 "
+        "(scale-only, no mean shift, no over-stationarization)."
     )
 
 

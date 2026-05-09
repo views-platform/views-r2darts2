@@ -275,11 +275,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = w_dro.view_as(cell_loss)
         w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
 
-        # Combine compound + DRO additively (mean-preserving average).
-        # Both are correlated (respond to same high-conflict cells);
-        # multiplication would quadratically suppress low-conflict events.
-        w_compound_norm = w_compound / w_compound.mean()
-        w_total = 0.5 * w_compound_norm + 0.5 * w_dro
+        # Combine compound × DRO, normalise jointly to mean=1
+        w_total = w_compound * w_dro
+        w_total = w_total / w_total.mean()
         # Safety: any residual NaN from degenerate batches → weight=1
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 

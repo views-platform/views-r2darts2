@@ -291,14 +291,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
         # large |ē| → saturated tanh → strong level signal;
         # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        # Event-presence weighting: series containing ≥1 event get 2×
-        # level pressure. Symmetric in sign — corrects both under- and
-        # overprediction equally. Necessary because sparse event series
-        # (1 spike in 36 months) have diluted e_mean ≈ spike/36 ≈ 0.
-        has_event = (abs_y > self.non_zero_threshold).any(dim=1).float()
-        level_weight = 1.0 + has_event
-        level_weight = level_weight / level_weight.mean()
-        loss_level = T * (level_weight * self._log_cosh(e_mean.squeeze(1))).mean()
+        # Uniform across series: preserves the shape:level gradient ratio
+        # identically for every series. Asymmetric per-series weighting
+        # would break this balance — event series would get disproportionate
+        # "find the mean" pressure vs "fix the shape" pressure.
+        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

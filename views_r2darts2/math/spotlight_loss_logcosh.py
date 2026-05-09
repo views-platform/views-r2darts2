@@ -242,16 +242,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Adaptive compound weighting (dynamic, self-correcting) ─────
         # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
-        # importance = difficulty × magnitude : consequential AND wrong
-        # w_compound = 1 + difficulty × importance ∈ [1, 2)
-        # Self-correcting: as |e|→0, w→1 quadratically regardless of |y|.
+        # event = 𝟙(|y| > threshold) : binary, all events equal
+        # w_compound = 1 + difficulty × event ∈ [1, 2)
+        # Self-correcting: as |e|→0, w→1 regardless of |y|.
+        # Binary event indicator: 1-death and 100-death events get the
+        # same importance — only difficulty differentiates within events.
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        magnitude = 1.0 - torch.exp(-abs_y)
-        importance = difficulty * magnitude
-        w_compound = 1.0 + importance
+        event = (abs_y > self.non_zero_threshold).float()
+        w_compound = 1.0 + difficulty * event
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
         # Z-score log(cell_loss) for proportional outlier detection.
@@ -274,9 +275,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = w_dro.view_as(cell_loss)
         w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
 
-        # Combine compound × DRO, normalise jointly to mean=1
-        w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean()
+        # Combine compound + DRO additively (mean-preserving average).
+        # Both are correlated (respond to same high-conflict cells);
+        # multiplication would quadratically suppress low-conflict events.
+        w_compound_norm = w_compound / w_compound.mean()
+        w_total = 0.5 * w_compound_norm + 0.5 * w_dro
         # Safety: any residual NaN from degenerate batches → weight=1
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 

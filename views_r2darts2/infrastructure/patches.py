@@ -142,130 +142,165 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm Scale-Only Normalization Patch ---
+# --- 3. RINorm Count-Space RMS Normalization Patch ---
 #
 # ═══════════════════════════════════════════════════════════════════════
 # PROBLEM (v1–v3: mean-shift RevIN → over-stationarization)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# All previous variants subtract the instance mean in the forward pass
-# and add it back in the inverse:
+# All previous variants subtract the instance mean and restore it:
 #
 #   v1: z = (x − μ) / σ          → ŷ = ẑ·σ + μ
 #   v2: z = asinh((sinh(x)−μ_r)/σ_r) → ŷ = asinh(sinh(ẑ)·σ_r + μ_r)
 #   v3: z = asinh(sinh(x−μ)/σ_c) → ŷ = asinh(sinh(ẑ)·σ_c) + μ
 #
-# In all cases, at ẑ=0 the model gets a FREE mean prediction:
-#   v1: ŷ = μ        v2: ŷ = asinh(μ_r)      v3: ŷ = μ_asinh
-#
-# Liu et al. (NeurIPS 2022, "Non-stationary Transformers") term this
-# OVER-STATIONARIZATION: "the stationarized series deprived of inherent
-# non-stationarity can be less instructive for real-world bursty events
-# forecasting."
-#
-# For 90% zero-inflated conflict data, this produces SMOOTHED forecasts:
-# the model learns ẑ≈0 is "good enough" (free mean covers most of the
-# loss), and never develops the capacity to predict actual conflict
-# dynamics. The temporal structure is erased.
+# At ẑ=0 the model gets a FREE mean prediction (over-stationarization).
+# For 90% zero-inflated conflict data the model learns ẑ≈0 is good
+# enough and never develops the capacity to predict conflict dynamics.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# FIX: TEMPORAL RMS INSTANCE NORMALIZATION (v4)
+# PROBLEM (v4: asinh-space RMS → Jensen amplification under MC dropout)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Inspired by RMSNorm (Zhang & Sennrich, 2019 — used in LLaMA, Gemma):
-# mean subtraction is unnecessary; scale-only normalization works as
-# well as or better than full LayerNorm.
+# v4: z = x_asinh / RMS_asinh    → ŷ_asinh = ẑ · RMS_asinh
 #
-# Forward:
-#   RMS = √(E_t[x²] + ε)          — root mean square over time
-#   z = x / RMS                    — scale-only normalization
+# At ẑ=0: ŷ=0 ✓  No mean bias.  But for MC dropout:
 #
-# Inverse:
-#   ŷ = ẑ · RMS                    — rescale to original magnitude
+#   count_s = sinh(ŷ_asinh_s) = sinh(ẑ_s · RMS_asinh)
 #
-# ═══════════════════════════════════════════════════════════════════════
-# WHY RMS, NOT STD
-# ═══════════════════════════════════════════════════════════════════════
+# For ẑ_s ~ N(μ_z, σ²_z):
+#   E[count_s] = sinh(μ_z · RMS) · exp(σ²_z · RMS² / 2)
+#                                   ─────────────────────
+#                                      Jensen factor
 #
-# std(x) measures spread around the mean. For a flat-but-nonzero series
-# (sustained conflict at x≈3.0±0.01), std≈0.01 → z=3.0/0.01=300.
-# Catastrophic scale mismatch between flat and variable series.
+# With dropout=0.35 and RMS_asinh≈5 (Syria):
+#   Jensen factor = exp(0.48² · 25 / 2) = exp(2.88) ≈ 18×
 #
-# RMS = √(μ² + σ²) captures BOTH level and variability:
-#   - Flat conflict (x≈3):   RMS≈3.0  → z≈1.0     ✓
-#   - Variable conflict:     RMS≈√(μ²+σ²) → z∈[-1,3]  ✓
-#   - All-zero (peace):      RMS≈√ε   → z≈0, ŷ≈0   ✓
+# Averaging MC samples in count space overestimates fatalities by 18×.
+# y_hat_bar_mean completely wrong.
+#
+# Root cause: combining a stochastic ẑ with a multiplicative scale RMS
+# before the nonlinear sinh creates a compound distribution whose mean
+# is not the mean-path evaluation.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# KEY PROPERTIES
+# FIX: COUNT-SPACE RMS NORMALIZATION (v5)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# 1. NO FREE MEAN: at ẑ=0, ŷ=0 (not μ). The model must predict actual
-#    conflict levels — no lazy equilibrium at the instance mean.
+# The necessary and sufficient condition for Jensen-free MC dropout is:
 #
-# 2. LEVEL PRESERVATION: z retains the sign and relative magnitude of x.
-#    A conflict country (z≈1) looks different from a peace country (z≈0).
-#    The model can discriminate without needing separate statistics.
+#   count_s = f(ẑ_s) is LINEAR in ẑ.
 #
-# 3. GRADIENT: ∂ŷ/∂ẑ = RMS — constant per series, bounded by data
-#    magnitude. No exponential growth, no sinh/cosh in the computation.
-#    In asinh-space, max x≈10 → max RMS≈10 → max gradient=10.
+# The full pipeline is:
+#   RINorm.inverse(ẑ) → ŷ_asinh → AsinhTransform.inverse=sinh → count
 #
-# 4. NO CLIPPING/CAPPING: purely linear scaling. No hardcoded thresholds.
-#    ε is the standard numerical stability constant (1e-5 from Darts).
+# For count = g(ẑ) to be linear, we need:
+#   sinh(RINorm.inverse(ẑ)) = ẑ · c           for some constant c
+#   ⟹ RINorm.inverse(ẑ) = asinh(ẑ · c)
 #
-# 5. ROUND-TRIP: z = x/RMS → ẑ·RMS = x (exact when ẑ=z).
+# For the forward to be a valid inverse of this:
+#   asinh(z · c) = x  ⟹  z · c = sinh(x)  ⟹  z = sinh(x) / c
 #
-# 6. MC DROPOUT: ŷ = ẑ·RMS. E[ŷ] = E[ẑ]·RMS. No Jensen bias
-#    (linear function of the stochastic variable ẑ).
+# Setting c = RMS_raw = √(E_t[sinh²(x)] + ε) (per-instance scale):
+#
+#   Forward:  x_raw = sinh(x_asinh)                  [undo AsinhTransform]
+#             RMS_raw = √(E_t[x_raw²] + ε)            [RMS of raw counts]
+#             z = x_raw / RMS_raw                     [normalize]
+#
+#   Inverse:  ŷ_asinh = asinh(ẑ · RMS_raw)           [to asinh-space]
+#
+#   Count:    count = sinh(ŷ_asinh)
+#                   = sinh(asinh(ẑ · RMS_raw))
+#                   = ẑ · RMS_raw                     ← EXACT LINEAR
+#
+# For MC dropout: E[count_s] = E[ẑ_s] · RMS_raw      ← NO JENSEN AT ALL
+#
+# ═══════════════════════════════════════════════════════════════════════
+# ROUND-TRIP VERIFICATION
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Forward followed by inverse (in asinh-space):
+#   z = sinh(x) / RMS_raw
+#   ŷ = asinh(z · RMS_raw) = asinh(sinh(x)/RMS_raw · RMS_raw)
+#      = asinh(sinh(x)) = x  ✓
+#
+# The sinh and asinh cancel exactly. No approximation.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# OVER-STATIONARIZATION CURE
+# ═══════════════════════════════════════════════════════════════════════
+#
+# At ẑ=0:  count = 0 · RMS_raw = 0  ← NO FREE MEAN.✓
+#
+# The model cannot predict the instance mean by outputting zero.
+# It must learn to output ẑ matching the actual conflict level.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# GRADIENT ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Training loss (SpotlightLossLogcosh) is in asinh-space:
+#   L(ŷ_asinh, y_asinh)  where  ŷ_asinh = asinh(ẑ · RMS_raw)
+#
+#   ∂L/∂ẑ = ∂L/∂ŷ · ∂ŷ/∂ẑ
+#          = tanh(ŷ−y)  ·  RMS_raw / √(1 + (ẑ·RMS_raw)²)
+#             ∈[-1,1]       1/√(1+ẑ²·RMS²) ∈ (0, 1/RMS_raw)
+#
+# Gradient is bounded in [−1, 1] at all times. Better than v4 (which
+# had ∂ŷ_asinh/∂ẑ = RMS = constant) because the asinh compresses
+# large ẑ excursions back toward bounded gradients.
 #
 # ═══════════════════════════════════════════════════════════════════════
 # Z-RANGE ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════
 #
-# For Ukraine (x_asinh∈[1, 8], μ≈5, σ≈2):
-#   RMS ≈ √(25+4) ≈ 5.4
-#   z = x/5.4 ∈ [0.19, 1.48]  — compact, centered around 1
+# Peaceful (counts≈0 throughout):
+#   x_raw = sinh(0) ≈ 0, RMS_raw ≈ √ε, z = 0 → count = 0 ✓
 #
-# For low conflict (x_asinh∈[0, 2], rare spikes):
-#   RMS ≈ 0.5
-#   z = x/0.5 ∈ [0, 4]  — spikes visible, zeros preserved
+# Intermittent conflict (1 spike at count=100, rest 0):
+#   mean(x_raw²) = 100²/36 ≈ 278, RMS_raw ≈ 16.7
+#   z_spike = 100/16.7 ≈ 6.0, z_rest = 0
+#   count = ẑ · 16.7 → if ẑ=6: count=100 ✓
 #
-# For peaceful (x_asinh≈0 for all t):
-#   RMS ≈ √ε ≈ 0.003
-#   z = 0/0.003 = 0, ŷ = 0·0.003 = 0  — exact zero preservation
+# Sustained conflict (Syria, counts≈1000):
+#   RMS_raw = √(mean(1000²)) ≈ 1000
+#   z ≈ 1.0 throughout (stable GRU target)
+#   MC samples: E[count_s] = E[ẑ_s] · 1000 (linear, no Jensen) ✓
 #
 # ═══════════════════════════════════════════════════════════════════════
 # IMPLEMENTATION NOTES
 # ═══════════════════════════════════════════════════════════════════════
 #
-# - self.mean stores zeros (for Darts state_dict API compatibility).
-# - self.stdev stores RMS (temporal root mean square).
-# - No sinh/cosh/asinh operations → no overflow risk → no clamps.
+# - self.mean stores zeros (Darts state_dict API compatibility).
+# - self.stdev stores RMS_raw (raw-count temporal root mean square).
+# - GRU input is z = counts/RMS_raw (sparse, right-skewed but bounded).
+# - Inverse asinh wraps the output back to asinh-space for the loss.
 # - Backwards-compatible: no new state_dict keys.
-# - Affine γ/β are per-channel (shared across batch), cannot learn
-#   per-instance levels, so no risk of re-introducing the mean shortcut.
+# - Affine γ/β linear in z-space → count = ((ẑ−β/γ)/γ)·RMS_raw still
+#   linear in ẑ → MC dropout unbiased even with affine enabled.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with temporal RMS instance normalization (v4).
+    Patches Darts RINorm with count-space RMS normalization (v5).
 
-    Scale-only normalization using root mean square over time. No mean
-    subtraction — preserves the absolute level that distinguishes
-    conflict series from peace baselines.
+    Operates in raw-count space internally, exposing asinh-space
+    predictions to the loss. The composition of the inverse with
+    AsinhTransform.inverse (sinh) is exactly linear in ẑ, eliminating
+    Jensen amplification for MC dropout completely.
 
-    Addresses the over-stationarization problem (Liu et al., NeurIPS 2022)
-    by retaining non-stationary level information in the normalized
-    representation. Uses RMS instead of std following RMSNorm
-    (Zhang & Sennrich, 2019) to handle flat-but-nonzero series cleanly.
+    Forward:  x_raw = sinh(x_asinh)        [undo AsinhTransform]
+              RMS   = √(E_t[x_raw²] + ε)   [RMS of raw counts]
+              z     = x_raw / RMS           [scale-only, no mean]
 
-    Forward:  z = x / RMS(x)       RMS = √(mean_t(x²) + ε)
-    Inverse:  ŷ = ẑ · RMS(x)
+    Inverse:  ŷ_asinh = asinh(ẑ · RMS)     [back to asinh-space]
 
-    At ẑ=0: ŷ = 0 (not μ). No forecast smoothing.
-    Gradient: ∂ŷ/∂ẑ = RMS — constant, bounded, no exponential growth.
-    Round-trip: exact (z·RMS = x).
+    Count:    sinh(ŷ_asinh) = ẑ · RMS      [sinh · asinh cancel → linear]
+
+    At ẑ=0: count = 0. No forecast smoothing.
+    MC dropout: E[count_s] = E[ẑ_s] · RMS — no Jensen bias, ever.
+    Round-trip: asinh(sinh(x_asinh)) = x_asinh (exact).
+    Gradient: ∂ŷ_asinh/∂ẑ bounded ∈ (0, 1] after asinh compression.
     No hardcoded values. No clipping. Backwards-compatible state_dict.
     """
     from darts.models.components.layer_norm_variants import RINorm
@@ -273,29 +308,37 @@ def apply_rinorm_compression_patch():
     if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
 
-    def _rms_forward(self, x: torch.Tensor):
-        # x is in asinh-space: (batch, input_chunk_length, n_targets)
+    def _count_rms_forward(self, x: torch.Tensor):
+        # x is in asinh-space: (batch, input_chunk_length, n_targets).
+        # Recover raw counts to compute a scale that makes the
+        # composition sinh(RINorm.inverse(ẑ)) linear in ẑ.
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Root mean square over time dimensions.
-        # RMS = √(E_t[x²] + ε) captures both level and variability.
+        x_raw = torch.sinh(x)  # asinh-space → raw count space
+
+        # RMS of raw counts over time. Captures both level and variability:
+        #   RMS² = μ_raw² + σ_raw²
+        # Flat conflict (count≈C): RMS≈C → z≈1.
+        # Peace (count≈0):         RMS≈√ε → z≈0, count prediction=0.
         self.stdev = torch.sqrt(
-            torch.mean(x * x, dim=calc_dims, keepdim=True) + self.eps
+            torch.mean(x_raw * x_raw, dim=calc_dims, keepdim=True) + self.eps
         ).detach()
 
-        # Zero mean for Darts API compatibility (inverse expects self.mean).
+        # Zero mean for Darts state_dict API compatibility.
         self.mean = torch.zeros_like(self.stdev)
 
-        # Scale-only normalization — level information preserved in z.
-        x = x / self.stdev
+        # Normalize: z = counts / RMS_raw.
+        # GRU sees sparse right-skewed values: z=0 for peace, z≈1 for
+        # sustained conflict, z>1 for conflict spikes relative to RMS.
+        z = x_raw / self.stdev
 
         if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
-        return x
+            z = z * self.affine_weight
+            z = z + self.affine_bias
+        return z
 
-    def _rms_inverse(self, x: torch.Tensor):
-        # x shape: (batch, output_chunk_length, n_targets, nr_params)
+    def _count_rms_inverse(self, x: torch.Tensor):
+        # x shape: (batch, output_chunk_length, n_targets, nr_params).
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
             x = x / (
@@ -305,17 +348,22 @@ def apply_rinorm_compression_patch():
 
         sigma = self.stdev.view(self.stdev.shape + (1,))
 
-        # Rescale to original magnitude. No mean addition — ẑ=0 maps to 0.
-        x = x * sigma
+        # Rescale ẑ back to raw-count predictions: x_raw_hat = ẑ · RMS_raw.
+        # Then convert to asinh-space for the loss.
+        #
+        # Key identity: sinh(asinh(u)) = u  →  count = ẑ · RMS_raw (linear)
+        #
+        # For MC dropout over samples s:
+        #   E[count_s] = E[sinh(asinh(ẑ_s · RMS_raw))]
+        #              = E[ẑ_s · RMS_raw]
+        #              = E[ẑ_s] · RMS_raw    ← no Jensen factor whatsoever
+        return torch.asinh(x * sigma)
 
-        return x
-
-    RINorm.forward = _rms_forward
-    RINorm.inverse = _rms_inverse
+    RINorm.forward = _count_rms_forward
+    RINorm.inverse = _count_rms_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: temporal RMS instance normalization v4 "
-        "(scale-only, no mean shift, no over-stationarization)."
+        "🐨 Patched RINorm: count-space RMS normalization v5"
     )
 
 

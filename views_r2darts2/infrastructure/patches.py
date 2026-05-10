@@ -206,7 +206,7 @@ def apply_nbeats_patch():
 # Forward:
 #   μ_asinh = mean(x, dim=time)              — asinh-space mean
 #   x_c = sinh(x − μ_asinh)                  — center in asinh, then to raw
-#   σ_c = MeanAD(x_c) × √(π/2)              — centered-raw MeanAD scale
+#   σ_c = std(x_c, dim=time)                 — centered-raw std
 #   z = asinh(x_c / σ_c)                     — normalize, compress
 #
 # Inverse:
@@ -243,25 +243,16 @@ def apply_nbeats_patch():
 #   Jensen factor for σ_ẑ≈0.3: exp(0.09/2)≈1.05× (negligible)
 #
 # ═══════════════════════════════════════════════════════════════════════
-# Z-RANGE ANALYSIS (with MeanAD-based σ_c)
-# ═══════════════════════════════════════════════════════════════════
+# Z-RANGE ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
 #
-# MeanAD linear influence bounds σ_c between std (quadratic, too large)
-# and MAD (zero for >50% identical values, too small).
-#
-#   | Window type              | std σ_c | MAD σ_c | MeanAD σ_c |
-#   |──────────────────────────|─────────|─────────|────────────|
-#   | Peaceful                 | ~0.5    | ~0.5    | ~0.5       |
-#   | 3 spikes / 36 months     | ~6      | ~0      | ~4         |
-#   | 1 spike / 36 months      | ~5.6    | ~0      | ~2.2       |
-#   | Syria (many high months) | ~34     | ~15     | ~20        |
-#   | Extreme (Ukraine peak)   | ~96-138 | ~15     | ~44        |
-#
-# z-range is bounded by n: worst case |z| ≤ asinh(n) ≈ 4.3 for n=36.
-# Gradient amplifier ∂ŷ/∂ẑ at ẑ=0 = σ_c: always within clip=50.
+# For Ukraine (μ_asinh≈5, σ_asinh≈4):
+#   x − μ ∈ [−5, +2], sinh(x−μ) ∈ [−74, +3.6]
+#   σ_c ≈ 20 (dominated by the positive tail)
+#   z = asinh(sinh(x−μ)/20) → z ∈ [−2.0, 0.18] (compact!)
 #
 # For peaceful (μ_asinh≈0.1):
-#   x − μ ≈ 0 for all t → z ≈ 0 (compact, no gradient contribution)
+#   x − μ ≈ 0 for all t → z ≈ 0 (even more compact)
 #
 # ═══════════════════════════════════════════════════════════════════════
 # ROUND-TRIP VERIFICATION
@@ -282,13 +273,11 @@ def apply_nbeats_patch():
 #
 # - No learnable parameters. Fully deterministic.
 # - No checkpoint compatibility issue (no new state_dict keys).
-# - self.mean stores μ_asinh. self.stdev stores σ_c (MeanAD-based scale).
+# - self.mean stores μ_asinh. self.stdev stores σ_c (centered-raw std).
 # - Inverse patches shape broadcasting for Darts' 4D output tensor.
-# - σ_c = mean(|x_c − mean(x_c)|) × √(π/2) computed from sinh(x − μ_asinh).
-#   Linear influence function (|x| not x²) bounds outlier contribution.
-#   Never collapses for zero-inflated data (unlike MAD/IQR which give 0
-#   when >50% of values are identical).
-#   Ref: Geary (1935), Pham-Gia & Hung (2001).
+# - σ_c is computed from sinh(x − μ_asinh), NOT from sinh(x).
+#   These differ enormously — std(sinh(x)) is dominated by the
+#   raw-space mean offset; std(sinh(x−μ)) reflects actual variability.
 # - eps=1e-5 prevents division by zero for all-zero series.
 
 
@@ -306,7 +295,6 @@ def apply_rinorm_compression_patch():
 
     At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
     Gradient: bounded ∈ [1, σ_c], no exponential explosion.
-    σ_c estimated via MeanAD (robust to zero-inflated spike data).
     Round-trip: exact (forward ∘ inverse = identity).
     Zero learnable parameters. Backwards-compatible state_dict.
     """
@@ -328,38 +316,12 @@ def apply_rinorm_compression_patch():
         # Center in asinh space, convert to raw
         x_centered_raw = torch.sinh(x - self.mean)
 
-        # Mean Absolute Deviation (MeanAD) scale estimator (Geary, 1935).
-        #
-        # Why not std (L2): quadratic influence function → one spike month
-        # at sinh(4.2)=33 contributes 33²=1089 to variance, inflating σ_c
-        # to 30–138. Gradient amplifier ∂ŷ/∂ẑ(0)=σ_c starves the optimizer
-        # (clip_val/grad_norm = 50/383 = 13% pass-through).
-        #
-        # Why not MAD (median of |x - median|): collapses for zero-inflated
-        # data. When >50% of months are peace (identical values), the median
-        # of absolute deviations = 0 → σ_c = eps → z-values explode to ±∞
-        # for non-zero months → training diverges catastrophically.
-        #
-        # MeanAD uses the mean (not median) as center point:
-        #   σ_c = mean(|x_c - mean(x_c)|) × √(π/2)
-        # The mean gets pulled toward spikes, so even in a 90%-zero window,
-        # every zero month has a positive deviation from the mean. Linear
-        # penalty (|x| not x²) bounds the influence of extreme months while
-        # still acknowledging them — outliers are signal, not noise.
-        #
-        # Properties:
-        #   - Never collapses: any nonzero x_c gives σ_c > 0
-        #   - Bounded influence: f(x) = sign(x-μ), versus std's f(x) = x²
-        #   - 87.6% Gaussian efficiency (vs MAD's 37%, std's 100%)
-        #   - √(π/2) ≈ 1.253: Gaussian consistency factor (Geary 1935)
-        #   - z-range bounded: |z| ≤ asinh(n) ≈ 4.3 for n=36 (worst case)
-        #   - Round-trip exact: σ_c cancels in forward∘inverse
-        xc_mean = torch.mean(x_centered_raw, dim=calc_dims, keepdim=True)
-        self.stdev = (
-            torch.mean(
-                torch.abs(x_centered_raw - xc_mean),
-                dim=calc_dims, keepdim=True,
-            ) * 1.2533141373155003  # √(π/2)
+        # Compute variance of the centered-raw signal
+        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
+        # These differ enormously — std(sinh(x)) is inflated by the
+        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
+        self.stdev = torch.sqrt(
+            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
@@ -383,9 +345,16 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
+        # Cap per-series sigma to 5× the batch-mean sigma.
+        # Prevents RevIN denorm from amplifying extreme-conflict series
+        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
+        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
+        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
+        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
+
         # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; MeanAD-based σ_c typically 2–44,
-        # sinh(50)*44≈1.1e23 << 3.4e38.
+        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
+        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
         x = torch.clamp(x, -50.0, 50.0)
 
         # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
@@ -400,7 +369,7 @@ def apply_rinorm_compression_patch():
     RINorm._raw_space_patched = True
     logger.info(
         "🐨 Patched RINorm: hybrid-space normalization v3 "
-        "(asinh centering + MeanAD raw-space σ, zero mean bias)."
+        "(asinh centering + raw-space σ, zero mean bias)."
     )
 
 

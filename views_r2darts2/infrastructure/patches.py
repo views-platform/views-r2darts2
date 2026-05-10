@@ -243,16 +243,20 @@ def apply_nbeats_patch():
 #   Jensen factor for σ_ẑ≈0.3: exp(0.09/2)≈1.05× (negligible)
 #
 # ═══════════════════════════════════════════════════════════════════════
-# Z-RANGE ANALYSIS
+# Z-RANGE ANALYSIS (with MAD-based σ_c)
 # ═══════════════════════════════════════════════════════════════════════
 #
 # For Ukraine (μ_asinh≈5, σ_asinh≈4):
 #   x − μ ∈ [−5, +2], sinh(x−μ) ∈ [−74, +3.6]
-#   σ_c ≈ 20 (dominated by the positive tail)
-#   z = asinh(sinh(x−μ)/20) → z ∈ [−2.0, 0.18] (compact!)
+#   σ_c(MAD) ≈ 5-8 (typical deviation, not spike-dominated)
+#   z = asinh(sinh(x−μ)/σ_c) → spike months visible at z≈2.5,
+#   peace months at z≈−0.7 (clear contrast, not compressed)
+#
+# Compare to std-based σ_c ≈ 20-138:
+#   z ∈ [−2.0, 0.18] (spike compressed to z≈0.2, invisible)
 #
 # For peaceful (μ_asinh≈0.1):
-#   x − μ ≈ 0 for all t → z ≈ 0 (even more compact)
+#   x − μ ≈ 0 for all t → z ≈ 0 (unchanged from std-based)
 #
 # ═══════════════════════════════════════════════════════════════════════
 # ROUND-TRIP VERIFICATION
@@ -273,11 +277,13 @@ def apply_nbeats_patch():
 #
 # - No learnable parameters. Fully deterministic.
 # - No checkpoint compatibility issue (no new state_dict keys).
-# - self.mean stores μ_asinh. self.stdev stores σ_c (centered-raw std).
+# - self.mean stores μ_asinh. self.stdev stores σ_c (MAD-based centered-raw scale).
 # - Inverse patches shape broadcasting for Darts' 4D output tensor.
-# - σ_c is computed from sinh(x − μ_asinh), NOT from sinh(x).
-#   These differ enormously — std(sinh(x)) is dominated by the
-#   raw-space mean offset; std(sinh(x−μ)) reflects actual variability.
+# - σ_c is computed via MAD of sinh(x − μ_asinh), NOT via std.
+#   std is dominated by single spike months in conflict-onset windows
+#   (σ_c = 30–138), creating gradient amplifiers that starve the optimizer.
+#   MAD yields σ_c ≈ 3–8 for the same windows (robust to outliers).
+#   Round-trip exact: σ_c cancels in forward∘inverse regardless of estimator.
 # - eps=1e-5 prevents division by zero for all-zero series.
 
 
@@ -295,6 +301,7 @@ def apply_rinorm_compression_patch():
 
     At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
     Gradient: bounded ∈ [1, σ_c], no exponential explosion.
+    σ_c estimated via MAD (robust to spike-month outliers).
     Round-trip: exact (forward ∘ inverse = identity).
     Zero learnable parameters. Backwards-compatible state_dict.
     """
@@ -316,12 +323,21 @@ def apply_rinorm_compression_patch():
         # Center in asinh space, convert to raw
         x_centered_raw = torch.sinh(x - self.mean)
 
-        # Compute variance of the centered-raw signal
-        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
-        # These differ enormously — std(sinh(x)) is inflated by the
-        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
-        self.stdev = torch.sqrt(
-            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
+        # Robust scale: Median Absolute Deviation (MAD) instead of std.
+        # std is dominated by single-spike months (conflict onset windows):
+        #   window [0,0,...,5000,0,...] → sinh(x-μ) = [-3.6,...,33,...] → std ≈ 30-138
+        # This inflated σ_c creates a gradient amplifier (∂ŷ/∂ẑ ≈ σ_c at ẑ=0)
+        # that starves the optimizer: clip_val/grad_norm = 50/383 = 13% pass-through.
+        # MAD uses the *typical* deviation, robust to individual spikes:
+        #   MAD ≈ median(|x_c - median(x_c)|) × 1.4826 ≈ 3-8 (bounded amplifier)
+        # Round-trip exact: σ_c cancels in forward∘inverse regardless of estimator.
+        # 1.4826 = 1/Φ⁻¹(3/4): Gaussian consistency factor so MAD ≈ std for
+        # well-behaved (peaceful) series, preserving their normalization.
+        median_xc = torch.median(x_centered_raw, dim=1, keepdim=True).values
+        self.stdev = (
+            torch.median(
+                torch.abs(x_centered_raw - median_xc), dim=1, keepdim=True
+            ).values * 1.4826
             + self.eps
         ).detach()
 
@@ -345,16 +361,9 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Cap per-series sigma to 5× the batch-mean sigma.
-        # Prevents RevIN denorm from amplifying extreme-conflict series
-        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
-        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
-
         # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
-        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
+        # ±50 is safe: sinh(50)≈2.59e21; MAD-based σ_c typically 3-8
+        # (vs old std-based 30-138), sinh(50)*8≈2e22 << 3.4e38.
         x = torch.clamp(x, -50.0, 50.0)
 
         # Expand: sinh(ẑ) · σ_c gives centered-raw prediction

@@ -75,18 +75,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
        compound steers *which cells matter*, DRO steers *how losses
        are aggregated* across the 90/10 peace/event split.
 
-    4. **Level anchor** — Hookean spring (MSE) on per-series mean error.
+    4. **Level anchor** — T-scaled log_cosh on per-series mean error.
 
-           L_level = T · mean_over_series[ (mean(ŷ) − mean(y))² ]
+           L_level = T · mean_over_series[ log_cosh(mean(ŷ) − mean(y)) ]
 
        The ONLY mechanism that can shift per-series means. Necessary
        because the shape loss (DC/AC decomposed) is structurally blind
        to level. T-scaling compensates for the 1/T chain-rule factor.
-       MSE provides a restoring force proportional to displacement
-       (Hooke's law): gradient = 2ē, always stronger than shape loss
-       (max gradient ≈ 2) for |ē| > 1. Self-regulating curriculum:
-       large |ē| → level dominates → calibrate means first;
-       small |ē| → gradient → 0 → shape takes over naturally.
+       Natural curriculum: large mean error early → level dominates →
+       calibrate means first. Small mean error later → shape takes over.
        Not DRO-weighted — operates on a fundamentally different
        aggregation dimension (per-series means, not per-cell losses).
 
@@ -286,29 +283,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: Hookean spring on per-series mean error ─────
+        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
-        #
-        # Hooke's law: F = −kx.  Restoring force proportional to displacement.
-        #
-        # log_cosh level anchor (previous) has gradient = tanh(ē), which
-        # saturates at ±1 for |ē| > 2.  This is a friction force — constant
-        # magnitude regardless of how far the mean drifts.  The shape loss
-        # (with DRO + compound weights) produces per-parameter gradients
-        # that are NOT DC-free, creating an unbounded driving force.
-        # A saturating restoring force cannot hold against an unbounded
-        # driving force → mean prediction climbs monotonically.
-        #
-        # MSE gradient = 2ē: a proper spring.  Proportional restoring force.
-        # At any displacement, the spring eventually dominates the driving
-        # force.  Self-regulating curriculum preserved:
-        #   ē ≈ 0: gradient → 0 → shape dominates (fine-tune patterns)
-        #   ē ≈ 1: gradient = 2 ≈ shape gradient (balanced)
-        #   ē > 2: gradient > shape max → level dominates (correct drift)
-        #
-        # T scaling: ∂L/∂ŷⱼ = T · 2ē · (1/T) = 2ē per cell.
-        loss_level = T * (e_mean.squeeze(1) ** 2).mean()
+        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
+        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
+        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
+        # large |ē| → saturated tanh → strong level signal;
+        # small |ē| → tanh ≈ ē → level fades, shape takes over.
+        # Uniform across series: preserves the shape:level gradient ratio
+        # identically for every series. Asymmetric per-series weighting
+        # would break this balance — event series would get disproportionate
+        # "find the mean" pressure vs "fix the shape" pressure.
+        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

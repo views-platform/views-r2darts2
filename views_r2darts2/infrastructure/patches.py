@@ -344,28 +344,37 @@ def apply_rinorm_compression_patch():
     if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
 
-    def _linear_forward(self, x: torch.Tensor):
+    def _raw_space_forward(self, x: torch.Tensor):
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Standard instance normalization in asinh space.
-        # σ_asinh ∈ [0.1, 4] for typical conflict data — no starvation.
-        # Compare to raw-space σ_c (5–140) which was the root cause of
-        # the clip_val/σ_c gradient starvation problem.
+        # Guard against any upstream numeric accident before sinh.
+        x = torch.clamp(x, -88.0, 88.0)
+
+        # Compute asinh-space mean (bias-free centering point)
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
+
+        # Center in asinh space, convert to raw
+        x_centered_raw = torch.sinh(x - self.mean)
+
+        # Compute variance of the centered-raw signal
+        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
+        # These differ enormously — std(sinh(x)) is inflated by the
+        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
-            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False)
+            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        x = (x - self.mean) / self.stdev
+        # Normalize by centered-raw std, compress back via asinh
+        x = torch.asinh(x_centered_raw / self.stdev)
 
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    def _linear_inverse(self, x: torch.Tensor):
+    def _raw_space_inverse(self, x: torch.Tensor):
         # x shape: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
@@ -377,20 +386,31 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Standard linear denormalization: ŷ = ẑ × σ + μ
-        # ∂ŷ/∂ẑ = σ everywhere. No sinh amplifier, no gradient attenuation.
-        # Any overshoot produces proportional (not exponential) error
-        # with full-strength correction signal back to the model.
-        x = x * sigma + mu
+        # Cap per-series sigma to 5× the batch-mean sigma.
+        # Prevents RevIN denorm from amplifying extreme-conflict series
+        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
+        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
+        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
+        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
+
+        # Clamp before sinh to prevent float32 overflow.
+        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
+        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
+        x = torch.clamp(x, -50.0, 50.0)
+
+        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
+        # Compress: asinh wraps it back into asinh-space
+        # Shift: + μ_asinh re-centers (additive, no amplification)
+        x = torch.asinh(torch.sinh(x) * sigma) + mu
 
         return x
 
-    RINorm.forward = _linear_forward
-    RINorm.inverse = _linear_inverse
+    RINorm.forward = _raw_space_forward
+    RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: standard linear normalization v4 "
-        "(asinh-space μ + σ, no sinh/asinh wrapping)."
+        "🐨 Patched RINorm: hybrid-space normalization v3 "
+        "(asinh centering + raw-space σ, zero mean bias)."
     )
 
 

@@ -75,18 +75,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
        compound steers *which cells matter*, DRO steers *how losses
        are aggregated* across the 90/10 peace/event split.
 
-    4. **Level anchor** — T-scaled MSE on per-series mean error.
+    4. **Level anchor** — T-scaled log_cosh on per-series mean error.
 
-           L_level = T · mean_over_series[ (mean(ŷ) − mean(y))² ]
+           L_level = T · mean_over_series[ log_cosh(mean(ŷ) − mean(y)) ]
 
        The ONLY mechanism that can shift per-series means. Necessary
        because the shape loss (DC/AC decomposed) is structurally blind
        to level. T-scaling compensates for the 1/T chain-rule factor.
-       MSE gradient = 2ē grows linearly with mean error — acts as a
-       proportional restoring force. log_cosh (previous) saturates at
-       gradient=1 for |ē|>2, which allowed the mean to drift when
-       shape loss (with DRO+compound weights ≈ 2×) drove parameter
-       updates that indirectly shifted means upward.
+       Natural curriculum: large mean error early → level dominates →
+       calibrate means first. Small mean error later → shape takes over.
        Not DRO-weighted — operates on a fundamentally different
        aggregation dimension (per-series means, not per-cell losses).
 
@@ -286,29 +283,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled MSE on per-series mean error ─────
+        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
-        #
-        # Why MSE, not log_cosh:
-        #   log_cosh gradient = tanh(ē), saturates at ±1 for |ē| > 2.
-        #   Once the mean error exceeds 2 in asinh space (≈ 3.6 raw counts),
-        #   the level anchor is at MAX corrective force — it CANNOT push
-        #   harder no matter how far the mean drifts. Meanwhile, shape loss
-        #   (with DRO + compound weights ≈ 2×) continues driving parameter
-        #   updates that indirectly shift means. Result: mean prediction
-        #   climbs monotonically because the restoring force has a ceiling.
-        #
-        #   MSE gradient = 2ē: grows linearly with mean error. Acts as a
-        #   spring — proportional restoring force that always dominates
-        #   shape loss for large mean errors. No saturation, no ceiling.
-        #   For small ē (<1): MSE ≈ ē² vs log_cosh ≈ ē²/2 — similar.
-        #   For large ē: MSE = ē² → gradient = 2ē → always > 1 = tanh(ē).
-        #
-        # T scaling: ∂L/∂ŷⱼ = T·2ē·(1/T) = 2ē per cell.
-        # At ē=1: gradient=2 (slightly above shape's per-cell ≈1).
-        # At ē=5: gradient=10 (5× shape's maximum — strong correction).
-        loss_level = T * (e_mean.squeeze(1) ** 2).mean()
+        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
+        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
+        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
+        # large |ē| → saturated tanh → strong level signal;
+        # small |ē| → tanh ≈ ē → level fades, shape takes over.
+        # Uniform across series: preserves the shape:level gradient ratio
+        # identically for every series. Asymmetric per-series weighting
+        # would break this balance — event series would get disproportionate
+        # "find the mean" pressure vs "fix the shape" pressure.
+        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

@@ -283,19 +283,38 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
-        # Only mechanism that can shift per-series means. Shape loss is
-        # structurally DC-blind. Not DRO-weighted — different dimension.
-        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
-        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
-        # large |ē| → saturated tanh → strong level signal;
-        # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        # Uniform across series: preserves the shape:level gradient ratio
-        # identically for every series. Asymmetric per-series weighting
-        # would break this balance — event series would get disproportionate
-        # "find the mean" pressure vs "fix the shape" pressure.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
+        # ── Level anchor: two-scale design ───────────────────────────
+        #
+        # Two failure modes require correction at different scales:
+        #
+        # 1. Per-series miscalibration (Syria too high, Finland too low):
+        #    → log_cosh per series. Gradient = tanh(ē_i) ∈ [-1,1].
+        #    Bounded: no single extreme series can destabilize training.
+        #
+        # 2. Systematic batch-wide drift (ALL series shift upward):
+        #    → MSE on the batch-mean error. Gradient = 2·ē_batch.
+        #    Proportional restoring force — Hooke's law.
+        #    Safe because ē_batch averages over B series in the batch:
+        #    individual outliers contribute 1/B ≈ 0.8%. By the law
+        #    of large numbers, outlier influence is negligible.
+        #    MSE on this scalar cannot destabilize training.
+        #
+        # Why log_cosh alone fails: tanh(ē) saturates at 1. The shape
+        # loss produces a persistent DC component in parameter gradients
+        # (shape is DC-free at the OUTPUT level, NOT at the PARAMETER
+        # level). When this DC leakage exceeds 1.0, the level anchor
+        # cannot push back → monotonic mean drift.
+        #
+        # Why MSE alone is dangerous: a single batch with Syria (ē=10)
+        # would produce gradient = 20, spiking the parameter update and
+        # destabilizing all other series. Bounded per-series term needed.
+        #
+        # T scaling preserved on both: compensates for 1/T chain-rule.
+        e_mean_squeezed = e_mean.squeeze(1)
+        loss_level_per_series = T * self._log_cosh(e_mean_squeezed).mean()
+        batch_mean_error = e_mean_squeezed.mean()
+        loss_level_calibration = T * batch_mean_error ** 2
+        loss_level = loss_level_per_series + loss_level_calibration
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

@@ -72,6 +72,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         static_cov_transform: Optional[str] = None,
         static_cov_stats: Optional[List[str]] = None,
         inject_static_covariates: bool = False,
+        use_cyclic_encoders: bool = False,
     ):
         """
         Converts the internal data subset into a Darts TimeSeries object.
@@ -116,7 +117,7 @@ class _ViewsDatasetDarts(_ViewsDataset):
         # Values already in [-1, 1]; no scaling needed.
         resolution = self._time_id.split("_")[0][0]  # "month_id" → "m", "week_id" → "w", etc.
         cyclic_encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
-        if cyclic_encoders is not None:
+        if use_cyclic_encoders and cyclic_encoders is not None:
             for enc_fn in cyclic_encoders:
                 col_name = enc_fn.__name__
                 df_reset[col_name] = enc_fn(df_reset.index).astype(np.float32)

@@ -198,6 +198,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 else None
             ),
             checkpoint_mode=active_config.get("checkpoint_mode", "best"),
+            use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
         )
         forecaster.train()
 
@@ -289,6 +290,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 if active_config.get("use_static_covariates", False)
                 else None
             ),
+            use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
         )
         forecaster.load_model(path=path_artifact)
 
@@ -421,6 +423,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 if active_config.get("use_static_covariates", False)
                 else None
             ),
+            use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
         )
         forecaster.load_model(path=path_artifact)
 

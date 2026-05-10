@@ -47,6 +47,7 @@ class DartsForecaster:
         random_state: int = None,
         static_covariate_stats: Optional[Dict[str, Any]] = None,
         checkpoint_mode: str = "best",
+        use_cyclic_encoders: bool = False,
     ):
         """
         Initializes the forecaster with dataset, model, partition information, and optional scalers.
@@ -127,6 +128,9 @@ class DartsForecaster:
             raise ValueError(f"checkpoint_mode must be 'best' or 'last', got {checkpoint_mode!r}")
         self._checkpoint_mode = checkpoint_mode
         logger.info(f"checkpoint_mode: {self._checkpoint_mode!r}")
+
+        self._use_cyclic_encoders = use_cyclic_encoders
+        logger.info(f"use_cyclic_encoders: {self._use_cyclic_encoders!r}")
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler
@@ -551,6 +555,7 @@ class DartsForecaster:
             static_cov_transform=self._static_cov_transform,
             static_cov_stats=self._static_cov_stats,
             inject_static_covariates=self._static_cov_inject,
+            use_cyclic_encoders=self._use_cyclic_encoders,
         )
 
         target_series, past_covariates = self._preprocess_timeseries(
@@ -738,6 +743,7 @@ class DartsForecaster:
             static_cov_transform=self._static_cov_transform,
             static_cov_stats=self._static_cov_stats,
             inject_static_covariates=self._static_cov_inject,
+            use_cyclic_encoders=self._use_cyclic_encoders,
         )
 
         # Get the input window for forecasting based on sequence_number

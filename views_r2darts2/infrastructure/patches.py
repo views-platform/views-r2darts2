@@ -255,85 +255,117 @@ def apply_nbeats_patch():
 #   x − μ ≈ 0 for all t → z ≈ 0 (even more compact)
 #
 # ═══════════════════════════════════════════════════════════════════════
-# ROUND-TRIP VERIFICATION
+# PROBLEM (v3: hybrid-space RevIN — FAILED)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Forward: z = asinh(sinh(x − μ) / σ_c)
-# Inverse: ŷ = asinh(sinh(z) · σ_c) + μ
+# The v3 inverse uses asinh(sinh(ẑ) · σ_c) which introduces fatal
+# gradient attenuation. The Jacobian:
 #
-# Compose: asinh(sinh(asinh(sinh(x−μ)/σ_c)) · σ_c) + μ
-#         = asinh((sinh(x−μ)/σ_c) · σ_c) + μ    [sinh(asinh(a)) = a]
-#         = asinh(sinh(x−μ)) + μ
-#         = (x − μ) + μ
-#         = x  ✓  (exact reconstruction)
+#   ∂ŷ/∂ẑ = σ_c · cosh(ẑ) / √(1 + (sinh(ẑ)·σ_c)²)
+#
+#   At ẑ=0: ∂ŷ/∂ẑ = σ_c     (strong correction signal)
+#   At ẑ=3: ∂ŷ/∂ẑ ≈ 1       (weak — model barely corrects)
+#   At ẑ=5: ∂ŷ/∂ẑ ≈ 1       (constant regardless of error magnitude)
+#
+# This creates a positive feedback loop:
+#   1. Model overfits training → ẑ drifts beyond training z-range
+#   2. sinh(ẑ) amplifies exponentially: ẑ=5, σ_c=30 → 4,400× raw
+#   3. Gradient through inverse ≈ 1 (attenuated) → can't correct
+#   4. Training keeps pushing ẑ further → val_loss climbs forever
+#
+# Observed: monotonically climbing val_loss, y_hat_bar reaching
+# 10,000× truth by epoch 12, across N-HiTS, BlockRNN, and TSMixer.
+#
+# Compare standard linear RevIN: ∂ŷ/∂ẑ = σ everywhere. Constant.
+# Overshoot at any ẑ produces proportional error with full correction.
+#
+# Second issue: raw-space σ_c (from sinh(x−μ)) ranges 5–140+. This
+# multiplies ALL model parameter gradients by σ_c at ẑ≈0, causing
+# the "gradient starvation" we attributed to clip_val / σ_c ratio.
+# Asinh-space σ is 0.5–4 — starvation disappears without clip changes.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# FIX: STANDARD LINEAR REVIN IN ASINH SPACE (v4)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Key realization: the v1 "problems" (Jensen amplification, sensitivity
+# explosion, asymmetric count-space errors) all occur AFTER sinh(ŷ)
+# converts asinh-space predictions to raw counts. But:
+#
+#   - The loss function operates entirely in asinh space
+#   - Gradients flow in asinh space
+#   - The model never sees count-space errors during training
+#
+# Therefore v1 pathologies don't affect training stability. They're
+# prediction-time concerns (MC dropout averaging in count space),
+# addressable as a post-hoc correction — not in RevIN.
+#
+# Standard linear RevIN in asinh space:
+#
+#   Forward:  z = (x − μ) / σ       where μ = mean(x), σ = std(x)
+#   Inverse:  ŷ = ẑ · σ + μ
+#
+# Properties:
+#   - At ẑ=0: ŷ = μ (bias-free, same as v3 ✓)
+#   - ∂ŷ/∂ẑ = σ (constant, ~0.5–4, no attenuation at any ẑ ✓)
+#   - Round-trip exact: inverse(forward(x)) = x ✓
+#   - No exponential amplifiers anywhere in the chain ✓
+#   - z-range bounded: max |z| ≈ 6 for single-spike windows ✓
+#   - σ_asinh ∈ [0.1, 4] — no gradient starvation without clip ✓
 #
 # ═══════════════════════════════════════════════════════════════════════
 # IMPLEMENTATION NOTES
 # ═══════════════════════════════════════════════════════════════════════
 #
-# - No learnable parameters. Fully deterministic.
-# - No checkpoint compatibility issue (no new state_dict keys).
-# - self.mean stores μ_asinh. self.stdev stores σ_c (centered-raw std).
+# - Functionally equivalent to standard Darts RINorm.
+# - self.mean stores μ_asinh. self.stdev stores σ_asinh.
 # - Inverse patches shape broadcasting for Darts' 4D output tensor.
-# - σ_c is computed from sinh(x − μ_asinh), NOT from sinh(x).
-#   These differ enormously — std(sinh(x)) is dominated by the
-#   raw-space mean offset; std(sinh(x−μ)) reflects actual variability.
 # - eps=1e-5 prevents division by zero for all-zero series.
+# - Affine parameters (learnable scale/bias) preserved from Darts.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with hybrid-space normalization (v3).
+    Patches Darts RINorm with standard linear normalization (v4).
 
-    Centers in asinh-space (zero mean bias), normalizes variance in
-    raw-space (bounded gradients). Eliminates both the gradient
-    explosion of standard RevIN AND the systematic positive bias of
-    pure raw-space RevIN.
+    Replaces hybrid sinh/asinh-wrapped normalization (v3), which caused
+    monotonically climbing val_loss due to gradient attenuation in the
+    inverse at large |ẑ| values.
 
-    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
-    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
+    Forward:  z = (x − μ) / σ        (standard RevIN in asinh space)
+    Inverse:  ŷ = ẑ · σ + μ
 
-    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
-    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
+    At ẑ=0: ŷ = μ exactly. No Jensen bias.
+    Gradient: ∂ŷ/∂ẑ = σ everywhere. No attenuation. No feedback loop.
     Round-trip: exact (forward ∘ inverse = identity).
-    Zero learnable parameters. Backwards-compatible state_dict.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
     if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
 
-    def _raw_space_forward(self, x: torch.Tensor):
+    def _linear_forward(self, x: torch.Tensor):
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Guard against any upstream numeric accident before sinh.
-        x = torch.clamp(x, -88.0, 88.0)
-
-        # Compute asinh-space mean (bias-free centering point)
+        # Standard instance normalization in asinh space.
+        # σ_asinh ∈ [0.1, 4] for typical conflict data — no starvation.
+        # Compare to raw-space σ_c (5–140) which was the root cause of
+        # the clip_val/σ_c gradient starvation problem.
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-
-        # Center in asinh space, convert to raw
-        x_centered_raw = torch.sinh(x - self.mean)
-
-        # Compute variance of the centered-raw signal
-        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
-        # These differ enormously — std(sinh(x)) is inflated by the
-        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
-            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
+            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        # Normalize by centered-raw std, compress back via asinh
-        x = torch.asinh(x_centered_raw / self.stdev)
+        x = (x - self.mean) / self.stdev
 
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    def _raw_space_inverse(self, x: torch.Tensor):
+    def _linear_inverse(self, x: torch.Tensor):
         # x shape: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
@@ -345,31 +377,20 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Cap per-series sigma to 5× the batch-mean sigma.
-        # Prevents RevIN denorm from amplifying extreme-conflict series
-        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
-        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
-
-        # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
-        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
-        x = torch.clamp(x, -50.0, 50.0)
-
-        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
-        # Compress: asinh wraps it back into asinh-space
-        # Shift: + μ_asinh re-centers (additive, no amplification)
-        x = torch.asinh(torch.sinh(x) * sigma) + mu
+        # Standard linear denormalization: ŷ = ẑ × σ + μ
+        # ∂ŷ/∂ẑ = σ everywhere. No sinh amplifier, no gradient attenuation.
+        # Any overshoot produces proportional (not exponential) error
+        # with full-strength correction signal back to the model.
+        x = x * sigma + mu
 
         return x
 
-    RINorm.forward = _raw_space_forward
-    RINorm.inverse = _raw_space_inverse
+    RINorm.forward = _linear_forward
+    RINorm.inverse = _linear_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3 "
-        "(asinh centering + raw-space σ, zero mean bias)."
+        "🐨 Patched RINorm: standard linear normalization v4 "
+        "(asinh-space μ + σ, no sinh/asinh wrapping)."
     )
 
 

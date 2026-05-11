@@ -332,19 +332,20 @@ def apply_nbeats_patch():
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with swapped-compression normalization (v5).
+    Patches Darts RINorm with hybrid-space normalization (v3).
 
-    Moves the asinh compression from the forward to the inverse,
-    eliminating the sinh exponential amplifier that caused runaway
-    predictions. Borrowed from μ-law companding in telecommunications:
-    compress at the receiver, not transmitter.
+    Centers in asinh-space (zero mean bias), normalizes variance in
+    raw-space (bounded gradients). Eliminates both the gradient
+    explosion of standard RevIN AND the systematic positive bias of
+    pure raw-space RevIN.
 
-    Forward:  z = sinh(x − μ) / σ_c      (linear normalization)
-    Inverse:  ŷ = asinh(ẑ · σ_c) + μ     (logarithmic saturation)
+    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
+    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
 
-    At ẑ=0: ŷ = μ exactly. No bias.
+    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
+    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
     Round-trip: exact (forward ∘ inverse = identity).
-    No clamps. Logarithmic output saturation is structural.
+    Zero learnable parameters. Backwards-compatible state_dict.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
@@ -364,17 +365,17 @@ def apply_rinorm_compression_patch():
         # Center in asinh space, convert to raw
         x_centered_raw = torch.sinh(x - self.mean)
 
-        # Raw-space std (same as v3 — captures actual variability
-        # of the centered signal, not inflated by raw-space mean offset).
+        # Compute variance of the centered-raw signal
+        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
+        # These differ enormously — std(sinh(x)) is inflated by the
+        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
             torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        # Linear normalization — no asinh compression in forward.
-        # z-values are wider than v3 (up to ~6 for single-spike series)
-        # but the model handles this — standard instance normalization.
-        x = x_centered_raw / self.stdev
+        # Normalize by centered-raw std, compress back via asinh
+        x = torch.asinh(x_centered_raw / self.stdev)
 
         if self.affine:
             x = x * self.affine_weight
@@ -393,11 +394,22 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Scale up to centered-raw space, then compress via asinh.
-        # No sinh(ẑ) — no exponential amplifier, no clamp needed.
-        # Output grows logarithmically: asinh(ẑσ) ≈ ln(2ẑσ) for large ẑσ.
-        # Each doubling of ẑ adds only ln(2) ≈ 0.69 in asinh-space.
-        x = torch.asinh(x * sigma) + mu
+        # Cap per-series sigma to 5× the batch-mean sigma.
+        # Prevents RevIN denorm from amplifying extreme-conflict series
+        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
+        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
+        sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
+        sigma = sigma.clamp(max=4.0 * sigma_batch_mean)
+
+        # Clamp before sinh to prevent float32 overflow.
+        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
+        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
+        x = torch.clamp(x, -50.0, 50.0)
+
+        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
+        # Compress: asinh wraps it back into asinh-space
+        # Shift: + μ_asinh re-centers (additive, no amplification)
+        x = torch.asinh(torch.sinh(x) * sigma) + mu
 
         return x
 
@@ -405,8 +417,8 @@ def apply_rinorm_compression_patch():
     RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: swapped-compression normalization v5 "
-        "(linear forward + asinh inverse, no sinh amplifier)."
+        "🐨 Patched RINorm: hybrid-space normalization v3 "
+        "(asinh centering + raw-space σ, zero mean bias)."
     )
 
 

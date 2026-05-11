@@ -332,18 +332,18 @@ def apply_nbeats_patch():
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with hybrid-space normalization (v3).
+    Patches Darts RINorm with swapped-compression hybrid normalization (v5).
 
     Centers in asinh-space (zero mean bias), normalizes variance in
-    raw-space (bounded gradients). Eliminates both the gradient
-    explosion of standard RevIN AND the systematic positive bias of
-    pure raw-space RevIN.
+    centered-raw space, and puts compression on the receiver side
+    (inverse). This removes the sinh(z_hat) exponential amplifier
+    without any clipping.
 
-    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
-    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
+    Forward:  z = sinh(x − μ_asinh) / σ_c
+    Inverse:  ŷ = asinh(ẑ · σ_c) + μ_asinh
 
     At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
-    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
+    Gradient: σ_c / sqrt(1 + (ẑ·σ_c)^2) (bounded, diminishing).
     Round-trip: exact (forward ∘ inverse = identity).
     Zero learnable parameters. Backwards-compatible state_dict.
     """
@@ -355,9 +355,6 @@ def apply_rinorm_compression_patch():
     def _raw_space_forward(self, x: torch.Tensor):
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
-
-        # Guard against any upstream numeric accident before sinh.
-        x = torch.clamp(x, -88.0, 88.0)
 
         # Compute asinh-space mean (bias-free centering point)
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
@@ -374,8 +371,8 @@ def apply_rinorm_compression_patch():
             + self.eps
         ).detach()
 
-        # Normalize by centered-raw std, compress back via asinh
-        x = torch.asinh(x_centered_raw / self.stdev)
+        # Normalize by centered-raw std (linear z-space)
+        x = x_centered_raw / self.stdev
 
         if self.affine:
             x = x * self.affine_weight
@@ -394,20 +391,9 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Cap per-series sigma to 5× the batch-mean sigma.
-        # Prevents RevIN denorm from amplifying extreme-conflict series
-        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
-        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
-
-
-        x = torch.clamp(x, -4.0, 4.0)
-
-        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
-        # Compress: asinh wraps it back into asinh-space
-        # Shift: + μ_asinh re-centers (additive, no amplification)
-        x = torch.asinh(torch.sinh(x) * sigma) + mu
+        # Receiver-side compression: asinh(ẑ·σ_c) + μ_asinh
+        # No sinh(ẑ) term -> no exponential z-extrapolation amplifier.
+        x = torch.asinh(x * sigma) + mu
 
         return x
 
@@ -415,7 +401,7 @@ def apply_rinorm_compression_patch():
     RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3 "
+        "🐨 Patched RINorm: swapped-compression hybrid normalization v5 (no clamps)"
 
     )
 

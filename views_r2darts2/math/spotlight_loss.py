@@ -343,15 +343,15 @@ class SpotlightLoss(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
+        # ── Level anchor: T-scaled Barron(1.5) on per-series mean error ──
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
-        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
-        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
-        # large |ē| → saturated tanh → strong level signal;
-        # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
+        # T scaling: ∂L/∂ŷⱼ = T · ρ'(ē) · (1/T) = ρ'(ē) per cell.
+        # Barron replaces log_cosh: gradient grows as √|ē| instead of
+        # saturating at ±1. At ē=5 (Syria-level offset): Barron gives
+        # 1.87 vs log_cosh's saturated 1.0 — 87% more restoring force.
+        # No saturation → level correction scales with actual bias magnitude.
+        loss_level = T * self._soft_power(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

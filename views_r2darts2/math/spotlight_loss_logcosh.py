@@ -240,37 +240,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Base cell loss: log_cosh on demeaned error ────────────────
         cell_loss = self._log_cosh(e_shape)
 
-        # ── Adaptive compound weighting (continuous magnitude-aware) ───
-        # difficulty  = 1 − exp(−|e_shape|)           ∈ [0, 1)
-        # importance  = 1 + log1p(|y_true|)           ∈ [1, ∞)
-        # w_compound  = 1 + difficulty × importance   ∈ [1, 2+)
-        #
-        # Replaces binary event = 𝟙(|y| > threshold). Binary weighting
-        # treats 1-death and 1000-death events identically; log1p-importance
-        # scales proportionally, aligning compound weight with MSLE's
-        # log-error structure.
-        #
-        # The +1 floor on importance ensures balanced treatment of over-
-        # and underprediction. Without it, peace cells (|y|≈0) get
-        # importance=0 → w=1 regardless of error, meaning overprediction
-        # on peace is invisible to the shape loss. With the floor:
-        #   peace overprediction:   w = 1 + difficulty × 1.0  → up to 2.0
-        #   conflict underprediction: w = 1 + difficulty × 2.8 → up to 3.4
-        # Ratio ≈ 1.8× (conflict still prioritised for MSLE) vs ∞ without floor.
-        #
-        # Truth-anchored (abs_y only, not max(abs_y, abs_pred)):
-        # Using abs_pred would inflate weights for peace series being
-        # overpredicted, distorting the normalization denominator (90% peace
-        # cells in batch) and suppressing conflict cell weights.
-        #
-        # self.non_zero_threshold is still used in _spectral_loss to
-        # filter which series receive spectral regularization.
+        # ── Adaptive compound weighting (dynamic, self-correcting) ─────
+        # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
+        # event = 𝟙(|y| > threshold) : binary, all events equal
+        # w_compound = 1 + difficulty × event ∈ [1, 2)
+        # Self-correcting: as |e|→0, w→1 regardless of |y|.
+        # Binary event indicator: 1-death and 100-death events get the
+        # same importance — only difficulty differentiates within events.
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        importance = 1.0 + torch.log1p(abs_y)
-        w_compound = 1.0 + difficulty * importance
+        event = (abs_y > self.non_zero_threshold).float()
+        w_compound = 1.0 + difficulty * event
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
         # Z-score log(cell_loss) for proportional outlier detection.

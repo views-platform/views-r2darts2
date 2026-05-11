@@ -394,12 +394,10 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Cap per-series sigma to 5× the batch-mean sigma.
-        # Prevents RevIN denorm from amplifying extreme-conflict series
-        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
-        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        sigma = sigma.clamp(max=4.0 * sigma_batch_mean)
+        sigma_cap = torch.quantile(
+            sigma.float(), 0.999, dim=0, keepdim=True
+        ).to(sigma.dtype)
+        sigma = sigma.clamp(max=sigma_cap)
 
         # Clamp before sinh to prevent float32 overflow.
         # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000

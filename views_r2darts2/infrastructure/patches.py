@@ -401,10 +401,8 @@ def apply_rinorm_compression_patch():
         sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
         sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
 
-        # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
-        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
-        x = torch.clamp(x, -50.0, 50.0)
+
+        x = torch.clamp(x, -4.0, 4.0)
 
         # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
         # Compress: asinh wraps it back into asinh-space

@@ -324,7 +324,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         series_mag = y_true.abs().mean(dim=1)
         level_weights = 1.0 + torch.log1p(series_mag)
         level_weights = level_weights / level_weights.mean().clamp(min=1e-8)
-        loss_level = T * (level_weights * self._log_cosh(e_mean.squeeze(1))).mean()
+        # MSE on the level anchor (not log_cosh): log_cosh saturates at tanh(ē)≈1
+        # for large mean errors, giving the same gradient whether the model is 2×
+        # or 10× wrong. MSE gradient = w·ē grows linearly with the mean error,
+        # providing proportional pull-back against the learned high-conflict mapping.
+        loss_level = T * (level_weights * (0.5 * e_mean.squeeze(1) ** 2)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

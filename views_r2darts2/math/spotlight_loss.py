@@ -299,32 +299,32 @@ class SpotlightLoss(torch.nn.Module):
         # ── Base cell loss: Barron(1.5) on demeaned error ─────────────
         cell_loss = self._soft_power(e_shape)
 
-        # ── Adaptive compound weighting ───────────────────────────────
+        # ── Adaptive compound weighting (dynamic, self-correcting) ─────
         # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
-        # importance = 1 − exp(−mag) : how consequential
-        # w_compound = 1 + difficulty × importance ∈ [1, 2)
+        # event = 𝟙(|y| > threshold) : binary, all events equal
+        # w_compound = 1 + difficulty × event ∈ [1, 2)
+        # Self-correcting: as |e|→0, w→1 regardless of |y|.
+        # Binary event indicator: 1-death and 100-death events get the
+        # same importance — only difficulty differentiates within events.
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
-        abs_y_hat = torch.abs(y_pred.detach())
-        # magnitude = torch.max(abs_y, abs_y_hat)
-        magnitude = torch.max(abs_y)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        importance = 1.0 - torch.exp(-magnitude)
-        w_compound = 1.0 + difficulty * importance
+        event = (abs_y > self.non_zero_threshold).float()
+        w_compound = 1.0 + difficulty * event
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
-        # Z-score log(|e_shape|) for proportional outlier detection.
-        # Previous: z-scored log(cell_loss) — but Barron(1.5) compresses
-        # differently near zero (~x²) vs tails (~|x|^1.5), distorting
-        # proportional comparisons in log-space. Using |e_shape| directly
-        # gives undistorted log-space z-scores: DRO identifies true tail
-        # cells independent of the loss function's curvature.
-        error_flat = torch.abs(e_shape).detach().flatten()
-        log_loss = torch.log(error_flat + 1e-8)
+        # Z-score log(cell_loss) for proportional outlier detection.
+        # Operates on raw cell_loss (before compound weighting).
+        # Flattened cross-series: event cells dominate the tail.
+        loss_flat = cell_loss.detach().flatten()
+        log_loss = torch.log(loss_flat + 1e-8)
         log_std = log_loss.std()
 
-        dro_alpha = log_std / (log_std + 1.0)
+        # CV-based alpha: self-normalizing, naturally bounded.
+        # CV=2→α≈0.52, CV=5→α≈0.64, CV=10→α≈0.71. Cannot saturate to 1.
+        log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
+        dro_alpha = log_cv / (log_cv + 1.0)
         # Clamp at 0.1, not 1e-8: std<0.1 means losses span <1.1×,
         # too little variation for meaningful z-scores. At 1e-8, z can
         # reach 1e8 → log1p(1e8) ≈ 18.4 → NaN after normalisation × 0.

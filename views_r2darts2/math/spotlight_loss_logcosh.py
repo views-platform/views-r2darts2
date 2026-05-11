@@ -241,20 +241,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         cell_loss = self._log_cosh(e_shape)
 
         # ── Adaptive compound weighting (continuous magnitude-aware) ───
-        # difficulty  = 1 − exp(−|e_shape|)         ∈ [0, 1)
-        # importance  = log1p(max(|y|, |ŷ_sg|))     ∈ [0, ∞)
-        # w_compound  = 1 + difficulty × importance  ∈ [1, ∞)
+        # difficulty  = 1 − exp(−|e_shape|)       ∈ [0, 1)
+        # importance  = log1p(|y_true|)            ∈ [0, ∞)
+        # w_compound  = 1 + difficulty × importance ∈ [1, ∞)
         #
         # Replaces binary event = 𝟙(|y| > threshold). Binary weighting
         # treats 1-death and 1000-death events identically; log1p-importance
         # scales proportionally, aligning compound weight with MSLE's
-        # log-error structure. log1p(magnitude) matches the log-space
+        # log-error structure. log1p(|y_true|) matches the log-space
         # gradient sensitivity of MSLE: where MSLE cares more, so do we.
         #
-        # max(|y|, |ŷ|) covers both directions of miscalibration:
-        #   underprediction (|y| large, |ŷ| small): truth drives importance
-        #   overprediction (|ŷ| large, |y| small): prediction drives importance
-        # Both are correctly penalized at the target's magnitude scale.
+        # Truth-anchored (abs_y only, not max(abs_y, abs_pred)):
+        # MSLE importance is defined by the target scale. Using abs_pred
+        # would inflate weights for peace series being overpredicted, which
+        # distorts the normalization denominator (90% peace cells in batch)
+        # and suppresses conflict cell weights — exactly backwards. Level
+        # anchor handles overprediction correction; shape weight handles scale.
         #
         # self.non_zero_threshold is still used in _spectral_loss to
         # filter which series receive spectral regularization.
@@ -262,7 +264,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_y = torch.abs(y_true)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        importance = torch.log1p(torch.max(abs_y, torch.abs(y_pred.detach())))
+        # importance = log1p(|y_true|): truth-anchored log-magnitude weighting.
+        # Uses only abs_y, NOT abs_pred. Rationale:
+        #   - MSLE cares about (log(ŷ+1) − log(y+1))² — the target scale defines
+        #     proportional importance, not the prediction scale.
+        #   - Using max(abs_y, abs_pred) distorts normalization during overprediction
+        #     phases: elevated abs_pred on peace series (y_true≈0) inflates the
+        #     denominator of w_total/mean(w_total), suppressing conflict cell weights.
+        #   - Overprediction of peace series is already handled by the level anchor;
+        #     the shape weight should only scale with what we know is true.
+        importance = torch.log1p(abs_y)
         w_compound = 1.0 + difficulty * importance
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────

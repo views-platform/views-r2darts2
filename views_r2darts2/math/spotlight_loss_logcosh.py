@@ -240,19 +240,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Base cell loss: log_cosh on demeaned error ────────────────
         cell_loss = self._log_cosh(e_shape)
 
-        # ── Adaptive compound weighting (dynamic, self-correcting) ─────
-        # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
-        # event = 𝟙(|y| > threshold) : binary, all events equal
-        # w_compound = 1 + difficulty × event ∈ [1, 2)
-        # Self-correcting: as |e|→0, w→1 regardless of |y|.
-        # Binary event indicator: 1-death and 100-death events get the
-        # same importance — only difficulty differentiates within events.
+        # ── Adaptive compound weighting (continuous magnitude-aware) ───
+        # difficulty  = 1 − exp(−|e_shape|)         ∈ [0, 1)
+        # importance  = log1p(max(|y|, |ŷ_sg|))     ∈ [0, ∞)
+        # w_compound  = 1 + difficulty × importance  ∈ [1, ∞)
+        #
+        # Replaces binary event = 𝟙(|y| > threshold). Binary weighting
+        # treats 1-death and 1000-death events identically; log1p-importance
+        # scales proportionally, aligning compound weight with MSLE's
+        # log-error structure. log1p(magnitude) matches the log-space
+        # gradient sensitivity of MSLE: where MSLE cares more, so do we.
+        #
+        # max(|y|, |ŷ|) covers both directions of miscalibration:
+        #   underprediction (|y| large, |ŷ| small): truth drives importance
+        #   overprediction (|ŷ| large, |y| small): prediction drives importance
+        # Both are correctly penalized at the target's magnitude scale.
+        #
+        # self.non_zero_threshold is still used in _spectral_loss to
+        # filter which series receive spectral regularization.
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        event = (abs_y > self.non_zero_threshold).float()
-        w_compound = 1.0 + difficulty * event
+        importance = torch.log1p(torch.max(abs_y, torch.abs(y_pred.detach())))
+        w_compound = 1.0 + difficulty * importance
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
         # Z-score log(cell_loss) for proportional outlier detection.

@@ -241,22 +241,27 @@ class SpotlightLossLogcosh(torch.nn.Module):
         cell_loss = self._log_cosh(e_shape)
 
         # ── Adaptive compound weighting (continuous magnitude-aware) ───
-        # difficulty  = 1 − exp(−|e_shape|)       ∈ [0, 1)
-        # importance  = log1p(|y_true|)            ∈ [0, ∞)
-        # w_compound  = 1 + difficulty × importance ∈ [1, ∞)
+        # difficulty  = 1 − exp(−|e_shape|)           ∈ [0, 1)
+        # importance  = 1 + log1p(|y_true|)           ∈ [1, ∞)
+        # w_compound  = 1 + difficulty × importance   ∈ [1, 2+)
         #
         # Replaces binary event = 𝟙(|y| > threshold). Binary weighting
         # treats 1-death and 1000-death events identically; log1p-importance
         # scales proportionally, aligning compound weight with MSLE's
-        # log-error structure. log1p(|y_true|) matches the log-space
-        # gradient sensitivity of MSLE: where MSLE cares more, so do we.
+        # log-error structure.
+        #
+        # The +1 floor on importance ensures balanced treatment of over-
+        # and underprediction. Without it, peace cells (|y|≈0) get
+        # importance=0 → w=1 regardless of error, meaning overprediction
+        # on peace is invisible to the shape loss. With the floor:
+        #   peace overprediction:   w = 1 + difficulty × 1.0  → up to 2.0
+        #   conflict underprediction: w = 1 + difficulty × 2.8 → up to 3.4
+        # Ratio ≈ 1.8× (conflict still prioritised for MSLE) vs ∞ without floor.
         #
         # Truth-anchored (abs_y only, not max(abs_y, abs_pred)):
-        # MSLE importance is defined by the target scale. Using abs_pred
-        # would inflate weights for peace series being overpredicted, which
-        # distorts the normalization denominator (90% peace cells in batch)
-        # and suppresses conflict cell weights — exactly backwards. Level
-        # anchor handles overprediction correction; shape weight handles scale.
+        # Using abs_pred would inflate weights for peace series being
+        # overpredicted, distorting the normalization denominator (90% peace
+        # cells in batch) and suppressing conflict cell weights.
         #
         # self.non_zero_threshold is still used in _spectral_loss to
         # filter which series receive spectral regularization.
@@ -264,16 +269,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_y = torch.abs(y_true)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        # importance = log1p(|y_true|): truth-anchored log-magnitude weighting.
-        # Uses only abs_y, NOT abs_pred. Rationale:
-        #   - MSLE cares about (log(ŷ+1) − log(y+1))² — the target scale defines
-        #     proportional importance, not the prediction scale.
-        #   - Using max(abs_y, abs_pred) distorts normalization during overprediction
-        #     phases: elevated abs_pred on peace series (y_true≈0) inflates the
-        #     denominator of w_total/mean(w_total), suppressing conflict cell weights.
-        #   - Overprediction of peace series is already handled by the level anchor;
-        #     the shape weight should only scale with what we know is true.
-        importance = torch.log1p(abs_y)
+        importance = 1.0 + torch.log1p(abs_y)
         w_compound = 1.0 + difficulty * importance
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
@@ -309,15 +305,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
         # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
-        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
-        # large |ē| → saturated tanh → strong level signal;
-        # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        # Uniform across series: preserves the shape:level gradient ratio
-        # identically for every series. Asymmetric per-series weighting
-        # would break this balance — event series would get disproportionate
-        # "find the mean" pressure vs "fix the shape" pressure.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
+        #
+        # ── Magnitude-aware level weighting ──────────────────────────
+        # level_weight = 1 + log1p(mean|y|), normalised to mean=1.
+        # MSLE penalty from level error scales with log(y+1): a 1-unit
+        # mean error on Syria (μ≈200) contributes more to MSLE than the
+        # same error on a 5-death series. Weights direct level correction
+        # budget proportionally.
+        #
+        # Floor of 1.0: ensures peace series (mean|y|≈0 → weight=1.0) still
+        # receive full baseline level correction. Without the floor, peace
+        # overprediction would be invisible to the level anchor — the only
+        # mechanism that can correct it. Conflict series get up to ~2.8×
+        # more correction (Syria), matching MSLE's log-sensitivity ratio.
+        #
+        # Normalised to mean=1: keeps loss_level scale stable across batches
+        # regardless of the conflict/peace series mix.
+        series_mag = y_true.abs().mean(dim=1)
+        level_weights = 1.0 + torch.log1p(series_mag)
+        level_weights = level_weights / level_weights.mean().clamp(min=1e-8)
+        loss_level = T * (level_weights * self._log_cosh(e_mean.squeeze(1))).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

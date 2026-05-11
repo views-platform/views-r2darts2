@@ -176,35 +176,35 @@ def apply_nbeats_patch():
 # no convex function to act on — amplification is structurally dead.
 #
 # Forward:
-#   M = mean(sinh(x))                         — raw-space mean
+#   μ = mean(x)                               — asinh-space mean
 #   S = std(sinh(x))                          — raw-space std
-#   z = (sinh(x) - M) / S                     — standard normalization
+#   z = (sinh(x) − sinh(μ)) / S               — standard normalization
 #
 # Inverse:
-#   ŷ_asinh = asinh(ẑ · S + M)                — affine denorm in asinh
+#   ŷ_asinh = asinh(ẑ · S + sinh(μ))           — affine denorm in asinh
 #
 # ═══════════════════════════════════════════════════════════════════════
 # WHY JENSEN'S IS STRUCTURALLY DEAD
 # ═══════════════════════════════════════════════════════════════════════
 #
 # The raw-space prediction is:
-#   ŷ_raw = sinh(ŷ_asinh) = sinh(asinh(ẑ·S + M)) = ẑ·S + M
+#   ŷ_raw = sinh(ŷ_asinh) = sinh(asinh(ẑ·S + sinh(μ))) = ẑ·S + sinh(μ)
 #
-# E[ŷ_raw] = E[ẑ]·S + M — PURELY LINEAR. No convex function wrapping
-# ẑ, so Jensen's inequality has nothing to amplify. This holds for MC
-# dropout, ensembles, or any stochastic ẑ.
+# E[ŷ_raw] = E[ẑ]·S + sinh(μ) — PURELY LINEAR. No convex function
+# wrapping ẑ, so Jensen's inequality has nothing to amplify. This
+# holds for MC dropout, ensembles, or any stochastic ẑ.
 #
 # Compare v1: sinh(ẑ·σ+μ) — sinh is convex → systematic inflation.
 # Compare v3: sinh(asinh(sinh(ẑ)·σ)+μ) — residual nonlinearity.
-# v7: sinh(asinh(ẑ·S+M)) = ẑ·S+M — identity cancellation.
+# v7: sinh(asinh(ẑ·S+sinh(μ))) = ẑ·S+sinh(μ) — identity cancellation.
 #
 # ═══════════════════════════════════════════════════════════════════════
 # GRADIENT PROPERTIES
 # ═══════════════════════════════════════════════════════════════════════
 #
-# ∂ŷ_asinh/∂ẑ = S / √(1 + (ẑ·S + M)²)
+# ∂ŷ_asinh/∂ẑ = S / √(1 + (ẑ·S + sinh(μ))²)
 #
-# At ẑ=0: S/√(1+M²) — moderate, M-dependent.
+# At ẑ=0: S/√(1+sinh(μ)²) = S/cosh(μ) — moderate, μ-dependent.
 # At ẑ→±∞: → 0 — model's gradient VANISHES for extreme predictions.
 # No clamp needed. The asinh's derivative is the structural limiter.
 #
@@ -212,23 +212,19 @@ def apply_nbeats_patch():
 # ROUND-TRIP PROOF
 # ═══════════════════════════════════════════════════════════════════════
 #
-# inverse(forward(x)) = asinh(((sinh(x)-M)/S)·S + M)
-#                      = asinh(sinh(x) - M + M)
+# inverse(forward(x)) = asinh(((sinh(x)-sinh(μ))/S)·S + sinh(μ))
+#                      = asinh(sinh(x) - sinh(μ) + sinh(μ))
 #                      = asinh(sinh(x)) = x  ✓  (exact)
 #
 # ═══════════════════════════════════════════════════════════════════════
-# NEUTRAL OUTPUT BIAS
+# NEUTRAL OUTPUT BIAS — ZERO
 # ═══════════════════════════════════════════════════════════════════════
 #
-# At ẑ=0: ŷ_asinh = asinh(M) = asinh(E[sinh(x)])
-# True mean: μ_asinh = E[x] = E[asinh(sinh(x))]
-# By Jensen (asinh concave for x>0): asinh(E[sinh(x)]) ≥ E[asinh(sinh(x))]
-# So ŷ(ẑ=0) ≥ μ_asinh — slight positive bias like v2.
+# At ẑ=0: ŷ_asinh = asinh(sinh(μ)) = μ  ✓  (exact)
 #
-# BUT: the bias is much smaller than v2 because it's ONLY the
-# asinh(E[·]) vs E[asinh(·)] gap, with no multiplicative σ term.
-# For typical series the gap is <0.1 in asinh-space.
-# The level anchor in SpotlightLoss easily corrects this.
+# Using sinh(μ) instead of M=mean(sinh(x)) avoids the Jensen gap
+# that plagued v2: asinh(mean(sinh(x))) > mean(x). With sinh(μ),
+# the asinh∘sinh cancellation is exact — no bias, no approximation.
 #
 # ═══════════════════════════════════════════════════════════════════════
 # MC DROPOUT SAFETY
@@ -241,10 +237,10 @@ def apply_nbeats_patch():
 # IMPLEMENTATION NOTES
 # ═══════════════════════════════════════════════════════════════════════
 #
-# - self.mean stores M (raw-space mean via sinh).
+# - self.mean stores sinh(μ_asinh) (raw-space centering via sinh(mean(x))).
 # - self.stdev stores S (raw-space std via sinh).
-# - Forward: sinh → subtract M → divide S. Model sees linear-normalized values.
-# - Inverse: multiply S → add M → asinh. No sinh(ẑ) anywhere.
+# - Forward: sinh → subtract sinh(μ) → divide S. Model sees linear-normalized values.
+# - Inverse: multiply S → add sinh(μ) → asinh. No sinh(ẑ) anywhere.
 # - No sigma clamp needed — asinh structurally prevents runaway.
 # - No ẑ clamp needed — ẑ·S+M fed to asinh never overflows float32.
 # - eps=1e-5 prevents division by zero for all-zero series.
@@ -259,11 +255,11 @@ def apply_rinorm_compression_patch():
     from model output to raw counts purely affine — Jensen's
     inequality has no convex function to amplify.
 
-    Forward:  z = (sinh(x) − M) / S        — linear normalization in raw space
-    Inverse:  ŷ = asinh(ẑ · S + M)          — affine denorm wrapped in asinh
+    Forward:  z = (sinh(x) − sinh(μ)) / S  — linear normalization in raw space
+    Inverse:  ŷ = asinh(ẑ · S + sinh(μ))    — affine denorm wrapped in asinh
 
-    At ẑ=0: ŷ = asinh(M) ≈ μ_asinh. Bias-free.
-    Raw-space map: ŷ_raw = sinh(asinh(ẑ·S+M)) = ẑ·S+M.
+    At ẑ=0: ŷ = asinh(sinh(μ)) = μ. Exactly bias-free.
+    Raw-space map: ŷ_raw = sinh(asinh(ẑ·S+sinh(μ))) = ẑ·S+sinh(μ). Purely linear.
     Gradient: S/√(1+(ẑS+M)²) → 0 for large ẑ.
     Round-trip: exact (forward ∘ inverse = identity).
     """
@@ -282,15 +278,19 @@ def apply_rinorm_compression_patch():
         # Convert to raw space
         x_raw = torch.sinh(x)
 
-        # Raw-space statistics: M = mean(raw), S = std(raw)
-        self.mean = torch.mean(x_raw, dim=calc_dims, keepdim=True).detach()
+        # Centering constant: sinh(μ_asinh), NOT mean(sinh(x)).
+        # mean(sinh(x)) > sinh(mean(x)) by Jensen → positive bias at ẑ=0.
+        # sinh(mean(x)) gives exact: asinh(sinh(μ)) = μ.
+        mu_asinh = torch.mean(x, dim=calc_dims, keepdim=True)
+        self.mean = torch.sinh(mu_asinh).detach()
+
         self.stdev = torch.sqrt(
             torch.var(x_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        # Standard linear normalization in raw space.
-        # Model sees z = (raw - M) / S — mean 0, std 1.
+        # Linear normalization in raw space, centered on sinh(μ).
+        # z = (sinh(x) - sinh(μ)) / S
         x = (x_raw - self.mean) / self.stdev
 
         if self.affine:
@@ -311,13 +311,16 @@ def apply_rinorm_compression_patch():
         mu = self.mean.view(self.mean.shape + (1,))
 
         # Raw-space affine denormalization wrapped in asinh.
-        # ŷ_asinh = asinh(ẑ · S + M)
+        # ŷ_asinh = asinh(ẑ · S + sinh(μ))
         #
         # Jensen's is structurally dead:
-        #   ŷ_raw = sinh(ŷ_asinh) = sinh(asinh(ẑ·S + M)) = ẑ·S + M
-        #   E[ŷ_raw] = E[ẑ]·S + M — purely linear, no convex function.
+        #   ŷ_raw = sinh(ŷ_asinh) = sinh(asinh(ẑ·S + sinh(μ))) = ẑ·S + sinh(μ)
+        #   E[ŷ_raw] = E[ẑ]·S + sinh(μ) — purely linear, no convex function.
         #
-        # Gradient: ∂ŷ_asinh/∂ẑ = S / √(1 + (ẑ·S+M)²) → 0 for large ẑ.
+        # ẑ=0 bias — zero:
+        #   ŷ(0) = asinh(sinh(μ)) = μ  ✓  (exact)
+        #
+        # Gradient: ∂ŷ_asinh/∂ẑ = S / √(1 + (ẑ·S+sinh(μ))²) → 0 for large ẑ.
         # Automatic regularization — model cannot push extreme predictions.
         x = torch.asinh(x * sigma + mu)
 

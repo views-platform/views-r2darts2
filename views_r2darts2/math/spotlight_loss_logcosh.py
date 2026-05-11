@@ -305,30 +305,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind. Not DRO-weighted — different dimension.
         # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        #
-        # ── Magnitude-aware level weighting ──────────────────────────
-        # level_weight = 1 + log1p(mean|y|), normalised to mean=1.
-        # MSLE penalty from level error scales with log(y+1): a 1-unit
-        # mean error on Syria (μ≈200) contributes more to MSLE than the
-        # same error on a 5-death series. Weights direct level correction
-        # budget proportionally.
-        #
-        # Floor of 1.0: ensures peace series (mean|y|≈0 → weight=1.0) still
-        # receive full baseline level correction. Without the floor, peace
-        # overprediction would be invisible to the level anchor — the only
-        # mechanism that can correct it. Conflict series get up to ~2.8×
-        # more correction (Syria), matching MSLE's log-sensitivity ratio.
-        #
-        # Normalised to mean=1: keeps loss_level scale stable across batches
-        # regardless of the conflict/peace series mix.
-        series_mag = y_true.abs().mean(dim=1)
-        level_weights = 1.0 + torch.log1p(series_mag)
-        level_weights = level_weights / level_weights.mean().clamp(min=1e-8)
-        # MSE on the level anchor (not log_cosh): log_cosh saturates at tanh(ē)≈1
-        # for large mean errors, giving the same gradient whether the model is 2×
-        # or 10× wrong. MSE gradient = w·ē grows linearly with the mean error,
-        # providing proportional pull-back against the learned high-conflict mapping.
-        loss_level = T * (level_weights * (0.5 * e_mean.squeeze(1) ** 2)).mean()
+        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
+        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
+        # large |ē| → saturated tanh → strong level signal;
+        # small |ē| → tanh ≈ ē → level fades, shape takes over.
+        # Uniform across series: preserves the shape:level gradient ratio
+        # identically for every series. Asymmetric per-series weighting
+        # would break this balance — event series would get disproportionate
+        # "find the mean" pressure vs "fix the shape" pressure.
+        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

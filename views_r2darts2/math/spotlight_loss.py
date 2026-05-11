@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLoss(torch.nn.Module):
     """
-    SpotlightLoss v37 — asinh + RevIN compatible, with DRO aggregation.
+    SpotlightLoss v38 — asinh, no RevIN, Barron-on-full-e, with DRO aggregation.
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -18,24 +18,7 @@ class SpotlightLoss(torch.nn.Module):
 
     Four orthogonal components, each addressing a specific failure mode:
 
-    1. **DC/AC decomposition** — prevents RevIN DC offset amplification.
-       Error is demeaned per series: e_shape = e − mean(e). The shape
-       gradient sums to exactly zero per series (structural, not tuned):
-
-           Σᵢ ∂L_shape/∂ŷᵢ = 0    ∀ series
-
-       Proof: e_shape = J·e where J = I − 11ᵀ/T is the centering matrix.
-       J has zero column sums → backprop through J zeroes out the DC
-       component of the gradient, regardless of per-cell weights.
-
-       Why this matters with RevIN: RevIN denormalizes as ŷ = ẑ·σ + μ.
-       A small bias b in normalized space becomes b·σ in asinh space.
-       Through sinh (convex for x > 0), Jensen's inequality amplifies
-       this to E[sinh(b·σ)] > sinh(E[b·σ]) — exponential overprediction
-       in raw counts. The DC/AC split makes it structurally impossible
-       for the shape loss to accumulate any DC bias, period.
-
-    2. **Adaptive compound weighting** — parameter-free, replaces alpha.
+    1. **Adaptive compound weighting** — parameter-free, replaces alpha.
 
        Per-cell weight is the product of two bounded signals:
 
@@ -75,19 +58,7 @@ class SpotlightLoss(torch.nn.Module):
        compound steers *which cells matter*, DRO steers *how losses
        are aggregated* across the 90/10 peace/event split.
 
-    4. **Level anchor** — T-scaled log_cosh on per-series mean error.
-
-           L_level = T · mean_over_series[ log_cosh(mean(ŷ) − mean(y)) ]
-
-       The ONLY mechanism that can shift per-series means. Necessary
-       because the shape loss (DC/AC decomposed) is structurally blind
-       to level. T-scaling compensates for the 1/T chain-rule factor.
-       Natural curriculum: large mean error early → level dominates →
-       calibrate means first. Small mean error later → shape takes over.
-       Not DRO-weighted — operates on a fundamentally different
-       aggregation dimension (per-series means, not per-cell losses).
-
-    5. **Spectral regularization** (optional, gated by δ > 0).
+    4. **Spectral regularization** (optional, gated by δ > 0).
        Multi-resolution STFT magnitude comparison with DC bin masked.
        Unchanged from v35. Phase-invariant; log_cosh on magnitude diffs.
 
@@ -130,20 +101,13 @@ class SpotlightLoss(torch.nn.Module):
     saturating gradient is desirable (natural curriculum), and spectral
     magnitudes are bounded in practice.
 
-    ── Changes from v36 ─────────────────────────────────────────────────
+    ── Changes from v37 ─────────────────────────────────────────────────
 
-    - Base cell loss changed from log_cosh to Barron(α=1.5).
-      No new hyperparameters — α=1.5 and c=1 are fixed design choices.
-    - Level anchor unchanged (log_cosh). Spectral unchanged (log_cosh).
-    - Weighting, DRO, DC/AC decomposition all unchanged.
-
-    ── Changes from v35 → v36 ───────────────────────────────────────────
-
-    - `alpha` parameter removed. Compound weighting is parameter-free.
-    - KL-DRO aggregation replaces simple weighted mean on shape loss.
-    - Compound weight (difficulty × importance) replaces alpha-scaled
-      log_cosh importance weight.
-    - Level anchor unchanged. Spectral unchanged.
+    - DC/AC decomposition removed. Barron loss operates on full error e.
+    - Level anchor removed (was only needed as the sole DC gradient when
+      shape loss was DC-blind). Barron on full e handles level natively.
+    - RevIN disabled at the model level; loss no longer assumes it.
+    - _log_cosh retained only for spectral loss (bounded magnitudes).
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -193,7 +157,7 @@ class SpotlightLoss(torch.nn.Module):
         self.non_zero_threshold = non_zero_threshold
 
         logger.info(
-            "SpotlightLoss v37 (DRO+Barron) | delta=%.4f threshold=%.4f",
+            "SpotlightLoss v38 (DRO+Barron, full-e) | delta=%.4f threshold=%.4f",
             delta, non_zero_threshold,
         )
 
@@ -290,23 +254,17 @@ class SpotlightLoss(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── DC/AC decomposition ───────────────────────────────────────
-        # e_shape sums to zero per series → shape gradient is DC-free.
-        # This is the structural RevIN safety mechanism.
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
-
-        # ── Base cell loss: Barron(1.5) on demeaned error ─────────────
-        cell_loss = self._soft_power(e_shape)
+        # ── Base cell loss: Barron(1.5) on full error ─────────────────
+        cell_loss = self._soft_power(e)
 
         # ── Adaptive compound weighting (dynamic, self-correcting) ─────
-        # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
+        # difficulty = 1 − exp(−|e|) : how wrong (curriculum)
         # event = 𝟙(|y| > threshold) : binary, all events equal
         # w_compound = 1 + difficulty × event ∈ [1, 2)
         # Self-correcting: as |e|→0, w→1 regardless of |y|.
         # Binary event indicator: 1-death and 100-death events get the
         # same importance — only difficulty differentiates within events.
-        abs_e = torch.abs(e_shape.detach())
+        abs_e = torch.abs(e.detach())
         abs_y = torch.abs(y_true)
 
         difficulty = 1.0 - torch.exp(-abs_e)
@@ -342,33 +300,22 @@ class SpotlightLoss(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
-        # Only mechanism that can shift per-series means. Shape loss is
-        # structurally DC-blind. Not DRO-weighted — different dimension.
-        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
-        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
-        # large |ē| → saturated tanh → strong level signal;
-        # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
-
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)
         if self.delta > 0.0 and T >= 6:
             loss_spectral = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + self.delta * loss_spectral
+        total_loss = loss_shape + self.delta * loss_spectral
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} spectral={loss_spectral.item():.6f}"
+                f"spectral={loss_spectral.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f level=%.6f spec=%.6f total=%.6f",
+            "SpotlightLoss | shape=%.6f spec=%.6f total=%.6f",
             loss_shape.item(),
-            loss_level.item(),
             loss_spectral.item(),
             total_loss.item(),
         )

@@ -77,28 +77,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
        compound steers *which cells matter*, DRO steers *how losses
        are aggregated* across the 90/10 peace/event split.
 
-    4. **Level anchor** — T-scaled log_cosh on per-series mean error,
-       with series-level DRO aggregation.
+    4. **Windowed level anchor** — T-scaled log_cosh on per-series,
+       per-window mean error, with DRO aggregation.
 
-           l_s = log_cosh(mean(ŷ_s) − mean(y_s))         per series s
-           z_s = (log(l_s) − mean(log(l))) / std(log(l))  log-space z-score
-           w_s = log1p(clamp(1+z, min=0)) / mean(·)       concave DRO weight
-           L_level = T · mean_s[ w_s · l_s ]              DRO-weighted
+       The horizon is split into non-overlapping windows of width
+       W = max(6, T // 3). Each window's mean error is penalised
+       independently via log_cosh:
 
-       The ONLY mechanism that can shift per-series means. Necessary
-       because the shape loss (DC/AC decomposed) is structurally blind
-       to level. T-scaling compensates for the 1/T chain-rule factor.
-       Natural curriculum: large mean error early → level dominates →
-       calibrate means first. Small mean error later → shape takes over.
+           ē_w = mean(e[t_start:t_end])         per window w, series s
+           l_{s,w} = log_cosh(ē_w)
+           L_level = T · DRO_mean_{s,w}[ l_{s,w} ]
 
-       Series-level DRO upweights series whose level error is a
-       proportional outlier (log-space z-score), applying concave
-       log1p compression to avoid runaway emphasis. CV-based alpha
-       blends toward uniform when log-loss variance is low (early
-       training, or when level is well-calibrated). This targets
-       MSLE directly: series with worst *relative* mean-bias get
-       more gradient pressure, while series already calibrated
-       are not over-penalised.
+       Window width is dynamic — computed from the actual output length,
+       no hyperparameter. Floor of 6 ensures each window mean is
+       statistically meaningful. Remainder timesteps form a final
+       shorter window.
+
+       Why windowed: a single full-mean anchor is blind to intra-horizon
+       drift. A series overpredicted in months 1-12 and underpredicted
+       in 25-36 can have ~zero full-mean error. MSLE sees each timestep
+       independently and penalises both sub-periods. Windowed anchors
+       catch this.
+
+       DRO aggregation operates over all (series × window) level losses,
+       upweighting whichever (series, window) pair has proportionally
+       worst level error. Same log-space z-score + log1p compression
+       as cell-level DRO.
 
     5. **Spectral regularization** (optional, gated by δ > 0).
        Multi-resolution STFT magnitude comparison with DC bin masked.
@@ -306,23 +310,42 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         loss_shape = (w_total * cell_loss).mean()
 
-        # ── Level anchor: T-scaled log_cosh on per-series mean error ──
+        # ── Windowed level anchor ──────────────────────────────────────
         # Only mechanism that can shift per-series means. Shape loss is
         # structurally DC-blind.
-        # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
-        # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
-        # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
-        # large |ē| → saturated tanh → strong level signal;
-        # small |ē| → tanh ≈ ē → level fades, shape takes over.
         #
-        # Series-level DRO: upweight series whose level loss is a
-        # proportional outlier (log-space z-score). Concave log1p
-        # compression prevents any single series from dominating.
-        # CV-based alpha blends toward uniform when log-loss variance
-        # is low (early training / well-calibrated levels).
-        level_per_series = self._log_cosh(e_mean.squeeze(1))  # (B,)
+        # Windowed: instead of a single full-horizon mean, split the T
+        # timesteps into non-overlapping windows of width W and compute
+        # log_cosh(ē_w) per window per series. This catches intra-horizon
+        # level drift invisible to a single full-mean anchor — e.g. a
+        # series overpredicted in months 1-12 and underpredicted in 25-36
+        # would have ~zero full-mean error but large windowed error.
+        #
+        # Window width is dynamic: W = max(6, T // 3). Floor of 6 ensures
+        # each window mean is statistically meaningful (~6 observations).
+        # T // 3 targets ~3 windows. Any remainder timesteps form a final
+        # shorter window (still ≥ 1 timestep). No hyperparameter, no
+        # assumption about output length.
+        #
+        # T scaling preserved: each window contributes T·log_cosh(ē_w),
+        # maintaining the same gradient magnitude ratio with shape loss.
+        # Natural curriculum preserved per window.
+        #
+        # Series-level DRO across all (series × window) level losses:
+        # upweight whichever (series, window) pair has proportionally
+        # worst level error. Same log-space z-score + log1p compression.
+        W = max(6, T // 3)
+        # Split e into windows: (B, T) → list of (B, W_i)
+        e_windows = list(e.split(W, dim=1))  # last chunk may be < W
+        # Per-window mean error: (B, n_windows)
+        window_means = torch.stack(
+            [ew.mean(dim=1) for ew in e_windows], dim=1
+        )  # (B, n_windows)
+        level_losses = self._log_cosh(window_means)  # (B, n_windows)
 
-        log_level = torch.log(level_per_series.detach() + 1e-8)
+        # Series×window DRO
+        level_flat = level_losses.detach().flatten()
+        log_level = torch.log(level_flat + 1e-8)
         level_log_std = log_level.std()
         level_log_cv = torch.log1p(
             level_log_std / (log_level.mean().abs() + 1e-8)
@@ -334,8 +357,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_level = w_level / w_level.mean().clamp(min=1e-8)
         w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
         w_level = torch.nan_to_num(w_level, nan=1.0, posinf=1.0, neginf=0.0)
+        w_level = w_level.view_as(level_losses)
 
-        loss_level = T * (w_level * level_per_series).mean()
+        loss_level = T * (w_level * level_losses).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

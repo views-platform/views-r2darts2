@@ -77,17 +77,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
        compound steers *which cells matter*, DRO steers *how losses
        are aggregated* across the 90/10 peace/event split.
 
-    4. **Level anchor** — T-scaled log_cosh on per-series mean error.
+    4. **Level anchor** — T-scaled log_cosh on per-series mean error,
+       with series-level DRO aggregation.
 
-           L_level = T · mean_over_series[ log_cosh(mean(ŷ) − mean(y)) ]
+           l_s = log_cosh(mean(ŷ_s) − mean(y_s))         per series s
+           z_s = (log(l_s) − mean(log(l))) / std(log(l))  log-space z-score
+           w_s = log1p(clamp(1+z, min=0)) / mean(·)       concave DRO weight
+           L_level = T · mean_s[ w_s · l_s ]              DRO-weighted
 
        The ONLY mechanism that can shift per-series means. Necessary
        because the shape loss (DC/AC decomposed) is structurally blind
        to level. T-scaling compensates for the 1/T chain-rule factor.
        Natural curriculum: large mean error early → level dominates →
        calibrate means first. Small mean error later → shape takes over.
-       Not DRO-weighted — operates on a fundamentally different
-       aggregation dimension (per-series means, not per-cell losses).
+
+       Series-level DRO upweights series whose level error is a
+       proportional outlier (log-space z-score), applying concave
+       log1p compression to avoid runaway emphasis. CV-based alpha
+       blends toward uniform when log-loss variance is low (early
+       training, or when level is well-calibrated). This targets
+       MSLE directly: series with worst *relative* mean-bias get
+       more gradient pressure, while series already calibrated
+       are not over-penalised.
 
     5. **Spectral regularization** (optional, gated by δ > 0).
        Multi-resolution STFT magnitude comparison with DC bin masked.
@@ -297,17 +308,34 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Level anchor: T-scaled log_cosh on per-series mean error ──
         # Only mechanism that can shift per-series means. Shape loss is
-        # structurally DC-blind. Not DRO-weighted — different dimension.
+        # structurally DC-blind.
         # T scaling: ∂L/∂ŷⱼ = T·tanh(ē)·(1/T) = tanh(ē) per cell.
         # L2 norm across T cells = √T·|tanh(ē)|, matching shape gradient
         # norm ~ √T·avg|ρ'(e_shape)|. Natural curriculum preserved:
         # large |ē| → saturated tanh → strong level signal;
         # small |ē| → tanh ≈ ē → level fades, shape takes over.
-        # Uniform across series: preserves the shape:level gradient ratio
-        # identically for every series. Asymmetric per-series weighting
-        # would break this balance — event series would get disproportionate
-        # "find the mean" pressure vs "fix the shape" pressure.
-        loss_level = T * self._log_cosh(e_mean.squeeze(1)).mean()
+        #
+        # Series-level DRO: upweight series whose level loss is a
+        # proportional outlier (log-space z-score). Concave log1p
+        # compression prevents any single series from dominating.
+        # CV-based alpha blends toward uniform when log-loss variance
+        # is low (early training / well-calibrated levels).
+        level_per_series = self._log_cosh(e_mean.squeeze(1))  # (B,)
+
+        log_level = torch.log(level_per_series.detach() + 1e-8)
+        level_log_std = log_level.std()
+        level_log_cv = torch.log1p(
+            level_log_std / (log_level.mean().abs() + 1e-8)
+        )
+        level_dro_alpha = level_log_cv / (level_log_cv + 1.0)
+
+        level_z = (log_level - log_level.mean()) / level_log_std.clamp(min=0.1)
+        w_level = torch.log1p((1.0 + level_z).clamp(min=0.0))
+        w_level = w_level / w_level.mean().clamp(min=1e-8)
+        w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
+        w_level = torch.nan_to_num(w_level, nan=1.0, posinf=1.0, neginf=0.0)
+
+        loss_level = T * (w_level * level_per_series).mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

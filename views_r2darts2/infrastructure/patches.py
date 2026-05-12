@@ -332,21 +332,20 @@ def apply_nbeats_patch():
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with swapped-compression normalization (v5).
+    Patches Darts RINorm with hybrid-space normalization (v3).
 
-    Swaps the compression placement vs v3: v3 compresses during forward
-    (asinh) and must decompress during inverse (sinh — exponential).
-    v5 leaves the forward linear and puts compression (asinh) at the
-    inverse. This makes output saturation structural, not clamp-based.
+    Centers in asinh-space (zero mean bias), normalizes variance in
+    raw-space (bounded gradients). Eliminates both the gradient
+    explosion of standard RevIN AND the systematic positive bias of
+    pure raw-space RevIN.
 
-    Forward:  z = sinh(x − μ_asinh) / σ_c        — linear normalization
-    Inverse:  ŷ = asinh(ẑ · σ_c) + μ_asinh        — logarithmic compression
+    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
+    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
 
     At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
+    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
     Round-trip: exact (forward ∘ inverse = identity).
-    Output growth: logarithmic (each doubling of ẑ adds ln(2) ≈ 0.69).
-    Gradient: ∂ŷ/∂ẑ = σ / √(1+(ẑσ)²) → 1/ẑ at large ẑ (vanishing).
-    No clamps needed. Saturation is structural.
+    Zero learnable parameters. Backwards-compatible state_dict.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
@@ -367,16 +366,16 @@ def apply_rinorm_compression_patch():
         x_centered_raw = torch.sinh(x - self.mean)
 
         # Compute variance of the centered-raw signal
+        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
+        # These differ enormously — std(sinh(x)) is inflated by the
+        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
             torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        # v5: linear normalization (no asinh compression on output)
-        # z-values are wider than v3 (linear in raw/σ, not compressed).
-        # For a 1-spike-in-36-months series, z_max ≈ 6 vs v3's ≈ 2.5.
-        # This is the standard regime for instance normalization.
-        x = x_centered_raw / self.stdev
+        # Normalize by centered-raw std, compress back via asinh
+        x = torch.asinh(x_centered_raw / self.stdev)
 
         if self.affine:
             x = x * self.affine_weight
@@ -395,21 +394,20 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Sigma cap retained: prevents extreme-variance series from
-        # dominating the asinh compression range. Less critical than
-        # in v3 (where sinh amplified exponentially), but still useful
-        # to keep series on comparable output scales.
+        # Cap per-series sigma to 5× the batch-mean sigma.
+        # Prevents RevIN denorm from amplifying extreme-conflict series
+        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
+        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
         sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
         sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
 
-        # v5 inverse: asinh(ẑ · σ) + μ
-        # - ẑ · σ rescales to centered-raw space (linear)
-        # - asinh compresses back to asinh-space (logarithmic saturation)
-        # - + μ re-centers (additive, no amplification)
-        #
-        # At large ẑ: ŷ ≈ ln(2ẑσ) + μ — logarithmic growth.
-        # vs v3:      ŷ ≈ ẑ + ln(σ) + μ — linear growth.
-        x = torch.asinh(x * sigma) + mu
+
+        # x = torch.clamp(x, -4.0, 4.0)
+
+        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
+        # Compress: asinh wraps it back into asinh-space
+        # Shift: + μ_asinh re-centers (additive, no amplification)
+        x = torch.asinh(torch.sinh(x) * sigma) + mu
 
         return x
 
@@ -417,7 +415,8 @@ def apply_rinorm_compression_patch():
     RINorm.inverse = _raw_space_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: swapped-compression normalization v5 "
+        "🐨 Patched RINorm: hybrid-space normalization v3 "
+
     )
 
 

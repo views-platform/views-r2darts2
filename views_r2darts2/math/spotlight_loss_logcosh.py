@@ -35,24 +35,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
        in raw counts. The DC/AC split makes it structurally impossible
        for the shape loss to accumulate any DC bias, period.
 
-    2. **Adaptive compound weighting** — parameter-free, replaces alpha.
+    2. **Adaptive compound weighting** — magnitude-proportional, parameter-free.
 
        Per-cell weight is the product of two bounded signals:
 
            difficulty  = 1 − exp(−|e_shape|)                      ∈ [0, 1)
-           event       = 𝟙(max(|y|, |ŷ_sg|) > non_zero_threshold) ∈ {0, 1}
-           w_compound  = 1 + difficulty × event                    ∈ [1, 2)
+           event_mag   = max(|y|, |ŷ_sg|) / (τ + max(|y|, |ŷ_sg|)) ∈ [0, 1)
+           w_compound  = 1 + 2 × difficulty × event_mag            ∈ [1, 3)
 
-       Both must be present for high weight: a cell must be **both hard
-       AND an event** (truth or prediction). Union event indicator penalises
-       false positives (y=0, ŷ>τ) as well as misses (y>τ, ŷ=0) — directly
-       reducing peace_mean false-alarm drift. ŷ is stop-gradient.
-       Normalised to mean=1 jointly with DRO weights.
+       event_mag is a continuous magnitude signal replacing the binary
+       event indicator. At threshold τ → 0.5, at 10×τ → 0.91. This
+       aligns compound weighting with MSLE's proportional sensitivity:
+       Syria (500 deaths, event_mag≈0.998) gets more weight than Chad
+       (2 deaths, event_mag≈0.72). Binary event treated both identically.
 
-       Replaces the alpha-tuned `w = 1 + log_cosh(α · mag)` from v35.
-       Alpha was a hyperparameter controlling event budget; compound
-       weighting achieves this automatically — cells the model already
-       predicts well get difficulty→0 → w→1 regardless of magnitude.
+       Union semantics preserved: false positives (y=0, ŷ>τ) get
+       event_mag > 0.5. ŷ is stop-gradient. Self-correcting: as
+       |e|→0, w→1 regardless of event_mag.
 
     3. **KL-DRO tail aggregation (log-space)** — parameter-free.
 
@@ -69,7 +68,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
        as a 1000-death miss at 10× the median. Aligned with the
        proportional error sensitivity of asinh-space prediction.
 
-       Soft activation α = log_std/(log_std + 1.0) blends toward
+       Soft activation α = log_cv/(log_cv + 1.0) blends toward
        uniform when log-loss variance is small (early training).
 
        Compound weight and DRO are combined independently (product,
@@ -257,31 +256,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Base cell loss: log_cosh on demeaned error ────────────────
         cell_loss = self._log_cosh(e_shape)
 
-        # ── Adaptive compound weighting (dynamic, self-correcting) ─────
+        # ── Adaptive compound weighting (magnitude-proportional) ──────
         # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
-        # event = 𝟙(max(|y|, |ŷ_sg|) > threshold) : union of truth and prediction.
-        #   Truth-only (old): false positives (y=0, ŷ>τ) get weight=1 — no pressure
-        #     to collapse false alarms → persistent peace_mean inflation.
-        #   Union (new): false positives also get event=1 → compound upweighting
-        #     fires on difficult false alarms, directly penalising peace_mean drift.
-        #   ŷ is stop-gradient → no second-order terms, backward pass unchanged.
-        #   Early training safety: uniform high ŷ → e_shape≈0 → difficulty→0 →
-        #     w→1 regardless of event=1. Self-correction holds under union.
-        # w_compound = 1 + difficulty × event ∈ [1, 2)
-        # Self-correcting: as |e|→0, w→1 regardless of event.
+        # event_mag = max(|y|, |ŷ_sg|) / (τ + max(|y|, |ŷ_sg|)) : continuous
+        #   magnitude signal ∈ [0, 1). At threshold → 0.5, at 10×τ → 0.91.
+        #   Replaces binary event indicator. Binary treated Syria (500 deaths)
+        #   and Chad (2 deaths) identically at event=1. Magnitude-proportional
+        #   gives Syria ~0.998 and Chad ~0.72 — aligned with MSLE's sensitivity
+        #   to proportional errors at different scales.
+        #   Union semantics preserved: false positives (y=0, ŷ>τ) still get
+        #   event_mag > 0.5, maintaining pressure to collapse false alarms.
+        #   ŷ is stop-gradient → no second-order terms.
+        # w_compound = 1 + 2 × difficulty × event_mag ∈ [1, 3)
+        #   Ceiling raised from 2 to 3: large, hard events get 3× weight.
+        #   Self-correcting: as |e|→0, w→1 regardless of event_mag.
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
+        abs_ypred_sg = torch.abs(y_pred.detach())
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        # Union event indicator: upweight cells where either truth or prediction
-        # exceeds the threshold. This penalises false positives (y=0, ŷ>τ) as
-        # heavily as misses (y>τ, ŷ=0), directly reducing peace_mean false alarms.
-        # ŷ is stop-gradient so no second-order terms enter the backward pass.
-        abs_ypred_sg = torch.abs(y_pred.detach())
-        event = (torch.max(abs_y, abs_ypred_sg) > self.non_zero_threshold).float()
-        w_compound = 1.0 + difficulty * event
+        abs_max = torch.max(abs_y, abs_ypred_sg)
+        event_mag = abs_max / (self.non_zero_threshold + abs_max)
+        w_compound = 1.0 + 2.0 * difficulty * event_mag
 
-        # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
+        # ── Sqrt-DRO tail aggregation (log-space z-scores) ─────────────
         # Z-score log(cell_loss) for proportional outlier detection.
         # Operates on raw cell_loss (before compound weighting).
         # Flattened cross-series: event cells dominate the tail.
@@ -290,12 +288,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         log_std = log_loss.std()
 
         # CV-based alpha: self-normalizing, naturally bounded.
-        # CV=2→α≈0.52, CV=5→α≈0.64, CV=10→α≈0.71. Cannot saturate to 1.
+        # Clamp at 0.1: std<0.1 means losses span <1.1×, too little
+        # variation for meaningful z-scores.
         log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
         dro_alpha = log_cv / (log_cv + 1.0)
-        # Clamp at 0.1, not 1e-8: std<0.1 means losses span <1.1×,
-        # too little variation for meaningful z-scores. At 1e-8, z can
-        # reach 1e8 → log1p(1e8) ≈ 18.4 → NaN after normalisation × 0.
         z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
         w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
         w_dro = w_dro / w_dro.mean().clamp(min=1e-8)

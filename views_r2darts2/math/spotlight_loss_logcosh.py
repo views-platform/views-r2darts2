@@ -39,13 +39,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
        Per-cell weight is the product of two bounded signals:
 
-           difficulty  = 1 − exp(−|e_shape|)            ∈ [0, 1)
-           importance  = 1 − exp(−max(|y|, |ŷ_sg|))    ∈ [0, 1)
-           w_compound  = 1 + difficulty × importance     ∈ [1, 2)
+           difficulty  = 1 − exp(−|e_shape|)                      ∈ [0, 1)
+           event       = 𝟙(max(|y|, |ŷ_sg|) > non_zero_threshold) ∈ {0, 1}
+           w_compound  = 1 + difficulty × event                    ∈ [1, 2)
 
        Both must be present for high weight: a cell must be **both hard
-       AND important**. Detached — no gradient coupling. Normalised to
-       mean=1 jointly with DRO weights.
+       AND an event** (truth or prediction). Union event indicator penalises
+       false positives (y=0, ŷ>τ) as well as misses (y>τ, ŷ=0) — directly
+       reducing peace_mean false-alarm drift. ŷ is stop-gradient.
+       Normalised to mean=1 jointly with DRO weights.
 
        Replaces the alpha-tuned `w = 1 + log_cosh(α · mag)` from v35.
        Alpha was a hyperparameter controlling event budget; compound
@@ -242,16 +244,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Adaptive compound weighting (dynamic, self-correcting) ─────
         # difficulty = 1 − exp(−|e_shape|) : how wrong (curriculum)
-        # event = 𝟙(|y| > threshold) : binary, all events equal
+        # event = 𝟙(max(|y|, |ŷ_sg|) > threshold) : union of truth and prediction.
+        #   Truth-only (old): false positives (y=0, ŷ>τ) get weight=1 — no pressure
+        #     to collapse false alarms → persistent peace_mean inflation.
+        #   Union (new): false positives also get event=1 → compound upweighting
+        #     fires on difficult false alarms, directly penalising peace_mean drift.
+        #   ŷ is stop-gradient → no second-order terms, backward pass unchanged.
+        #   Early training safety: uniform high ŷ → e_shape≈0 → difficulty→0 →
+        #     w→1 regardless of event=1. Self-correction holds under union.
         # w_compound = 1 + difficulty × event ∈ [1, 2)
-        # Self-correcting: as |e|→0, w→1 regardless of |y|.
-        # Binary event indicator: 1-death and 100-death events get the
-        # same importance — only difficulty differentiates within events.
+        # Self-correcting: as |e|→0, w→1 regardless of event.
         abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
 
         difficulty = 1.0 - torch.exp(-abs_e)
-        event = (abs_y > self.non_zero_threshold).float()
+        # Union event indicator: upweight cells where either truth or prediction
+        # exceeds the threshold. This penalises false positives (y=0, ŷ>τ) as
+        # heavily as misses (y>τ, ŷ=0), directly reducing peace_mean false alarms.
+        # ŷ is stop-gradient so no second-order terms enter the backward pass.
+        abs_ypred_sg = torch.abs(y_pred.detach())
+        event = (torch.max(abs_y, abs_ypred_sg) > self.non_zero_threshold).float()
         w_compound = 1.0 + difficulty * event
 
         # ── KL-DRO tail aggregation (log-space z-scores) ──────────────

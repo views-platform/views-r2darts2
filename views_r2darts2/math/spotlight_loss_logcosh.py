@@ -49,9 +49,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
        Syria (500 deaths, event_mag≈0.998) gets more weight than Chad
        (2 deaths, event_mag≈0.72). Binary event treated both identically.
 
-       Union semantics preserved: false positives (y=0, ŷ>τ) get
-       event_mag > 0.5. ŷ is stop-gradient. Self-correcting: as
-       |e|→0, w→1 regardless of event_mag.
+       Gated: hard zero below τ restores false-positive discipline —
+       sub-threshold cells get event_mag=0 → same w=1 as the original
+       binary indicator. Above τ, smooth magnitude scaling applies.
+       ŷ is stop-gradient. Self-correcting: as |e|→0, w→1.
 
     3. **KL-DRO tail aggregation (log-space)** — parameter-free.
 
@@ -264,8 +265,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         #   and Chad (2 deaths) identically at event=1. Magnitude-proportional
         #   gives Syria ~0.998 and Chad ~0.72 — aligned with MSLE's sensitivity
         #   to proportional errors at different scales.
-        #   Union semantics preserved: false positives (y=0, ŷ>τ) still get
-        #   event_mag > 0.5, maintaining pressure to collapse false alarms.
+        #   Gated: hard zero below threshold (restores false-positive discipline),
+        #   continuous magnitude above threshold. Sub-threshold cells get
+        #   event_mag=0 → w=1, identical to original binary indicator for peace.
         #   ŷ is stop-gradient → no second-order terms.
         # w_compound = 1 + 2 × difficulty × event_mag ∈ [1, 3)
         #   Ceiling raised from 2 to 3: large, hard events get 3× weight.
@@ -276,7 +278,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         difficulty = 1.0 - torch.exp(-abs_e)
         abs_max = torch.max(abs_y, abs_ypred_sg)
-        event_mag = abs_max / (self.non_zero_threshold + abs_max)
+        above_threshold = (abs_max > self.non_zero_threshold).float()
+        event_mag = (abs_max / (self.non_zero_threshold + abs_max)) * above_threshold
         w_compound = 1.0 + 2.0 * difficulty * event_mag
 
         # ── Sqrt-DRO tail aggregation (log-space z-scores) ─────────────

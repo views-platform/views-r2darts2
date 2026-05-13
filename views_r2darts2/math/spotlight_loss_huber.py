@@ -86,15 +86,21 @@ class SpotlightLossHuber(torch.nn.Module):
        Multi-resolution STFT magnitude comparison with DC bin masked.
        Phase-invariant; log_cosh on magnitude diffs (unchanged).
 
-    ── Base cell loss: Huber with adaptive δ ────────────────────────────
+    ── Base cell loss: Huber with tuning-free δ (Wang et al. 2021) ───
 
     huber(x, δ) = 0.5x²         if |x| ≤ δ
                   δ(|x| − δ/2)   if |x| > δ
 
-    Gradient = x for |x| ≤ δ, capped at ±δ beyond. Quadratic regime
-    extends to δ = median + 2·MAD ≈ 90th percentile of |e|. The vast
-    majority of cells get pure quadratic loss aligned with MSE/MSLE,
-    while extreme outliers get linearly bounded gradients.
+    δ is determined by solving for τ² via bisection on:
+
+        (1/n) Σᵢ min(rᵢ²/τ², 1) = log(n)/n
+
+    where n = number of cells in the batch. This is the optimal
+    bias-robustness tradeoff from Sun, Zhou & Fan (JASA 2020),
+    operationalised via the tuning-free calibration principle of
+    Wang, Zheng, Zhou & Zhou (Statistica Sinica 2021).
+
+    No thresholds, no percentiles, no hyperparameters beyond n.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -169,36 +175,59 @@ class SpotlightLossHuber(torch.nn.Module):
     def _compute_adaptive_delta(
         abs_errors: torch.Tensor,
         min_delta: float = 0.5,
-        event_threshold: float = 0.0,
+        event_threshold: float = 0.0,  # deprecated — ignored
     ) -> torch.Tensor:
-        """Compute adaptive Huber delta from the event-cell error distribution.
+        """Tuning-free adaptive Huber δ via Wang, Zheng, Zhou & Zhou (2021).
 
-        δ = median(|e|) + 2 × MAD(|e|), floored at min_delta.
+        Solves for τ² by bisection on the equation:
 
-        When event_threshold > 0, only cells with |e| > threshold are used
-        to compute the statistic. This prevents the 90% peace population
-        (|e| ≈ 0) from driving median → 0 and collapsing δ → min_delta,
-        which would push all event errors into the linear (saturating) regime
-        and reproduce log_cosh-like gradient saturation.
+            (1/n) Σᵢ min(rᵢ²/τ², 1) = log(n)/n
 
-        Falls back to all cells if fewer than 10 event cells exist in batch.
-        Non-finite values are always excluded.
+        where rᵢ = |eᵢ| are the absolute errors and n = sample size.
+
+        The sole "parameter" is n — the number of cells in the batch.
+        As n grows, log(n)/n → 0, so τ grows (estimator becomes less
+        robust, closer to quadratic/MSE). With small n the RHS is
+        larger, τ shrinks, and the Huber loss becomes more robust
+        (linear regime kicks in earlier). This is the optimal
+        bias-robustness tradeoff proven in Sun, Zhou & Fan (JASA 2020).
+
+        Reference implementation: adaHuber R/C++ package (XiaoouPan).
+
+        No thresholds, no percentiles, no hyperparameters.
         """
         flat = abs_errors.detach().flatten()
         flat = flat[flat.isfinite()]
-        if flat.numel() == 0:
+        n = flat.numel()
+        if n < 2:
             return abs_errors.new_tensor(min_delta)
 
-        # Filter to event cells if threshold given and enough samples exist
-        if event_threshold > 0.0:
-            event_flat = flat[flat > event_threshold]
-            if event_flat.numel() >= 10:
-                flat = event_flat
+        res_sq = flat * flat
+        rhs = math.log(n) / n  # the tuning-free target
 
-        median_val = flat.median()
-        mad = (flat - median_val).abs().median()
-        raw = median_val + 2.0 * mad
-        return raw if raw.isfinite() and raw.item() >= min_delta else abs_errors.new_tensor(min_delta)
+        # Bisection bounds: τ² ∈ [min(rᵢ²), Σ rᵢ²]
+        low = res_sq.min().item()
+        up = res_sq.sum().item()
+
+        # Edge case: all errors identical (e.g. all-zero batch)
+        if up - low < 1e-12:
+            tau = math.sqrt(max(up, min_delta * min_delta))
+            return abs_errors.new_tensor(max(tau, min_delta))
+
+        # f(x) = mean(min(rᵢ²/x, 1)) - rhs
+        # f is monotonically decreasing in x → standard bisection
+        for _ in range(64):  # 64 iterations ≈ 19 digits of precision
+            mid = 0.5 * (low + up)
+            val = torch.mean(torch.clamp(res_sq / mid, max=1.0)).item() - rhs
+            if val > 0:
+                low = mid  # f(mid) > 0 → need larger τ²
+            else:
+                up = mid
+            if up - low < 1e-10:
+                break
+
+        tau = math.sqrt(0.5 * (low + up))
+        return abs_errors.new_tensor(max(tau, min_delta))
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only)."""
@@ -280,16 +309,12 @@ class SpotlightLossHuber(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Adaptive Huber delta ──────────────────────────────────────
+        # ── Adaptive Huber delta (tuning-free, Wang et al. 2021) ─────
         # Clamp abs_e_shape before passing to adaptive delta: if any value
         # were inf (shouldn't happen after the guard above, but belt+braces),
-        # the median computation would return inf and clamp can't fix NaN.
-        # Pass non_zero_threshold so δ is calibrated to the event-error
-        # distribution, not the 90% peace population which has |e| ≈ 0.
+        # the bisection division res_sq/mid could produce inf.
         abs_e_shape = torch.abs(e_shape.detach()).clamp(max=1e4)
-        huber_delta = self._compute_adaptive_delta(
-            abs_e_shape, event_threshold=self.non_zero_threshold
-        )
+        huber_delta = self._compute_adaptive_delta(abs_e_shape)
 
         # ── Base cell loss: Huber on demeaned error ───────────────────
         cell_loss = self._adaptive_huber(e_shape, huber_delta)

@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v37 — asinh + RevIN compatible, with DRO aggregation.
+    SpotlightLoss v36 — asinh + RevIN compatible, with DRO aggregation.
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -35,23 +35,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
        in raw counts. The DC/AC split makes it structurally impossible
        for the shape loss to accumulate any DC bias, period.
 
-    2. **Adaptive compound weighting** — difficulty-gated, no magnitude
-       bias.
+    2. **Adaptive compound weighting** — magnitude-proportional, parameter-free.
 
-       Per-cell weight uses difficulty only, with a threshold gate:
+       Per-cell weight is the product of two bounded signals:
 
-           difficulty  = |e_shape| / (1 + |e_shape|)               ∈ [0, 1)
-           w_compound  = 1 + difficulty × 1[abs_max > τ]           ∈ [1, 2)
+           difficulty  = 1 − exp(−|e_shape|)                      ∈ [0, 1)
+           event_mag   = max(|y|, |ŷ_sg|) / (τ + max(|y|, |ŷ_sg|)) ∈ [0, 1)
+           w_compound  = 1 + 2 × difficulty × event_mag            ∈ [1, 3)
 
-       No event_mag term — avoids double-stacking magnitude emphasis
-       with DRO. A 2-death cell with the same proportional error as
-       a 500-death cell gets the same compound weight. The threshold
-       gate still provides false-positive discipline: sub-threshold
-       cells get w=1. DRO alone handles the event-vs-peace split
-       (event cells are naturally loss outliers). The difficulty
-       function uses |e|/(1+|e|) instead of 1−exp(−|e|) for slower
-       saturation — a 10-unit error gets 1.82× the weight of a 1-unit
-       error, vs 1.59× with the exponential form.
+       event_mag is a continuous magnitude signal replacing the binary
+       event indicator. At threshold τ → 0.5, at 10×τ → 0.91. This
+       aligns compound weighting with MSLE's proportional sensitivity:
+       Syria (500 deaths, event_mag≈0.998) gets more weight than Chad
+       (2 deaths, event_mag≈0.72). Binary event treated both identically.
+
+       Gated: hard zero below τ restores false-positive discipline —
+       sub-threshold cells get event_mag=0 → same w=1 as the original
+       binary indicator. Above τ, smooth magnitude scaling applies.
+       ŷ is stop-gradient. Self-correcting: as |e|→0, w→1.
 
     3. **KL-DRO tail aggregation (log-space)** — parameter-free.
 
@@ -80,15 +81,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
        per-window mean error, with DRO aggregation.
 
        The horizon is split into non-overlapping windows of width
-       W = max(4, T // 6). Each window's mean error is penalised
+       W = max(6, T // 3). Each window's mean error is penalised
        independently via log_cosh:
 
            ē_w = mean(e[t_start:t_end])         per window w, series s
            l_{s,w} = log_cosh(ē_w)
            L_level = T · DRO_mean_{s,w}[ l_{s,w} ]
 
-       Finer windows (T//6 → ~6 windows for T=36) to catch sub-window
-       timing drift.
+       Window width is dynamic — computed from the actual output length,
+       no hyperparameter. Floor of 6 ensures each window mean is
+       statistically meaningful. Remainder timesteps form a final
+       shorter window.
 
        Why windowed: a single full-mean anchor is blind to intra-horizon
        drift. A series overpredicted in months 1-12 and underpredicted
@@ -110,16 +113,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
     log_cosh(x) ≈ 0.5x² for |x| < 1, ≈ |x| − ln2 for |x| > 2.
     Gradient = tanh(x) ∈ (−1, +1). Bounded by construction.
 
-    ── Changes from v36 ───────────────────────────────────────────────────
+    ── Changes from v35 ─────────────────────────────────────────────────
 
-    - Non-finite y_pred guard: clamps inf/NaN before loss computation.
-    - Compound weighting simplified: difficulty uses |e|/(1+|e|) instead
-      of 1−exp(−|e|) for slower saturation. event_mag removed — avoids
-      double-stacking magnitude bias with DRO. Weight range [1, 2).
-    - DRO guards: isfinite() check on log_std before z-score computation
-      (shape and level). Falls back to uniform weights on degenerate batches.
-    - Finer windows: W = max(4, T // 6) → ~6 windows for T=36 (was 3).
-      Better timing sensitivity for sub-window drift.
+    - `alpha` parameter removed. Compound weighting is parameter-free.
+    - KL-DRO aggregation replaces simple weighted mean on shape loss.
+    - Compound weight (difficulty × importance) replaces alpha-scaled
+      log_cosh importance weight.
+    - Level anchor unchanged. Spectral unchanged.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -152,7 +152,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
     ):
         if alpha != 0.0:
             logger.warning(
-                "SpotlightLoss v37: alpha is deprecated and ignored. "
+                "SpotlightLoss v36: alpha is deprecated and ignored. "
+                "Compound weighting + KL-DRO replaces alpha-based importance. "
                 "Remove alpha from your config. (received alpha=%.4f)",
                 alpha,
             )
@@ -168,7 +169,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.non_zero_threshold = non_zero_threshold
 
         logger.info(
-            "SpotlightLoss v37 (DRO) | delta=%.4f threshold=%.4f",
+            "SpotlightLoss v36 (DRO) | delta=%.4f threshold=%.4f",
             delta, non_zero_threshold,
         )
 
@@ -244,16 +245,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
-        # ── Guard: clamp non-finite predictions ───────────────────────
-        if not y_pred.isfinite().all():
-            logger.warning(
-                "Non-finite values in y_pred (has_nan=%s, has_inf=%s) — "
-                "clamping to prevent NaN loss.",
-                y_pred.isnan().any().item(),
-                y_pred.isinf().any().item(),
-            )
-            y_pred = torch.nan_to_num(y_pred, nan=0.0, posinf=20.0, neginf=-20.0)
-
         T = y_pred.size(1)
         e = y_pred - y_true
 
@@ -272,7 +263,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # No event_mag: avoids double-stacking magnitude bias with DRO.
         # Threshold gate provides false-positive discipline.
         # w_compound = 1 + difficulty × 1[abs_max > τ] ∈ [1, 2)
-        abs_e = torch.abs(e_shape.detach()).clamp(max=1e4)
+        abs_e = torch.abs(e_shape.detach())
         abs_y = torch.abs(y_true)
         abs_ypred_sg = torch.abs(y_pred.detach())
 
@@ -281,25 +272,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
         above_threshold = (abs_max > self.non_zero_threshold).float()
         w_compound = 1.0 + difficulty * above_threshold
 
-        # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
+        # ── Sqrt-DRO tail aggregation (log-space z-scores) ─────────────
+        # Z-score log(cell_loss) for proportional outlier detection.
+        # Operates on raw cell_loss (before compound weighting).
+        # Flattened cross-series: event cells dominate the tail.
         loss_flat = cell_loss.detach().flatten()
         log_loss = torch.log(loss_flat + 1e-8)
         log_std = log_loss.std()
-        # Guard: NaN < 0.01 evaluates False in PyTorch — must check isfinite.
-        if not log_std.isfinite() or log_std.item() < 0.01:
-            w_dro = torch.ones_like(cell_loss)
-        else:
-            log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
-            dro_alpha = log_cv / (log_cv + 1.0)
-            z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
-            w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
-            w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
-            w_dro = w_dro.view_as(cell_loss)
-            w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
+
+        # CV-based alpha: self-normalizing, naturally bounded.
+        # Clamp at 0.1: std<0.1 means losses span <1.1×, too little
+        # variation for meaningful z-scores.
+        log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
+        dro_alpha = log_cv / (log_cv + 1.0)
+        z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
+        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
+        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
+        w_dro = w_dro.view_as(cell_loss)
+        w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
 
         # Combine compound × DRO, normalise jointly to mean=1
         w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean().clamp(min=1e-8)
+        w_total = w_total / w_total.mean()
+        # Safety: any residual NaN from degenerate batches → weight=1
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         loss_shape = (w_total * cell_loss).mean()
@@ -330,20 +325,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_flat = level_losses.detach().flatten()
         log_level = torch.log(level_flat + 1e-8)
         level_log_std = log_level.std()
-        if not level_log_std.isfinite() or level_log_std.item() < 0.01:
-            w_level = torch.ones_like(level_losses)
-        else:
-            level_log_cv = torch.log1p(
-                level_log_std / (log_level.mean().abs() + 1e-8)
-            )
-            level_dro_alpha = level_log_cv / (level_log_cv + 1.0)
+        level_log_cv = torch.log1p(
+            level_log_std / (log_level.mean().abs() + 1e-8)
+        )
+        level_dro_alpha = level_log_cv / (level_log_cv + 1.0)
 
-            level_z = (log_level - log_level.mean()) / level_log_std.clamp(min=0.1)
-            w_level = torch.log1p((1.0 + level_z).clamp(min=0.0))
-            w_level = w_level / w_level.mean().clamp(min=1e-8)
-            w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
-            w_level = torch.nan_to_num(w_level, nan=1.0, posinf=1.0, neginf=0.0)
-            w_level = w_level.view_as(level_losses)
+        level_z = (log_level - log_level.mean()) / level_log_std.clamp(min=0.1)
+        w_level = torch.log1p((1.0 + level_z).clamp(min=0.0))
+        w_level = w_level / w_level.mean().clamp(min=1e-8)
+        w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
+        w_level = torch.nan_to_num(w_level, nan=1.0, posinf=1.0, neginf=0.0)
+        w_level = w_level.view_as(level_losses)
 
         loss_level = T * (w_level * level_losses).mean()
 

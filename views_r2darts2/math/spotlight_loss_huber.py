@@ -86,30 +86,35 @@ class SpotlightLossHuber(torch.nn.Module):
        Multi-resolution STFT magnitude comparison with DC bin masked.
        Phase-invariant; log_cosh on magnitude diffs (unchanged).
 
-    ── Base cell loss: Pseudo-Huber with δ = std(e_shape) ──────────
+    ── Base cell loss: Huber with per-series δ = median(|e_shape|) ──
 
-    L_δ(e) = δ²(√(1 + (e/δ)²) − 1)
+    L_δ(e) = δ²(√(1 + (e/δ)²) − 1)       (smooth Huber / Pseudo-Huber)
 
     Gradient: dL/de = e / √(1 + (e/δ)²)
 
     For |e| << δ:  L ≈ e²/2 (MSE),       gradient ≈ e
     For |e| >> δ:  L ≈ δ|e| − δ²/2 (L1), gradient → ±δ
 
-    δ = std(e_shape) — the RMS of the demeaned errors (since
-    mean(e_shape)≡0 per series, std = RMS). This is immune to
-    peace-cell contamination: std is an L2 statistic, so a few
-    large event errors keep it healthy even when 90% are ≈0.
+    δ is computed **per series**, not per batch:
 
-    Previous δ-selection methods failed on zero-inflated data:
-    - median+2·MAD: order statistics → median=0, MAD=0, δ collapsed
-    - Wang et al. bisection: peace cells contributed 0 → δ→∞ → MSE
-    - Event-threshold filtering: rejected (more hyperparameters)
+        δ_s = median(|e_shape_s|)       for each series s
 
-    std-based δ is:
-    - Fully dynamic (changes every batch)
-    - Scale-invariant (if errors double, δ doubles)
-    - Converges naturally (model improves → errors shrink → δ shrinks)
-    - Zero hyperparameters
+    Why per-series solves the zero-inflation problem:
+    The 90/10 peace/event split is BETWEEN series, not within them.
+    A peace series is all-peace; an event series is all-event.
+    Per-series, there is no contamination:
+    - Peace series: median ≈ 0 → clamp to 0.01 → gradient ≈ 0.
+      Correct: nothing to learn from near-zero errors.
+    - Event series: median of T=36 |e| values → meaningful δ.
+      Exactly 50% quadratic (MSE), 50% gradient-capped.
+
+    Previous batch-level δ methods all failed on zero-inflated data:
+    - median+2·MAD: 90% zeros → batch median=0 → δ collapsed
+    - Wang et al. bisection: zeros contribute 0 → δ→∞ → pure MSE
+    - std: outlier-sensitive → early training std≈4 → effectively MSE
+
+    Per-series median is robust (to outlier timesteps within a series),
+    self-scaling (as errors shrink, δ shrinks), and zero-hyperparameter.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -262,9 +267,10 @@ class SpotlightLossHuber(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Base cell loss: Pseudo-Huber with δ = std(e_shape) ─────
+        # ── Base cell loss: Pseudo-Huber, δ per series ─────────────
+        # δ_s = median(|e_shape_s|) along T dimension → [B, 1]
         abs_e_shape = torch.abs(e_shape.detach()).clamp(max=1e4)
-        shape_delta = e_shape.detach().std().clamp(min=0.1)
+        shape_delta = abs_e_shape.median(dim=1, keepdim=True).values.clamp(min=0.01)
         cell_loss = self._pseudo_huber(e_shape, shape_delta)
 
         # ── Adaptive compound weighting (difficulty-gated) ────────────
@@ -315,11 +321,9 @@ class SpotlightLossHuber(torch.nn.Module):
             [ew.mean(dim=1) for ew in e_windows], dim=1
         )
 
-        # Level anchor: Pseudo-Huber with δ = std(window_means).
-        # Same gradient profile as shape: MSE for small DC offsets,
-        # gradient capped at ±δ for large ones. Prevents runaway
-        # gradients from T× scaling on extreme event windows.
-        level_delta = window_means.detach().std().clamp(min=0.1)
+        # Level anchor: Pseudo-Huber, δ per series over windows.
+        # δ_s = median(|ē_w|) along window dimension → [B, 1]
+        level_delta = torch.abs(window_means.detach()).median(dim=1, keepdim=True).values.clamp(min=0.01)
         level_losses = self._pseudo_huber(window_means, level_delta)
 
         # Series×window DRO
@@ -363,8 +367,8 @@ class SpotlightLossHuber(torch.nn.Module):
             loss_level.item(),
             loss_spectral.item(),
             total_loss.item(),
-            shape_delta.item(),
-            level_delta.item(),
+            shape_delta.mean().item(),
+            level_delta.mean().item(),
         )
 
         return total_loss

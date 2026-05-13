@@ -246,6 +246,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
             y_true = y_true.squeeze(-1)
 
         T = y_pred.size(1)
+
+        # ── Non-finite guard ───────────────────────────────────────────
+        # Clamp non-finite y_pred *before* any arithmetic. NaN/inf in
+        # predictions can arise from exploding activations or degenerate
+        # RevIN statistics. Clamping to y_true keeps gradients alive
+        # (large but finite error) instead of propagating NaN everywhere.
+        if not torch.isfinite(y_pred).all():
+            y_pred = torch.where(
+                torch.isfinite(y_pred), y_pred, y_true
+            )
+
         e = y_pred - y_true
 
         # ── DC/AC decomposition ───────────────────────────────────────
@@ -283,6 +294,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # CV-based alpha: self-normalizing, naturally bounded.
         # Clamp at 0.1: std<0.1 means losses span <1.1×, too little
         # variation for meaningful z-scores.
+        if not torch.isfinite(log_std) or log_std < 1e-8:
+            log_std = loss_flat.new_tensor(0.1)
         log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
         dro_alpha = log_cv / (log_cv + 1.0)
         z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
@@ -293,7 +306,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Combine compound × DRO, normalise jointly to mean=1
         w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean()
+        w_total = w_total / w_total.mean().clamp(min=1e-8)
         # Safety: any residual NaN from degenerate batches → weight=1
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
@@ -325,6 +338,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_flat = level_losses.detach().flatten()
         log_level = torch.log(level_flat + 1e-8)
         level_log_std = log_level.std()
+        if not torch.isfinite(level_log_std) or level_log_std < 1e-8:
+            level_log_std = level_flat.new_tensor(0.1)
         level_log_cv = torch.log1p(
             level_log_std / (log_level.mean().abs() + 1e-8)
         )

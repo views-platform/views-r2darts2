@@ -246,17 +246,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             y_true = y_true.squeeze(-1)
 
         T = y_pred.size(1)
-
-        # ── Non-finite guard ───────────────────────────────────────────
-        # Clamp non-finite y_pred *before* any arithmetic. NaN/inf in
-        # predictions can arise from exploding activations or degenerate
-        # RevIN statistics. Clamping to y_true keeps gradients alive
-        # (large but finite error) instead of propagating NaN everywhere.
-        if not torch.isfinite(y_pred).all():
-            y_pred = torch.where(
-                torch.isfinite(y_pred), y_pred, y_true
-            )
-
         e = y_pred - y_true
 
         # ── DC/AC decomposition ───────────────────────────────────────

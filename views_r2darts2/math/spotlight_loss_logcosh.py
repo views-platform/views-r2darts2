@@ -283,8 +283,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Cell-level DRO (log-space, Tukey-capped) ────────────────────
         # Z-score log(cell_loss) across all B×T cells.
-        # Tukey fence caps z at Q75+1.5×IQR — fully data-driven, no
-        # hardcoded scalar. With 90/10 data Q25/Q75 sit in the peace
+        # Tukey fence caps z at Q75+1.5×IQR — With 90/10 data Q25/Q75 sit in the peace
         # mass (z≈0), so the fence lands at z≈0.5-1.0. All event cells
         # exceed it and are capped to equal cell-DRO weight, preventing
         # extreme events from pulling away from mid-range ones.

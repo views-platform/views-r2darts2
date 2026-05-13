@@ -265,6 +265,13 @@ class GradientHealthCallback(Callback):
             f"zero={zero_count}/{total_params}"
         )
 
+        if nan_count > 0 or inf_count > 0:
+            logger.error(
+                f"[Epoch {trainer.current_epoch}] Stopping: {nan_count} NaN + "
+                f"{inf_count} Inf gradients detected — run is unrecoverable."
+            )
+            trainer.should_stop = True
+
 
 # ---------------------------------------------------------------------------
 # Weight Norm Monitor

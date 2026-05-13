@@ -146,35 +146,16 @@ class SpotlightLossAsinh(torch.nn.Module):
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
-    def _soft_dtw_pair(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Soft-DTW between two 1-D sequences x, y of length T.
-
-        Uses squared-error cell cost and soft-min with temperature γ.
-        Returns a scalar (the soft-DTW divergence for this pair).
-
-        Complexity: O(T²) time and space.
-        """
-        gamma = self._GAMMA
-        T = x.size(0)
-
-        # Pairwise squared-error cost matrix: C[i,j] = (x[i] - y[j])²
-        C = (x.unsqueeze(1) - y.unsqueeze(0)).pow(2)  # (T, T)
-
-        # DP table, padded with +inf sentinel row/col at index 0
-        INF = 1e9
-        D = x.new_full((T + 1, T + 1), INF)
-        D[0, 0] = 0.0
-
-        for i in range(1, T + 1):
-            for j in range(1, T + 1):
-                neighbors = torch.stack([D[i - 1, j], D[i, j - 1], D[i - 1, j - 1]])
-                soft_min = -gamma * torch.logsumexp(-neighbors / gamma, dim=0)
-                D[i, j] = C[i - 1, j - 1] + soft_min
-
-        return D[T, T]
-
     def _soft_dtw_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Batched soft-DTW, applied only to series with signal."""
+        """Batched soft-DTW via anti-diagonal wavefront.
+
+        Vectorised over both the batch dimension and each anti-diagonal
+        of the T×T DP table. Replaces the naive N×T² Python loop with
+        2T−1 vectorised steps — each step processes an entire
+        anti-diagonal across all N series in parallel.
+
+        Complexity: O(T²) work total, but only O(T) sequential steps.
+        """
         if y_pred.dim() == 3:
             B, T, C = y_pred.shape
             pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
@@ -192,12 +173,36 @@ class SpotlightLossAsinh(torch.nn.Module):
         pred = pred[has_signal]
         true = true[has_signal]
 
-        N = pred.size(0)
-        total = pred.new_tensor(0.0)
-        for k in range(N):
-            total = total + self._soft_dtw_pair(pred[k], true[k])
+        N, T = pred.shape
+        gamma = self._GAMMA
+        INF = 1e9
 
-        return total / N
+        # Cost matrix: (N, T, T)
+        cost = (pred.unsqueeze(2) - true.unsqueeze(1)).pow(2)
+
+        # DP table padded with +inf sentinel row/col at index 0
+        D = pred.new_full((N, T + 1, T + 1), INF)
+        D[:, 0, 0] = 0.0
+
+        # Wavefront: iterate over anti-diagonals k = i + j, k ∈ [2, 2T]
+        # All cells (i, j) with i+j=k have dependencies only on
+        # anti-diagonals k−1 and k−2, so they can be computed in parallel.
+        for k in range(2, 2 * T + 1):
+            i_start = max(1, k - T)
+            i_end = min(T, k - 1)
+            i_idx = torch.arange(i_start, i_end + 1, device=pred.device)
+            j_idx = k - i_idx
+
+            d_above = D[:, i_idx - 1, j_idx]        # (N, diag_len)
+            d_left  = D[:, i_idx, j_idx - 1]        # (N, diag_len)
+            d_diag  = D[:, i_idx - 1, j_idx - 1]    # (N, diag_len)
+
+            neighbors = torch.stack([d_above, d_left, d_diag], dim=-1)  # (N, diag_len, 3)
+            soft_min = -gamma * torch.logsumexp(-neighbors / gamma, dim=-1)
+
+            D[:, i_idx, j_idx] = cost[:, i_idx - 1, j_idx - 1] + soft_min
+
+        return D[:, T, T].mean()
 
     # ------------------------------------------------------------------
     # Forward

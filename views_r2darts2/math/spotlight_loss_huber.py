@@ -173,14 +173,19 @@ class SpotlightLossHuber(torch.nn.Module):
 
         δ = median(|e|) + 2 × MAD(|e|), floored at min_delta.
 
-        The median+2·MAD estimator is robust to outliers and places the
-        quadratic-to-linear transition just past the bulk of errors.
-        As training progresses and errors shrink, δ tightens.
+        Non-finite values are excluded before computing statistics so that
+        inf/NaN in early-training activations cannot corrupt the delta.
         """
         flat = abs_errors.detach().flatten()
+        # Filter non-finite: torch.clamp does NOT handle NaN.
+        flat = flat[flat.isfinite()]
+        if flat.numel() == 0:
+            return abs_errors.new_tensor(min_delta)
         median_val = flat.median()
         mad = (flat - median_val).abs().median()
-        return torch.clamp(median_val + 2.0 * mad, min=min_delta)
+        raw = median_val + 2.0 * mad
+        # Use max() instead of clamp: clamp passes NaN through unchanged.
+        return raw if raw.isfinite() and raw.item() >= min_delta else abs_errors.new_tensor(min_delta)
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only)."""
@@ -242,6 +247,19 @@ class SpotlightLossHuber(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
+        # ── Guard: clamp non-finite predictions ───────────────────────
+        # Exploding model activations early in training can produce inf/NaN
+        # which propagates through inf/inf=NaN in difficulty and log(inf)→
+        # inf-inf=NaN in DRO. Clamp before anything else.
+        if not y_pred.isfinite().all():
+            logger.warning(
+                "Non-finite values in y_pred (has_nan=%s, has_inf=%s) — "
+                "clamping to prevent NaN loss.",
+                y_pred.isnan().any().item(),
+                y_pred.isinf().any().item(),
+            )
+            y_pred = torch.nan_to_num(y_pred, nan=0.0, posinf=20.0, neginf=-20.0)
+
         T = y_pred.size(1)
         e = y_pred - y_true
 
@@ -250,7 +268,10 @@ class SpotlightLossHuber(torch.nn.Module):
         e_shape = e - e_mean
 
         # ── Adaptive Huber delta ──────────────────────────────────────
-        abs_e_shape = torch.abs(e_shape.detach())
+        # Clamp abs_e_shape before passing to adaptive delta: if any value
+        # were inf (shouldn't happen after the guard above, but belt+braces),
+        # the median computation would return inf and clamp can't fix NaN.
+        abs_e_shape = torch.abs(e_shape.detach()).clamp(max=1e4)
         huber_delta = self._compute_adaptive_delta(abs_e_shape)
 
         # ── Base cell loss: Huber on demeaned error ───────────────────
@@ -265,6 +286,8 @@ class SpotlightLossHuber(torch.nn.Module):
         abs_y = torch.abs(y_true)
         abs_ypred_sg = torch.abs(y_pred.detach())
 
+        # abs_e_shape is already clamped to 1e4 above, so inf/(1+inf)=NaN
+        # cannot happen here.
         difficulty = abs_e_shape / (1.0 + abs_e_shape)
         abs_max = torch.max(abs_y, abs_ypred_sg)
         above_threshold = (abs_max > self.non_zero_threshold).float()
@@ -274,9 +297,8 @@ class SpotlightLossHuber(torch.nn.Module):
         loss_flat = cell_loss.detach().flatten()
         log_loss = torch.log(loss_flat + 1e-8)
         log_std = log_loss.std()
-
-        # Guard: if losses are near-constant (degenerate batch), skip DRO
-        if log_std < 0.01:
+        # Guard: NaN < 0.01 evaluates False in PyTorch — must check isfinite.
+        if not log_std.isfinite() or log_std.item() < 0.01:
             w_dro = torch.ones_like(cell_loss)
         else:
             log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
@@ -289,8 +311,7 @@ class SpotlightLossHuber(torch.nn.Module):
 
         # Combine compound × DRO, normalise jointly to mean=1
         w_total = w_compound * w_dro
-        w_mean = w_total.mean()
-        w_total = w_total / w_mean.clamp(min=1e-8)
+        w_total = w_total / w_total.mean().clamp(min=1e-8)
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         loss_shape = (w_total * cell_loss).mean()
@@ -314,8 +335,7 @@ class SpotlightLossHuber(torch.nn.Module):
         level_flat = level_losses.detach().flatten()
         log_level = torch.log(level_flat + 1e-8)
         level_log_std = log_level.std()
-
-        if level_log_std < 0.01:
+        if not level_log_std.isfinite() or level_log_std.item() < 0.01:
             w_level = torch.ones_like(level_losses)
         else:
             level_log_cv = torch.log1p(

@@ -287,6 +287,7 @@ class ReproducibilityGate:
             "SpotlightLossLogcosh": ["delta", "non_zero_threshold"],
             "SpotlightLossHuber": ["delta", "non_zero_threshold"],
             "SpotlightLossPowerLaw": ["delta", "non_zero_threshold"],
+            "SpotlightLossAsinh": ["delta", "non_zero_threshold"],
             "SpotlightFocalLoss": ["gamma", "delta", "non_zero_threshold"],
             "SentinelLoss": ["alpha", "beta", "kappa", "delta", "gamma"],
             "MSELoss": [],

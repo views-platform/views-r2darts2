@@ -254,6 +254,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
+        # ── Input guard: clamp inf → finite before anything touches e ──
+        # Model weight explosion can produce inf activations; allow
+        # training to continue (with degraded but finite gradients)
+        # rather than crashing.
+        _SAFE = 1e4  # asinh(1e4) ≈ 9.9 — well beyond any real target
+        y_pred = y_pred.clamp(-_SAFE, _SAFE)
+        y_true = y_true.clamp(-_SAFE, _SAFE)
+
         T = y_pred.size(1)
         e = y_pred - y_true
 
@@ -297,7 +305,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         z_cell = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
         z_q25 = torch.quantile(z_cell, 0.25)
         z_q75 = torch.quantile(z_cell, 0.75)
-        z_cell = z_cell.clamp(max=z_q75 + 1.5 * (z_q75 - z_q25))
+        iqr_cell = (z_q75 - z_q25).clamp(min=0.5)  # floor prevents collapse when Q25≈Q75
+        z_cell = z_cell.clamp(max=z_q75 + 1.5 * iqr_cell)
         w_cell_dro = torch.log1p((1.0 + z_cell).clamp(min=0.0))
         w_cell_dro = w_cell_dro / w_cell_dro.mean().clamp(min=1e-8)
         w_cell_dro = w_cell_dro.view_as(cell_loss)
@@ -320,7 +329,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         z_series = (log_series - log_series.mean()) / series_log_std.clamp(min=0.1)
         sq25 = torch.quantile(z_series, 0.25)
         sq75 = torch.quantile(z_series, 0.75)
-        z_series = z_series.clamp(max=sq75 + 1.5 * (sq75 - sq25))
+        iqr_series = (sq75 - sq25).clamp(min=0.5)
+        z_series = z_series.clamp(max=sq75 + 1.5 * iqr_series)
         w_series_dro = torch.log1p((1.0 + z_series).clamp(min=0.0))
         w_series_dro = w_series_dro / w_series_dro.mean().clamp(min=1e-8)
         w_series_dro = series_dro_alpha * w_series_dro + (1.0 - series_dro_alpha)
@@ -368,6 +378,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_dro_alpha = level_log_cv / (level_log_cv + 1.0)
 
         level_z = (log_level - log_level.mean()) / level_log_std.clamp(min=0.1)
+        lq25 = torch.quantile(level_z, 0.25)
+        lq75 = torch.quantile(level_z, 0.75)
+        iqr_level = (lq75 - lq25).clamp(min=0.5)
+        level_z = level_z.clamp(max=lq75 + 1.5 * iqr_level)
         w_level = torch.log1p((1.0 + level_z).clamp(min=0.0))
         w_level = w_level / w_level.mean().clamp(min=1e-8)
         w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
@@ -383,11 +397,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         total_loss = loss_shape + loss_level + self.delta * loss_spectral
 
-        if torch.isnan(total_loss):
-            raise RuntimeError(
-                f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} spectral={loss_spectral.item():.6f}"
+        if not torch.isfinite(total_loss):
+            logger.warning(
+                "SpotlightLoss non-finite: shape=%.6f level=%.6f "
+                "spectral=%.6f — returning safe fallback",
+                loss_shape.item(), loss_level.item(), loss_spectral.item(),
             )
+            # Fallback: unweighted log_cosh on raw error, guaranteed finite
+            # after input clamping. Keeps gradients flowing.
+            return self._log_cosh(e).mean()
 
         logger.debug(
             "SpotlightLoss | shape=%.6f level=%.6f spec=%.6f total=%.6f",

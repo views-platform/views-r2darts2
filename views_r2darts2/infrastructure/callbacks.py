@@ -1028,3 +1028,126 @@ class YHatBarCallback(Callback):
         self._preds.clear()
         self._truths.clear()
 
+
+# ---------------------------------------------------------------------------
+# Validation MSLE / MSE
+# ---------------------------------------------------------------------------
+
+
+class ValMetricsCallback(Callback):
+    """
+    Epoch-level MSLE and MSE on the validation set in raw (un-transformed) space.
+
+    Intent Contract:
+        - Purpose: Provide calibration-quality metrics (MSLE, RMSLE, MSE) on the
+          held-out validation fold so that overprediction bias visible in training
+          calibration is also tracked on unseen windows.
+        - Mechanism: ``on_validation_batch_end`` runs a fresh ``no_grad`` forward
+          pass using the batch that was just processed.  The model is already in
+          ``eval()`` mode, so RevIN and dropout behave identically to what the
+          ``validation_step`` already computed — the extra overhead is one
+          forward pass per val batch with no gradient tape.
+        - Guarantees: Logs ``val_metrics/MSLE``, ``val_metrics/RMSLE``,
+          ``val_metrics/MSE`` to WandB at the end of each validation epoch.
+        - Non-Goals: Does not recompute val_loss or interfere with early stopping.
+
+    Parameters
+    ----------
+    target_scaler : str, optional
+        ``"AsinhTransform"`` → inverse = ``sinh``; anything else → ``expm1``.
+    log_every_n_epochs : int
+        Skip logging on epochs that are not multiples of this value (still
+        clears the accumulators to avoid stale data).
+    """
+
+    def __init__(
+        self,
+        target_scaler: str | None = None,
+        log_every_n_epochs: int = 1,
+    ):
+        super().__init__()
+        self.log_every_n_epochs = log_every_n_epochs
+        self._preds: list = []
+        self._truths: list = []
+        self._inverse_fn = (
+            torch.sinh if target_scaler == "AsinhTransform" else torch.expm1
+        )
+
+    def on_validation_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
+    ):
+        if batch is None:
+            return
+        try:
+            # Resolve input slice: use model's own input_tuple_size when available,
+            # else mirror the training_step patch which excludes sample_weight (-2)
+            # and future_target (-1).
+            n_inputs = getattr(pl_module, "input_tuple_size", None)
+            if n_inputs is not None:
+                input_batch = batch[:n_inputs]
+            else:
+                input_batch = batch[:-2]
+
+            target = batch[-1]
+
+            with torch.no_grad():
+                output = pl_module._produce_train_output(input_batch)
+
+            preds = output.detach().float()
+            if preds.dim() == 4:
+                preds = preds[..., 0]  # point forecast (first likelihood param)
+            if preds.dim() == 2:
+                preds = preds.unsqueeze(-1)
+
+            truth = target.detach().float()
+            if truth.dim() == 2:
+                truth = truth.unsqueeze(-1)
+
+            self._preds.append(preds.cpu())
+            self._truths.append(truth.cpu())
+        except Exception as exc:
+            logger.debug(
+                f"ValMetricsCallback: skipped batch {batch_idx} — {exc}"
+            )
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        preds_buf = self._preds[:]
+        truths_buf = self._truths[:]
+        self._preds.clear()
+        self._truths.clear()
+
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+        if not preds_buf or not truths_buf:
+            return
+
+        all_preds = torch.cat(preds_buf, dim=0).float()   # (N, T, C)
+        all_truths = torch.cat(truths_buf, dim=0).float()  # (N, T, C)
+
+        # Inverse-transform to raw (count) space and floor at 0
+        raw_preds = self._inverse_fn(all_preds).clamp(min=0.0)
+        raw_truths = self._inverse_fn(all_truths).clamp(min=0.0)
+
+        # MSLE: mean((log(1 + y_hat) - log(1 + y))^2)
+        log_pred = torch.log1p(raw_preds)
+        log_true = torch.log1p(raw_truths)
+        msle = ((log_pred - log_true) ** 2).mean().item()
+        rmsle = msle ** 0.5
+
+        # MSE in raw space
+        mse = ((raw_preds - raw_truths) ** 2).mean().item()
+
+        metrics = {
+            "val_metrics/MSLE": msle,
+            "val_metrics/RMSLE": rmsle,
+            "val_metrics/MSE": mse,
+        }
+
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        logger.info(
+            f"[Epoch {trainer.current_epoch}] Val Metrics | "
+            f"MSLE={msle:.5f}  RMSLE={rmsle:.4f}  MSE={mse:.2f}"
+        )
+

@@ -30,6 +30,7 @@ from views_r2darts2.infrastructure.callbacks import (
     LossStabilityCallback,
     EpochTimingCallback,
     YHatBarCallback,
+    ValMetricsCallback,
 )
 
 
@@ -100,6 +101,9 @@ class ModelCatalog:
             YHatBarCallback(
                 target_scaler=self.config.get("target_scaler"),
                 non_zero_threshold=self.config.get("non_zero_threshold", 0.88),
+            ),
+            ValMetricsCallback(
+                target_scaler=self.config.get("target_scaler"),
             ),
         ]
         if extra_callbacks:

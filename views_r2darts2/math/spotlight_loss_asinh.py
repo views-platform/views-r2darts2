@@ -57,22 +57,22 @@ class SpotlightLossAsinh(torch.nn.Module):
        in raw counts. The DC/AC split makes it structurally impossible
        for the shape loss to accumulate any DC bias, period.
 
-    2. **Windowed level anchor** — T-scaled asinh_integral on per-series,
-       per-window mean error.
+    2. **Windowed level anchor with optional Tukey-capped DRO** — log_cosh
+       on per-series, per-window mean error.
 
        Only mechanism that can shift per-series means. Shape loss is
        structurally DC-blind.
 
-       The horizon is split into non-overlapping windows of width
-       W = max(4, T // 6). Each window's mean error is penalised
-       independently:
+       log_cosh (not asinh_integral) is used deliberately: the level
+       anchor's job is gentle DC correction. tanh saturation at ±1
+       prevents the anchor from dominating late in training as shape
+       loss decreases.
 
-           ē_w = mean(e[t_start:t_end])         per window w, series s
-           l_{s,w} = asinh_integral(ē_w)
-           L_level = T · mean_{s,w}[ l_{s,w} ]
-
-       Window width is dynamic — computed from the actual output length.
-       Floor of 4 ensures each window mean is statistically meaningful.
+       When _LEVEL_DRO=True: log-space DRO concentrates the level
+       gradient on drifting (series, window) pairs. Without it, the
+       ~90% near-zero peace windows dilute the gradient on event-series
+       DC bias and it never gets corrected. Same z-score + log1p +
+       soft alpha-blend mechanism, no Tukey cap.
 
     3. **Spectral regularization** (optional, gated by δ > 0).
        Multi-resolution STFT magnitude comparison with DC bin masked.
@@ -103,6 +103,7 @@ class SpotlightLossAsinh(torch.nn.Module):
     """
 
     SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
+    _LEVEL_DRO = True
 
     def __init__(self, delta: float, non_zero_threshold: float):
         if delta < 0.0:
@@ -216,17 +217,33 @@ class SpotlightLossAsinh(torch.nn.Module):
         loss_shape = cell_loss.mean()
 
         # ── Windowed level anchor ─────────────────────────────────────
-        # Uses log_cosh (not asinh_integral) deliberately: the level
-        # anchor's job is gentle DC correction, not magnitude-proportional
-        # pursuit. tanh saturation at ±1 prevents the anchor from
-        # dominating late in training as shape loss decreases.
+        # log_cosh: saturating gradient prevents late-training domination.
         W = max(4, T // 6)
         e_windows = list(e.split(W, dim=1))
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e_windows], dim=1
         )
-        level_losses = self._log_cosh(window_means)
-        loss_level = T * level_losses.mean()
+        level_losses = self._log_cosh(window_means)    # (B, n_windows)
+
+        if self._LEVEL_DRO:
+            # DRO: concentrate gradient on drifting (series, window)
+            # pairs, suppressed by 90% peace entries.
+            level_flat = level_losses.detach().flatten()
+            log_lv = torch.log(level_flat + 1e-8)
+            lv_std = log_lv.std()
+            if not torch.isfinite(lv_std) or lv_std < 1e-8:
+                lv_std = level_flat.new_tensor(0.1)
+            lv_cv = torch.log1p(lv_std / (log_lv.mean().abs() + 1e-8))
+            lv_alpha = lv_cv / (lv_cv + 1.0)
+            lv_z = (log_lv - log_lv.mean()) / lv_std.clamp(min=0.1)
+            w_lv = torch.log1p((1.0 + lv_z).clamp(min=0.0))
+            w_lv = w_lv / w_lv.mean().clamp(min=1e-8)
+            w_lv = lv_alpha * w_lv + (1.0 - lv_alpha)
+            w_lv = torch.nan_to_num(w_lv, nan=1.0, posinf=1.0, neginf=0.0)
+            w_lv = w_lv.view_as(level_losses)
+            loss_level = T * (w_lv * level_losses).mean()
+        else:
+            loss_level = T * level_losses.mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────
         loss_spectral = y_pred.new_tensor(0.0)

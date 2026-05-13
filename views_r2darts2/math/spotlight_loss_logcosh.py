@@ -54,37 +54,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
        binary indicator. Above τ, smooth magnitude scaling applies.
        ŷ is stop-gradient. Self-correcting: as |e|→0, w→1.
 
-    3. **Dual DRO tail aggregation (log-space, Tukey-capped)** — parameter-free.
+    3. **KL-DRO tail aggregation (log-space)** — parameter-free.
 
-       Two DRO passes operate at orthogonal granularities:
+       Instead of a plain mean over weighted shape losses, z-score
+       log(cell_loss) and apply concave-compressed DRO weights:
 
-       **Cell-level DRO** — z-scores log(cell_loss) across all B×T cells,
-       detects proportional outlier *cells* within the batch:
+           log_l = log(l + ε)
+           z = (log_l − mean(log_l)) / std(log_l)
+           dro_w = log1p(clamp(1+z, min=0))
+           dro_w = dro_w / mean(dro_w)
 
-           z = (log_l − mean) / std
-           z = clamp(z, max = Q75(z) + 1.5 × IQR(z))   ← Tukey fence
-           dro_w = log1p(clamp(1+z, min=0)) / mean
+       KL-DRO detects *proportional* outliers, not absolute. A
+       5-death miss at 10× the median loss gets the same DRO emphasis
+       as a 1000-death miss at 10× the median. Aligned with the
+       proportional error sensitivity of asinh-space prediction.
 
-       The Tukey fence is fully data-driven — no hardcoded scalar. With
-       90/10 data, Q25 and Q75 both fall in the peace mass (z ≈ 0), so
-       the fence sits at z ≈ 0.5–1.0. All event cells exceed it and
-       receive equal cell-DRO weight; the extreme few cannot pull away
-       from mid-range events. Differentiation *within* events is left
-       to compound weighting.
-
-       **Series-level DRO** — aggregates cell_loss to per-series means
-       first, then z-scores across B series. Catches *systematically
-       hard series* that cell DRO misses: a country with consistent
-       moderate errors has no individual outlier cells, but its series
-       mean sits in the event tail. Same Tukey fence applied.
-       Broadcasts back to (B, T) before combining.
-
-       Final shape weight = compound × cell_DRO × series_DRO,
-       normalised jointly to mean=1. Each DRO operates independently:
-       cell_DRO = which timesteps, series_DRO = which series.
-
-       Soft activation α = log_cv/(log_cv + 1.0) blends each DRO toward
+       Soft activation α = log_cv/(log_cv + 1.0) blends toward
        uniform when log-loss variance is small (early training).
+
+       Compound weight and DRO are combined independently (product,
+       normalised jointly to mean=1) — they address orthogonal concerns:
+       compound steers *which cells matter*, DRO steers *how losses
+       are aggregated* across the 90/10 peace/event split.
 
     4. **Windowed level anchor** — T-scaled log_cosh on per-series,
        per-window mean error, with DRO aggregation.
@@ -254,14 +245,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
-        # ── Input guard: clamp inf → finite before anything touches e ──
-        # Model weight explosion can produce inf activations; allow
-        # training to continue (with degraded but finite gradients)
-        # rather than crashing.
-        _SAFE = 1e4  # asinh(1e4) ≈ 9.9 — well beyond any real target
-        y_pred = y_pred.clamp(-_SAFE, _SAFE)
-        y_true = y_true.clamp(-_SAFE, _SAFE)
-
         T = y_pred.size(1)
         e = y_pred - y_true
 
@@ -289,57 +272,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
         above_threshold = (abs_max > self.non_zero_threshold).float()
         w_compound = 1.0 + difficulty * above_threshold
 
-        # ── Cell-level DRO (log-space, Tukey-capped) ────────────────────
-        # Z-score log(cell_loss) across all B×T cells.
-        # Tukey fence caps z at Q75+1.5×IQR — With 90/10 data Q25/Q75 sit in the peace
-        # mass (z≈0), so the fence lands at z≈0.5-1.0. All event cells
-        # exceed it and are capped to equal cell-DRO weight, preventing
-        # extreme events from pulling away from mid-range ones.
+        # ── Sqrt-DRO tail aggregation (log-space z-scores) ─────────────
+        # Z-score log(cell_loss) for proportional outlier detection.
+        # Operates on raw cell_loss (before compound weighting).
+        # Flattened cross-series: event cells dominate the tail.
         loss_flat = cell_loss.detach().flatten()
         log_loss = torch.log(loss_flat + 1e-8)
         log_std = log_loss.std()
-        if not torch.isfinite(log_std) or log_std < 1e-8:
-            log_std = loss_flat.new_tensor(0.1)
+
+        # CV-based alpha: self-normalizing, naturally bounded.
+        # Clamp at 0.1: std<0.1 means losses span <1.1×, too little
+        # variation for meaningful z-scores.
         log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
         dro_alpha = log_cv / (log_cv + 1.0)
-        z_cell = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
-        z_q25 = torch.quantile(z_cell, 0.25)
-        z_q75 = torch.quantile(z_cell, 0.75)
-        iqr_cell = (z_q75 - z_q25).clamp(min=0.5)  # floor prevents collapse when Q25≈Q75
-        z_cell = z_cell.clamp(max=z_q75 + 1.5 * iqr_cell)
-        w_cell_dro = torch.log1p((1.0 + z_cell).clamp(min=0.0))
-        w_cell_dro = w_cell_dro / w_cell_dro.mean().clamp(min=1e-8)
-        w_cell_dro = w_cell_dro.view_as(cell_loss)
-        w_cell_dro = dro_alpha * w_cell_dro + (1.0 - dro_alpha)
+        z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
+        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
+        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
+        w_dro = w_dro.view_as(cell_loss)
+        w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
 
-        # ── Series-level DRO (per-series aggregated loss) ────────────────
-        # Aggregate to per-series mean loss, then z-score over B series.
-        # Catches systematically-hard series (consistent moderate error
-        # across 36 timesteps) that cell DRO misses because no individual
-        # cell is a proportional outlier. Same Tukey fence.
-        series_loss = cell_loss.detach().mean(dim=1)          # (B,)
-        log_series = torch.log(series_loss + 1e-8)
-        series_log_std = log_series.std()
-        if not torch.isfinite(series_log_std) or series_log_std < 1e-8:
-            series_log_std = series_loss.new_tensor(0.1)
-        series_log_cv = torch.log1p(
-            series_log_std / (log_series.mean().abs() + 1e-8)
-        )
-        series_dro_alpha = series_log_cv / (series_log_cv + 1.0)
-        z_series = (log_series - log_series.mean()) / series_log_std.clamp(min=0.1)
-        sq25 = torch.quantile(z_series, 0.25)
-        sq75 = torch.quantile(z_series, 0.75)
-        iqr_series = (sq75 - sq25).clamp(min=0.5)
-        z_series = z_series.clamp(max=sq75 + 1.5 * iqr_series)
-        w_series_dro = torch.log1p((1.0 + z_series).clamp(min=0.0))
-        w_series_dro = w_series_dro / w_series_dro.mean().clamp(min=1e-8)
-        w_series_dro = series_dro_alpha * w_series_dro + (1.0 - series_dro_alpha)
-        w_series_dro = torch.nan_to_num(w_series_dro, nan=1.0, posinf=1.0, neginf=0.0)
-        w_series_dro = w_series_dro.unsqueeze(1).expand_as(cell_loss)  # (B, T)
-
-        # Combine compound × cell_DRO × series_DRO, normalise jointly to mean=1
-        w_total = w_compound * w_cell_dro * w_series_dro
-        w_total = w_total / w_total.mean().clamp(min=1e-8)
+        # Combine compound × DRO, normalise jointly to mean=1
+        w_total = w_compound * w_dro
+        w_total = w_total / w_total.mean()
+        # Safety: any residual NaN from degenerate batches → weight=1
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         loss_shape = (w_total * cell_loss).mean()
@@ -370,18 +325,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_flat = level_losses.detach().flatten()
         log_level = torch.log(level_flat + 1e-8)
         level_log_std = log_level.std()
-        if not torch.isfinite(level_log_std) or level_log_std < 1e-8:
-            level_log_std = level_flat.new_tensor(0.1)
         level_log_cv = torch.log1p(
             level_log_std / (log_level.mean().abs() + 1e-8)
         )
         level_dro_alpha = level_log_cv / (level_log_cv + 1.0)
 
         level_z = (log_level - log_level.mean()) / level_log_std.clamp(min=0.1)
-        lq25 = torch.quantile(level_z, 0.25)
-        lq75 = torch.quantile(level_z, 0.75)
-        iqr_level = (lq75 - lq25).clamp(min=0.5)
-        level_z = level_z.clamp(max=lq75 + 1.5 * iqr_level)
         w_level = torch.log1p((1.0 + level_z).clamp(min=0.0))
         w_level = w_level / w_level.mean().clamp(min=1e-8)
         w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
@@ -397,15 +346,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         total_loss = loss_shape + loss_level + self.delta * loss_spectral
 
-        if not torch.isfinite(total_loss):
-            logger.warning(
-                "SpotlightLoss non-finite: shape=%.6f level=%.6f "
-                "spectral=%.6f — returning safe fallback",
-                loss_shape.item(), loss_level.item(), loss_spectral.item(),
+        if torch.isnan(total_loss):
+            raise RuntimeError(
+                f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
+                f"level={loss_level.item():.6f} spectral={loss_spectral.item():.6f}"
             )
-            # Fallback: unweighted log_cosh on raw error, guaranteed finite
-            # after input clamping. Keeps gradients flowing.
-            return self._log_cosh(e).mean()
 
         logger.debug(
             "SpotlightLoss | shape=%.6f level=%.6f spec=%.6f total=%.6f",

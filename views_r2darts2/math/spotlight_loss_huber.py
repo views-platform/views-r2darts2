@@ -167,24 +167,37 @@ class SpotlightLossHuber(torch.nn.Module):
 
     @staticmethod
     def _compute_adaptive_delta(
-        abs_errors: torch.Tensor, min_delta: float = 0.5
+        abs_errors: torch.Tensor,
+        min_delta: float = 0.5,
+        event_threshold: float = 0.0,
     ) -> torch.Tensor:
-        """Compute adaptive Huber delta from the error distribution.
+        """Compute adaptive Huber delta from the event-cell error distribution.
 
         δ = median(|e|) + 2 × MAD(|e|), floored at min_delta.
 
-        Non-finite values are excluded before computing statistics so that
-        inf/NaN in early-training activations cannot corrupt the delta.
+        When event_threshold > 0, only cells with |e| > threshold are used
+        to compute the statistic. This prevents the 90% peace population
+        (|e| ≈ 0) from driving median → 0 and collapsing δ → min_delta,
+        which would push all event errors into the linear (saturating) regime
+        and reproduce log_cosh-like gradient saturation.
+
+        Falls back to all cells if fewer than 10 event cells exist in batch.
+        Non-finite values are always excluded.
         """
         flat = abs_errors.detach().flatten()
-        # Filter non-finite: torch.clamp does NOT handle NaN.
         flat = flat[flat.isfinite()]
         if flat.numel() == 0:
             return abs_errors.new_tensor(min_delta)
+
+        # Filter to event cells if threshold given and enough samples exist
+        if event_threshold > 0.0:
+            event_flat = flat[flat > event_threshold]
+            if event_flat.numel() >= 10:
+                flat = event_flat
+
         median_val = flat.median()
         mad = (flat - median_val).abs().median()
         raw = median_val + 2.0 * mad
-        # Use max() instead of clamp: clamp passes NaN through unchanged.
         return raw if raw.isfinite() and raw.item() >= min_delta else abs_errors.new_tensor(min_delta)
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -271,8 +284,12 @@ class SpotlightLossHuber(torch.nn.Module):
         # Clamp abs_e_shape before passing to adaptive delta: if any value
         # were inf (shouldn't happen after the guard above, but belt+braces),
         # the median computation would return inf and clamp can't fix NaN.
+        # Pass non_zero_threshold so δ is calibrated to the event-error
+        # distribution, not the 90% peace population which has |e| ≈ 0.
         abs_e_shape = torch.abs(e_shape.detach()).clamp(max=1e4)
-        huber_delta = self._compute_adaptive_delta(abs_e_shape)
+        huber_delta = self._compute_adaptive_delta(
+            abs_e_shape, event_threshold=self.non_zero_threshold
+        )
 
         # ── Base cell loss: Huber on demeaned error ───────────────────
         cell_loss = self._adaptive_huber(e_shape, huber_delta)
@@ -325,11 +342,16 @@ class SpotlightLossHuber(torch.nn.Module):
             [ew.mean(dim=1) for ew in e_windows], dim=1
         )
 
-        # Adaptive delta for level anchor (separate from cell delta)
-        level_huber_delta = self._compute_adaptive_delta(
-            torch.abs(window_means.detach()), min_delta=0.1
-        )
-        level_losses = self._adaptive_huber(window_means, level_huber_delta)
+        # Level anchor uses MSE (half-squared-error on window means) instead
+        # of adaptive Huber.  Rationale: _compute_adaptive_delta collapses to
+        # min_delta when 75% peace series drive median(|window_means|) → 0.
+        # At min_delta=0.1, event series with ~1-unit DC errors are in the
+        # LINEAR regime → gradient ≈ 0.1 (constant), an order of magnitude
+        # weaker than the shape loss.  MSE fixes this: gradient = window_mean
+        # directly, no delta parameter, no collapse.  MSE on window means is
+        # also the exact DC complement to MSE on demeaned AC errors: together
+        # they decompose total MSE without dead zones.
+        level_losses = 0.5 * window_means * window_means
 
         # Series×window DRO
         level_flat = level_losses.detach().flatten()
@@ -367,13 +389,12 @@ class SpotlightLossHuber(torch.nn.Module):
 
         logger.debug(
             "SpotlightLossHuber | shape=%.6f level=%.6f spec=%.6f total=%.6f "
-            "huber_delta=%.4f level_delta=%.4f",
+            "huber_delta=%.4f",
             loss_shape.item(),
             loss_level.item(),
             loss_spectral.item(),
             total_loss.item(),
             huber_delta.item(),
-            level_huber_delta.item(),
         )
 
         return total_loss

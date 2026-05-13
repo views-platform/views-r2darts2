@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class SpotlightLossAsinh(torch.nn.Module):
+class SpotlightLossHuber(torch.nn.Module):
     """
     SpotlightLoss — Huber variant with adaptive delta.
 
@@ -86,26 +86,30 @@ class SpotlightLossAsinh(torch.nn.Module):
        Multi-resolution STFT magnitude comparison with DC bin masked.
        Phase-invariant; log_cosh on magnitude diffs (unchanged).
 
-    ── Base cell loss: asinh-integral (parameter-free) ─────────────
+    ── Base cell loss: Pseudo-Huber with δ = std(e_shape) ──────────
 
-    L(e) = e·asinh(e) − √(1+e²) + 1
+    L_δ(e) = δ²(√(1 + (e/δ)²) − 1)
 
-    Gradient: dL/de = asinh(e)
+    Gradient: dL/de = e / √(1 + (e/δ)²)
 
-    Quadratic for small e (≈ 0.5e² ≈ MSE), transitions smoothly to
-    |e|·log(2|e|) for large e. Gradient grows logarithmically — never
-    saturates (unlike log_cosh/tanh) but never runs away (unlike MSE).
+    For |e| << δ:  L ≈ e²/2 (MSE),       gradient ≈ e
+    For |e| >> δ:  L ≈ δ|e| − δ²/2 (L1), gradient → ±δ
 
-    Previous approaches failed on this zero-inflated data:
-    - Huber with adaptive δ (median+2·MAD): δ collapsed to min_delta
-      because 90% peace cells drove median→0 → gradient capped too low.
-    - Huber with Wang et al. bisection: bisection produced δ >> max|e|
-      because peace cells contributed 0 to the LHS → Huber=MSE →
-      uncapped gradients → positive feedback → model divergence.
+    δ = std(e_shape) — the RMS of the demeaned errors (since
+    mean(e_shape)≡0 per series, std = RMS). This is immune to
+    peace-cell contamination: std is an L2 statistic, so a few
+    large event errors keep it healthy even when 90% are ≈0.
 
-    The asinh-integral avoids the δ problem entirely. The transition
-    from quadratic to sub-linear is structural, not parametric.
-    No δ parameter, no bisection, no thresholds.
+    Previous δ-selection methods failed on zero-inflated data:
+    - median+2·MAD: order statistics → median=0, MAD=0, δ collapsed
+    - Wang et al. bisection: peace cells contributed 0 → δ→∞ → MSE
+    - Event-threshold filtering: rejected (more hyperparameters)
+
+    std-based δ is:
+    - Fully dynamic (changes every batch)
+    - Scale-invariant (if errors double, δ doubles)
+    - Converges naturally (model improves → errors shrink → δ shrinks)
+    - Zero hyperparameters
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -120,7 +124,7 @@ class SpotlightLossAsinh(torch.nn.Module):
             - FourthRootTransform: 0.19 ≈ (1+1)^0.25 − 1
 
     Example:
-        >>> loss_fn = SpotlightLossAsinh(delta=0.10, non_zero_threshold=0.88)
+        >>> loss_fn = SpotlightLossHuber(delta=0.10, non_zero_threshold=0.88)
         >>> y_pred = torch.randn(8, 36)
         >>> y_true = torch.zeros(8, 36)
         >>> y_true[:, 10:15] = 2.5
@@ -138,15 +142,15 @@ class SpotlightLossAsinh(torch.nn.Module):
     ):
         if alpha != 0.0:
             logger.warning(
-                "SpotlightLossAsinh: alpha is deprecated and ignored. "
+                "SpotlightLossHuber: alpha is deprecated and ignored. "
                 "Remove alpha from your config. (received alpha=%.4f)",
                 alpha,
             )
         if delta < 0.0:
-            raise ValueError(f"SpotlightLossAsinh: delta must be non-negative, got {delta}")
+            raise ValueError(f"SpotlightLossHuber: delta must be non-negative, got {delta}")
         if non_zero_threshold <= 0.0:
             raise ValueError(
-                f"SpotlightLossAsinh: non_zero_threshold must be positive, got {non_zero_threshold}"
+                f"SpotlightLossHuber: non_zero_threshold must be positive, got {non_zero_threshold}"
             )
 
         super().__init__()
@@ -154,7 +158,7 @@ class SpotlightLossAsinh(torch.nn.Module):
         self.non_zero_threshold = non_zero_threshold
 
         logger.info(
-            "SpotlightLossAsinh | delta=%.4f threshold=%.4f",
+            "SpotlightLossHuber | delta=%.4f threshold=%.4f",
             delta, non_zero_threshold,
         )
 
@@ -169,15 +173,14 @@ class SpotlightLossAsinh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     @staticmethod
-    def _asinh_loss(x: torch.Tensor) -> torch.Tensor:
-        """Asinh-integral loss: L(e) = e·asinh(e) − √(1+e²) + 1.
+    def _pseudo_huber(x: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
+        """Pseudo-Huber loss: L(e) = δ²(√(1 + (e/δ)²) − 1).
 
-        Gradient: dL/de = asinh(e).
-
-        Quadratic for small e (≈ MSE), gradient grows logarithmically
-        for large e. No parameters. Convex, smooth, L(0)=0.
+        Gradient: e / √(1 + (e/δ)²).
+        Smooth Huber: MSE for |e|<<δ, L1 for |e|>>δ.
         """
-        return x * torch.asinh(x) - torch.sqrt(1.0 + x * x) + 1.0
+        r = x / delta
+        return delta * delta * (torch.sqrt(1.0 + r * r) - 1.0)
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only)."""
@@ -259,9 +262,10 @@ class SpotlightLossAsinh(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Base cell loss: asinh-integral on demeaned error ────────
+        # ── Base cell loss: Pseudo-Huber with δ = std(e_shape) ─────
         abs_e_shape = torch.abs(e_shape.detach()).clamp(max=1e4)
-        cell_loss = self._asinh_loss(e_shape)
+        shape_delta = e_shape.detach().std().clamp(min=0.1)
+        cell_loss = self._pseudo_huber(e_shape, shape_delta)
 
         # ── Adaptive compound weighting (difficulty-gated) ────────────
         # difficulty = |e| / (1 + |e|): slower saturation than 1-exp(-|e|).
@@ -311,12 +315,12 @@ class SpotlightLossAsinh(torch.nn.Module):
             [ew.mean(dim=1) for ew in e_windows], dim=1
         )
 
-        # Level anchor uses asinh-integral (same as shape loss) instead
-        # of MSE. MSE on window means gives gradient = T × ē_w, which for
-        # extreme event errors (ē_w ≈ 5) produces gradients of ~180.
-        # With asinh-integral: gradient = T × asinh(ē_w) = T × 2.3 ≈ 83.
-        # Same logarithmic gradient profile as the shape component.
-        level_losses = self._asinh_loss(window_means)
+        # Level anchor: Pseudo-Huber with δ = std(window_means).
+        # Same gradient profile as shape: MSE for small DC offsets,
+        # gradient capped at ±δ for large ones. Prevents runaway
+        # gradients from T× scaling on extreme event windows.
+        level_delta = window_means.detach().std().clamp(min=0.1)
+        level_losses = self._pseudo_huber(window_means, level_delta)
 
         # Series×window DRO
         level_flat = level_losses.detach().flatten()
@@ -348,22 +352,25 @@ class SpotlightLossAsinh(torch.nn.Module):
 
         if torch.isnan(total_loss):
             raise RuntimeError(
-                f"NaN in SpotlightLossAsinh: shape={loss_shape.item():.6f} "
+                f"NaN in SpotlightLossHuber: shape={loss_shape.item():.6f} "
                 f"level={loss_level.item():.6f} spectral={loss_spectral.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossAsinh | shape=%.6f level=%.6f spec=%.6f total=%.6f",
+            "SpotlightLossHuber | shape=%.6f level=%.6f spec=%.6f total=%.6f "
+            "shape_delta=%.4f level_delta=%.4f",
             loss_shape.item(),
             loss_level.item(),
             loss_spectral.item(),
             total_loss.item(),
+            shape_delta.item(),
+            level_delta.item(),
         )
 
         return total_loss
 
     def __repr__(self) -> str:
         return (
-            f"SpotlightLossAsinh(delta={self.delta}, "
+            f"SpotlightLossHuber(delta={self.delta}, "
             f"non_zero_threshold={self.non_zero_threshold})"
         )

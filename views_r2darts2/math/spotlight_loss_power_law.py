@@ -8,19 +8,28 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossPowerLaw(torch.nn.Module):
     """
-    SpotlightLoss (Power-Law) — asinh + RevIN compatible.
+    SpotlightLoss (Hybrid Power-Law / Log-Cosh) — asinh + RevIN compatible.
 
     Identical Spotlight architecture as SpotlightLossLogcosh (DC/AC,
     compound weighting, KL-DRO, windowed level anchor, spectral reg)
-    but uses a pure power-law base cell loss:
+    but uses a threshold-gated hybrid base cell loss:
 
-        cell_loss = (e² + ε)^0.75 − ε^0.75,  p = 1.5
+        Event cells (abs_max > τ):  power law  (x² + ε)^0.75 − ε^0.75
+        Peace cells (abs_max ≤ τ):  log_cosh   |x| + softplus(−2|x|) − ln2
 
-    Gradient ∝ e / (e² + ε)^0.25 ≈ sign(e) · |e|^0.5 for large |e|,
-    giving scale-aware updates that distinguish 50-death from 500-death
-    misses. Peace-cell gradient budget is controlled by compound
-    weighting (w_compound = 1 for peace cells, ≤ 2 for event cells)
-    and DRO z-scores — no separate loss branch needed.
+    Power law gradient ∝ |e|^0.5 for large |e| — distinguishes 50-death
+    from 500-death misses (2.24× ratio vs 1.31× for log_cosh).
+    Log-cosh gradient = tanh(e) → 0 for small |e| — keeps the 90% peace
+    mass from dominating the optimizer update budget.
+
+    This gives a clean bimodal loss distribution: peace cells cluster
+    near zero in log-space, event cells occupy the tail. DRO z-scores
+    then cleanly upweight the event tail without peace-cell contamination.
+
+    Level anchor uses log_cosh on window means — window means are
+    averages of 4–6 timesteps so |ē_w| is small even for imperfect
+    series; log_cosh is quadratic there (correct proportionality),
+    whereas power law would amplify small level errors 4.7×.
     """
 
     SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
@@ -57,18 +66,14 @@ class SpotlightLossPowerLaw(torch.nn.Module):
     # Helpers
     # ------------------------------------------------------------------
 
-    _P = 1.5
-    _EPS = 1e-6
-    _EPS_P2 = 1e-6 ** 0.75  # ε^(p/2), precomputed
-
     @staticmethod
     def _power_law(x: torch.Tensor) -> torch.Tensor:
-        """Smoothed power-law loss: (x² + ε)^(p/2) − ε^(p/2), p=1.5."""
+        """Smoothed power-law loss: (x² + ε)^0.75 − ε^0.75, p=1.5."""
         return (x * x + 1e-6).pow(0.75) - 1e-6 ** 0.75
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
-        """log(cosh(x)), numerically stable. Used for spectral loss only."""
+        """log(cosh(x)), numerically stable."""
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
@@ -143,25 +148,30 @@ class SpotlightLossPowerLaw(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Base cell loss: pure power law ───────────────────────────
-        # Gradient ∝ |e|^0.5 for large |e| — distinguishes 50-death from
-        # 500-death misses. Peace-cell budget controlled by compound
-        # weighting and DRO; no separate loss branch required.
-        cell_loss = self._power_law(e_shape)
+        # ── Event mask ────────────────────────────────────────────────
+        abs_y = torch.abs(y_true)
+        abs_ypred_sg = torch.abs(y_pred.detach())
+        abs_max = torch.max(abs_y, abs_ypred_sg)
+        event_mask = (abs_max > self.non_zero_threshold).float()
+
+        # ── Base cell loss: hybrid power-law / log_cosh ───────────────
+        # Event cells (abs_max > τ): power law — gradient ∝ |e|^0.5,
+        #   distinguishes 50-death from 500-death misses (2.24× ratio).
+        # Peace cells (abs_max ≤ τ): log_cosh — tanh gradient → 0 for
+        #   small |e|, keeping the 90% peace mass from dominating budget.
+        # Clean bimodal loss distribution → DRO z-scores work optimally.
+        cell_loss = (
+            event_mask * self._power_law(e_shape)
+            + (1.0 - event_mask) * self._log_cosh(e_shape)
+        )
 
         # ── Adaptive compound weighting (difficulty-gated) ────────────
         # difficulty = |e| / (1 + |e|): slower saturation than 1-exp(-|e|).
         #   |e|=1 → 0.50,  |e|=3 → 0.75,  |e|=10 → 0.91
-        # No event_mag: avoids double-stacking magnitude bias with DRO.
-        # Threshold gate provides false-positive discipline.
         # w_compound = 1 + difficulty × 1[abs_max > τ] ∈ [1, 2)
-        abs_y = torch.abs(y_true)
-        abs_ypred_sg = torch.abs(y_pred.detach())
-        abs_max = torch.max(abs_y, abs_ypred_sg)
-        above_threshold = (abs_max > self.non_zero_threshold).float()
-
         abs_e = torch.abs(e_shape.detach())
         difficulty = abs_e / (1.0 + abs_e)
+        above_threshold = event_mask
         w_compound = 1.0 + difficulty * above_threshold
 
         # ── Sqrt-DRO tail aggregation (log-space z-scores) ─────────────
@@ -213,7 +223,10 @@ class SpotlightLossPowerLaw(torch.nn.Module):
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e_windows], dim=1
         )  # (B, n_windows)
-        level_losses = self._power_law(window_means)
+        # log_cosh on window means: window means are small-magnitude averages;
+        # power law amplifies small |x| by ~4.7× vs MSE — log_cosh is
+        # quadratic here (correct proportionality for small level errors).
+        level_losses = self._log_cosh(window_means)
 
         # Series×window DRO
         level_flat = level_losses.detach().flatten()

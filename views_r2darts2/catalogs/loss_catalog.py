@@ -12,6 +12,7 @@ from views_r2darts2.math.prism_loss import PrismLoss
 from views_r2darts2.math.spotlight_loss import SpotlightLoss
 from views_r2darts2.math.spotlight_loss_logcosh import SpotlightLossLogcosh
 from views_r2darts2.math.spotlight_loss_huber import SpotlightLossHuber
+from views_r2darts2.math.spotlight_loss_power_law import SpotlightLossPowerLaw
 from views_r2darts2.math.spotlight_focal_loss import SpotlightFocalLoss
 from views_r2darts2.math.sentinel_loss import SentinelLoss
 
@@ -68,6 +69,7 @@ class LossCatalog:
             "SpotlightLoss": SpotlightLoss,
             "SpotlightLossLogcosh": SpotlightLossLogcosh,
             "SpotlightLossHuber": SpotlightLossHuber,
+            "SpotlightLossPowerLaw": SpotlightLossPowerLaw,
             "SpotlightFocalLoss": SpotlightFocalLoss,
             "SentinelLoss": SentinelLoss,
             "MSELoss": torch.nn.MSELoss,

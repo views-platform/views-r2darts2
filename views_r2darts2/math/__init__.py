@@ -10,6 +10,7 @@ from .prism_loss import PrismLoss
 from .spotlight_loss import SpotlightLoss
 from .spotlight_loss_logcosh import SpotlightLossLogcosh
 from .spotlight_loss_huber import SpotlightLossHuber
+from .spotlight_loss_power_law import SpotlightLossPowerLaw
 from .spotlight_focal_loss import SpotlightFocalLoss
 from .sentinel_loss import SentinelLoss
 
@@ -26,6 +27,7 @@ __all__ = [
     "SpotlightLoss",
     "SpotlightLossLogcosh",
     "SpotlightLossHuber",
+    "SpotlightLossPowerLaw",
     "SpotlightFocalLoss",
     "SentinelLoss",
 ]

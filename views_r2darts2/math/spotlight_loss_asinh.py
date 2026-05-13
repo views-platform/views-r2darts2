@@ -112,7 +112,8 @@ class SpotlightLossAsinh(torch.nn.Module):
 
     SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))  # kept for backward compat
     _LEVEL_DRO = True
-    _GAMMA = 0.2  # soft-DTW smoothing temperature
+    _GAMMA = 0.2   # soft-DTW smoothing temperature
+    _BANDWIDTH = 3  # Sakoe-Chiba band (max warp in timesteps)
 
     def __init__(self, delta: float, non_zero_threshold: float):
         if non_zero_threshold <= 0.0:
@@ -147,14 +148,14 @@ class SpotlightLossAsinh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     def _soft_dtw_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Batched soft-DTW via anti-diagonal wavefront.
+        """Batched soft-DTW via anti-diagonal wavefront with Sakoe-Chiba band.
 
         Vectorised over both the batch dimension and each anti-diagonal
-        of the T×T DP table. Replaces the naive N×T² Python loop with
-        2T−1 vectorised steps — each step processes an entire
-        anti-diagonal across all N series in parallel.
+        of the T×T DP table.  Only cells within _BANDWIDTH of the
+        diagonal are computed — shifts larger than the band are treated
+        as hard mismatches (D stays at INF).
 
-        Complexity: O(T²) work total, but only O(T) sequential steps.
+        Complexity: O(T · bandwidth) work, O(T) sequential steps.
         """
         if y_pred.dim() == 3:
             B, T, C = y_pred.shape
@@ -175,6 +176,7 @@ class SpotlightLossAsinh(torch.nn.Module):
 
         N, T = pred.shape
         gamma = self._GAMMA
+        bw = self._BANDWIDTH
         INF = 1e9
 
         # Cost matrix: (N, T, T)
@@ -185,13 +187,18 @@ class SpotlightLossAsinh(torch.nn.Module):
         D[:, 0, 0] = 0.0
 
         # Wavefront: iterate over anti-diagonals k = i + j, k ∈ [2, 2T]
-        # All cells (i, j) with i+j=k have dependencies only on
-        # anti-diagonals k−1 and k−2, so they can be computed in parallel.
         for k in range(2, 2 * T + 1):
             i_start = max(1, k - T)
             i_end = min(T, k - 1)
             i_idx = torch.arange(i_start, i_end + 1, device=pred.device)
             j_idx = k - i_idx
+
+            # Sakoe-Chiba band: keep only cells within bandwidth of diagonal
+            mask = (i_idx - j_idx).abs() <= bw
+            i_idx = i_idx[mask]
+            j_idx = j_idx[mask]
+            if i_idx.numel() == 0:
+                continue
 
             d_above = D[:, i_idx - 1, j_idx]        # (N, diag_len)
             d_left  = D[:, i_idx, j_idx - 1]        # (N, diag_len)

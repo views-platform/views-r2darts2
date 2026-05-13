@@ -267,10 +267,15 @@ class SpotlightLossHuber(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Base cell loss: Pseudo-Huber, δ per series ─────────────
-        # δ_s = median(|e_shape_s|) along T dimension → [B, 1]
+        # ── Base cell loss: Pseudo-Huber, δ = RMS(e_shape) per series ──
+        # δ_s = √(mean(e_shape²)) along T dimension → [B, 1]
+        # RMS is the natural scale: cells with |e| < RMS → MSE, |e| > RMS → L1.
+        # Unlike median (always 50% L1) or quantiles (fixed %), the L1
+        # fraction adapts to the actual error distribution:
+        #   - Near convergence: all |e| ≈ RMS → pure MSE (L1 fraction → 0)
+        #   - Heavy-tailed: only genuine outliers > RMS get capped
         abs_e_shape = torch.abs(e_shape.detach()).clamp(max=1e4)
-        shape_delta = abs_e_shape.median(dim=1, keepdim=True).values.clamp(min=0.01)
+        shape_delta = torch.sqrt((e_shape.detach().clamp(-1e4, 1e4) ** 2).mean(dim=1, keepdim=True)).clamp(min=0.01)
         cell_loss = self._pseudo_huber(e_shape, shape_delta)
 
         # ── Adaptive compound weighting (difficulty-gated) ────────────
@@ -321,9 +326,9 @@ class SpotlightLossHuber(torch.nn.Module):
             [ew.mean(dim=1) for ew in e_windows], dim=1
         )
 
-        # Level anchor: Pseudo-Huber, δ per series over windows.
-        # δ_s = median(|ē_w|) along window dimension → [B, 1]
-        level_delta = torch.abs(window_means.detach()).median(dim=1, keepdim=True).values.clamp(min=0.01)
+        # Level anchor: Pseudo-Huber, δ = RMS(window_means) per series.
+        # δ_s = √(mean(ē_w²)) along window dimension → [B, 1]
+        level_delta = torch.sqrt((window_means.detach() ** 2).mean(dim=1, keepdim=True)).clamp(min=0.01)
         level_losses = self._pseudo_huber(window_means, level_delta)
 
         # Series×window DRO

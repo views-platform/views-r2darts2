@@ -275,17 +275,22 @@ class SpotlightLossHuber(torch.nn.Module):
         log_loss = torch.log(loss_flat + 1e-8)
         log_std = log_loss.std()
 
-        log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
-        dro_alpha = log_cv / (log_cv + 1.0)
-        z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
-        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
-        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
-        w_dro = w_dro.view_as(cell_loss)
-        w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
+        # Guard: if losses are near-constant (degenerate batch), skip DRO
+        if log_std < 0.01:
+            w_dro = torch.ones_like(cell_loss)
+        else:
+            log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
+            dro_alpha = log_cv / (log_cv + 1.0)
+            z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
+            w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
+            w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
+            w_dro = w_dro.view_as(cell_loss)
+            w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
 
         # Combine compound × DRO, normalise jointly to mean=1
         w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean()
+        w_mean = w_total.mean()
+        w_total = w_total / w_mean.clamp(min=1e-8)
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         loss_shape = (w_total * cell_loss).mean()
@@ -309,17 +314,21 @@ class SpotlightLossHuber(torch.nn.Module):
         level_flat = level_losses.detach().flatten()
         log_level = torch.log(level_flat + 1e-8)
         level_log_std = log_level.std()
-        level_log_cv = torch.log1p(
-            level_log_std / (log_level.mean().abs() + 1e-8)
-        )
-        level_dro_alpha = level_log_cv / (level_log_cv + 1.0)
 
-        level_z = (log_level - log_level.mean()) / level_log_std.clamp(min=0.1)
-        w_level = torch.log1p((1.0 + level_z).clamp(min=0.0))
-        w_level = w_level / w_level.mean().clamp(min=1e-8)
-        w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
-        w_level = torch.nan_to_num(w_level, nan=1.0, posinf=1.0, neginf=0.0)
-        w_level = w_level.view_as(level_losses)
+        if level_log_std < 0.01:
+            w_level = torch.ones_like(level_losses)
+        else:
+            level_log_cv = torch.log1p(
+                level_log_std / (log_level.mean().abs() + 1e-8)
+            )
+            level_dro_alpha = level_log_cv / (level_log_cv + 1.0)
+
+            level_z = (log_level - log_level.mean()) / level_log_std.clamp(min=0.1)
+            w_level = torch.log1p((1.0 + level_z).clamp(min=0.0))
+            w_level = w_level / w_level.mean().clamp(min=1e-8)
+            w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
+            w_level = torch.nan_to_num(w_level, nan=1.0, posinf=1.0, neginf=0.0)
+            w_level = w_level.view_as(level_losses)
 
         loss_level = T * (w_level * level_losses).mean()
 

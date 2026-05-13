@@ -57,20 +57,7 @@ class SpotlightLossAsinh(torch.nn.Module):
        in raw counts. The DC/AC split makes it structurally impossible
        for the shape loss to accumulate any DC bias, period.
 
-    2. **Adaptive compound weighting** — difficulty-gated, parameter-free.
-
-       w_compound = 1 + difficulty × 1[abs_max > τ]     ∈ [1, 2)
-
-       difficulty = |e| / (1 + |e|). Distinguishes *how wrong* from
-       *how big* — a correctly-predicted Syria cell (|e|≈0) gets w≈1,
-       while a badly-predicted Chad cell (|e|=2) gets w≈1.67. The
-       threshold gate provides false-positive discipline: sub-threshold
-       cells always get w=1. Self-correcting: as |e|→0, w→1.
-
-       Still needed alongside asinh: the base loss gives proportional
-       *magnitude* sensitivity; compound adds *difficulty* sensitivity.
-
-    3. **Windowed level anchor** — T-scaled asinh_integral on per-series,
+    2. **Windowed level anchor** — T-scaled asinh_integral on per-series,
        per-window mean error.
 
        Only mechanism that can shift per-series means. Shape loss is
@@ -87,7 +74,7 @@ class SpotlightLossAsinh(torch.nn.Module):
        Window width is dynamic — computed from the actual output length.
        Floor of 4 ensures each window mean is statistically meaningful.
 
-    4. **Spectral regularization** (optional, gated by δ > 0).
+    3. **Spectral regularization** (optional, gated by δ > 0).
        Multi-resolution STFT magnitude comparison with DC bin masked.
        Phase-invariant; log_cosh on magnitude diffs.
 
@@ -226,29 +213,19 @@ class SpotlightLossAsinh(torch.nn.Module):
         # ── Base cell loss: asinh integral on demeaned error ──────────
         cell_loss = self._asinh_integral(e_shape)
 
-        # ── Adaptive compound weighting (difficulty-gated) ────────────
-        abs_e = torch.abs(e_shape.detach())
-        abs_y = torch.abs(y_true)
-        abs_ypred_sg = torch.abs(y_pred.detach())
-
-        difficulty = abs_e / (1.0 + abs_e)
-        abs_max = torch.max(abs_y, abs_ypred_sg)
-        above_threshold = (abs_max > self.non_zero_threshold).float()
-        w_compound = 1.0 + difficulty * above_threshold
-
-        # Normalise to mean=1
-        w_total = w_compound / w_compound.mean().clamp(min=1e-8)
-        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-
-        loss_shape = (w_total * cell_loss).mean()
+        loss_shape = cell_loss.mean()
 
         # ── Windowed level anchor ─────────────────────────────────────
+        # Uses log_cosh (not asinh_integral) deliberately: the level
+        # anchor's job is gentle DC correction, not magnitude-proportional
+        # pursuit. tanh saturation at ±1 prevents the anchor from
+        # dominating late in training as shape loss decreases.
         W = max(4, T // 6)
         e_windows = list(e.split(W, dim=1))
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e_windows], dim=1
         )
-        level_losses = self._asinh_integral(window_means)
+        level_losses = self._log_cosh(window_means)
         loss_level = T * level_losses.mean()
 
         # ── Spectral: AC bins only ────────────────────────────────────

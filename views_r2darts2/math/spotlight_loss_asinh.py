@@ -199,10 +199,11 @@ class SpotlightLossAsinh(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
-        # ── Input guard: clamp inf → finite ───────────────────────────
+        # ── Input guard: replace NaN and ±inf before any arithmetic ─────
+        # torch.clamp() passes NaN through unchanged — use nan_to_num.
         _SAFE = 1e4
-        y_pred = y_pred.clamp(-_SAFE, _SAFE)
-        y_true = y_true.clamp(-_SAFE, _SAFE)
+        y_pred = torch.nan_to_num(y_pred, nan=0.0, posinf=_SAFE, neginf=-_SAFE)
+        y_true = torch.nan_to_num(y_true, nan=0.0, posinf=_SAFE, neginf=-_SAFE)
 
         T = y_pred.size(1)
         e = y_pred - y_true
@@ -258,7 +259,8 @@ class SpotlightLossAsinh(torch.nn.Module):
                 "spectral=%.6f — returning safe fallback",
                 loss_shape.item(), loss_level.item(), loss_spectral.item(),
             )
-            return self._asinh_integral(e).mean()
+            safe_e = torch.nan_to_num(e, nan=0.0, posinf=_SAFE, neginf=-_SAFE)
+            return self._asinh_integral(safe_e).mean()
 
         logger.debug(
             "SpotlightLossAsinh | shape=%.6f level=%.6f spec=%.6f total=%.6f",

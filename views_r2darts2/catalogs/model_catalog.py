@@ -102,9 +102,6 @@ class ModelCatalog:
                 target_scaler=self.config.get("target_scaler"),
                 non_zero_threshold=self.config.get("non_zero_threshold", 0.88),
             ),
-            ValMetricsCallback(
-                target_scaler=self.config.get("target_scaler"),
-            ),
         ]
         if extra_callbacks:
             callbacks.extend(extra_callbacks)

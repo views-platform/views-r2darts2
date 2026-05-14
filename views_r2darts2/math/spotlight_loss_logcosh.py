@@ -60,12 +60,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
        90% peace-cell majority pulling toward zero.
 
     5. **Temporal gradient matching** — log_cosh on first-difference
-       errors (∂ŷ/∂t − ∂y/∂t).  Signal-filtered and compound-weighted.
+       errors (∂ŷ/∂t − ∂y/∂t).  Soft-weighted, fully data-driven.
 
-       Only series with signal above τ are included (peaceful series
-       contribute zero-information gradient).  Per-transition log1p
-       difficulty weighting ensures spike onsets/offsets get
-       proportional attention despite tanh saturation.
+       Continuous relevance weight w = 1 − exp(−r) where
+       r = |Δy_raw|/max(midpoint_raw, 1) is the proportional raw-space
+       change magnitude (via sinh inversion).  Plateau transitions get
+       w≈0 naturally; onset/offset ~0.63; doublings ~0.63; major events
+       ~0.86.  No hardcoded thresholds — the raw-space proportional
+       change is the only signal.  Combined with log1p error-curriculum.
        O(T) computation.
 
     6. **Multi-resolution STFT loss** — log_cosh on magnitude-spectrum
@@ -217,42 +219,57 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return T * (w * level_losses).mean()
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Transition-filtered, compound-weighted temporal gradient matching.
+        """Soft-weighted temporal gradient matching — fully data-driven.
 
-        Computes log_cosh on first-difference errors (Δŷ − Δy).
-        Only transitions where at least one endpoint (t or t+1) exceeds τ
-        in y_true or y_pred are included.  This removes zero→zero transitions
-        entirely, preventing the smoothness penalty from competing with the
-        shape loss at peace timesteps within conflict series.
+        Replaces all binary thresholds (τ onset, _ESCALATION_FRAC) with a
+        single continuous relevance weight derived from the proportional
+        raw-space change magnitude:
+
+            r = |Δy_raw| / max(midpoint(|y_raw_a|, |y_raw_b|), 1)
+            w_rel = 1 − exp(−max(r_true, r_pred))
+
+        Properties:
+        • Plateau (Δy=0)           → w=0.  Silent, no smoothness pressure.
+        • Mild escalation (18%)    → w≈0.17.  Proportional penalty.
+        • Moderate escalation (27%) → w≈0.24.
+        • Onset 0→1 death          → w≈0.63.  (raw_local clamps to 1.)
+        • Major event 0→100        → w≈0.86.
+
+        Inflection at ~100% raw change (doubling),
+        which is a natural scale anchor.  Combined with log1p error-
+        curriculum weighting: total_w = w_rel × (1 + log1p(|de|)).
         """
-        τ = self.non_zero_threshold
-        # Build (B, T-1) signal mask: transition is active if either endpoint
-        # has signal in ground truth or (stop-gradient) prediction.
-        sig = (
-            (torch.abs(y_true) > τ)
-            | (torch.abs(y_pred.detach()) > τ)
-        )  # (B, T)
-        trans_mask = sig[:, :-1] | sig[:, 1:]  # (B, T-1): either endpoint
+        _CLAMP = 10.0  # sinh(10) ≈ 11 013, numerical safety only
 
-        if not trans_mask.any():
+        # ── Proportional raw-space change magnitude ────────────────────
+        def _rel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            raw_a = torch.sinh(a.clamp(-_CLAMP, _CLAMP))
+            raw_b = torch.sinh(b.clamp(-_CLAMP, _CLAMP))
+            raw_mid = (raw_a.abs() + raw_b.abs()).mul(0.5).clamp(min=1.0)
+            return (raw_b - raw_a).abs() / raw_mid
+
+        rel_true = _rel(y_true[:, :-1], y_true[:, 1:])
+        rel_pred = _rel(y_pred[:, :-1].detach(), y_pred[:, 1:].detach())
+
+        # Soft relevance weight: 0 at plateaus, →1 for large changes.
+        soft_w = 1.0 - torch.exp(-torch.max(rel_true, rel_pred))  # (B, T-1)
+
+        if soft_w.sum() < 1e-8:
             return y_pred.new_tensor(0.0)
 
-        dy_pred = y_pred[:, 1:] - y_pred[:, :-1]   # (B, T-1)
-        dy_true = y_true[:, 1:] - y_true[:, :-1]   # (B, T-1)
+        # ── Temporal gradient error ────────────────────────────────────
+        dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
+        dy_true = y_true[:, 1:] - y_true[:, :-1]
         de = dy_pred - dy_true
 
         cell_grad = self._log_cosh(de)
 
-        # Zero out non-signal transitions, then average over active ones only.
-        cell_grad = cell_grad * trans_mask.float()
-
-        # Compound weighting: upweight spike onsets/offsets.
+        # Combined weight: data-driven relevance × error curriculum.
         abs_de = torch.abs(de.detach())
-        w_grad = 1.0 + torch.log1p(abs_de)
-        w_grad = w_grad * trans_mask.float()
-        denom = w_grad.sum().clamp(min=1e-8)
+        w = soft_w * (1.0 + torch.log1p(abs_de))
+        denom = w.sum().clamp(min=1e-8)
 
-        return (w_grad * cell_grad).sum() / denom
+        return (w * cell_grad).sum() / denom
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

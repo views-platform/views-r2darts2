@@ -154,22 +154,27 @@ class SpotlightLossAsinh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Transition-filtered, compound-weighted temporal gradient matching.
+        """Soft-weighted temporal gradient matching — fully data-driven.
 
-        Computes asinh_integral on first-difference errors (Δŷ − Δy).
-        Only transitions where at least one endpoint (t or t+1) exceeds τ
-        in y_true or y_pred are included.  This removes zero→zero transitions
-        entirely, preventing the smoothness penalty from competing with the
-        shape loss at peace timesteps within conflict series.
+        See SpotlightLossLogcosh._temporal_gradient_loss for detailed
+        rationale.  Uses proportional raw-space change as continuous
+        relevance weight: w = 1 − exp(−max(r_true, r_pred)).  No
+        hardcoded thresholds.
         """
-        τ = self.non_zero_threshold
-        sig = (
-            (torch.abs(y_true) > τ)
-            | (torch.abs(y_pred.detach()) > τ)
-        )  # (B, T)
-        trans_mask = sig[:, :-1] | sig[:, 1:]  # (B, T-1)
+        _CLAMP = 10.0  # sinh(10) ≈ 11 013, numerical safety only
 
-        if not trans_mask.any():
+        def _rel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            raw_a = torch.sinh(a.clamp(-_CLAMP, _CLAMP))
+            raw_b = torch.sinh(b.clamp(-_CLAMP, _CLAMP))
+            raw_mid = (raw_a.abs() + raw_b.abs()).mul(0.5).clamp(min=1.0)
+            return (raw_b - raw_a).abs() / raw_mid
+
+        rel_true = _rel(y_true[:, :-1], y_true[:, 1:])
+        rel_pred = _rel(y_pred[:, :-1].detach(), y_pred[:, 1:].detach())
+
+        soft_w = 1.0 - torch.exp(-torch.max(rel_true, rel_pred))
+
+        if soft_w.sum() < 1e-8:
             return y_pred.new_tensor(0.0)
 
         dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
@@ -177,14 +182,12 @@ class SpotlightLossAsinh(torch.nn.Module):
         de = dy_pred - dy_true
 
         cell_grad = self._asinh_integral(de)
-        cell_grad = cell_grad * trans_mask.float()
 
         abs_de = torch.abs(de.detach())
-        w_grad = 1.0 + torch.log1p(abs_de)
-        w_grad = w_grad * trans_mask.float()
-        denom = w_grad.sum().clamp(min=1e-8)
+        w = soft_w * (1.0 + torch.log1p(abs_de))
+        denom = w.sum().clamp(min=1e-8)
 
-        return (w_grad * cell_grad).sum() / denom
+        return (w * cell_grad).sum() / denom
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

@@ -74,17 +74,17 @@ class SpotlightLossAsinh(torch.nn.Module):
        DC bias and it never gets corrected. Same z-score + log1p +
        soft alpha-blend mechanism, no Tukey cap.
 
-    3. **Soft-DTW temporal alignment** (optional, gated by δ > 0).
-       Differentiable dynamic time warping (Cuturi & Blondel, 2017)
-       with smoothing parameter γ.  Replaces spectral regularization.
+    3. **Temporal gradient matching** — asinh_integral on first-difference
+       errors (∂ŷ/∂t − ∂y/∂t). Always on, no hyperparameters.
 
-       Gives partial credit for near-correct timing: a spike predicted
-       1 step late incurs only the alignment cost, not two large
-       pointwise errors.  Uses squared error as the cell cost inside
-       the DP, smoothed by soft-min with temperature γ.
+       Penalizes wrong slopes: if the model predicts the right magnitude
+       but at the wrong time, the pointwise shape loss may be large but
+       the gradient loss directly targets onset/offset timing errors.
+       Complementary to the shape loss: shape sees level of error at
+       each timestep, gradient sees rate-of-change mismatches.
 
-       Applied only to series with signal (above non_zero_threshold)
-       to avoid wasting computation on flat-zero peace series.
+       O(T) computation, no DP needed. Uses the same asinh_integral
+       base loss for consistent gradient scaling.
 
     ── asinh_integral properties ────────────────────────────────────────
 
@@ -96,13 +96,11 @@ class SpotlightLossAsinh(torch.nn.Module):
     ─────────────────────────────────────────────────────────────────────
 
     Args:
-        delta: Soft-DTW loss weight. Values ≤ 0 disable soft-DTW entirely.
-        non_zero_threshold: Transformed-space cutoff for compound weighting
-            gate and soft-DTW signal filtering.
+        non_zero_threshold: Transformed-space cutoff for signal filtering.
             - AsinhTransform: 0.88 ≈ asinh(1)
 
     Example:
-        >>> loss_fn = SpotlightLossAsinh(delta=0.10, non_zero_threshold=0.88)
+        >>> loss_fn = SpotlightLossAsinh(non_zero_threshold=0.88)
         >>> y_pred = torch.randn(8, 36)
         >>> y_true = torch.zeros(8, 36)
         >>> y_true[:, 10:15] = 2.5
@@ -112,20 +110,17 @@ class SpotlightLossAsinh(torch.nn.Module):
 
     SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))  # kept for backward compat
     _LEVEL_DRO = True
-    _GAMMA = 0.2   # soft-DTW smoothing temperature
-    _BANDWIDTH = 3  # Sakoe-Chiba band (max warp in timesteps)
 
-    def __init__(self, delta: float, non_zero_threshold: float):
+    def __init__(self, non_zero_threshold: float):
         if non_zero_threshold <= 0.0:
             raise ValueError(
                 f"non_zero_threshold must be positive, got {non_zero_threshold}"
             )
         super().__init__()
-        self.delta = delta
         self.non_zero_threshold = non_zero_threshold
         logger.info(
-            "SpotlightLossAsinh | delta=%.4f threshold=%.4f",
-            delta, non_zero_threshold,
+            "SpotlightLossAsinh | threshold=%.4f",
+            non_zero_threshold,
         )
 
     # ------------------------------------------------------------------
@@ -147,69 +142,21 @@ class SpotlightLossAsinh(torch.nn.Module):
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
-    def _soft_dtw_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Batched soft-DTW via anti-diagonal wavefront with Sakoe-Chiba band.
+    @staticmethod
+    def _temporal_gradient_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Temporal gradient matching via first-difference errors.
 
-        Vectorised over both the batch dimension and each anti-diagonal
-        of the T×T DP table.  Only cells within _BANDWIDTH of the
-        diagonal are computed — shifts larger than the band are treated
-        as hard mismatches (D stays at INF).
+        Computes asinh_integral on (Δŷ − Δy) where Δ is the first
+        temporal difference.  Penalises rate-of-change mismatches:
+        if the model predicts the right magnitude at the wrong time,
+        shape loss sees two large pointwise errors while this term
+        directly targets the onset/offset timing error.
 
-        Complexity: O(T · bandwidth) work, O(T) sequential steps.
+        Complexity: O(T), no DP or convolution needed.
         """
-        if y_pred.dim() == 3:
-            B, T, C = y_pred.shape
-            pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
-            true = y_true.permute(0, 2, 1).reshape(B * C, T)
-        else:
-            pred = y_pred
-            true = y_true
-
-        has_signal = (
-            (torch.abs(true) > self.non_zero_threshold)
-            | (torch.abs(pred.detach()) > self.non_zero_threshold)
-        ).any(dim=1)
-        if not has_signal.any():
-            return pred.new_tensor(0.0)
-        pred = pred[has_signal]
-        true = true[has_signal]
-
-        N, T = pred.shape
-        gamma = self._GAMMA
-        bw = self._BANDWIDTH
-        INF = 1e9
-
-        # Cost matrix: (N, T, T)
-        cost = (pred.unsqueeze(2) - true.unsqueeze(1)).pow(2)
-
-        # DP table padded with +inf sentinel row/col at index 0
-        D = pred.new_full((N, T + 1, T + 1), INF)
-        D[:, 0, 0] = 0.0
-
-        # Wavefront: iterate over anti-diagonals k = i + j, k ∈ [2, 2T]
-        for k in range(2, 2 * T + 1):
-            i_start = max(1, k - T)
-            i_end = min(T, k - 1)
-            i_idx = torch.arange(i_start, i_end + 1, device=pred.device)
-            j_idx = k - i_idx
-
-            # Sakoe-Chiba band: keep only cells within bandwidth of diagonal
-            mask = (i_idx - j_idx).abs() <= bw
-            i_idx = i_idx[mask]
-            j_idx = j_idx[mask]
-            if i_idx.numel() == 0:
-                continue
-
-            d_above = D[:, i_idx - 1, j_idx]        # (N, diag_len)
-            d_left  = D[:, i_idx, j_idx - 1]        # (N, diag_len)
-            d_diag  = D[:, i_idx - 1, j_idx - 1]    # (N, diag_len)
-
-            neighbors = torch.stack([d_above, d_left, d_diag], dim=-1)  # (N, diag_len, 3)
-            soft_min = -gamma * torch.logsumexp(-neighbors / gamma, dim=-1)
-
-            D[:, i_idx, j_idx] = cost[:, i_idx - 1, j_idx - 1] + soft_min
-
-        return D[:, T, T].mean()
+        dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
+        dy_true = y_true[:, 1:] - y_true[:, :-1]
+        return SpotlightLossAsinh._asinh_integral(dy_pred - dy_true).mean()
 
     # ------------------------------------------------------------------
     # Forward
@@ -267,32 +214,30 @@ class SpotlightLossAsinh(torch.nn.Module):
         else:
             loss_level = T * level_losses.mean()
 
-        # ── Soft-DTW: temporal alignment ─────────────────────────────
-        loss_dtw = y_pred.new_tensor(0.0)
-        if self.delta > 0.0 and T >= 4:
-            loss_dtw = self._soft_dtw_loss(y_pred, y_true)
+        # ── Temporal gradient matching ────────────────────────────────
+        loss_grad = self._temporal_gradient_loss(y_pred, y_true) if T >= 2 else y_pred.new_tensor(0.0)
 
-        total_loss = loss_shape + loss_level + self.delta * loss_dtw
+        total_loss = loss_shape + loss_level + loss_grad
 
         if not torch.isfinite(total_loss):
             logger.warning(
                 "SpotlightLossAsinh non-finite: shape=%.6f level=%.6f "
-                "dtw=%.6f — returning safe fallback",
-                loss_shape.item(), loss_level.item(), loss_dtw.item(),
+                "grad=%.6f — returning safe fallback",
+                loss_shape.item(), loss_level.item(), loss_grad.item(),
             )
             safe_e = torch.nan_to_num(e, nan=0.0, posinf=_SAFE, neginf=-_SAFE)
             return self._asinh_integral(safe_e).mean()
 
         logger.debug(
-            "SpotlightLossAsinh | shape=%.6f level=%.6f dtw=%.6f total=%.6f",
+            "SpotlightLossAsinh | shape=%.6f level=%.6f grad=%.6f total=%.6f",
             loss_shape.item(), loss_level.item(),
-            loss_dtw.item(), total_loss.item(),
+            loss_grad.item(), total_loss.item(),
         )
 
         return total_loss
 
     def __repr__(self) -> str:
         return (
-            f"SpotlightLossAsinh(delta={self.delta}, "
+            f"SpotlightLossAsinh("
             f"non_zero_threshold={self.non_zero_threshold})"
         )

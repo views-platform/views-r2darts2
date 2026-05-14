@@ -86,6 +86,14 @@ class SpotlightLossAsinh(torch.nn.Module):
        O(T) computation, no DP needed. Uses the same asinh_integral
        base loss for consistent gradient scaling.
 
+    4. **Multi-resolution STFT loss** — log_cosh on magnitude-spectrum
+       differences at three (n_fft, hop) resolutions, AC bins only.
+       DC bin masked (level anchor handles DC).  Safe magnitude
+       sqrt(re²+im²+ε) avoids gradient blowup at |z|→0.  Only series
+       with signal above τ are included.  Uses log_cosh (not
+       asinh_integral) so the regulariser stays bounded.
+       Always on, no hyperparameters.
+
     ── asinh_integral properties ────────────────────────────────────────
 
     L(0) = 0,  L'(0) = 0,  L''(0) = 1   (matches MSE curvature at origin)
@@ -108,7 +116,7 @@ class SpotlightLossAsinh(torch.nn.Module):
         >>> loss.backward()
     """
 
-    SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))  # kept for backward compat
+    SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
     _LEVEL_DRO = True
 
     def __init__(self, non_zero_threshold: float):
@@ -157,6 +165,60 @@ class SpotlightLossAsinh(torch.nn.Module):
         dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
         dy_true = y_true[:, 1:] - y_true[:, :-1]
         return SpotlightLossAsinh._asinh_integral(dy_pred - dy_true).mean()
+
+    def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Multi-resolution STFT magnitude comparison (AC bins only).
+
+        Safe magnitude sqrt(re² + im² + ε) avoids gradient blowup at
+        |z|→0.  DC bin is masked — level anchor already handles DC.
+        Only series with signal above threshold are included.
+        log_cosh (not asinh_integral) keeps the regulariser bounded.
+        """
+        if y_pred.dim() == 3:
+            B, T, C = y_pred.shape
+            pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
+            true = y_true.permute(0, 2, 1).reshape(B * C, T)
+        else:
+            pred = y_pred
+            true = y_true
+
+        has_signal = (
+            (torch.abs(true) > self.non_zero_threshold)
+            | (torch.abs(pred.detach()) > self.non_zero_threshold)
+        ).any(dim=1)
+        if not has_signal.any():
+            return pred.new_tensor(0.0)
+        pred = pred[has_signal]
+        true = true[has_signal]
+
+        T = pred.size(1)
+        total = pred.new_tensor(0.0)
+        n_valid = 0
+
+        for n_fft, hop in self.SPECTRAL_RESOLUTIONS:
+            if T < n_fft:
+                continue
+            window = torch.hann_window(n_fft, device=pred.device, dtype=pred.dtype)
+            S_pred = torch.stft(
+                pred, n_fft, hop_length=hop, win_length=n_fft,
+                window=window, center=False, return_complex=True,
+            )
+            S_true = torch.stft(
+                true, n_fft, hop_length=hop, win_length=n_fft,
+                window=window, center=False, return_complex=True,
+            )
+            # Safe magnitude — bounded gradient at |z|→0
+            mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
+            mag_true = S_true.abs()
+            # Mask DC bin — level is handled by the level anchor
+            mag_pred = mag_pred.clone()
+            mag_true = mag_true.clone()
+            mag_pred[:, 0, :] = 0.0
+            mag_true[:, 0, :] = 0.0
+            total = total + self._log_cosh(mag_pred - mag_true).mean()
+            n_valid += 1
+
+        return total / max(n_valid, 1)
 
     # ------------------------------------------------------------------
     # Forward
@@ -217,21 +279,26 @@ class SpotlightLossAsinh(torch.nn.Module):
         # ── Temporal gradient matching ────────────────────────────────
         loss_grad = self._temporal_gradient_loss(y_pred, y_true) if T >= 2 else y_pred.new_tensor(0.0)
 
-        total_loss = loss_shape + loss_level + loss_grad
+        # ── Multi-resolution spectral loss ────────────────────────────
+        loss_spec = self._spectral_loss(y_pred, y_true) if T >= 6 else y_pred.new_tensor(0.0)
+
+        total_loss = loss_shape + loss_level + loss_grad + loss_spec
 
         if not torch.isfinite(total_loss):
             logger.warning(
                 "SpotlightLossAsinh non-finite: shape=%.6f level=%.6f "
-                "grad=%.6f — returning safe fallback",
+                "grad=%.6f spec=%.6f — returning safe fallback",
                 loss_shape.item(), loss_level.item(), loss_grad.item(),
+                loss_spec.item(),
             )
             safe_e = torch.nan_to_num(e, nan=0.0, posinf=_SAFE, neginf=-_SAFE)
             return self._asinh_integral(safe_e).mean()
 
         logger.debug(
-            "SpotlightLossAsinh | shape=%.6f level=%.6f grad=%.6f total=%.6f",
+            "SpotlightLossAsinh | shape=%.6f level=%.6f grad=%.6f "
+            "spec=%.6f total=%.6f",
             loss_shape.item(), loss_level.item(),
-            loss_grad.item(), total_loss.item(),
+            loss_grad.item(), loss_spec.item(), total_loss.item(),
         )
 
         return total_loss

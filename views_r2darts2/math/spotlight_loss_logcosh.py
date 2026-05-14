@@ -34,26 +34,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
        in raw counts. The DC/AC split makes it structurally impossible
        for the shape loss to accumulate any DC bias, period.
 
-    2. **Log-compensated compound weighting** — parameter-free.
+    2. **Adaptive compound weighting** — magnitude-proportional, parameter-free.
 
-       difficulty = log(1 + |e|): logarithmic growth compensates tanh
-       saturation in the log_cosh gradient.  Effective gradient ∝
-       log1p(|e|) × tanh(|e|) ≈ asinh(|e|) for large |e|, restoring
-       proportional sensitivity that raw log_cosh loses.
+       difficulty = 1 − exp(−|e|): how wrong this cell is (curriculum).
+       event_mag = max(|y|, |ŷ_sg|) / (τ + max(|y|, |ŷ_sg|)): continuous
+       magnitude signal ∈ [0, 1).  Syria (500 deaths) gets ~0.998,
+       Chad (2 deaths) ~0.72.  Union semantics: false positives get
+       event_mag > 0.5.  w_compound = 1 + 2 × difficulty × event_mag
+       ∈ [1, 3).  Self-correcting: as |e|→0, w→1.
 
-       Relative sigmoid gate σ(5·(abs_max/series_scale − 1)) fires on
-       signals that are unusual *for this series*, not just non-zero in
-       absolute terms.  series_scale = mean(|y_true|) per series,
-       clamped at τ.  Differentiable, still disciplines false positives.
+    3. **KL-DRO tail aggregation (log-space)** — parameter-free.
 
-    3. **Hierarchical DRO tail aggregation** — parameter-free.
-
-       Per-series DRO: within each series, upweight hard timesteps
-       relative to that series' own difficulty distribution.
-       Cross-series DRO: upweight globally harder series by their
-       mean cell loss.  Product of both avoids single-cell dominance
-       across series while preserving cross-series attention to
-       systematically hard forecasts.
+       Z-score log(cell_loss) globally across all B×T cells, apply
+       concave log1p weights, soft alpha-blend toward uniform when
+       variance is small.  Detects *proportional* outliers across
+       the 90/10 peace/event split.
 
     4. **Windowed level anchor** — √T-scaled log_cosh on per-window
        mean error with DRO aggregation.
@@ -298,24 +293,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Compound weighting ────────────────────────────────────────
         abs_e = torch.abs(e_shape.detach())
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        # Log-scaled difficulty compensates tanh saturation of log_cosh:
-        # effective gradient ∝ log1p(|e|) × tanh(|e|) ≈ asinh(|e|)
-        difficulty = torch.log1p(abs_e)
-        # Relative gate: normalise by per-series mean intensity so the
-        # gate fires on "unusual for this series" not "non-zero in absolute terms".
-        # Syria at constant 3 → scale=3, routine cells get gate≈0.5;
-        # Thailand with one spike → scale clamped to τ, spike gets gate≈1.0.
-        series_scale = torch.abs(y_true).mean(dim=1, keepdim=True).clamp(min=self.non_zero_threshold)
-        soft_gate = torch.sigmoid(5.0 * (abs_max / series_scale - 1.0))
-        w_compound = 1.0 + difficulty * soft_gate
+        difficulty = 1.0 - torch.exp(-abs_e)
+        event_mag = abs_max / (self.non_zero_threshold + abs_max)
+        w_compound = 1.0 + 2.0 * difficulty * event_mag
 
-        # ── Shape DRO (hierarchical: per-series × cross-series) ───────
-        # Per-series DRO: within each series, upweight hard timesteps
-        w_within = self._dro_weights_2d(cell_loss)            # (B, T)
-        # Cross-series DRO: upweight globally harder series
-        series_means = cell_loss.detach().mean(dim=1)         # (B,)
-        w_across = self._dro_weights(series_means).unsqueeze(1)  # (B, 1)
-        w_dro = w_within * w_across
+        # ── Shape DRO (global) ─────────────────────────────────────────
+        w_dro = self._dro_weights(cell_loss.flatten()).view_as(cell_loss)
         w_total = w_compound * w_dro
         w_total = w_total / w_total.mean()
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)

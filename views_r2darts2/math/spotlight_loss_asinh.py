@@ -124,9 +124,11 @@ class SpotlightLossAsinh(torch.nn.Module):
             )
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
-        # Curriculum gating: regularisers activate as core loss converges
-        self.register_buffer('_core_ema', torch.tensor(float('inf')))
-        self.register_buffer('_core_peak', torch.tensor(0.0))
+        # Curriculum gating: regularisers activate as core loss converges.
+        # persistent=False: excluded from state_dict — resets each training
+        # run, no checkpoint mismatch on load.
+        self.register_buffer('_core_ema', torch.tensor(float('inf')), persistent=False)
+        self.register_buffer('_core_peak', torch.tensor(0.0), persistent=False)
         logger.info(
             "SpotlightLossAsinh | threshold=%.4f",
             non_zero_threshold,
@@ -152,33 +154,37 @@ class SpotlightLossAsinh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Signal-filtered, compound-weighted temporal gradient matching.
+        """Transition-filtered, compound-weighted temporal gradient matching.
 
         Computes asinh_integral on first-difference errors (Δŷ − Δy).
-        Only series with signal above τ are included.  Per-transition
-        log1p difficulty weighting ensures spike onsets/offsets get
-        proportional gradient.
+        Only transitions where at least one endpoint (t or t+1) exceeds τ
+        in y_true or y_pred are included.  This removes zero→zero transitions
+        entirely, preventing the smoothness penalty from competing with the
+        shape loss at peace timesteps within conflict series.
         """
-        has_signal = (
-            (torch.abs(y_true) > self.non_zero_threshold)
-            | (torch.abs(y_pred.detach()) > self.non_zero_threshold)
-        ).any(dim=1)
-        if not has_signal.any():
+        τ = self.non_zero_threshold
+        sig = (
+            (torch.abs(y_true) > τ)
+            | (torch.abs(y_pred.detach()) > τ)
+        )  # (B, T)
+        trans_mask = sig[:, :-1] | sig[:, 1:]  # (B, T-1)
+
+        if not trans_mask.any():
             return y_pred.new_tensor(0.0)
-        pred = y_pred[has_signal]
-        true = y_true[has_signal]
 
-        dy_pred = pred[:, 1:] - pred[:, :-1]
-        dy_true = true[:, 1:] - true[:, :-1]
+        dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
+        dy_true = y_true[:, 1:] - y_true[:, :-1]
         de = dy_pred - dy_true
-        cell_grad = self._asinh_integral(de)
 
-        # Compound weighting on transitions: upweight spike onsets/offsets
+        cell_grad = self._asinh_integral(de)
+        cell_grad = cell_grad * trans_mask.float()
+
         abs_de = torch.abs(de.detach())
         w_grad = 1.0 + torch.log1p(abs_de)
-        w_grad = w_grad / w_grad.mean()
+        w_grad = w_grad * trans_mask.float()
+        denom = w_grad.sum().clamp(min=1e-8)
 
-        return (w_grad * cell_grad).mean()
+        return (w_grad * cell_grad).sum() / denom
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

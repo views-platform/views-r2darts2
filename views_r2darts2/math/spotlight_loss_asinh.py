@@ -258,7 +258,7 @@ class SpotlightLossAsinh(torch.nn.Module):
 
         # ── Windowed level anchor ─────────────────────────────────────
         # log_cosh: saturating gradient prevents late-training domination.
-        W = max(4, T // 6)
+        W = max(6, T // 3)
         e_windows = list(e.split(W, dim=1))
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e_windows], dim=1
@@ -281,17 +281,17 @@ class SpotlightLossAsinh(torch.nn.Module):
             w_lv = lv_alpha * w_lv + (1.0 - lv_alpha)
             w_lv = torch.nan_to_num(w_lv, nan=1.0, posinf=1.0, neginf=0.0)
             w_lv = w_lv.view_as(level_losses)
-            loss_level = math.sqrt(T) * (w_lv * level_losses).mean()
+            loss_level = T * (w_lv * level_losses).mean()
         else:
-            loss_level = math.sqrt(T) * level_losses.mean()
+            loss_level = T * level_losses.mean()
 
-        # ── Temporal gradient matching ────────────────────────────────
+        # ── Temporal gradient matching (regulariser, half-weight) ──────
         loss_grad = self._temporal_gradient_loss(y_pred, y_true) if T >= 2 else y_pred.new_tensor(0.0)
 
-        # ── Multi-resolution spectral loss ────────────────────────────
+        # ── Multi-resolution spectral loss (regulariser, half-weight) ──
         loss_spec = self._spectral_loss(y_pred, y_true) if T >= 6 else y_pred.new_tensor(0.0)
 
-        total_loss = loss_shape + loss_level + loss_grad + loss_spec
+        total_loss = loss_shape + loss_level + 0.5 * loss_grad + 0.5 * loss_spec
 
         if not torch.isfinite(total_loss):
             logger.warning(

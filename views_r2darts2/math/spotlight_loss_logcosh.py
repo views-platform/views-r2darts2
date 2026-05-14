@@ -55,18 +55,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
        across series while preserving cross-series attention to
        systematically hard forecasts.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window
+    4. **Windowed level anchor** — √T-scaled log_cosh on per-window
        mean error with DRO aggregation.
 
        Only mechanism that can shift per-series means (shape loss is
        structurally DC-blind).  Windows of width max(4, T//6) catch
-       intra-horizon level drift.
+       intra-horizon level drift.  Scaled by √T (not T) to prevent
+       the level anchor from dominating early training and pushing
+       the optimizer toward flat-baseline solutions.
 
     5. **Temporal gradient matching** — log_cosh on first-difference
-       errors (∂ŷ/∂t − ∂y/∂t). Always on, no hyperparameters.
+       errors (∂ŷ/∂t − ∂y/∂t).  Signal-filtered and compound-weighted.
 
-       Penalises onset/offset timing errors via rate-of-change
-       mismatches.  O(T) computation.
+       Only series with signal above τ are included (peaceful series
+       contribute zero-information gradient).  Per-transition log1p
+       difficulty weighting ensures spike onsets/offsets get
+       proportional attention despite tanh saturation.
+       O(T) computation.
 
     6. **Multi-resolution STFT loss** — log_cosh on magnitude-spectrum
        differences at three (n_fft, hop) resolutions, AC bins only.
@@ -177,8 +182,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         Splits the T-length error into non-overlapping windows of width
         max(4, T//6), computes log_cosh on per-window means, then
-        aggregates with DRO weights.  Scaled by T to keep level gradient
-        comparable to shape across different horizons.
+        aggregates with DRO weights.  Scaled by √T to keep level
+        gradient meaningful without dominating shape/grad/spec.
         """
         W = max(4, T // 6)
         window_means = torch.stack(
@@ -186,13 +191,37 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         level_losses = self._log_cosh(window_means)
         w = self._dro_weights(level_losses.flatten()).view_as(level_losses)
-        return T * (w * level_losses).mean()
+        return math.sqrt(T) * (w * level_losses).mean()
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """log_cosh on first-difference errors (Δŷ − Δy)."""
-        dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
-        dy_true = y_true[:, 1:] - y_true[:, :-1]
-        return self._log_cosh(dy_pred - dy_true).mean()
+        """Signal-filtered, compound-weighted temporal gradient matching.
+
+        Computes log_cosh on first-difference errors (Δŷ − Δy).
+        Only series with signal above τ are included.  Per-transition
+        log1p difficulty weighting ensures spike onsets/offsets get
+        proportional gradient despite tanh saturation.
+        """
+        # Filter to signal series (same logic as spectral loss)
+        has_signal = (
+            (torch.abs(y_true) > self.non_zero_threshold)
+            | (torch.abs(y_pred.detach()) > self.non_zero_threshold)
+        ).any(dim=1)
+        if not has_signal.any():
+            return y_pred.new_tensor(0.0)
+        pred = y_pred[has_signal]
+        true = y_true[has_signal]
+
+        dy_pred = pred[:, 1:] - pred[:, :-1]
+        dy_true = true[:, 1:] - true[:, :-1]
+        de = dy_pred - dy_true
+        cell_grad = self._log_cosh(de)
+
+        # Compound weighting on transitions: upweight spike onsets/offsets
+        abs_de = torch.abs(de.detach())
+        w_grad = 1.0 + torch.log1p(abs_de)
+        w_grad = w_grad / w_grad.mean()
+
+        return (w_grad * cell_grad).mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

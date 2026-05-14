@@ -75,16 +75,12 @@ class SpotlightLossAsinh(torch.nn.Module):
        soft alpha-blend mechanism, no Tukey cap.
 
     3. **Temporal gradient matching** — asinh_integral on first-difference
-       errors (∂ŷ/∂t − ∂y/∂t). Always on, no hyperparameters.
+       errors (∂ŷ/∂t − ∂y/∂t).  Signal-filtered and compound-weighted.
 
-       Penalizes wrong slopes: if the model predicts the right magnitude
-       but at the wrong time, the pointwise shape loss may be large but
-       the gradient loss directly targets onset/offset timing errors.
-       Complementary to the shape loss: shape sees level of error at
-       each timestep, gradient sees rate-of-change mismatches.
-
-       O(T) computation, no DP needed. Uses the same asinh_integral
-       base loss for consistent gradient scaling.
+       Only series with signal above τ are included (peaceful series
+       contribute zero-information gradient).  Per-transition log1p
+       difficulty weighting ensures spike onsets/offsets get
+       proportional attention.  O(T) computation.
 
     4. **Multi-resolution STFT loss** — log_cosh on magnitude-spectrum
        differences at three (n_fft, hop) resolutions, AC bins only.
@@ -146,25 +142,38 @@ class SpotlightLossAsinh(torch.nn.Module):
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
-        """log(cosh(x)), numerically stable. Used for spectral loss only."""
+        """log(cosh(x)), numerically stable. Used for spectral/level loss."""
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
-    @staticmethod
-    def _temporal_gradient_loss(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Temporal gradient matching via first-difference errors.
+    def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Signal-filtered, compound-weighted temporal gradient matching.
 
-        Computes asinh_integral on (Δŷ − Δy) where Δ is the first
-        temporal difference.  Penalises rate-of-change mismatches:
-        if the model predicts the right magnitude at the wrong time,
-        shape loss sees two large pointwise errors while this term
-        directly targets the onset/offset timing error.
-
-        Complexity: O(T), no DP or convolution needed.
+        Computes asinh_integral on first-difference errors (Δŷ − Δy).
+        Only series with signal above τ are included.  Per-transition
+        log1p difficulty weighting ensures spike onsets/offsets get
+        proportional gradient.
         """
-        dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
-        dy_true = y_true[:, 1:] - y_true[:, :-1]
-        return SpotlightLossAsinh._asinh_integral(dy_pred - dy_true).mean()
+        has_signal = (
+            (torch.abs(y_true) > self.non_zero_threshold)
+            | (torch.abs(y_pred.detach()) > self.non_zero_threshold)
+        ).any(dim=1)
+        if not has_signal.any():
+            return y_pred.new_tensor(0.0)
+        pred = y_pred[has_signal]
+        true = y_true[has_signal]
+
+        dy_pred = pred[:, 1:] - pred[:, :-1]
+        dy_true = true[:, 1:] - true[:, :-1]
+        de = dy_pred - dy_true
+        cell_grad = self._asinh_integral(de)
+
+        # Compound weighting on transitions: upweight spike onsets/offsets
+        abs_de = torch.abs(de.detach())
+        w_grad = 1.0 + torch.log1p(abs_de)
+        w_grad = w_grad / w_grad.mean()
+
+        return (w_grad * cell_grad).mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -272,9 +281,9 @@ class SpotlightLossAsinh(torch.nn.Module):
             w_lv = lv_alpha * w_lv + (1.0 - lv_alpha)
             w_lv = torch.nan_to_num(w_lv, nan=1.0, posinf=1.0, neginf=0.0)
             w_lv = w_lv.view_as(level_losses)
-            loss_level = T * (w_lv * level_losses).mean()
+            loss_level = math.sqrt(T) * (w_lv * level_losses).mean()
         else:
-            loss_level = T * level_losses.mean()
+            loss_level = math.sqrt(T) * level_losses.mean()
 
         # ── Temporal gradient matching ────────────────────────────────
         loss_grad = self._temporal_gradient_loss(y_pred, y_true) if T >= 2 else y_pred.new_tensor(0.0)

@@ -98,7 +98,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
     _TEMPORAL_GRADIENT = True
-    _STFT = False
+    _STFT = True
 
     def __init__(
         self,
@@ -118,6 +118,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
+        # Curriculum gating: regularisers activate as core loss converges
+        self.register_buffer('_core_ema', torch.tensor(float('inf')))
+        self.register_buffer('_core_peak', torch.tensor(0.0))
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -310,17 +313,38 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, T)
 
-        # ── Temporal gradient matching (optional, half-weight) ────────
+        # ── Curriculum gate for regularisers ────────────────────────
+        # Track EMA of core (shape+level) loss and its peak.
+        # gate = fraction of peak loss recovered: 0.05 at start, opens as
+        # core converges. If core spikes (bad batch / interference),
+        # gate contracts automatically.  Prevents timing/spectral
+        # gradients from competing with shape+level during early learning.
+        # Leaky peak (×0.999/batch, half-life ≈ 693 batches) avoids
+        # permanent inflation from outlier batches.
+        core_det = (loss_shape + loss_level).detach()
+        if self.training:
+            with torch.no_grad():
+                if torch.isinf(self._core_ema):
+                    self._core_ema.fill_(core_det)
+                else:
+                    self._core_ema.lerp_(core_det, 0.05)
+                self._core_peak.copy_(torch.max(self._core_peak * 0.999, self._core_ema))
+        if torch.isinf(self._core_ema) or self._core_peak < 1e-8:
+            gate = core_det.new_tensor(0.05)
+        else:
+            gate = (1.0 - self._core_ema / (self._core_peak + 1e-8)).clamp(0.05, 1.0)
+
+        # ── Temporal gradient matching (gated) ─────────────────────
         loss_grad = y_pred.new_tensor(0.0)
         if self._TEMPORAL_GRADIENT and T >= 2:
             loss_grad = self._temporal_gradient_loss(y_pred, y_true)
 
-        # ── Multi-resolution spectral loss (optional, half-weight) ────
+        # ── Multi-resolution spectral loss (gated) ─────────────────
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + 0.5 * loss_grad + 0.5 * loss_spec
+        total_loss = loss_shape + loss_level + gate * (0.5 * loss_grad + 0.5 * loss_spec)
 
         if torch.isnan(total_loss):
             raise RuntimeError(
@@ -331,9 +355,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         logger.debug(
             "SpotlightLossLogcosh | shape=%.6f level=%.6f grad=%.6f "
-            "spec=%.6f total=%.6f",
+            "spec=%.6f gate=%.4f total=%.6f",
             loss_shape.item(), loss_level.item(),
-            loss_grad.item(), loss_spec.item(), total_loss.item(),
+            loss_grad.item(), loss_spec.item(),
+            gate.item(), total_loss.item(),
         )
         return total_loss
 

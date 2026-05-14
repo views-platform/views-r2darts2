@@ -97,6 +97,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
+    _TEMPORAL_GRADIENT = True
+    _STFT = False
 
     def __init__(
         self,
@@ -308,11 +310,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, T)
 
-        # ── Temporal gradient matching (regulariser, half-weight) ────
-        loss_grad = self._temporal_gradient_loss(y_pred, y_true) if T >= 2 else y_pred.new_tensor(0.0)
+        # ── Temporal gradient matching (optional, half-weight) ────────
+        loss_grad = y_pred.new_tensor(0.0)
+        if self._TEMPORAL_GRADIENT and T >= 2:
+            loss_grad = self._temporal_gradient_loss(y_pred, y_true)
 
-        # ── Multi-resolution spectral loss (regulariser, half-weight) ─
-        loss_spec = self._spectral_loss(y_pred, y_true) if T >= 6 else y_pred.new_tensor(0.0)
+        # ── Multi-resolution spectral loss (optional, half-weight) ────
+        loss_spec = y_pred.new_tensor(0.0)
+        if self._STFT and T >= 6:
+            loss_spec = self._spectral_loss(y_pred, y_true)
 
         total_loss = loss_shape + loss_level + 0.5 * loss_grad + 0.5 * loss_spec
 

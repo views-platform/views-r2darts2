@@ -114,6 +114,8 @@ class SpotlightLossAsinh(torch.nn.Module):
 
     SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
     _LEVEL_DRO = True
+    _TEMPORAL_GRADIENT = True
+    _STFT = False
 
     def __init__(self, non_zero_threshold: float):
         if non_zero_threshold <= 0.0:
@@ -285,11 +287,15 @@ class SpotlightLossAsinh(torch.nn.Module):
         else:
             loss_level = T * level_losses.mean()
 
-        # ── Temporal gradient matching (regulariser, half-weight) ──────
-        loss_grad = self._temporal_gradient_loss(y_pred, y_true) if T >= 2 else y_pred.new_tensor(0.0)
+        # ── Temporal gradient matching (optional, half-weight) ────────
+        loss_grad = y_pred.new_tensor(0.0)
+        if self._TEMPORAL_GRADIENT and T >= 2:
+            loss_grad = self._temporal_gradient_loss(y_pred, y_true)
 
-        # ── Multi-resolution spectral loss (regulariser, half-weight) ──
-        loss_spec = self._spectral_loss(y_pred, y_true) if T >= 6 else y_pred.new_tensor(0.0)
+        # ── Multi-resolution spectral loss (optional, half-weight) ────
+        loss_spec = y_pred.new_tensor(0.0)
+        if self._STFT and T >= 6:
+            loss_spec = self._spectral_loss(y_pred, y_true)
 
         total_loss = loss_shape + loss_level + 0.5 * loss_grad + 0.5 * loss_spec
 

@@ -295,9 +295,9 @@ class SpotlightLossAsinh(torch.nn.Module):
             w_lv = lv_alpha * w_lv + (1.0 - lv_alpha)
             w_lv = torch.nan_to_num(w_lv, nan=1.0, posinf=1.0, neginf=0.0)
             w_lv = w_lv.view_as(level_losses)
-            loss_level = T * (w_lv * level_losses).mean()
+            loss_level = T ** 0.5 * (w_lv * level_losses).mean()
         else:
-            loss_level = T * level_losses.mean()
+            loss_level = T ** 0.5 * level_losses.mean()
 
         # ── Curriculum gate for regularisers ────────────────────────
         core_det = (loss_shape + loss_level).detach()

@@ -50,14 +50,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
        variance is small.  Detects *proportional* outliers across
        the 90/10 peace/event split.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window
+    4. **Windowed level anchor** — √T-scaled log_cosh on per-window
        mean error with DRO aggregation.
 
        Only mechanism that can shift per-series means (shape loss is
        structurally DC-blind).  Windows of width max(6, T//3) (~3 wide
-       windows) catch intra-horizon level drift.  Scaled by T so the
-       level gradient is strong enough to correct volume against the
-       90% peace-cell majority pulling toward zero.
+       windows) catch intra-horizon level drift.  Scaled by √T: softer
+       than T but still horizon-aware, preventing level from dominating
+       late training on longer horizons.
 
     5. **Temporal gradient matching** — log_cosh on first-difference
        errors (∂ŷ/∂t − ∂y/∂t).  Soft-weighted, fully data-driven.
@@ -206,9 +206,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         Splits the T-length error into non-overlapping windows of width
         max(6, T//3) (~3 wide windows), computes log_cosh on per-window
-        means, then aggregates with DRO weights.  Scaled by T to keep
-        the level gradient strong enough to correct volume against the
-        90% peace-cell majority.
+        means, then aggregates with DRO weights.  Scaled by sqrt(T) —
+        softer than T scaling, still horizon-aware.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
@@ -216,7 +215,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         level_losses = self._log_cosh_proportional(window_means)
         w = self._dro_weights(level_losses.flatten()).view_as(level_losses)
-        return T * (w * level_losses).mean()
+        return T ** 0.5 * (w * level_losses).mean()
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Soft-weighted temporal gradient matching — fully data-driven.

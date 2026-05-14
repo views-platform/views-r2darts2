@@ -40,8 +40,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
        event_mag = max(|y|, |ŷ_sg|) / (τ + max(|y|, |ŷ_sg|)): continuous
        magnitude signal ∈ [0, 1).  Syria (500 deaths) gets ~0.998,
        Chad (2 deaths) ~0.72.  Union semantics: false positives get
-       event_mag > 0.5.  w_compound = 1 + 2 × difficulty × event_mag
-       ∈ [1, 3).  Self-correcting: as |e|→0, w→1.
+       event_mag > 0.5.  w_compound = 1 + 4 × difficulty × event_mag
+       ∈ [1, 5).  Self-correcting: as |e|→0, w→1.
 
     3. **KL-DRO tail aggregation (log-space)** — parameter-free.
 
@@ -74,10 +74,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
        sqrt(re²+im²+ε) avoids gradient blowup at |z|→0.  Only series
        with signal above τ are included.  Always on, no hyperparameters.
 
-    ── Base cell loss: log_cosh ─────────────────────────────────────────
+    ── Base cell loss: log_cosh × (1 + log(1+e²))  (proportional) ────
 
-    log_cosh(x) ≈ 0.5x² for |x| < 1, ≈ |x| − ln2 for |x| > 2.
-    Gradient = tanh(x) ∈ (−1, +1). Bounded by construction.
+    Multiplies log_cosh by (1 + log(1+e²)) to restore proportional
+    sensitivity for large errors.  For |e|<1: ≈0.5e² (unchanged).
+    For |e|>2: ≈|e|·2·ln|e|, restoring MSLE-like scaling that raw
+    log_cosh (gradient=tanh, caps at ±1) loses above the threshold.
+    Gradient = tanh(e)·(1+log1p(e²)) + log_cosh(e)·2e/(1+e²).
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -97,7 +100,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _TEMPORAL_GRADIENT = False
+    _TEMPORAL_GRADIENT = True
     _STFT = True
 
     def __init__(
@@ -134,6 +137,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """log(cosh(x)), numerically stable: |x| + softplus(−2|x|) − ln2."""
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
+
+    @staticmethod
+    def _log_cosh_proportional(x: torch.Tensor) -> torch.Tensor:
+        """log_cosh with proportional sensitivity correction.
+
+        log_cosh(x) × (1 + log(1 + x²)).
+
+        For |x| < 1: ≈ 0.5x² (unchanged — quadratic MSE-like).
+        For |x| > 2: ≈ |x| × 2·ln|x| (restores MSLE-like scaling).
+
+        Gradient = tanh(x)·(1 + log1p(x²)) + log_cosh(x)·2x/(1+x²).
+        The tanh factor is bounded but the scaling grows as ~ln(e²),
+        giving proportional sensitivity to large errors without explosion.
+        """
+        abs_x = torch.abs(x)
+        lc = abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
+        return lc * (1.0 + torch.log1p(x * x))
 
     @staticmethod
     def _dro_weights(losses: torch.Tensor) -> torch.Tensor:
@@ -192,7 +212,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
-        level_losses = self._log_cosh(window_means)
+        level_losses = self._log_cosh_proportional(window_means)
         w = self._dro_weights(level_losses.flatten()).view_as(level_losses)
         return T * (w * level_losses).mean()
 
@@ -303,15 +323,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Base cell loss ────────────────────────────────────────────
-        cell_loss = self._log_cosh(e_shape)
+        # ── Base cell loss (proportional variant for MSLE sensitivity) ─
+        cell_loss = self._log_cosh_proportional(e_shape)
 
         # ── Compound weighting ────────────────────────────────────────
         abs_e = torch.abs(e_shape.detach())
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         difficulty = 1.0 - torch.exp(-abs_e)
         event_mag = abs_max / (self.non_zero_threshold + abs_max)
-        w_compound = 1.0 + 2.0 * difficulty * event_mag
+        w_compound = 1.0 + 4.0 * difficulty * event_mag
 
         # ── Shape DRO (global) ─────────────────────────────────────────
         w_dro = self._dro_weights(cell_loss.flatten()).view_as(cell_loss)

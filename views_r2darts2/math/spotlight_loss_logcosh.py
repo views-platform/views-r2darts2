@@ -102,7 +102,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _TEMPORAL_GRADIENT = True
+    _TEMPORAL_GRADIENT = False
     _STFT = True
 
     def __init__(

@@ -114,8 +114,8 @@ class SpotlightLossAsinh(torch.nn.Module):
 
     SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
     _LEVEL_DRO = True
-    _TEMPORAL_GRADIENT = True
-    _STFT = False
+    _TEMPORAL_GRADIENT = False
+    _STFT = True
 
     def __init__(self, non_zero_threshold: float):
         if non_zero_threshold <= 0.0:
@@ -295,9 +295,9 @@ class SpotlightLossAsinh(torch.nn.Module):
             w_lv = lv_alpha * w_lv + (1.0 - lv_alpha)
             w_lv = torch.nan_to_num(w_lv, nan=1.0, posinf=1.0, neginf=0.0)
             w_lv = w_lv.view_as(level_losses)
-            loss_level = T ** 0.5 * (w_lv * level_losses).mean()
+            loss_level = T * (w_lv * level_losses).mean()
         else:
-            loss_level = T ** 0.5 * level_losses.mean()
+            loss_level = T * level_losses.mean()
 
         # ── Curriculum gate for regularisers ────────────────────────
         core_det = (loss_shape + loss_level).detach()

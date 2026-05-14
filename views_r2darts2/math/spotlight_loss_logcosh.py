@@ -50,14 +50,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
        variance is small.  Detects *proportional* outliers across
        the 90/10 peace/event split.
 
-    4. **Windowed level anchor** — √T-scaled log_cosh on per-window
+    4. **Windowed level anchor** — T-scaled log_cosh on per-window
        mean error with DRO aggregation.
 
        Only mechanism that can shift per-series means (shape loss is
        structurally DC-blind).  Windows of width max(6, T//3) (~3 wide
-       windows) catch intra-horizon level drift.  Scaled by √T: softer
-       than T but still horizon-aware, preventing level from dominating
-       late training on longer horizons.
+       windows) catch intra-horizon level drift.  Scaled by T: necessary
+       to overcome the 90% zero-cell majority.  √T empirically caused
+       flatlines (TsMixer + TiDE) because DC never converged.  The
+       flat-window-mean attractor is broken by ungated STFT instead.
 
     5. **Temporal gradient matching** — log_cosh on first-difference
        errors (∂ŷ/∂t − ∂y/∂t).  Soft-weighted, fully data-driven.
@@ -76,13 +77,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
        sqrt(re²+im²+ε) avoids gradient blowup at |z|→0.  Only series
        with signal above τ are included.  Always on, no hyperparameters.
 
-    ── Base cell loss: log_cosh × (1 + log(1+e²))  (proportional) ────
+    ── Base cell loss: log_cosh × (1 + log(1+|x|³))  (proportional) ───
 
-    Multiplies log_cosh by (1 + log(1+e²)) to restore proportional
-    sensitivity for large errors.  For |e|<1: ≈0.5e² (unchanged).
-    For |e|>2: ≈|e|·2·ln|e|, restoring MSLE-like scaling that raw
-    log_cosh (gradient=tanh, caps at ±1) loses above the threshold.
-    Gradient = tanh(e)·(1+log1p(e²)) + log_cosh(e)·2e/(1+e²).
+    Multiplies log_cosh by (1 + log(1+|x|³)) to restore proportional
+    sensitivity for large errors.  For |x|<1: ≈0.5x² (cubic interior
+    shrinks faster toward zero, so noise cells are quieter).
+    For |x|>2: ≈|x|·3·ln|x|, ~50% steeper than x² variant while
+    remaining in the same O(ln) growth class (non-explosive).
+    Gradient = tanh(x)·(1+log1p(|x|³)) + log_cosh(x)·3x²·sign(x)/(1+|x|³).
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -108,14 +110,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def __init__(
         self,
         non_zero_threshold: float,
-        alpha: float = 0.0,  # deprecated — ignored, kept for backward compat
     ):
-        if alpha != 0.0:
-            logger.warning(
-                "SpotlightLossLogcosh: alpha is deprecated and ignored. "
-                "Remove alpha from your config. (received alpha=%.4f)",
-                alpha,
-            )
         if non_zero_threshold <= 0.0:
             raise ValueError(
                 f"non_zero_threshold must be positive, got {non_zero_threshold}"
@@ -144,18 +139,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _log_cosh_proportional(x: torch.Tensor) -> torch.Tensor:
         """log_cosh with proportional sensitivity correction.
 
-        log_cosh(x) × (1 + log(1 + x²)).
+        log_cosh(x) × (1 + log(1 + |x|³)).
 
-        For |x| < 1: ≈ 0.5x² (unchanged — quadratic MSE-like).
-        For |x| > 2: ≈ |x| × 2·ln|x| (restores MSLE-like scaling).
+        For |x| < 1: ≈ 0.5x² (cubic interior shrinks faster toward zero,
+            so noise cells are quieter than the old x² variant).
+        For |x| > 2: ≈ |x| × 3·ln|x| (~50% steeper than x² formula).
 
-        Gradient = tanh(x)·(1 + log1p(x²)) + log_cosh(x)·2x/(1+x²).
-        The tanh factor is bounded but the scaling grows as ~ln(e²),
-        giving proportional sensitivity to large errors without explosion.
+        Gradient = tanh(x)·(1 + log1p(|x|³))
+                   + log_cosh(x)·3x²·sign(x)/(1+|x|³).
         """
         abs_x = torch.abs(x)
         lc = abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
-        return lc * (1.0 + torch.log1p(x * x))
+        return lc * (1.0 + torch.log1p(abs_x * abs_x * abs_x))
 
     @staticmethod
     def _dro_weights(losses: torch.Tensor) -> torch.Tensor:
@@ -206,8 +201,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         Splits the T-length error into non-overlapping windows of width
         max(6, T//3) (~3 wide windows), computes log_cosh on per-window
-        means, then aggregates with DRO weights.  Scaled by sqrt(T) —
-        softer than T scaling, still horizon-aware.
+        means, then aggregates with DRO weights.  Scaled by T: necessary
+        to overcome the 90% zero-cell majority pulling the DC component
+        toward zero.  Empirically, √T is insufficient — both TsMixer and
+        TiDE flatlined with it because level never converged and shape had
+        no stable DC base to refine.  The flat-minimum-at-window-mean is
+        broken by ungated STFT instead of weakening level.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
@@ -215,7 +214,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         level_losses = self._log_cosh_proportional(window_means)
         w = self._dro_weights(level_losses.flatten()).view_as(level_losses)
-        return T ** 0.5 * (w * level_losses).mean()
+        return T * (w * level_losses).mean()
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Soft-weighted temporal gradient matching — fully data-driven.

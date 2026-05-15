@@ -264,7 +264,7 @@ def apply_rinorm_compression_patch():
         x_c = torch.sinh(x - self.mean)                  # centered raw
         self.stdev = torch.sqrt(
             torch.var(x_c, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
-        ).detach()  # .clamp(max=15.0) cap outlier targets; asinh keeps ŷ bounded regardless
+        ).detach()
         z = x_c / self.stdev                             # linear normalization
 
         if self.affine:
@@ -273,10 +273,10 @@ def apply_rinorm_compression_patch():
         # CONET conditioning from detached lookback statistics
         T = x.shape[1]
         mu_sq = self.mean.squeeze(1)                    # (B, n_targets)
-        sigma_sq = self.stdev.squeeze(1)                # (B, n_targets)
+        log_sigma_sq = torch.log(self.stdev.squeeze(1) + self.eps)  # log-compress: [0,500] → [-7,6]
         trend = ((x[:, -1, :] - x[:, 0, :]) / max(T - 1, 1)).detach()  # (B, n_targets)
 
-        conet_in = torch.cat([mu_sq, sigma_sq, trend], dim=-1)  # (B, 3*n_targets)
+        conet_in = torch.cat([mu_sq, log_sigma_sq, trend], dim=-1)  # (B, 3*n_targets)
         conet_out = self._output_conet(conet_in)                # (B, 2*n_targets)
 
         n = self._n_targets
@@ -292,7 +292,7 @@ def apply_rinorm_compression_patch():
             logger.info(
                 f"[Dish-TS v7 step {self._dish_step}] "
                 f"μ_asinh={mu_sq.mean():.3f}±{mu_sq.std():.3f}  "
-                f"σ_c={sigma_sq.mean():.3f}±{sigma_sq.std():.3f}  "
+                f"log_σ_c={log_sigma_sq.mean():.3f}±{log_sigma_sq.std():.3f}  "
                 f"Δμ={_dm.mean():.4f}±{_dm.std():.4f}  "
                 f"σ_mult={_mult.mean():.4f}±{_mult.std():.4f}  "
                 f"trend={trend.mean():.4f}"

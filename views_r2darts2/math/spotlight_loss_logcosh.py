@@ -212,7 +212,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
-        level_losses = self._log_cosh(window_means)
+        level_losses = self._log_cosh_proportional(window_means)
         w = self._dro_weights(level_losses.flatten()).view_as(level_losses)
         return T * (w * level_losses).mean()
 
@@ -339,7 +339,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_shape = e - e_mean
 
         # ── Base cell loss (proportional variant for MSLE sensitivity) ─
-        cell_loss = self._log_cosh(e_shape)
+        cell_loss = self._log_cosh_proportional(e_shape)
 
         # ── Compound weighting ────────────────────────────────────────
         abs_e = torch.abs(e_shape.detach())

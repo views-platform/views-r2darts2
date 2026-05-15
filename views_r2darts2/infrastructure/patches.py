@@ -178,7 +178,7 @@ def apply_nbeats_patch():
 #
 # Inverse (v5 structure + learned corrections):
 #   μ_out = μ + Δμ                     — learned mean shift
-#   σ_out = σ_c × (0.5 + sigmoid(s))  — bounded ∈ [0.5σ_c, 1.5σ_c]
+#   σ_out = σ_c × exp(s)             — unconstrained positive, exp(0)=1 at init
 #   ŷ = asinh(ẑ · σ_out) + μ_out      — LOGARITHMIC compression
 #
 # ═══════════════════════════════════════════════════════════════════════
@@ -228,7 +228,7 @@ def apply_rinorm_compression_patch():
     The CONET maps 3 lookback statistics [μ, σ_c, trend_slope] to 2
     correction coefficients [Δμ, raw_scale] per target:
       - μ_out = μ + Δμ (learned shift)
-      - σ_out = σ_c × (0.5 + sigmoid(raw_scale)) (bounded ∈ [0.5σ_c, 1.5σ_c])
+      - σ_out = σ_c × exp(raw_scale)   (unconstrained positive; exp(0)=1 at init)
 
     At initialization the CONET outputs zeros → exact v5 behavior.
     ~100 learnable parameters for n_targets=1.
@@ -264,7 +264,7 @@ def apply_rinorm_compression_patch():
         x_c = torch.sinh(x - self.mean)                  # centered raw
         self.stdev = torch.sqrt(
             torch.var(x_c, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
-        ).detach()
+        ).detach()  # .clamp(max=15.0) cap outlier targets; asinh keeps ŷ bounded regardless
         z = x_c / self.stdev                             # linear normalization
 
         if self.affine:
@@ -288,7 +288,7 @@ def apply_rinorm_compression_patch():
         if self._dish_step % 500 == 1:
             _dm = self._delta_mu.detach()
             _rs = self._raw_scale.detach()
-            _mult = (0.5 + torch.sigmoid(_rs)).detach()
+            _mult = torch.exp(_rs).detach()
             logger.info(
                 f"[Dish-TS v7 step {self._dish_step}] "
                 f"μ_asinh={mu_sq.mean():.3f}±{mu_sq.std():.3f}  "
@@ -311,9 +311,7 @@ def apply_rinorm_compression_patch():
 
         # Learned denormalization: v5 structure + CONET corrections
         mu_out = self.mean + self._delta_mu          # (B, 1, n_targets)
-        sigma_out = self.stdev * (
-            0.5 + torch.sigmoid(self._raw_scale)     # ∈ [0.5σ_c, 1.5σ_c]
-        )
+        sigma_out = self.stdev * torch.exp(self._raw_scale)  # unconstrained positive; init=σ_c
 
         # Broadcast over nr_params dimension
         mu_out = mu_out.unsqueeze(-1)                # (B, 1, n_targets, 1)

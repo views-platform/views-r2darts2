@@ -356,13 +356,20 @@ def apply_rinorm_compression_patch():
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Pure asinh-space RevIN
+        # Center in asinh-space
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
+        
+        # Center in asinh, convert to raw 
+        x_c = torch.sinh(x - self.mean)
+        
+        # Variance of the centered-raw signal
         self.stdev = torch.sqrt(
-            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
+            torch.var(x_c, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
         ).detach()
 
-        x = (x - self.mean) / self.stdev
+        # Normalize, but DO NOT apply asinh. 
+        # The network operates in linearly-scaled raw-variance space.
+        x = x_c / self.stdev
 
         if self.affine:
             x = x * self.affine_weight
@@ -381,8 +388,10 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Pure asinh-space denormalization
-        x = x * sigma + mu
+        # Expand linearly, then COMPRESS back into asinh-space.
+        # This makes it mathematically impossible for the global
+        # pipeline's sinh(x) inversion to explode exponentially.
+        x = torch.asinh(x * sigma) + mu
 
         return x
 

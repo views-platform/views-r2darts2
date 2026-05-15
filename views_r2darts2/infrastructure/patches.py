@@ -356,33 +356,13 @@ def apply_rinorm_compression_patch():
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Guard against any upstream numeric accident before sinh.
-        x = torch.clamp(x, -88.0, 88.0)
-
-        # Compute asinh-space mean (bias-free centering point)
+        # Pure asinh-space RevIN
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-
-        # Center in asinh space, convert to raw
-        x_centered_raw = torch.sinh(x - self.mean)
-
-        # Compute variance of the centered-raw signal
-        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
-        # These differ enormously — std(sinh(x)) is inflated by the
-        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
-            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
-            + self.eps
+            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
         ).detach()
 
-        # Normalize by centered-raw std, compress back via asinh
-        x = torch.asinh(x_centered_raw / self.stdev)
-
-        # Store the max |z| seen in this lookback window.
-        # Used in the inverse to clamp ẑ to the training z-range,
-        # preventing σ_sinh (which can be large for spike series)
-        # from amplifying OOD model outputs into runaway forecasts.
-        # Shape matches self.mean / self.stdev: (batch, 1, n_targets).
-        self.z_abs_max = x.abs().amax(dim=calc_dims, keepdim=True).detach()
+        x = (x - self.mean) / self.stdev
 
         if self.affine:
             x = x * self.affine_weight
@@ -400,27 +380,9 @@ def apply_rinorm_compression_patch():
 
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
-        z_abs_max = self.z_abs_max.view(self.z_abs_max.shape + (1,))
 
-        # Clamp ẑ to 1.5× the maximum z observed in the lookback window.
-        # This is entirely data-driven — no fixed hyperparameter.
-        #
-        # Why this works for extreme-conflict series (Sudan/Niger):
-        #   Forward: σ_sinh≈290 absorbs the spike → z_max≈2.5 (learnable)
-        #   Inverse: clamp at ±3.75 allows full spike recovery when the
-        #     model correctly outputs ẑ≈2.5, but caps OOD drift at ẑ=10
-        #     to 3.75 → σ=290 amplifies to a bounded range, not infinity.
-        #
-        # Why 1.5×: allows headroom above the training max (the model may
-        #   legitimately forecast a slightly larger spike than the lookback
-        #   contains), while keeping the clamp within the region where the
-        #   inverse Jacobian is well-conditioned.
-        x = x.clamp(-1.5 * z_abs_max, 1.5 * z_abs_max)
-
-        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
-        # Compress: asinh wraps it back into asinh-space
-        # Shift: + μ_asinh re-centers (additive, no amplification)
-        x = torch.asinh(torch.sinh(x) * sigma) + mu
+        # Pure asinh-space denormalization
+        x = x * sigma + mu
 
         return x
 

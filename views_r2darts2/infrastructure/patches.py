@@ -178,7 +178,7 @@ def apply_nbeats_patch():
 #
 # Inverse (v5 structure + learned corrections):
 #   μ_out = μ + Δμ                     — learned mean shift
-#   σ_out = σ_c × exp(s)             — unconstrained positive, exp(0)=1 at init
+#   σ_out = σ_c × exp(tanh(s))         — ∈ [σ_c/e, σ_c·e], identity at init
 #   ŷ = asinh(ẑ · σ_out) + μ_out      — LOGARITHMIC compression
 #
 # ═══════════════════════════════════════════════════════════════════════
@@ -288,7 +288,7 @@ def apply_rinorm_compression_patch():
         if self._dish_step % 500 == 1:
             _dm = self._delta_mu.detach()
             _rs = self._raw_scale.detach()
-            _mult = torch.exp(_rs).detach()
+            _mult = torch.exp(torch.tanh(_rs)).detach()
             logger.info(
                 f"[Dish-TS v7 step {self._dish_step}] "
                 f"μ_asinh={mu_sq.mean():.3f}±{mu_sq.std():.3f}  "
@@ -311,7 +311,7 @@ def apply_rinorm_compression_patch():
 
         # Learned denormalization: v5 structure + CONET corrections
         mu_out = self.mean + self._delta_mu          # (B, 1, n_targets)
-        sigma_out = self.stdev * torch.exp(self._raw_scale)  # unconstrained positive; init=σ_c
+        sigma_out = self.stdev * torch.exp(torch.tanh(self._raw_scale))  # ∈ [σ_c/e, σ_c·e] ≈ [0.37σ_c, 2.72σ_c]
 
         # Broadcast over nr_params dimension
         mu_out = mu_out.unsqueeze(-1)                # (B, 1, n_targets, 1)

@@ -253,6 +253,7 @@ def apply_rinorm_compression_patch():
         nn.init.zeros_(self._output_conet[2].weight)
         nn.init.zeros_(self._output_conet[2].bias)
         self._n_targets = input_dim
+        self._dish_step = 0
 
     def _dish_ts_forward(self, x: torch.Tensor):
         # x: (batch, input_chunk_length, n_targets) in asinh-space
@@ -282,6 +283,21 @@ def apply_rinorm_compression_patch():
         self._delta_mu = conet_out[:, :n].unsqueeze(1)    # (B, 1, n_targets)
         self._raw_scale = conet_out[:, n:].unsqueeze(1)   # (B, 1, n_targets)
 
+        # Log CONET diagnostics every 500 forward passes
+        self._dish_step += 1
+        if self._dish_step % 500 == 1:
+            _dm = self._delta_mu.detach()
+            _rs = self._raw_scale.detach()
+            _mult = (0.5 + torch.sigmoid(_rs)).detach()
+            logger.info(
+                f"[Dish-TS step {self._dish_step}] "
+                f"μ_asinh={mu_sq.mean():.3f}±{mu_sq.std():.3f}  "
+                f"σ_asinh={sigma_sq.mean():.3f}±{sigma_sq.std():.3f}  "
+                f"Δμ={_dm.mean():.4f}±{_dm.std():.4f}  "
+                f"σ_mult={_mult.mean():.4f}±{_mult.std():.4f}  "
+                f"trend={trend.mean():.4f}"
+            )
+
         return z
 
     def _dish_ts_inverse(self, x: torch.Tensor):
@@ -304,6 +320,18 @@ def apply_rinorm_compression_patch():
         sigma_out = sigma_out.unsqueeze(-1)          # (B, 1, n_targets, 1)
 
         x = x * sigma_out + mu_out
+
+        # Log inverse diagnostics at same cadence as forward
+        if hasattr(self, '_dish_step') and self._dish_step % 500 == 1:
+            logger.info(
+                f"[Dish-TS inv  step {self._dish_step}] "
+                f"μ_out={mu_out.mean():.3f}  "
+                f"σ_out={sigma_out.mean():.4f}  "
+                f"ŷ_range=[{x.min():.3f}, {x.max():.3f}]  "
+                f"sinh(ŷ)_range=[{torch.sinh(x.clamp(-20,20)).min():.1f}, "
+                f"{torch.sinh(x.clamp(-20,20)).max():.1f}]"
+            )
+
         return x
 
     _original_load = RINorm._load_from_state_dict

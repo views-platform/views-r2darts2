@@ -367,7 +367,7 @@ def apply_rinorm_compression_patch():
             torch.var(x_c, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
         ).detach()
 
-        # Normalize, but DO NOT apply asinh. 
+        # Normalize, but do not apply asinh. 
         # The network operates in linearly-scaled raw-variance space.
         x = x_c / self.stdev
 

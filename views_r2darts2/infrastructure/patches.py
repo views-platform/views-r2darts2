@@ -142,242 +142,150 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm Hybrid-Space Normalization Patch ---
+# --- 3. RINorm Dish-TS Patch (Learned Denormalization) ---
 #
 # ═══════════════════════════════════════════════════════════════════════
-# PROBLEM (v1: standard RevIN in asinh-space)
+# BACKGROUND
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Pipeline: raw counts → asinh → RevIN → model → RevIN⁻¹ → sinh → counts
 #
-# Standard RevIN: z = (x_asinh - μ_asinh) / σ_asinh.
-# Inverse: ŷ_asinh = ẑ·σ_asinh + μ_asinh → counts = sinh(ŷ_asinh).
+# ALL fixed RevIN variants (v1/v3/v5) share a fatal flaw: the sinh()
+# evaluation step exponentially amplifies any bias in asinh-space.
 #
-# Three pathologies:
-#   1. Jensen amplification: E[sinh(μ + σ·Z)] = sinh(μ)·exp(σ²/2).
-#   2. Sensitivity explosion: ∂counts/∂ẑ = σ·cosh(ẑ·σ+μ) → exponential.
-#   3. Asymmetric errors in count space.
-#
-# ═══════════════════════════════════════════════════════════════════════
-# PROBLEM (v2: pure raw-space RevIN — PREVIOUS IMPLEMENTATION)
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Pure raw-space centering: z = asinh((sinh(x) - μ_raw) / σ_raw)
-# Inverse: ŷ = asinh(sinh(ẑ)·σ_raw + μ_raw)
-#
-# Gradient-safe (bounded ≈1 for large |ẑ|): ✓
-# Jensen-safe for MC dropout (E[sinh(ẑ)]=0): ✓
-#
-# BUT: systematic positive mean bias.
-#
-# At ẑ=0 (model's "neutral" output):
-#   ŷ_asinh = asinh(0·σ + μ_raw) = asinh(μ_raw)
-#
-# Meanwhile the true asinh-space mean is μ_asinh = E[x_asinh].
-# Since sinh is convex for x>0:
-#   μ_raw = E[sinh(x_asinh)] ≥ sinh(E[x_asinh]) = sinh(μ_asinh)
-#   ⟹ asinh(μ_raw) ≥ μ_asinh
-#
-# The "neutral" prediction overshoots in asinh-space by:
-#   bias = asinh(μ_raw) − μ_asinh = asinh(E[sinh(X)]) − E[X]
-#
-# For Gaussian X~N(μ,σ²): μ_raw = sinh(μ)·exp(σ²/2), so:
-#   bias = asinh(sinh(μ)·exp(σ²/2)) − μ
-#
-#   | Series         | μ_asinh | σ_asinh | bias    |
-#   |----------------|---------|---------|---------|
-#   | Peaceful       | 0.10    | 0.30    | +0.00   |
-#   | Low conflict   | 1.50    | 1.00    | +0.89   |
-#   | Medium         | 3.00    | 2.00    | +1.71   |
-#   | High           | 5.00    | 3.00    | +2.60   |
-#   | Extreme (UKR)  | 5.00    | 4.00    | +7.70   |
-#
-# The level anchor partially compensates but requires the model to
-# learn a per-series negative DC shift from context. Limited capacity
-# → chronic overprediction across all series and all architectures.
+# Proof: sinh(asinh(ẑ·σ) + μ) ≈ ẑ·σ·exp(μ) for large ẑ.
+# Each +0.1 unit of ẑ-bias at μ=5.69 → +656 raw fatalities.
+# No fixed normalization inverse can prevent this — the amplification
+# happens AFTER the inverse, in the sinh conversion to raw counts.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# FIX: HYBRID-SPACE REVIN (v3)
+# SOLUTION: DISH-TS LEARNED DENORMALIZATION (v6)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Key insight: center in asinh-space (bias-free), normalize variance in
-# raw-space (gradient-safe). Best of both worlds.
+# Inspired by Dish-TS (Fan et al., 2023): learned Output CONET replaces
+# the fixed inverse. The CONET adjusts μ and σ for denormalization,
+# compensating for inter-space distribution shift and Jensen amplification.
 #
-# Forward:
-#   μ_asinh = mean(x, dim=time)              — asinh-space mean
-#   x_c = sinh(x − μ_asinh)                  — center in asinh, then to raw
-#   σ_c = std(x_c, dim=time)                 — centered-raw std
-#   z = asinh(x_c / σ_c)                     — normalize, compress
+# Forward (standard linear RevIN — clean z-distribution):
+#   μ = mean(x, dim=time)              — asinh-space mean (detached)
+#   σ = std(x, dim=time)               — asinh-space std (detached)
+#   z = (x − μ) / σ                    — standard z-scores
+#   CONET conditioning: [μ, σ, trend_slope] → [Δμ, raw_scale]
 #
-# Inverse:
-#   ŷ_asinh = asinh(sinh(ẑ) · σ_c) + μ_asinh — expand, shift back
-#
-# ═══════════════════════════════════════════════════════════════════════
-# WHY THIS ELIMINATES THE MEAN BIAS
-# ═══════════════════════════════════════════════════════════════════════
-#
-# At ẑ=0: ŷ = asinh(sinh(0)·σ_c) + μ_asinh = asinh(0) + μ_asinh = μ_asinh
-#
-# The model's neutral output maps EXACTLY to the asinh-space mean.
-# No Jensen gap. No per-series DC correction needed.
+# Inverse (learned denormalization):
+#   μ_out = μ + Δμ                     — learned shift
+#   σ_out = σ × (0.5 + sigmoid(s))     — bounded ∈ [0.5σ, 1.5σ]
+#   ŷ = ẑ · σ_out + μ_out              — linear denorm with learned stats
 #
 # ═══════════════════════════════════════════════════════════════════════
-# WHY GRADIENTS REMAIN BOUNDED
+# WHY THIS WORKS
 # ═══════════════════════════════════════════════════════════════════════
 #
-# ∂ŷ/∂ẑ = σ_c · cosh(ẑ) / √(1 + (sinh(ẑ)·σ_c)²)
+# 1. CONET can learn to SHRINK σ_out → directly reduces the Jensen
+#    amplification factor exp(σ²/2) at the sinh eval step.
 #
-# At ẑ=0: = σ_c (moderate — similar to σ_asinh)
-# At ẑ→∞: cosh(ẑ) ≈ sinh(ẑ) → σ_c·sinh(ẑ) / (σ_c·sinh(ẑ)) = 1
+# 2. CONET can learn a NEGATIVE Δμ → counteracts the systematic
+#    positive bias from E[sinh(X)] > sinh(E[X]).
 #
-# Bounded ∈ [1, σ_c]. No exponential explosion.
-# The outer asinh cancels the inner sinh curvature.
+# 3. Identity warm start: at init, Δμ=0, sigmoid(0)=0.5 → σ_out=σ,
+#    μ_out=μ. Exact standard RevIN. No risk of degradation.
 #
-# ═══════════════════════════════════════════════════════════════════════
-# MC DROPOUT SAFETY
-# ═══════════════════════════════════════════════════════════════════════
+# 4. Bounded corrections: σ_out ∈ [0.5σ, 1.5σ], Δμ starts at 0.
+#    The CONET can dampen (fighting Jensen) but never collapse.
 #
-# The inverse is: asinh(sinh(ẑ)·σ_c) + μ_asinh.  The μ_asinh term is
-# additive (constant, no amplification). The sinh(ẑ)·σ_c term:
-#   E[sinh(ẑ)] = 0 when E[ẑ]=0 (odd symmetry)
-#   Jensen factor for σ_ẑ≈0.3: exp(0.09/2)≈1.05× (negligible)
+# 5. ~100 learnable parameters (for n_targets=1). Minimal overhead.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# Z-RANGE ANALYSIS
+# ARCHITECTURE
 # ═══════════════════════════════════════════════════════════════════════
 #
-# For Ukraine (μ_asinh≈5, σ_asinh≈4):
-#   x − μ ∈ [−5, +2], sinh(x−μ) ∈ [−74, +3.6]
-#   σ_c ≈ 20 (dominated by the positive tail)
-#   z = asinh(sinh(x−μ)/20) → z ∈ [−2.0, 0.18] (compact!)
+# Output CONET: Linear(3·n_targets, 16) → GELU → Linear(16, 2·n_targets)
+#   Input:  [μ_asinh, σ_asinh, trend_slope] per target (detached)
+#   Output: [Δμ, raw_scale] per target
+#   Init:   Final layer weights=0, bias=0 → identity at start
 #
-# For peaceful (μ_asinh≈0.1):
-#   x − μ ≈ 0 for all t → z ≈ 0 (even more compact)
-#
-# ═══════════════════════════════════════════════════════════════════════
-# FIX: SWAPPED-COMPRESSION REVIN (v5) — μ-law companding at the inverse
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Root cause of v3 runaway: asinh compresses z-values during forward,
-# so the inverse must decompress via sinh(ẑ) — an exponential amplifier.
-# When ẑ drifts beyond the training z-range:
-#   sinh(ẑ=10) × σ_c=20 = 220,264 → 162K deaths (absurd)
-#   Jacobian → 1 (constant) — linear growth at constant rate → no stop.
-#
-# Insight from μ-law companding (telecom): put compression at the
-# receiver (inverse), not the transmitter (forward). The compression
-# inherently bounds the output without clamps or hardcoded limits.
-#
-# v5 architecture:
-#   Forward:  z = sinh(x − μ) / σ_c              — linear normalization
-#   Inverse:  ŷ = asinh(ẑ · σ_c) + μ              — logarithmic compression
-#
-# Round-trip verification:
-#   inverse(forward(x)) = asinh(sinh(x−μ)/σ · σ) + μ
-#                        = asinh(sinh(x−μ)) + μ
-#                        = (x − μ) + μ = x  ✓  (exact)
-#
-# At ẑ=0: ŷ = asinh(0) + μ = μ  ✓  (bias-free)
-#
-# Output growth at large ẑ:
-#   v3: ŷ ≈ ẑ + ln(σ) + μ     (LINEAR — constant slope forever)
-#   v5: ŷ ≈ ln(2ẑσ) + μ       (LOGARITHMIC — diminishing returns)
-#
-# Each doubling of ẑ adds only ln(2) ≈ 0.69 in asinh-space.
-# Compare v3: each unit of ẑ adds 1.0.  No natural stopping point.
-#
-# Gradient: ∂ŷ/∂ẑ = σ / √(1 + (ẑσ)²)
-#   At ẑ=0: σ (full strength correction)
-#   At ẑ=1/σ: σ/√2 ≈ 0.7σ (good)
-#   At large ẑ: → 1/ẑ (diminishes, BUT output also saturates)
-#
-# The v3 Jacobian was also ~1 at large ẑ, but ŷ grew linearly.
-# Here, both gradient AND output diminish → natural convergence.
-#
-# Concrete comparison at ẑ=10, σ_c=20 (Syria peak):
-#   v3: asinh(sinh(10)×20) + μ = 12.7 + μ → 162K deaths
-#   v5: asinh(10×20) + μ = 5.99 + μ → 200 deaths
-#
-# MC dropout safety:
-#   E[ŷ] = E[asinh(ẑσ)] + μ ≈ asinh(E[ẑ]σ) + μ
-#   Jensen correction ≈ −Var[ẑ]σ² × E[ẑ]σ / (1+(E[ẑ]σ)²)^(3/2) / 2
-#   At E[ẑ]=0: correction = 0 (exact).
-#   At E[ẑ]=1: correction ≈ −0.05 (mild negative — under-prediction
-#   bias, which is preferable to the exponential over-prediction of
-#   standard linear RevIN's sinh(ẑσ+μ) Jensen gap).
-#
-# Jensen's amplification at eval (sinh conversion to raw counts):
-#   With v3/v5: counts = sinh(ŷ) = sinh(asinh(ẑσ) + μ)
-#   The asinh(ẑσ) term compresses the MC variance before μ is added,
-#   reducing the effective Var[ŷ] that feeds into Jensen's inequality
-#   compared to linear RevIN where Var[ŷ] = σ²·Var[ẑ] uncompressed.
-#
-# Trade-off: z-values from the forward pass are wider (linear in raw/σ,
-# not asinh-compressed). For a 1-spike-in-36-months series, z_max ≈ 6
-# vs v3's z_max ≈ 2.5. The model must learn in a wider z-range, but
-# this is the standard regime for instance normalization — no harder
-# than what standard RevIN asks of the model.
+# Registered as self._output_conet on RINorm → discovered by
+# model.parameters() automatically. Backprop through inverse provides
+# gradients naturally. No training loop changes needed.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# IMPLEMENTATION NOTES
+# CHECKPOINT COMPATIBILITY
 # ═══════════════════════════════════════════════════════════════════════
 #
-# - self.mean stores μ_asinh (asinh-space mean, bias-free centering).
-# - self.stdev stores σ_c (centered-raw std, same as v3).
-# - Forward: sinh centering in asinh space → linear σ division.
-# - Inverse: linear σ multiplication → asinh compression → μ shift.
-# - No clamps anywhere. Logarithmic saturation is structural.
-# - eps=1e-5 prevents division by zero for all-zero series.
+# _load_from_state_dict patched to silently ignore missing CONET keys.
+# Old checkpoints load normally — CONET initializes to identity and
+# learns from scratch during fine-tuning.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with hybrid-space normalization (v3).
+    Patches Darts RINorm with Dish-TS-inspired learned denormalization (v6).
 
-    Centers in asinh-space (zero mean bias), normalizes variance in
-    raw-space (bounded gradients). Eliminates both the gradient
-    explosion of standard RevIN AND the systematic positive bias of
-    pure raw-space RevIN.
+    Forward: standard linear RevIN in asinh-space (clean z-distribution).
+    Inverse: learned Output CONET adjusts μ and σ for denormalization.
 
-    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
-    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
+    The CONET maps 3 lookback statistics [μ, σ, trend_slope] to 2
+    correction coefficients [Δμ, raw_scale] per target:
+      - μ_out = μ + Δμ (learned shift)
+      - σ_out = σ × (0.5 + sigmoid(raw_scale)) (bounded ∈ [0.5σ, 1.5σ])
+      - ŷ = ẑ · σ_out + μ_out
 
-    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
-    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
-    Round-trip: exact (forward ∘ inverse = identity).
-    Zero learnable parameters. Backwards-compatible state_dict.
+    At initialization the CONET outputs zeros → exact standard RevIN.
+    ~100 learnable parameters for n_targets=1.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm, '_raw_space_patched', False):
+    if getattr(RINorm, '_dish_ts_patched', False):
         return  # Already patched
 
-    def _raw_space_forward(self, x: torch.Tensor):
-        # x is in asinh-space: (batch, input_chunk_length, n_targets)
+    _original_init = RINorm.__init__
+
+    def _dish_ts_init(self, input_dim, eps=1e-5, affine=True):
+        _original_init(self, input_dim, eps=eps, affine=affine)
+
+        # Output CONET: [μ, σ, trend_slope] → [Δμ, raw_scale] per target
+        self._output_conet = nn.Sequential(
+            nn.Linear(3 * input_dim, 16),
+            nn.GELU(),
+            nn.Linear(16, 2 * input_dim),
+        )
+        # Identity init: final layer zeros → Δμ=0, sigmoid(0)=0.5 → σ_out=σ
+        nn.init.zeros_(self._output_conet[2].weight)
+        nn.init.zeros_(self._output_conet[2].bias)
+        self._n_targets = input_dim
+
+    def _dish_ts_forward(self, x: torch.Tensor):
+        # x: (batch, input_chunk_length, n_targets) in asinh-space
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Center in asinh-space
+        # Standard linear RevIN normalization (detached statistics)
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-        
-        # Center in asinh, convert to raw 
-        x_c = torch.sinh(x - self.mean)
-        
-        # Variance of the centered-raw signal
         self.stdev = torch.sqrt(
-            torch.var(x_c, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
+            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
         ).detach()
 
-        # Normalize, but do not apply asinh. 
-        # The network operates in linearly-scaled raw-variance space.
-        x = x_c / self.stdev
+        z = (x - self.mean) / self.stdev
 
         if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
-        return x
+            z = z * self.affine_weight + self.affine_bias
 
-    def _raw_space_inverse(self, x: torch.Tensor):
-        # x shape: (batch, output_chunk_length, n_targets, nr_params)
+        # CONET conditioning from detached lookback statistics
+        T = x.shape[1]
+        mu_sq = self.mean.squeeze(1)                    # (B, n_targets)
+        sigma_sq = self.stdev.squeeze(1)                # (B, n_targets)
+        trend = ((x[:, -1, :] - x[:, 0, :]) / max(T - 1, 1)).detach()  # (B, n_targets)
+
+        conet_in = torch.cat([mu_sq, sigma_sq, trend], dim=-1)  # (B, 3*n_targets)
+        conet_out = self._output_conet(conet_in)                # (B, 2*n_targets)
+
+        n = self._n_targets
+        self._delta_mu = conet_out[:, :n].unsqueeze(1)    # (B, 1, n_targets)
+        self._raw_scale = conet_out[:, n:].unsqueeze(1)   # (B, 1, n_targets)
+
+        return z
+
+    def _dish_ts_inverse(self, x: torch.Tensor):
+        # x: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
             x = x / (
@@ -385,22 +293,45 @@ def apply_rinorm_compression_patch():
                 + self.eps * self.eps
             )
 
-        sigma = self.stdev.view(self.stdev.shape + (1,))
-        mu = self.mean.view(self.mean.shape + (1,))
+        # Learned denormalization via CONET corrections
+        mu_out = self.mean + self._delta_mu          # (B, 1, n_targets)
+        sigma_out = self.stdev * (
+            0.5 + torch.sigmoid(self._raw_scale)     # ∈ [0.5σ, 1.5σ]
+        )
 
-        # Expand linearly, then COMPRESS back into asinh-space.
-        # This makes it mathematically impossible for the global
-        # pipeline's sinh(x) inversion to explode exponentially.
-        x = torch.asinh(x * sigma) + mu
+        # Broadcast over nr_params dimension
+        mu_out = mu_out.unsqueeze(-1)                # (B, 1, n_targets, 1)
+        sigma_out = sigma_out.unsqueeze(-1)          # (B, 1, n_targets, 1)
 
+        x = x * sigma_out + mu_out
         return x
 
-    RINorm.forward = _raw_space_forward
-    RINorm.inverse = _raw_space_inverse
-    RINorm._raw_space_patched = True
+    _original_load = RINorm._load_from_state_dict
+
+    def _dish_ts_load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        # Let standard loading proceed
+        _original_load(
+            self, state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+        # Remove CONET keys from missing_keys so strict loading doesn't fail
+        # when loading pre-CONET checkpoints (CONET inits to identity anyway)
+        conet_keys = {
+            prefix + k for k in self.state_dict() if '_output_conet' in k
+        }
+        missing_keys[:] = [k for k in missing_keys if k not in conet_keys]
+
+    RINorm.__init__ = _dish_ts_init
+    RINorm.forward = _dish_ts_forward
+    RINorm.inverse = _dish_ts_inverse
+    RINorm._load_from_state_dict = _dish_ts_load_from_state_dict
+    RINorm._dish_ts_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3.1 "
-        "(sinh-space sigma + data-driven z-clamp)"
+        "🐨 Patched RINorm: Dish-TS learned denormalization v6 "
+        "(standard linear forward + Output CONET inverse)"
     )
 
 

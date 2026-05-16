@@ -248,9 +248,30 @@ class DartsForecaster:
 
         from darts.dataprocessing import Pipeline
 
+        # DEBUG: Log model z-score outputs BEFORE inverse transform.
+        # Trillions in eval with sane z-scores in training means the explosion
+        # is happening inside the inverse pipeline, not in the model weights.
+        _pre_vals = np.concatenate([ts.all_values().ravel() for ts in timeseries_pred])
+        logger.info(
+            "INVERSE_TRANSFORM_DEBUG | pre-inverse z-scores: "
+            "min=%.4f  mean=%.4f  max=%.4f  std=%.4f  any_nan=%s  any_inf=%s",
+            float(np.nanmin(_pre_vals)), float(np.nanmean(_pre_vals)),
+            float(np.nanmax(_pre_vals)), float(np.nanstd(_pre_vals)),
+            bool(np.any(np.isnan(_pre_vals))), bool(np.any(np.isinf(_pre_vals))),
+        )
+
         # If using Pipeline (for chained scalers), it handles samples correctly
         if isinstance(self.target_scaler, Pipeline):
-            return self.target_scaler.inverse_transform(timeseries_pred)
+            result = self.target_scaler.inverse_transform(timeseries_pred)
+            _post_vals = np.concatenate([ts.all_values().ravel() for ts in result])
+            logger.info(
+                "INVERSE_TRANSFORM_DEBUG | post-inverse raw counts: "
+                "min=%.4f  mean=%.4f  max=%.4f  std=%.4f  any_nan=%s  any_inf=%s",
+                float(np.nanmin(_post_vals)), float(np.nanmean(_post_vals)),
+                float(np.nanmax(_post_vals)), float(np.nanstd(_post_vals)),
+                bool(np.any(np.isnan(_post_vals))), bool(np.any(np.isinf(_post_vals))),
+            )
+            return result
 
         # For single Scaler, we need to manually handle probabilistic series
         result = []

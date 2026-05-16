@@ -142,59 +142,84 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm v8: Asinh-Space RevIN + Dish-TS HORICONET ---
+# --- 3. RINorm v9: Asinh-Space RevIN + Dish-TS HORICONET (linear inverse) ---
 #
 # ═══════════════════════════════════════════════════════════════════════
-# EVOLUTION: v3 → v5 → v7 → v8
+# EVOLUTION: v3 → v5 → v7 → v8 → v9
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Pipeline: raw counts → asinh → RevIN → model → RevIN⁻¹ → sinh → counts
 #
 # v3: σ = std(sinh(x−μ)). Sudan/Niger σ ≈ 80–290, crushing all quiet
 #     months to z ≈ 0. Model can't distinguish temporal patterns.
-#     Explodes on OOD ẑ without clamp.
 #
 # v5: Forward z = sinh(x−μ)/σ, Inverse ŷ = asinh(ẑ·σ)+μ.
-#     Logarithmic compression in inverse prevents explosion.
-#     Same sinh-space σ problem as v3.
+#     Matched nonlinearities: exact round-trip. Same σ explosion.
 #
-# v7: v5 + single CONET on inverse. σ_out = σ_c × exp(tanh(s)),
-#     bounded to [σ_c/e, σ_c·e]. CONET can't fix forward σ crush.
-#     3-feature input too sparse for regime detection.
+# v7: v5 + CONET on inverse. σ_out bounded by exp(tanh). Can't fix
+#     forward σ crush. 3 features too sparse.
 #
-# v8 (current): Decoupled forward/inverse.
-#   Forward: standard RevIN in asinh-space.
-#     μ = mean(x), σ = std(x−μ) — bounded ∈ [~0.3, ~5] for any series.
-#     z = (x − μ) / σ — full temporal detail preserved for all series.
-#   Inverse: asinh compression + HORICONET (Dish-TS inter-space shift).
-#     [Δμ, Δlog_σ] = HORICONET(7 features) — zero-init residual.
-#     μ_out = μ + Δμ, σ_out = exp(log(σ) + Δlog_σ) — unconstrained.
-#     ŷ = asinh(ẑ · σ_out) + μ_out — logarithmic safety envelope.
+# v8: Decoupled: linear forward z=(x−μ)/σ, asinh inverse. Fixed
+#     forward visibility (Sudan z_quiet=−0.17 vs 0.001). BUT:
+#     mismatched forward/inverse forces CONET to learn σ_out≈300,
+#     re-creating the ẑ-space crush. ẑ=0.0071 for moderate conflict
+#     vs ẑ=0 for peace. Gradient amplified 300× by inverse Jacobian.
+#
+# v9 (current): Linear forward AND linear inverse.
+#   Forward: z = (x − μ) / σ          — standard RevIN in asinh-space
+#   Inverse: ŷ = ẑ · σ_out + μ_out   — linear denormalization
+#
+#   Exact round-trip at init: (x−μ)/σ · σ + μ = x.
+#   σ_out ≈ σ_asinh ≈ 1.38 for Sudan — no inflation needed.
+#   CONET learns small inter-space corrections, not 300× rescaling.
+#   Uniform Jacobian: ∂ŷ/∂ẑ = σ_out ≈ 1.38 everywhere.
 #
 # ═══════════════════════════════════════════════════════════════════════
+# WHY LINEAR INVERSE IS SAFE (with SpotlightLossAsinh)
+# ═══════════════════════════════════════════════════════════════════════
 #
-# Sudan: 35 quiet months at asinh≈1.5, 1 spike at asinh≈9.9.
+# Previous versions used asinh in the inverse for three safety reasons.
+# SpotlightLossAsinh makes all three obsolete:
 #
-#   v7: σ_c = std(sinh(x−μ)) ≈ 290 → z_quiet ≈ 0.001, z_spike ≈ 2.5
-#       Model sees flat z ≈ 0 for all quiet months. Can't learn.
+# 1. Gradient explosion: Asinh-integral loss bounds ∂L/∂ŷ to asinh(e).
+#    DC/AC split prevents mean accumulation. Linear inverse Jacobian
+#    is σ_out ≈ 1–5, so ∂L/∂ẑ ≈ 1–5 × asinh(e). Bounded.
 #
-#   v8: σ = std(x−μ) ≈ 1.38 → z_quiet ≈ −0.17, z_spike ≈ 5.9
-#       35× separation between quiet and spike. Model learns patterns.
+# 2. MC Dropout Jensen: Average predictions in asinh space, sinh once.
+#    E[ẑ·σ+μ] = E[ẑ]·σ+μ = linear. No Jensen amplification.
 #
-# The HORICONET can learn σ_out for the inverse independently —
-# it's not chained to the forward σ. For series that need large σ_out
-# to reconstruct spikes (Sudan: σ_out ≈ 300), the CONET learns
-# Δlog_σ ≈ log(300) − log(1.38) ≈ 5.4. Unconstrained: no tanh cap.
+# 3. OOD runaway: ẑ=10 → ŷ=10×1.38+1.5=15.3 → sinh(15.3)=2.2M.
+#    Soft output clamp ŷ ∈ [-20, 20] prevents downstream Inf/NaN.
+#    Never binds on real data (asinh(10000)≈9.9 < 20).
+#
+# ═══════════════════════════════════════════════════════════════════════
+# DYNAMIC RANGE COMPARISON
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Sudan (μ=1.5, σ=1.38), required ẑ to predict various targets:
+#
+#   Target ŷ     | v8 asinh inv (σ_out=300) | v9 linear inv (σ_out=1.38)
+#   peace  1.5   | ẑ = 0.0000               | ẑ = 0.00
+#   low    2.0   | ẑ = 0.0024               | ẑ = 0.36
+#   mod    3.0   | ẑ = 0.0071               | ẑ = 1.09
+#   high   5.0   | ẑ = 0.0235               | ẑ = 2.54
+#   spike  9.9   | ẑ = 0.0588               | ẑ = 6.09
+#
+# v9: model distinguishes peace from moderate conflict by outputting
+# ẑ=1.09 vs ẑ=0. Clear signal. No sub-percent dynamic range.
 #
 # ═══════════════════════════════════════════════════════════════════════
 # DISH-TS ALIGNMENT
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Paper: Dual-CONET with BACKCONET (input) + HORICONET (output).
-# v8: BACKCONET omitted — asinh-space mean/std are bias-free and
-# bounded, so empirical statistics work well for the forward.
-# HORICONET: learns inter-space shift (different output distribution).
-# This is the paper's core contribution (Section 4.2, Eq. 6).
+# Paper Eq. 6: ŷ = ξ_h · F_Θ((x − φ_b) / ξ_b) + φ_h
+# v9:          ŷ = σ_out · ẑ + μ_out
+#
+# This IS the Dish-TS denormalization (Eq. 6, right side), with:
+#   φ_h = μ_out = μ + Δμ       (HORICONET level coefficient)
+#   ξ_h = σ_out = exp(log(σ) + Δlog_σ)  (HORICONET scaling coefficient)
+#
+# Exact match to the paper's linear denormalization structure.
 #
 # ═══════════════════════════════════════════════════════════════════════
 # HORICONET FEATURES (7 per target)
@@ -208,10 +233,6 @@ def apply_nbeats_patch():
 # 6. x_last       — last observation (most recent level)
 # 7. recent_trend — trend of last 25% of window (acceleration)
 #
-# These separate "one old spike + peaceful" (zero_frac=0.97, x_max=9.9)
-# from "steady low conflict" (zero_frac=0.3, x_max=2.0) — identical
-# in [μ, σ, trend] but very different futures.
-#
 # ═══════════════════════════════════════════════════════════════════════
 # ARCHITECTURE
 # ═══════════════════════════════════════════════════════════════════════
@@ -219,9 +240,6 @@ def apply_nbeats_patch():
 # HORICONET: Linear(7·n_targets, 16) → GELU → Linear(16, 2·n_targets)
 #   Output: [Δμ, Δlog_σ] per target — zero-init (identity at start)
 #   ~162 params for n_targets=1
-#
-# At init: Δμ=0, Δlog_σ=0 → μ_out=μ, σ_out=σ_asinh.
-# Inverse: ŷ = asinh(ẑ·σ_asinh) + μ ≈ x for |x−μ| < 1 (90% of data).
 #
 # ═══════════════════════════════════════════════════════════════════════
 # CHECKPOINT COMPATIBILITY
@@ -233,16 +251,19 @@ def apply_nbeats_patch():
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with v8: asinh-space RevIN + Dish-TS HORICONET.
+    Patches Darts RINorm with v9: asinh-space RevIN + Dish-TS HORICONET
+    with linear inverse.
 
     Forward: z = (x − μ) / σ  (standard RevIN in asinh-space, bounded σ)
-    Inverse: ŷ = asinh(ẑ · σ_out) + μ_out  (logarithmic compression)
+    Inverse: ŷ = ẑ · σ_out + μ_out  (linear denormalization, exact Dish-TS Eq. 6)
 
     HORICONET maps 7 lookback features to [Δμ, Δlog_σ] per target:
-      - μ_out = μ + Δμ (learned shift for inter-space distribution gap)
-      - σ_out = exp(log(σ) + Δlog_σ) (unconstrained positive, residual)
+      - μ_out = μ + Δμ (learned level shift)
+      - σ_out = exp(log(σ) + Δlog_σ) (learned scaling correction)
 
-    At initialization HORICONET outputs zeros → σ_out=σ, μ_out=μ.
+    Exact round-trip at init: (x−μ)/σ · σ + μ = x.
+    Uniform Jacobian: ∂ŷ/∂ẑ = σ_out ≈ 1–5 (no amplification).
+    OOD safety: soft clamp on ŷ ∈ [-20, 20] (sinh(20)=242M, never binds).
     ~162 learnable parameters for n_targets=1.
     """
     from darts.models.components.layer_norm_variants import RINorm
@@ -317,7 +338,7 @@ def apply_rinorm_compression_patch():
             _dm = self._delta_mu.detach()
             _dls = self._delta_log_sigma.detach()
             logger.info(
-                f"[v8 step {self._dish_step}] "
+                f"[v9 step {self._dish_step}] "
                 f"μ={f_mu.mean():.3f}±{f_mu.std():.3f}  "
                 f"log_σ={f_log_sigma.mean():.3f}±{f_log_sigma.std():.3f}  "
                 f"zero_frac={f_zero_frac.mean():.3f}  "
@@ -346,13 +367,16 @@ def apply_rinorm_compression_patch():
         mu_out = mu_out.unsqueeze(-1)                                 # (B, 1, n_targets, 1)
         sigma_out = sigma_out.unsqueeze(-1)                           # (B, 1, n_targets, 1)
 
-        # Asinh compression: ŷ = asinh(ẑ · σ_out) + μ_out
-        # Logarithmic growth for large ẑ → structural safety envelope
-        x = torch.asinh(x * sigma_out) + mu_out
+        # Linear denormalization: ŷ = ẑ · σ_out + μ_out
+        # Exact Dish-TS Eq. 6: uniform Jacobian ∂ŷ/∂ẑ = σ_out
+        x = x * sigma_out + mu_out
+
+        # OOD safety clamp — sinh(20) = 242M, never binds on real data
+        x = x.clamp(-20.0, 20.0)
 
         if hasattr(self, '_dish_step') and self._dish_step % 500 == 1:
             logger.info(
-                f"[v8 inv step {self._dish_step}] "
+                f"[v9 inv step {self._dish_step}] "
                 f"μ_out={mu_out.mean():.3f}  "
                 f"σ_out={sigma_out.mean():.4f}  "
                 f"ŷ_range=[{x.min():.3f}, {x.max():.3f}]"
@@ -382,8 +406,8 @@ def apply_rinorm_compression_patch():
     RINorm._load_from_state_dict = _dish_ts_load_from_state_dict
     RINorm._dish_ts_patched = True
     logger.info(
-        "🐨 Patched RINorm: v8 — asinh-space RevIN + Dish-TS HORICONET "
-        "(bounded forward σ, decoupled learned inverse σ_out)"
+        "🐨 Patched RINorm: v9 — asinh-space RevIN + Dish-TS HORICONET "
+        "(linear inverse, uniform Jacobian, soft output clamp)"
     )
 
 

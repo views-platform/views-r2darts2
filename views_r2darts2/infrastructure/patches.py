@@ -142,214 +142,49 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm v9: Asinh-Space RevIN + Dish-TS HORICONET (linear inverse) ---
+# --- 3. RINorm Patch: Clean Target-Space RevIN ---
 #
-# ═══════════════════════════════════════════════════════════════════════
-# EVOLUTION: v3 → v5 → v7 → v8 → v9
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Pipeline: raw counts → asinh → RevIN → model → RevIN⁻¹ → sinh → counts
-#
-# v3: σ = std(sinh(x−μ)). Sudan/Niger σ ≈ 80–290, crushing all quiet
-#     months to z ≈ 0. Model can't distinguish temporal patterns.
-#
-# v5: Forward z = sinh(x−μ)/σ, Inverse ŷ = asinh(ẑ·σ)+μ.
-#     Matched nonlinearities: exact round-trip. Same σ explosion.
-#
-# v7: v5 + CONET on inverse. σ_out bounded by exp(tanh). Can't fix
-#     forward σ crush. 3 features too sparse.
-#
-# v8: Decoupled: linear forward z=(x−μ)/σ, asinh inverse. Fixed
-#     forward visibility (Sudan z_quiet=−0.17 vs 0.001). BUT:
-#     mismatched forward/inverse forces CONET to learn σ_out≈300,
-#     re-creating the ẑ-space crush. ẑ=0.0071 for moderate conflict
-#     vs ẑ=0 for peace. Gradient amplified 300× by inverse Jacobian.
-#
-# v9 (current): Linear forward AND linear inverse.
-#   Forward: z = (x − μ) / σ          — standard RevIN in asinh-space
-#   Inverse: ŷ = ẑ · σ_out + μ_out   — linear denormalization
-#
-#   Exact round-trip at init: (x−μ)/σ · σ + μ = x.
-#   σ_out ≈ σ_asinh ≈ 1.38 for Sudan — no inflation needed.
-#   CONET learns small inter-space corrections, not 300× rescaling.
-#   Uniform Jacobian: ∂ŷ/∂ẑ = σ_out ≈ 1.38 everywhere.
-#
-# ═══════════════════════════════════════════════════════════════════════
-# WHY LINEAR INVERSE IS SAFE (with SpotlightLossAsinh)
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Previous versions used asinh in the inverse for three safety reasons.
-# SpotlightLossAsinh makes all three obsolete:
-#
-# 1. Gradient explosion: Asinh-integral loss bounds ∂L/∂ŷ to asinh(e).
-#    DC/AC split prevents mean accumulation. Linear inverse Jacobian
-#    is σ_out ≈ 1–5, so ∂L/∂ẑ ≈ 1–5 × asinh(e). Bounded.
-#
-# 2. MC Dropout Jensen: Average predictions in asinh space, sinh once.
-#    E[ẑ·σ+μ] = E[ẑ]·σ+μ = linear. No Jensen amplification.
-#
-# 3. OOD runaway: ẑ=10 → ŷ=10×1.38+1.5=15.3 → sinh(15.3)=2.2M.
-#    Soft output clamp ŷ ∈ [-20, 20] prevents downstream Inf/NaN.
-#    Never binds on real data (asinh(10000)≈9.9 < 20).
-#
-# ═══════════════════════════════════════════════════════════════════════
-# DYNAMIC RANGE COMPARISON
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Sudan (μ=1.5, σ=1.38), required ẑ to predict various targets:
-#
-#   Target ŷ     | v8 asinh inv (σ_out=300) | v9 linear inv (σ_out=1.38)
-#   peace  1.5   | ẑ = 0.0000               | ẑ = 0.00
-#   low    2.0   | ẑ = 0.0024               | ẑ = 0.36
-#   mod    3.0   | ẑ = 0.0071               | ẑ = 1.09
-#   high   5.0   | ẑ = 0.0235               | ẑ = 2.54
-#   spike  9.9   | ẑ = 0.0588               | ẑ = 6.09
-#
-# v9: model distinguishes peace from moderate conflict by outputting
-# ẑ=1.09 vs ẑ=0. Clear signal. No sub-percent dynamic range.
-#
-# ═══════════════════════════════════════════════════════════════════════
-# DISH-TS ALIGNMENT
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Paper Eq. 6: ŷ = ξ_h · F_Θ((x − φ_b) / ξ_b) + φ_h
-# v9:          ŷ = σ_out · ẑ + μ_out
-#
-# This IS the Dish-TS denormalization (Eq. 6, right side), with:
-#   φ_h = μ_out = μ + Δμ       (HORICONET level coefficient)
-#   ξ_h = σ_out = exp(log(σ) + tanh(Δlog_σ))  (bounded ∈ [σ/e, σ·e])
-#
-# Exact match to the paper's linear denormalization structure.
-#
-# ═══════════════════════════════════════════════════════════════════════
-# HORICONET FEATURES (7 per target)
-# ═══════════════════════════════════════════════════════════════════════
-#
-# 1. μ            — current asinh-space level
-# 2. log(σ)       — variability scale (log-compressed)
-# 3. trend        — (x[-1] − x[0]) / (T−1)
-# 4. zero_frac    — fraction of near-zero timesteps (< 0.88 asinh)
-# 5. x_max        — peak asinh value in window (spike magnitude)
-# 6. x_last       — last observation (most recent level)
-# 7. recent_trend — trend of last 25% of window (acceleration)
-#
-# ═══════════════════════════════════════════════════════════════════════
-# ARCHITECTURE
-# ═══════════════════════════════════════════════════════════════════════
-#
-# HORICONET: Linear(7·n_targets, 16) → GELU → Linear(16, 2·n_targets)
-#   Output: [Δμ, Δlog_σ] per target — zero-init (identity at start)
-#   ~162 params for n_targets=1
-#
-# ═══════════════════════════════════════════════════════════════════════
-# CHECKPOINT COMPATIBILITY
-# ═══════════════════════════════════════════════════════════════════════
-#
-# _load_from_state_dict patched to silently ignore missing CONET keys.
-# Old checkpoints load normally — CONET initializes to identity.
+# Target values enter Darts after the configured target scaler. With
+# AsinhTransform, RINorm therefore operates in asinh space and should remain a
+# linear reversible normalization in that space. Dish-TS horizon coefficients
+# require their own supervised/prior-guided objective and should not be hidden
+# inside denormalization as a shortcut.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with v9: asinh-space RevIN + Dish-TS HORICONET
-    with linear inverse.
-
-    Forward: z = (x − μ) / σ  (standard RevIN in asinh-space, bounded σ)
-    Inverse: ŷ = ẑ · σ_out + μ_out  (linear denormalization, exact Dish-TS Eq. 6)
-
-    HORICONET maps 7 lookback features to [Δμ, Δlog_σ] per target:
-      - μ_out = μ + Δμ (learned level shift)
-      - σ_out = exp(log(σ) + Δlog_σ) (learned scaling correction)
-
-    Exact round-trip at init: (x−μ)/σ · σ + μ = x.
-    Uniform Jacobian: ∂ŷ/∂ẑ = σ_out ≈ 1–5 (no amplification).
-    OOD safety: soft clamp on ŷ ∈ [-20, 20] (sinh(20)=242M, never binds).
-    ~162 learnable parameters for n_targets=1.
+    Patches Darts RINorm with exact reversible instance normalization in
+    target-transform space. For AsinhTransform targets, that means all RINorm
+    math is linear in asinh units and the global scaler handles sinh outside
+    the model.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm, '_dish_ts_patched', False):
+    if getattr(RINorm, '_views_asinh_revin_patched', False):
         return  # Already patched
 
     _original_init = RINorm.__init__
 
-    def _dish_ts_init(self, input_dim, eps=1e-5, affine=True):
+    def _asinh_revin_init(self, input_dim, eps=1e-5, affine=True):
         _original_init(self, input_dim, eps=eps, affine=affine)
 
-        # HORICONET: 7 features per target → [Δμ, Δlog_σ] per target
-        self._output_conet = nn.Sequential(
-            nn.Linear(7 * input_dim, 16),
-            nn.GELU(),
-            nn.Linear(16, 2 * input_dim),
-        )
-        # Zero-init final layer → identity at start (Δμ=0, Δlog_σ=0)
-        nn.init.zeros_(self._output_conet[2].weight)
-        nn.init.zeros_(self._output_conet[2].bias)
-        self._n_targets = input_dim
-        self._dish_step = 0
-
-    def _dish_ts_forward(self, x: torch.Tensor):
-        # x: (batch, input_chunk_length, n_targets) in asinh-space
+    def _asinh_revin_forward(self, x: torch.Tensor):
+        # x: (batch, input_chunk_length, n_targets), already target-scaled.
         calc_dims = tuple(range(1, x.ndim - 1))
-
-        # Standard RevIN in asinh-space — σ naturally bounded ∈ [~0.3, ~5]
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-        x_centered = x - self.mean
         self.stdev = torch.sqrt(
-            torch.var(x_centered, dim=calc_dims, keepdim=True, unbiased=False)
+            torch.var(x, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
-        z = x_centered / self.stdev
+
+        z = (x - self.mean) / self.stdev
 
         if self.affine:
             z = z * self.affine_weight + self.affine_bias
 
-        # ── HORICONET features (7 per target, all detached) ──
-        T = x.shape[1]
-        # 1. μ — current level
-        f_mu = self.mean.squeeze(1)                                   # (B, n_targets)
-        # 2. log(σ) — variability scale
-        f_log_sigma = torch.log(self.stdev.squeeze(1) + self.eps)     # (B, n_targets)
-        # 3. trend — overall slope
-        f_trend = ((x[:, -1, :] - x[:, 0, :]) / max(T - 1, 1)).detach()
-        # 4. zero_frac — fraction of near-zero timesteps (asinh < 0.88 ≈ asinh(1))
-        f_zero_frac = (x < 0.88).float().mean(dim=1).detach()        # (B, n_targets)
-        # 5. x_max — peak value in window
-        f_x_max = x.amax(dim=1).detach()                             # (B, n_targets)
-        # 6. x_last — most recent observation
-        f_x_last = x[:, -1, :].detach()                              # (B, n_targets)
-        # 7. recent_trend — trend of last 25% (acceleration)
-        q = max(T // 4, 1)
-        f_recent_trend = ((x[:, -1, :] - x[:, -q, :]) / max(q - 1, 1)).detach()
-
-        conet_in = torch.cat([
-            f_mu, f_log_sigma, f_trend, f_zero_frac,
-            f_x_max, f_x_last, f_recent_trend,
-        ], dim=-1)                                                    # (B, 7*n_targets)
-        conet_out = self._output_conet(conet_in)                      # (B, 2*n_targets)
-
-        n = self._n_targets
-        self._delta_mu = conet_out[:, :n].unsqueeze(1)                # (B, 1, n_targets)
-        self._delta_log_sigma = conet_out[:, n:].unsqueeze(1)         # (B, 1, n_targets)
-
-        # Diagnostics every 500 forward passes
-        self._dish_step += 1
-        if self._dish_step % 500 == 1:
-            _dm = self._delta_mu.detach()
-            _dls = self._delta_log_sigma.detach()
-            logger.info(
-                f"[v9 step {self._dish_step}] "
-                f"μ={f_mu.mean():.3f}±{f_mu.std():.3f}  "
-                f"log_σ={f_log_sigma.mean():.3f}±{f_log_sigma.std():.3f}  "
-                f"zero_frac={f_zero_frac.mean():.3f}  "
-                f"x_max={f_x_max.mean():.2f}  "
-                f"Δμ={_dm.mean():.4f}±{_dm.std():.4f}  "
-                f"Δlog_σ={_dls.mean():.4f}±{_dls.std():.4f}"
-            )
-
         return z
 
-    def _dish_ts_inverse(self, x: torch.Tensor):
+    def _asinh_revin_inverse(self, x: torch.Tensor):
         # x: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
@@ -358,31 +193,9 @@ def apply_rinorm_compression_patch():
                 + self.eps * self.eps
             )
 
-        # Residual-connected HORICONET corrections
-        mu_out = self.mean + self._delta_mu                           # (B, 1, n_targets)
-        log_sigma = torch.log(self.stdev + self.eps)
-        sigma_out = torch.exp(log_sigma + torch.tanh(self._delta_log_sigma))  # ∈ [σ/e, σ·e]
-
-        # Broadcast over nr_params dimension
-        mu_out = mu_out.unsqueeze(-1)                                 # (B, 1, n_targets, 1)
-        sigma_out = sigma_out.unsqueeze(-1)                           # (B, 1, n_targets, 1)
-
-        # Linear denormalization: ŷ = ẑ · σ_out + μ_out
-        # Exact Dish-TS Eq. 6: uniform Jacobian ∂ŷ/∂ẑ = σ_out
-        x = x * sigma_out + mu_out
-
-        # OOD safety clamp — sinh(20) = 242M, never binds on real data
-        x = x.clamp(-20.0, 20.0)
-
-        if hasattr(self, '_dish_step') and self._dish_step % 500 == 1:
-            logger.info(
-                f"[v9 inv step {self._dish_step}] "
-                f"μ_out={mu_out.mean():.3f}  "
-                f"σ_out={sigma_out.mean():.4f}  "
-                f"ŷ_range=[{x.min():.3f}, {x.max():.3f}]"
-            )
-
-        return x
+        return x * self.stdev.view(self.stdev.shape + (1,)) + self.mean.view(
+            self.mean.shape + (1,)
+        )
 
     _original_load = RINorm._load_from_state_dict
 
@@ -394,21 +207,16 @@ def apply_rinorm_compression_patch():
             self, state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs,
         )
-        # Silently ignore missing CONET keys for pre-v8 checkpoints
-        conet_keys = {
-            prefix + k for k in self.state_dict() if '_output_conet' in k
-        }
-        missing_keys[:] = [k for k in missing_keys if k not in conet_keys]
+        missing_keys[:] = [k for k in missing_keys if '_output_conet' not in k]
+        unexpected_keys[:] = [k for k in unexpected_keys if '_output_conet' not in k]
 
-    RINorm.__init__ = _dish_ts_init
-    RINorm.forward = _dish_ts_forward
-    RINorm.inverse = _dish_ts_inverse
+    RINorm.__init__ = _asinh_revin_init
+    RINorm.forward = _asinh_revin_forward
+    RINorm.inverse = _asinh_revin_inverse
     RINorm._load_from_state_dict = _dish_ts_load_from_state_dict
+    RINorm._views_asinh_revin_patched = True
     RINorm._dish_ts_patched = True
-    logger.info(
-        "🐨 Patched RINorm: v9 — asinh-space RevIN + Dish-TS HORICONET "
-        "(linear inverse, uniform Jacobian, soft output clamp)"
-    )
+    logger.info("Patched RINorm: clean reversible normalization in target-transform space.")
 
 
 # --- Initialize All Patches ---

@@ -283,93 +283,31 @@ def apply_nbeats_patch():
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with Dish-TS hybrid-space normalization.
+    Patches Darts RINorm with hybrid-space normalization (v3).
+
+    Centers in asinh-space (zero mean bias), normalizes variance in
+    raw-space (bounded gradients). Eliminates both the gradient
+    explosion of standard RevIN AND the systematic positive bias of
+    pure raw-space RevIN.
 
     Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
-    Inverse:  ŷ = asinh(sinh(K·tanh(ẑ/K)) · σ_out) + μ_out
+    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
 
-    where (σ_out, μ_out) are produced by a small learned CONET that
-    corrects for spike-inflated σ_c values. The CONET takes input-window
-    statistics — level, scale, skewness — and learns the appropriate
-    denormalization parameters for each series regime.
-
-    Key properties:
-    - At init (CONET zero-initialized): σ_out = σ_c, μ_out = μ. Identical
-      to the static v3+tanh behavior. Training starts from a stable point.
-    - For spike countries (skew_proxy >> 0): CONET learns to reduce σ_out
-      so a z=1 prediction reflects typical inter-month volatility, not the
-      historical genocide maximum.
-    - Tanh bound (K=3) prevents runaway even if CONET overestimates σ_out.
-    - ~98 extra parameters per RINorm instance (2-layer MLP).
-    - Backwards-compatible: loading old checkpoints (no CONET keys) silently
-      initialises CONET from scratch via suppressed missing_key errors.
+    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
+    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
+    Round-trip: exact (forward ∘ inverse = identity).
+    Zero learnable parameters. Backwards-compatible state_dict.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm, '_dish_ts_patched', False):
+    if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
-
-    # ── Patch __init__ to attach the CONET as a proper nn.Module ─────
-    #
-    # CONET architecture: Linear(3→16) → ReLU → Linear(16→2)
-    #   Input features (per batch×target):
-    #     [0] μ_asinh          — the series level
-    #     [1] log(1 + σ_c)     — log-scale (handles σ_c ∈ [0.01, 300])
-    #     [2] skew_proxy       — mean(x_c)/σ_c, dimensionless skewness
-    #                            ≈ 0 for peaceful/symmetric series
-    #                            >> 0 for spike countries (a genocide month
-    #                               shifts mean(x_c) far right)
-    #   Output corrections:
-    #     [0] Δlog_σ  → σ_out = σ_c · exp(Δlog_σ)
-    #     [1] Δμ      → μ_out = μ + Δμ
-    #
-    # Zero-init final layer → identity warm-start:
-    #   at epoch 0, Δlog_σ=0 and Δμ=0 → σ_out=σ_c, μ_out=μ (pure v3+tanh).
-    #
-    _original_rinorm_init = RINorm.__init__
-
-    def _patched_rinorm_init(self, input_dim: int, affine: bool = True, eps: float = 1e-5):
-        _original_rinorm_init(self, input_dim, affine=affine, eps=eps)
-        conet = nn.Sequential(
-            nn.Linear(3, 16, bias=True),
-            nn.ReLU(),
-            nn.Linear(16, 2, bias=True),
-        )
-        nn.init.zeros_(conet[2].weight)
-        nn.init.zeros_(conet[2].bias)
-        self._output_conet = conet  # registered as submodule via nn.Module.__setattr__
-        self._rinorm_step = 0       # for periodic diagnostic logging
-
-    RINorm.__init__ = _patched_rinorm_init
-
-    # ── Patch _load_from_state_dict for backward checkpoint compat ───
-    #
-    # Old checkpoints have no _output_conet.* keys. Without this patch,
-    # strict=True would raise on those missing keys. We silently remove
-    # them so the CONET initialises from scratch.
-    #
-    _original_load = RINorm._load_from_state_dict
-
-    def _patched_load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict,
-        missing_keys, unexpected_keys, error_msgs
-    ):
-        _original_load(
-            self, state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs
-        )
-        conet_missing = [k for k in missing_keys if '_output_conet' in k]
-        for k in conet_missing:
-            missing_keys.remove(k)
-
-    RINorm._load_from_state_dict = _patched_load_from_state_dict
-
-    # ── Forward pass ─────────────────────────────────────────────────
 
     def _raw_space_forward(self, x: torch.Tensor):
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
 
+        # Guard against any upstream numeric accident before sinh.
         x = torch.clamp(x, -88.0, 88.0)
 
         # Compute asinh-space mean (bias-free centering point)
@@ -378,29 +316,22 @@ def apply_rinorm_compression_patch():
         # Center in asinh space, convert to raw
         x_centered_raw = torch.sinh(x - self.mean)
 
+        # Compute variance of the centered-raw signal
+        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
+        # These differ enormously — std(sinh(x)) is inflated by the
+        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
             torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        # Skewness proxy: mean(x_c)/σ_c
-        # For symmetric series: E[sinh(x-μ)] ≈ 0 → proxy ≈ 0
-        # For spike countries: one extreme month makes mean(x_c) >> 0
-        #   e.g., a country with a single genocide spike: proxy ≈ 2–4
-        # This is the key feature that lets CONET distinguish spike-inflated
-        # σ_c from genuinely high-volatility series.
-        self._x_skew = (
-            torch.mean(x_centered_raw, dim=calc_dims, keepdim=True) / (self.stdev + self.eps)
-        ).detach()
-
+        # Normalize by centered-raw std, compress back via asinh
         x = torch.asinh(x_centered_raw / self.stdev)
 
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
-
-    # ── Inverse pass ─────────────────────────────────────────────────
 
     def _raw_space_inverse(self, x: torch.Tensor):
         # x shape: (batch, output_chunk_length, n_targets, nr_params)
@@ -411,84 +342,46 @@ def apply_rinorm_compression_patch():
                 + self.eps * self.eps
             )
 
-        # ── CONET: learn the correct (σ_out, μ_out) ──────────────────
-        #
-        # self.mean, self.stdev, self._x_skew are all (B, 1, N) from forward.
-        # nn.Linear operates on the last dimension, so stacking into
-        # (B, 1, N, 3) and passing through CONET gives (B, 1, N, 2).
-        #
-        feat = torch.stack([
-            self.mean,
-            torch.log1p(self.stdev),
-            self._x_skew.clamp(-5.0, 5.0),
-        ], dim=-1)  # (B, 1, N, 3)
+        sigma = self.stdev.view(self.stdev.shape + (1,))
+        mu = self.mean.view(self.mean.shape + (1,))
 
-        delta = self._output_conet(feat)  # (B, 1, N, 2)
-
-        # σ_out = σ_c · exp(Δlog_σ)   — identity at Δlog_σ=0 (zero-init)
-        # μ_out = μ  + Δμ             — identity at Δμ=0    (zero-init)
-        sigma_out = self.stdev.unsqueeze(-1) * torch.exp(delta[..., 0:1])  # (B, 1, N, 1)
-        mu_out    = self.mean.unsqueeze(-1)  + delta[..., 1:2]             # (B, 1, N, 1)
-
-        # ── Tanh-bounded denormalization ──────────────────────────────
+        # ── Tanh-bounded denormalization (Option 10) ──────────────────
         #
-        # K controls the maximum effective z-score that can pass through.
-        # Gradient through tanh: sech²(z/K). At K=3, z=4 → sech²(1.33)=0.23
-        # (77% of gradient killed). At K=5, z=4 → sech²(0.80)=0.50 (50% intact).
-        # K=3 was systematically suppressing gradient for any z>2, teaching
-        # the model to never deviate far from zero — causing the compression.
-        # K=5 retains meaningful gradient across the full observed z range
-        # [−1.4, 4.7] while still saturating at ±5 for true outliers.
-        K = 5.0
-        x_pre_tanh = x  # save for diagnostics before overwriting
+        # Standard v3 inverse: ŷ = asinh(sinh(ẑ) · σ) + μ
+        #   Problem: sinh(ẑ) grows exponentially. For ẑ=5, sinh(5)≈74.
+        #   Multiplied by σ_c=100 → 7400 → asinh(7400)≈9.6.
+        #   Through final pipeline sinh(9.6)≈7300 deaths. Manageable.
+        #   But ẑ=10 → sinh(10)·100 = 1.1M → asinh(1.1M)≈14.6 →
+        #   sinh(14.6)=1.1M deaths. Runaway.
+        #
+        # Fix: Replace ẑ with K·tanh(ẑ/K) before the sinh expansion.
+        #   - For |ẑ| << K: tanh(ẑ/K) ≈ ẑ/K, so K·tanh ≈ ẑ (linear)
+        #   - For |ẑ| >> K: tanh → ±1, so output saturates at ±K
+        #   - K=3 means "the model can deviate at most 3 z-units from
+        #     the historical norm in the hybrid z-space"
+        #
+        # Gradient: ∂(K·tanh(ẑ/K))/∂ẑ = sech²(ẑ/K) ∈ (0, 1]
+        #   Smooth, monotone, never zero, never explosive.
+        #   Combined with the v3 sinh·σ·asinh sandwich, total gradient
+        #   remains bounded everywhere.
+        #
+        # At ẑ=0: K·tanh(0) = 0 → asinh(0·σ) + μ = μ. Zero bias. ✓
+        # At ẑ=3: K·tanh(1) = 3·0.762 = 2.29 → mild compression
+        # At ẑ=10: K·tanh(3.33) = 3·0.997 = 2.99 → hard saturation
+        K = 3.0
         x_bounded = K * torch.tanh(x / K)
 
-        x = torch.asinh(torch.sinh(x_bounded) * sigma_out) + mu_out
-
-        # ── Periodic diagnostics (every 200 inverse calls) ───────────
-        self._rinorm_step += 1
-        if self._rinorm_step % 300 == 1:
-            with torch.no_grad():
-                sigma_c_flat = self.stdev.flatten()
-                sigma_out_flat = sigma_out.detach().flatten()
-                delta_log_sigma = delta[..., 0].detach().flatten()
-                delta_mu = delta[..., 1].detach().flatten()
-                skew_flat = self._x_skew.flatten()
-                # z before and after tanh (first param channel only to avoid quantile noise)
-                _xp = x_pre_tanh.detach()
-                _xb = x_bounded.detach()
-                z_pre = (_xp[..., 0] if _xp.ndim == 4 else _xp).flatten()
-                z_post = (_xb[..., 0] if _xb.ndim == 4 else _xb).flatten()
-                ratio = (sigma_out_flat / (sigma_c_flat.unsqueeze(-1) + 1e-8)).flatten()
-                logger.info(
-                    "[RINorm step=%d] "
-                    "σ_c: min=%.3f max=%.3f mean=%.3f | "
-                    "σ_out: min=%.3f max=%.3f mean=%.3f | "
-                    "σ_out/σ_c ratio: min=%.3f max=%.3f mean=%.3f | "
-                    "CONET Δlog_σ: min=%.3f max=%.3f mean=%.3f | "
-                    "CONET Δμ: min=%.3f max=%.3f mean=%.3f | "
-                    "skew_proxy: min=%.3f max=%.3f mean=%.3f | "
-                    "z pre-tanh: min=%.3f max=%.3f mean=%.3f | "
-                    "z post-tanh: min=%.3f max=%.3f mean=%.3f",
-                    self._rinorm_step,
-                    sigma_c_flat.min(), sigma_c_flat.max(), sigma_c_flat.mean(),
-                    sigma_out_flat.min(), sigma_out_flat.max(), sigma_out_flat.mean(),
-                    ratio.min(), ratio.max(), ratio.mean(),
-                    delta_log_sigma.min(), delta_log_sigma.max(), delta_log_sigma.mean(),
-                    delta_mu.min(), delta_mu.max(), delta_mu.mean(),
-                    skew_flat.min(), skew_flat.max(), skew_flat.mean(),
-                    z_pre.min(), z_pre.max(), z_pre.mean(),
-                    z_post.min(), z_post.max(), z_post.mean(),
-                )
+        # Standard v3 expansion with the bounded z-scores
+        x = torch.asinh(torch.sinh(x_bounded) * sigma) + mu
 
         return x
 
     RINorm.forward = _raw_space_forward
     RINorm.inverse = _raw_space_inverse
-    RINorm._dish_ts_patched = True
+    RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: Dish-TS hybrid-space normalization "
-        "(CONET-learned σ_out/μ_out, asinh centering, tanh-bounded denorm)."
+        "🐨 Patched RINorm: hybrid-space normalization v3 "
+        "(asinh centering + raw-space σ, zero mean bias)."
     )
 
 

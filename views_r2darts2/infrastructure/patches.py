@@ -153,7 +153,7 @@ def apply_rinorm_compression_patch():
     _original_init = RINorm.__init__
 
     def _asinh_standard_init(self, input_dim, eps=1e-5, affine=True):
-        _original_init(self, input_dim, eps=eps, affine=affine)
+        _original_init(self, input_dim, eps=eps, affine=False)
 
     def _asinh_standard_forward(self, x: torch.Tensor):
         calc_dims = tuple(range(1, x.ndim - 1))

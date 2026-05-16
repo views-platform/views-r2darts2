@@ -345,34 +345,58 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # ── Tanh-bounded denormalization (Option 10) ──────────────────
+        # ── Tanh-bounded denormalization ──────────────────────────────
         #
-        # Standard v3 inverse: ŷ = asinh(sinh(ẑ) · σ) + μ
-        #   Problem: sinh(ẑ) grows exponentially. For ẑ=5, sinh(5)≈74.
-        #   Multiplied by σ_c=100 → 7400 → asinh(7400)≈9.6.
-        #   Through final pipeline sinh(9.6)≈7300 deaths. Manageable.
-        #   But ẑ=10 → sinh(10)·100 = 1.1M → asinh(1.1M)≈14.6 →
-        #   sinh(14.6)=1.1M deaths. Runaway.
+        # Bounds the effective z-score to ±K before sinh expansion.
+        # For |ẑ| << K: K·tanh(ẑ/K) ≈ ẑ (linear, full gradient)
+        # For |ẑ| >> K: saturates at ±K (prevents exponential blowup)
         #
-        # Fix: Replace ẑ with K·tanh(ẑ/K) before the sinh expansion.
-        #   - For |ẑ| << K: tanh(ẑ/K) ≈ ẑ/K, so K·tanh ≈ ẑ (linear)
-        #   - For |ẑ| >> K: tanh → ±1, so output saturates at ±K
-        #   - K=3 means "the model can deviate at most 3 z-units from
-        #     the historical norm in the hybrid z-space"
+        # Gradient: sech²(ẑ/K). K must be large enough that the model's
+        # useful z range retains meaningful gradient:
         #
-        # Gradient: ∂(K·tanh(ẑ/K))/∂ẑ = sech²(ẑ/K) ∈ (0, 1]
-        #   Smooth, monotone, never zero, never explosive.
-        #   Combined with the v3 sinh·σ·asinh sandwich, total gradient
-        #   remains bounded everywhere.
+        #   | z   | K=3 grad | K=5 grad |
+        #   |-----|----------|----------|
+        #   | 1.0 | 0.89     | 0.96     |
+        #   | 2.0 | 0.64     | 0.85     |
+        #   | 3.0 | 0.42     | 0.66     |
+        #   | 4.0 | 0.23     | 0.50     |
+        #   | 4.7 | 0.14     | 0.42     |
         #
-        # At ẑ=0: K·tanh(0) = 0 → asinh(0·σ) + μ = μ. Zero bias. ✓
-        # At ẑ=3: K·tanh(1) = 3·0.762 = 2.29 → mild compression
-        # At ẑ=10: K·tanh(3.33) = 3·0.997 = 2.99 → hard saturation
-        K = 3.0
+        # K=3 killed gradient for z>2 → outputs compressed to 0.17x.
+        # K=5 retains ≥42% gradient across the full observed z range
+        # [-1.4, 5.3] while still capping at ±5 for true outliers.
+        K = 5.0
+        x_pre_tanh = x
         x_bounded = K * torch.tanh(x / K)
 
         # Standard v3 expansion with the bounded z-scores
         x = torch.asinh(torch.sinh(x_bounded) * sigma) + mu
+
+        # ── Periodic diagnostics (every 500 inverse calls) ───────────
+        if not hasattr(_raw_space_inverse, '_step'):
+            _raw_space_inverse._step = 0
+        _raw_space_inverse._step += 1
+        if _raw_space_inverse._step % 500 == 1:
+            with torch.no_grad():
+                _s = sigma.flatten()
+                _m = mu.flatten()
+                _zp = (x_pre_tanh[..., 0] if x_pre_tanh.ndim == 4 else x_pre_tanh).detach().flatten()
+                _zb = (x_bounded[..., 0] if x_bounded.ndim == 4 else x_bounded).detach().flatten()
+                _out = (x[..., 0] if x.ndim == 4 else x).detach().flatten()
+                logger.info(
+                    "[RINorm step=%d] "
+                    "σ_c: min=%.3f max=%.3f mean=%.3f | "
+                    "μ: min=%.3f max=%.3f mean=%.3f | "
+                    "z_pre: min=%.3f max=%.3f mean=%.3f | "
+                    "z_post(K=5): min=%.3f max=%.3f mean=%.3f | "
+                    "ŷ_asinh: min=%.3f max=%.3f mean=%.3f",
+                    _raw_space_inverse._step,
+                    _s.min(), _s.max(), _s.mean(),
+                    _m.min(), _m.max(), _m.mean(),
+                    _zp.min(), _zp.max(), _zp.mean(),
+                    _zb.min(), _zb.max(), _zb.mean(),
+                    _out.min(), _out.max(), _out.mean(),
+                )
 
         return x
 

@@ -217,7 +217,7 @@ def apply_nbeats_patch():
 #
 # This IS the Dish-TS denormalization (Eq. 6, right side), with:
 #   φ_h = μ_out = μ + Δμ       (HORICONET level coefficient)
-#   ξ_h = σ_out = exp(log(σ) + Δlog_σ)  (HORICONET scaling coefficient)
+#   ξ_h = σ_out = exp(log(σ) + tanh(Δlog_σ))  (bounded ∈ [σ/e, σ·e])
 #
 # Exact match to the paper's linear denormalization structure.
 #
@@ -361,7 +361,7 @@ def apply_rinorm_compression_patch():
         # Residual-connected HORICONET corrections
         mu_out = self.mean + self._delta_mu                           # (B, 1, n_targets)
         log_sigma = torch.log(self.stdev + self.eps)
-        sigma_out = torch.exp(log_sigma + self._delta_log_sigma)      # unconstrained positive
+        sigma_out = torch.exp(log_sigma + torch.tanh(self._delta_log_sigma))  # ∈ [σ/e, σ·e]
 
         # Broadcast over nr_params dimension
         mu_out = mu_out.unsqueeze(-1)                                 # (B, 1, n_targets, 1)

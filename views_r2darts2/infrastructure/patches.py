@@ -283,94 +283,82 @@ def apply_nbeats_patch():
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with hybrid-space normalization (v3).
+    Patches Darts RINorm with standard asinh-space normalization.
 
-    Centers in asinh-space (zero mean bias), normalizes variance in
-    raw-space (bounded gradients). Eliminates both the gradient
-    explosion of standard RevIN AND the systematic positive bias of
-    pure raw-space RevIN.
+    Forward:  z = (x - μ) / σ
+    Inverse:  ŷ = z · σ + μ
 
-    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
-    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
+    WHY THIS IS THE ONLY OPTION THAT PRESERVES DYNAMIC RANGE:
+    Raw-space σ (σ_c ≈ 300 for Sudan) crushes quiet months to z ≈ 0.
+    Robust stats (MAD) evaluate to ≈ 0 and blow up spikes.
+    Only asinh-space σ (σ ≈ 1.4) provides homoscedastic variance,
+    keeping quiet months visible (z ≈ -0.14) and spikes distinct (z ≈ 5.85).
 
-    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
-    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
-    Round-trip: exact (forward ∘ inverse = identity).
-    Zero learnable parameters. Backwards-compatible state_dict.
+    WHY THIS IS SAFE (with SpotlightLossAsinh):
+    1. Gradients bounded by Asinh-Integral loss (no exponential explosion).
+    2. DC accumulation prevented by loss DC/AC split (no climbing mean).
+    3. MC Dropout Jensen avoided by averaging in asinh-space.
+
+    Exact round-trip. Zero learnable parameters. No crushing.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
-    if getattr(RINorm, '_raw_space_patched', False):
-        return  # Already patched
+    if getattr(RINorm, '_asinh_standard_patched', False):
+        return
 
-    def _raw_space_forward(self, x: torch.Tensor):
-        # x is in asinh-space: (batch, input_chunk_length, n_targets)
+    _original_init = RINorm.__init__
+
+    def _asinh_standard_init(self, input_dim, eps=1e-5, affine=True):
+        _original_init(self, input_dim, eps=eps, affine=affine)
+
+    def _asinh_standard_forward(self, x: torch.Tensor):
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # Guard against any upstream numeric accident before sinh.
-        x = torch.clamp(x, -88.0, 88.0)
-
-        # Compute asinh-space mean (bias-free centering point)
+        # Compute asinh-space mean and std (bounded ~0.3 to ~5)
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-
-        # Center in asinh space, convert to raw
-        x_centered_raw = torch.sinh(x - self.mean)
-
-        # Compute variance of the centered-raw signal
-        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
-        # These differ enormously — std(sinh(x)) is inflated by the
-        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
         self.stdev = torch.sqrt(
-            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
+            torch.var(x - self.mean, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
 
-        # Normalize by centered-raw std, compress back via asinh
-        x = torch.asinh(x_centered_raw / self.stdev)
+        z = (x - self.mean) / self.stdev
 
         if self.affine:
-            x = x * self.affine_weight
-            x = x + self.affine_bias
-        return x
+            z = z * self.affine_weight + self.affine_bias
+        return z
 
-    def _raw_space_inverse(self, x: torch.Tensor):
-        # x shape: (batch, output_chunk_length, n_targets, nr_params)
+    def _asinh_standard_inverse(self, x: torch.Tensor):
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
-            x = x / (
-                self.affine_weight.view(self.affine_weight.shape + (1,))
-                + self.eps * self.eps
-            )
+            x = x / (self.affine_weight.view(self.affine_weight.shape + (1,)) + self.eps * self.eps)
 
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Cap per-series sigma to 5× the batch-mean sigma.
-        # Prevents RevIN denorm from amplifying extreme-conflict series
-        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
-        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
+        # Standard linear denormalization
+        return x * sigma + mu
 
-        # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
-        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
-        x = torch.clamp(x, -50.0, 50.0)
+    _original_load = RINorm._load_from_state_dict
 
-        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
-        # Compress: asinh wraps it back into asinh-space
-        # Shift: + μ_asinh re-centers (additive, no amplification)
-        x = torch.asinh(torch.sinh(x) * sigma) + mu
+    def _asinh_standard_load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        _original_load(
+            self, state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+        # Clean up old HORICONET keys if loading an old checkpoint
+        missing_keys[:] = [k for k in missing_keys if '_output_conet' not in k]
+        unexpected_keys[:] = [k for k in unexpected_keys if '_output_conet' not in k]
 
-        return x
-
-    RINorm.forward = _raw_space_forward
-    RINorm.inverse = _raw_space_inverse
-    RINorm._raw_space_patched = True
-    logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3 "
-        "(asinh centering + raw-space σ, zero mean bias)."
-    )
+    RINorm.__init__ = _asinh_standard_init
+    RINorm.forward = _asinh_standard_forward
+    RINorm.inverse = _asinh_standard_inverse
+    RINorm._load_from_state_dict = _asinh_standard_load_from_state_dict
+    RINorm._asinh_standard_patched = True
+    RINorm._dish_ts_patched = True
+    logger.info("🐨 Patched RINorm: Standard Asinh-Space RevIN")
 
 
 # --- Initialize All Patches ---

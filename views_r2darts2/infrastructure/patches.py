@@ -345,58 +345,22 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # ── Tanh-bounded denormalization ──────────────────────────────
-        #
-        # Bounds the effective z-score to ±K before sinh expansion.
-        # For |ẑ| << K: K·tanh(ẑ/K) ≈ ẑ (linear, full gradient)
-        # For |ẑ| >> K: saturates at ±K (prevents exponential blowup)
-        #
-        # Gradient: sech²(ẑ/K). K must be large enough that the model's
-        # useful z range retains meaningful gradient:
-        #
-        #   | z   | K=3 grad | K=5 grad |
-        #   |-----|----------|----------|
-        #   | 1.0 | 0.89     | 0.96     |
-        #   | 2.0 | 0.64     | 0.85     |
-        #   | 3.0 | 0.42     | 0.66     |
-        #   | 4.0 | 0.23     | 0.50     |
-        #   | 4.7 | 0.14     | 0.42     |
-        #
-        # K=3 killed gradient for z>2 → outputs compressed to 0.17x.
-        # K=5 retains ≥42% gradient across the full observed z range
-        # [-1.4, 5.3] while still capping at ±5 for true outliers.
-        K = 5.0
-        x_pre_tanh = x
-        x_bounded = K * torch.tanh(x / K)
+        # Cap per-series sigma to 5× the batch-mean sigma.
+        # Prevents RevIN denorm from amplifying extreme-conflict series
+        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
+        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
+        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
+        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
 
-        # Standard v3 expansion with the bounded z-scores
-        x = torch.asinh(torch.sinh(x_bounded) * sigma) + mu
+        # Clamp before sinh to prevent float32 overflow.
+        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
+        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
+        x = torch.clamp(x, -50.0, 50.0)
 
-        # ── Periodic diagnostics (every 500 inverse calls) ───────────
-        if not hasattr(_raw_space_inverse, '_step'):
-            _raw_space_inverse._step = 0
-        _raw_space_inverse._step += 1
-        if _raw_space_inverse._step % 500 == 1:
-            with torch.no_grad():
-                _s = sigma.flatten()
-                _m = mu.flatten()
-                _zp = (x_pre_tanh[..., 0] if x_pre_tanh.ndim == 4 else x_pre_tanh).detach().flatten()
-                _zb = (x_bounded[..., 0] if x_bounded.ndim == 4 else x_bounded).detach().flatten()
-                _out = (x[..., 0] if x.ndim == 4 else x).detach().flatten()
-                logger.info(
-                    "[RINorm step=%d] "
-                    "σ_c: min=%.3f max=%.3f mean=%.3f | "
-                    "μ: min=%.3f max=%.3f mean=%.3f | "
-                    "z_pre: min=%.3f max=%.3f mean=%.3f | "
-                    "z_post(K=5): min=%.3f max=%.3f mean=%.3f | "
-                    "ŷ_asinh: min=%.3f max=%.3f mean=%.3f",
-                    _raw_space_inverse._step,
-                    _s.min(), _s.max(), _s.mean(),
-                    _m.min(), _m.max(), _m.mean(),
-                    _zp.min(), _zp.max(), _zp.mean(),
-                    _zb.min(), _zb.max(), _zb.mean(),
-                    _out.min(), _out.max(), _out.mean(),
-                )
+        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
+        # Compress: asinh wraps it back into asinh-space
+        # Shift: + μ_asinh re-centers (additive, no amplification)
+        x = torch.asinh(torch.sinh(x) * sigma) + mu
 
         return x
 

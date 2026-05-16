@@ -338,6 +338,7 @@ def apply_rinorm_compression_patch():
         nn.init.zeros_(conet[2].weight)
         nn.init.zeros_(conet[2].bias)
         self._output_conet = conet  # registered as submodule via nn.Module.__setattr__
+        self._rinorm_step = 0       # for periodic diagnostic logging
 
     RINorm.__init__ = _patched_rinorm_init
 
@@ -429,11 +430,56 @@ def apply_rinorm_compression_patch():
         sigma_out = self.stdev.unsqueeze(-1) * torch.exp(delta[..., 0:1])  # (B, 1, N, 1)
         mu_out    = self.mean.unsqueeze(-1)  + delta[..., 1:2]             # (B, 1, N, 1)
 
-        # Tanh bound prevents runaway even if CONET overestimates σ_out
-        K = 3.0
+        # ── Tanh-bounded denormalization ──────────────────────────────
+        #
+        # K controls the maximum effective z-score that can pass through.
+        # Gradient through tanh: sech²(z/K). At K=3, z=4 → sech²(1.33)=0.23
+        # (77% of gradient killed). At K=5, z=4 → sech²(0.80)=0.50 (50% intact).
+        # K=3 was systematically suppressing gradient for any z>2, teaching
+        # the model to never deviate far from zero — causing the compression.
+        # K=5 retains meaningful gradient across the full observed z range
+        # [−1.4, 4.7] while still saturating at ±5 for true outliers.
+        K = 5.0
+        x_pre_tanh = x  # save for diagnostics before overwriting
         x_bounded = K * torch.tanh(x / K)
 
         x = torch.asinh(torch.sinh(x_bounded) * sigma_out) + mu_out
+
+        # ── Periodic diagnostics (every 200 inverse calls) ───────────
+        self._rinorm_step += 1
+        if self._rinorm_step % 300 == 1:
+            with torch.no_grad():
+                sigma_c_flat = self.stdev.flatten()
+                sigma_out_flat = sigma_out.detach().flatten()
+                delta_log_sigma = delta[..., 0].detach().flatten()
+                delta_mu = delta[..., 1].detach().flatten()
+                skew_flat = self._x_skew.flatten()
+                # z before and after tanh (first param channel only to avoid quantile noise)
+                _xp = x_pre_tanh.detach()
+                _xb = x_bounded.detach()
+                z_pre = (_xp[..., 0] if _xp.ndim == 4 else _xp).flatten()
+                z_post = (_xb[..., 0] if _xb.ndim == 4 else _xb).flatten()
+                ratio = (sigma_out_flat / (sigma_c_flat.unsqueeze(-1) + 1e-8)).flatten()
+                logger.info(
+                    "[RINorm step=%d] "
+                    "σ_c: min=%.3f max=%.3f mean=%.3f | "
+                    "σ_out: min=%.3f max=%.3f mean=%.3f | "
+                    "σ_out/σ_c ratio: min=%.3f max=%.3f mean=%.3f | "
+                    "CONET Δlog_σ: min=%.3f max=%.3f mean=%.3f | "
+                    "CONET Δμ: min=%.3f max=%.3f mean=%.3f | "
+                    "skew_proxy: min=%.3f max=%.3f mean=%.3f | "
+                    "z pre-tanh: min=%.3f max=%.3f mean=%.3f | "
+                    "z post-tanh: min=%.3f max=%.3f mean=%.3f",
+                    self._rinorm_step,
+                    sigma_c_flat.min(), sigma_c_flat.max(), sigma_c_flat.mean(),
+                    sigma_out_flat.min(), sigma_out_flat.max(), sigma_out_flat.mean(),
+                    ratio.min(), ratio.max(), ratio.mean(),
+                    delta_log_sigma.min(), delta_log_sigma.max(), delta_log_sigma.mean(),
+                    delta_mu.min(), delta_mu.max(), delta_mu.mean(),
+                    skew_flat.min(), skew_flat.max(), skew_flat.mean(),
+                    z_pre.min(), z_pre.max(), z_pre.mean(),
+                    z_post.min(), z_post.max(), z_post.mean(),
+                )
 
         return x
 

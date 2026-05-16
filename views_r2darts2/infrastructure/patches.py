@@ -142,96 +142,108 @@ def apply_nbeats_patch():
         logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
 
 
-# --- 3. RINorm v7: v5 Swapped-Compression + Dish-TS CONET ---
+# --- 3. RINorm v8: Asinh-Space RevIN + Dish-TS HORICONET ---
 #
 # ═══════════════════════════════════════════════════════════════════════
-# BACKGROUND
+# EVOLUTION: v3 → v5 → v7 → v8
 # ═══════════════════════════════════════════════════════════════════════
 #
 # Pipeline: raw counts → asinh → RevIN → model → RevIN⁻¹ → sinh → counts
 #
-# v5 (swapped-compression) achieved ratio=0.94× with structural safety:
-#   Forward:  z = sinh(x − μ) / σ_c      (linear normalization)
-#   Inverse:  ŷ = asinh(ẑ · σ_c) + μ     (logarithmic compression)
+# v3: σ = std(sinh(x−μ)). Sudan/Niger σ ≈ 80–290, crushing all quiet
+#     months to z ≈ 0. Model can't distinguish temporal patterns.
+#     Explodes on OOD ẑ without clamp.
 #
-# The asinh in the inverse provides STRUCTURAL bounds: ŷ grows as
-# ln(2·|ẑ|·σ) for large ẑ, preventing exponential explosion.
+# v5: Forward z = sinh(x−μ)/σ, Inverse ŷ = asinh(ẑ·σ)+μ.
+#     Logarithmic compression in inverse prevents explosion.
+#     Same sinh-space σ problem as v3.
 #
-# v6 (linear Dish-TS) failed because:
-#   Inverse:  ŷ = ẑ · σ_out + μ_out      (linear — no compression)
-#   The model and CONET enter an arms race: model pushes ẑ → ∞ while
-#   CONET shrinks σ_out. Calibration oscillated 2.6× ↔ 282×.
+# v7: v5 + single CONET on inverse. σ_out = σ_c × exp(tanh(s)),
+#     bounded to [σ_c/e, σ_c·e]. CONET can't fix forward σ crush.
+#     3-feature input too sparse for regime detection.
 #
-# ═══════════════════════════════════════════════════════════════════════
-# SOLUTION: v7 = v5 STRUCTURE + DISH-TS CONET
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Keep v5's proven forward/inverse structure. Graft the CONET onto the
-# inverse to learn inter-space corrections WITHIN the safe envelope:
-#
-# Forward (v5 unchanged):
-#   μ = mean(x, dim=time)              — asinh-space mean (detached)
-#   x_c = sinh(x − μ)                  — center, convert to raw
-#   σ_c = std(x_c, dim=time)           — centered-raw std (detached)
-#   z = x_c / σ_c                      — linear normalization
-#   CONET conditioning: [μ, σ_c, trend] → [Δμ, raw_scale]
-#
-# Inverse (v5 structure + learned corrections):
-#   μ_out = μ + Δμ                     — learned mean shift
-#   σ_out = σ_c × exp(tanh(s))         — ∈ [σ_c/e, σ_c·e], identity at init
-#   ŷ = asinh(ẑ · σ_out) + μ_out      — LOGARITHMIC compression
+# v8 (current): Decoupled forward/inverse.
+#   Forward: standard RevIN in asinh-space.
+#     μ = mean(x), σ = std(x−μ) — bounded ∈ [~0.3, ~5] for any series.
+#     z = (x − μ) / σ — full temporal detail preserved for all series.
+#   Inverse: asinh compression + HORICONET (Dish-TS inter-space shift).
+#     [Δμ, Δlog_σ] = HORICONET(7 features) — zero-init residual.
+#     μ_out = μ + Δμ, σ_out = exp(log(σ) + Δlog_σ) — unconstrained.
+#     ŷ = asinh(ẑ · σ_out) + μ_out — logarithmic safety envelope.
 #
 # ═══════════════════════════════════════════════════════════════════════
-# WHY THIS WORKS
+#
+# Sudan: 35 quiet months at asinh≈1.5, 1 spike at asinh≈9.9.
+#
+#   v7: σ_c = std(sinh(x−μ)) ≈ 290 → z_quiet ≈ 0.001, z_spike ≈ 2.5
+#       Model sees flat z ≈ 0 for all quiet months. Can't learn.
+#
+#   v8: σ = std(x−μ) ≈ 1.38 → z_quiet ≈ −0.17, z_spike ≈ 5.9
+#       35× separation between quiet and spike. Model learns patterns.
+#
+# The HORICONET can learn σ_out for the inverse independently —
+# it's not chained to the forward σ. For series that need large σ_out
+# to reconstruct spikes (Sudan: σ_out ≈ 300), the CONET learns
+# Δlog_σ ≈ log(300) − log(1.38) ≈ 5.4. Unconstrained: no tanh cap.
+#
+# ═══════════════════════════════════════════════════════════════════════
+# DISH-TS ALIGNMENT
 # ═══════════════════════════════════════════════════════════════════════
 #
-# 1. STRUCTURAL SAFETY from asinh: ŷ ≈ ln(2·|ẑ|·σ_out) + μ_out
-#    for large ẑ. No matter what CONET outputs, the inverse is bounded
-#    logarithmically. No arms race possible.
+# Paper: Dual-CONET with BACKCONET (input) + HORICONET (output).
+# v8: BACKCONET omitted — asinh-space mean/std are bias-free and
+# bounded, so empirical statistics work well for the forward.
+# HORICONET: learns inter-space shift (different output distribution).
+# This is the paper's core contribution (Section 4.2, Eq. 6).
 #
-# 2. CONET can learn a NEGATIVE Δμ → counteracts Jensen's E[sinh(X)]
-#    > sinh(E[X]) bias, pushing ratio from 0.94× toward 1.0×.
+# ═══════════════════════════════════════════════════════════════════════
+# HORICONET FEATURES (7 per target)
+# ═══════════════════════════════════════════════════════════════════════
 #
-# 3. CONET can SHRINK σ_out → reduces the linear growth slope
-#    ẑ·σ·exp(μ) in raw-count space after the global sinh eval.
+# 1. μ            — current asinh-space level
+# 2. log(σ)       — variability scale (log-compressed)
+# 3. trend        — (x[-1] − x[0]) / (T−1)
+# 4. zero_frac    — fraction of near-zero timesteps (< 0.88 asinh)
+# 5. x_max        — peak asinh value in window (spike magnitude)
+# 6. x_last       — last observation (most recent level)
+# 7. recent_trend — trend of last 25% of window (acceleration)
 #
-# 4. Identity warm start: at init, Δμ=0, σ_out=σ_c → exact v5.
-#    Guaranteed to perform at least as well as the proven v5 baseline.
-#
-# 5. Round-trip at init: inverse(forward(x)) = asinh(sinh(x−μ)/σ·σ)+μ
-#    = asinh(sinh(x−μ))+μ = x. Exact.
+# These separate "one old spike + peaceful" (zero_frac=0.97, x_max=9.9)
+# from "steady low conflict" (zero_frac=0.3, x_max=2.0) — identical
+# in [μ, σ, trend] but very different futures.
 #
 # ═══════════════════════════════════════════════════════════════════════
 # ARCHITECTURE
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Output CONET: Linear(3·n_targets, 16) → GELU → Linear(16, 2·n_targets)
-#   Input:  [μ_asinh, σ_c, trend_slope] per target (detached)
-#   Output: [Δμ, raw_scale] per target
-#   Init:   Final layer weights=0, bias=0 → identity at start
+# HORICONET: Linear(7·n_targets, 16) → GELU → Linear(16, 2·n_targets)
+#   Output: [Δμ, Δlog_σ] per target — zero-init (identity at start)
+#   ~162 params for n_targets=1
+#
+# At init: Δμ=0, Δlog_σ=0 → μ_out=μ, σ_out=σ_asinh.
+# Inverse: ŷ = asinh(ẑ·σ_asinh) + μ ≈ x for |x−μ| < 1 (90% of data).
 #
 # ═══════════════════════════════════════════════════════════════════════
 # CHECKPOINT COMPATIBILITY
 # ═══════════════════════════════════════════════════════════════════════
 #
 # _load_from_state_dict patched to silently ignore missing CONET keys.
-# Old v5 checkpoints load normally — CONET initializes to identity.
+# Old checkpoints load normally — CONET initializes to identity.
 
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with v7: v5 swapped-compression + Dish-TS CONET.
+    Patches Darts RINorm with v8: asinh-space RevIN + Dish-TS HORICONET.
 
-    Forward (v5): z = sinh(x − μ) / σ_c  (linear normalization in raw-space)
-    Inverse (v5 + CONET): ŷ = asinh(ẑ · σ_out) + μ_out  (logarithmic compression)
+    Forward: z = (x − μ) / σ  (standard RevIN in asinh-space, bounded σ)
+    Inverse: ŷ = asinh(ẑ · σ_out) + μ_out  (logarithmic compression)
 
-    The CONET maps 3 lookback statistics [μ, σ_c, trend_slope] to 2
-    correction coefficients [Δμ, raw_scale] per target:
-      - μ_out = μ + Δμ (learned shift)
-      - σ_out = σ_c × exp(raw_scale)   (unconstrained positive; exp(0)=1 at init)
+    HORICONET maps 7 lookback features to [Δμ, Δlog_σ] per target:
+      - μ_out = μ + Δμ (learned shift for inter-space distribution gap)
+      - σ_out = exp(log(σ) + Δlog_σ) (unconstrained positive, residual)
 
-    At initialization the CONET outputs zeros → exact v5 behavior.
-    ~100 learnable parameters for n_targets=1.
+    At initialization HORICONET outputs zeros → σ_out=σ, μ_out=μ.
+    ~162 learnable parameters for n_targets=1.
     """
     from darts.models.components.layer_norm_variants import RINorm
 
@@ -243,13 +255,13 @@ def apply_rinorm_compression_patch():
     def _dish_ts_init(self, input_dim, eps=1e-5, affine=True):
         _original_init(self, input_dim, eps=eps, affine=affine)
 
-        # Output CONET: [μ, σ_c, trend_slope] → [Δμ, raw_scale] per target
+        # HORICONET: 7 features per target → [Δμ, Δlog_σ] per target
         self._output_conet = nn.Sequential(
-            nn.Linear(3 * input_dim, 16),
+            nn.Linear(7 * input_dim, 16),
             nn.GELU(),
             nn.Linear(16, 2 * input_dim),
         )
-        # Identity init: final layer zeros → Δμ=0, sigmoid(0)=0.5 → σ_out=σ_c
+        # Zero-init final layer → identity at start (Δμ=0, Δlog_σ=0)
         nn.init.zeros_(self._output_conet[2].weight)
         nn.init.zeros_(self._output_conet[2].bias)
         self._n_targets = input_dim
@@ -259,43 +271,59 @@ def apply_rinorm_compression_patch():
         # x: (batch, input_chunk_length, n_targets) in asinh-space
         calc_dims = tuple(range(1, x.ndim - 1))
 
-        # v5 forward: center in asinh-space, normalize in raw-space
+        # Standard RevIN in asinh-space — σ naturally bounded ∈ [~0.3, ~5]
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
-        x_c = torch.sinh(x - self.mean)                  # centered raw
+        x_centered = x - self.mean
         self.stdev = torch.sqrt(
-            torch.var(x_c, dim=calc_dims, keepdim=True, unbiased=False) + self.eps
+            torch.var(x_centered, dim=calc_dims, keepdim=True, unbiased=False)
+            + self.eps
         ).detach()
-        z = x_c / self.stdev                             # linear normalization
+        z = x_centered / self.stdev
 
         if self.affine:
             z = z * self.affine_weight + self.affine_bias
 
-        # CONET conditioning from detached lookback statistics
+        # ── HORICONET features (7 per target, all detached) ──
         T = x.shape[1]
-        mu_sq = self.mean.squeeze(1)                    # (B, n_targets)
-        log_sigma_sq = torch.log(self.stdev.squeeze(1) + self.eps)  # log-compress: [0,500] → [-7,6]
-        trend = ((x[:, -1, :] - x[:, 0, :]) / max(T - 1, 1)).detach()  # (B, n_targets)
+        # 1. μ — current level
+        f_mu = self.mean.squeeze(1)                                   # (B, n_targets)
+        # 2. log(σ) — variability scale
+        f_log_sigma = torch.log(self.stdev.squeeze(1) + self.eps)     # (B, n_targets)
+        # 3. trend — overall slope
+        f_trend = ((x[:, -1, :] - x[:, 0, :]) / max(T - 1, 1)).detach()
+        # 4. zero_frac — fraction of near-zero timesteps (asinh < 0.88 ≈ asinh(1))
+        f_zero_frac = (x < 0.88).float().mean(dim=1).detach()        # (B, n_targets)
+        # 5. x_max — peak value in window
+        f_x_max = x.amax(dim=1).detach()                             # (B, n_targets)
+        # 6. x_last — most recent observation
+        f_x_last = x[:, -1, :].detach()                              # (B, n_targets)
+        # 7. recent_trend — trend of last 25% (acceleration)
+        q = max(T // 4, 1)
+        f_recent_trend = ((x[:, -1, :] - x[:, -q, :]) / max(q - 1, 1)).detach()
 
-        conet_in = torch.cat([mu_sq, log_sigma_sq, trend], dim=-1)  # (B, 3*n_targets)
-        conet_out = self._output_conet(conet_in)                # (B, 2*n_targets)
+        conet_in = torch.cat([
+            f_mu, f_log_sigma, f_trend, f_zero_frac,
+            f_x_max, f_x_last, f_recent_trend,
+        ], dim=-1)                                                    # (B, 7*n_targets)
+        conet_out = self._output_conet(conet_in)                      # (B, 2*n_targets)
 
         n = self._n_targets
-        self._delta_mu = conet_out[:, :n].unsqueeze(1)    # (B, 1, n_targets)
-        self._raw_scale = conet_out[:, n:].unsqueeze(1)   # (B, 1, n_targets)
+        self._delta_mu = conet_out[:, :n].unsqueeze(1)                # (B, 1, n_targets)
+        self._delta_log_sigma = conet_out[:, n:].unsqueeze(1)         # (B, 1, n_targets)
 
-        # Log CONET diagnostics every 500 forward passes
+        # Diagnostics every 500 forward passes
         self._dish_step += 1
         if self._dish_step % 500 == 1:
             _dm = self._delta_mu.detach()
-            _rs = self._raw_scale.detach()
-            _mult = torch.exp(torch.tanh(_rs)).detach()
+            _dls = self._delta_log_sigma.detach()
             logger.info(
-                f"[Dish-TS v7 step {self._dish_step}] "
-                f"μ_asinh={mu_sq.mean():.3f}±{mu_sq.std():.3f}  "
-                f"log_σ_c={log_sigma_sq.mean():.3f}±{log_sigma_sq.std():.3f}  "
+                f"[v8 step {self._dish_step}] "
+                f"μ={f_mu.mean():.3f}±{f_mu.std():.3f}  "
+                f"log_σ={f_log_sigma.mean():.3f}±{f_log_sigma.std():.3f}  "
+                f"zero_frac={f_zero_frac.mean():.3f}  "
+                f"x_max={f_x_max.mean():.2f}  "
                 f"Δμ={_dm.mean():.4f}±{_dm.std():.4f}  "
-                f"σ_mult={_mult.mean():.4f}±{_mult.std():.4f}  "
-                f"trend={trend.mean():.4f}"
+                f"Δlog_σ={_dls.mean():.4f}±{_dls.std():.4f}"
             )
 
         return z
@@ -309,26 +337,25 @@ def apply_rinorm_compression_patch():
                 + self.eps * self.eps
             )
 
-        # Learned denormalization: v5 structure + CONET corrections
-        mu_out = self.mean + self._delta_mu          # (B, 1, n_targets)
-        sigma_out = self.stdev * torch.exp(torch.tanh(self._raw_scale))  # ∈ [σ_c/e, σ_c·e] ≈ [0.37σ_c, 2.72σ_c]
+        # Residual-connected HORICONET corrections
+        mu_out = self.mean + self._delta_mu                           # (B, 1, n_targets)
+        log_sigma = torch.log(self.stdev + self.eps)
+        sigma_out = torch.exp(log_sigma + self._delta_log_sigma)      # unconstrained positive
 
         # Broadcast over nr_params dimension
-        mu_out = mu_out.unsqueeze(-1)                # (B, 1, n_targets, 1)
-        sigma_out = sigma_out.unsqueeze(-1)          # (B, 1, n_targets, 1)
+        mu_out = mu_out.unsqueeze(-1)                                 # (B, 1, n_targets, 1)
+        sigma_out = sigma_out.unsqueeze(-1)                           # (B, 1, n_targets, 1)
 
-        # v5 inverse with learned params: asinh compression + μ shift
+        # Asinh compression: ŷ = asinh(ẑ · σ_out) + μ_out
+        # Logarithmic growth for large ẑ → structural safety envelope
         x = torch.asinh(x * sigma_out) + mu_out
 
-        # Log inverse diagnostics at same cadence as forward
         if hasattr(self, '_dish_step') and self._dish_step % 500 == 1:
             logger.info(
-                f"[Dish-TS v7 inv step {self._dish_step}] "
+                f"[v8 inv step {self._dish_step}] "
                 f"μ_out={mu_out.mean():.3f}  "
                 f"σ_out={sigma_out.mean():.4f}  "
-                f"ŷ_range=[{x.min():.3f}, {x.max():.3f}]  "
-                f"sinh(ŷ)_range=[{torch.sinh(x.clamp(-20,20)).min():.1f}, "
-                f"{torch.sinh(x.clamp(-20,20)).max():.1f}]"
+                f"ŷ_range=[{x.min():.3f}, {x.max():.3f}]"
             )
 
         return x
@@ -339,13 +366,11 @@ def apply_rinorm_compression_patch():
         self, state_dict, prefix, local_metadata, strict,
         missing_keys, unexpected_keys, error_msgs,
     ):
-        # Let standard loading proceed
         _original_load(
             self, state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs,
         )
-        # Remove CONET keys from missing_keys so strict loading doesn't fail
-        # when loading pre-CONET checkpoints (CONET inits to identity anyway)
+        # Silently ignore missing CONET keys for pre-v8 checkpoints
         conet_keys = {
             prefix + k for k in self.state_dict() if '_output_conet' in k
         }
@@ -357,8 +382,8 @@ def apply_rinorm_compression_patch():
     RINorm._load_from_state_dict = _dish_ts_load_from_state_dict
     RINorm._dish_ts_patched = True
     logger.info(
-        "🐨 Patched RINorm: v7 — v5 swapped-compression + Dish-TS CONET "
-        "(sinh forward + asinh inverse with learned μ/σ corrections)"
+        "🐨 Patched RINorm: v8 — asinh-space RevIN + Dish-TS HORICONET "
+        "(bounded forward σ, decoupled learned inverse σ_out)"
     )
 
 

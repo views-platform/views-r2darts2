@@ -353,17 +353,15 @@ def apply_rinorm_compression_patch():
         # But actually, logarithmic dampening for very large sigma is cleaner:
         # sigma = torch.log1p(sigma) * ... 
         
-        # A clean, threshold-free way to prevent sigma explosions:
-        # Instead of sigma blowing up linearly, we compress extreme sigmas via an asinh mapping
-        # relative to the batch expectation.
-        sigma_batch = sigma.mean(dim=0, keepdim=True) + self.eps
-        # Ratio of local sigma to batch sigma. Usually ~ 1-2. 
-        # For extreme dist shifts, ratio can be 100+.
-        ratio = sigma / sigma_batch
-        # Compress the ratio smoothly for extreme values (e.g., > 3)
-        # Using a smooth log-like curve for x > 1: 1 + ln(x)
-        compressed_ratio = torch.where(ratio > 3.0, 3.0 + torch.log(ratio / 3.0), ratio)
-        sigma_safe = compressed_ratio * sigma_batch
+        # Compress extreme local sigmas WITHOUT relying on the batch dimension!
+        # Batch-dependent scaling (like sigma_batch = sigma.mean) causes severe 
+        # train vs. eval asymmetry because evaluation batch sizes and compositions
+        # are completely different (often evaluated 1 by 1 or sequentially).
+        # When eval batch_size=1, the ratio was 1.0, and compression turned off entirely,
+        # leading to massive overpredictions.
+        # Fix: Use an absolute soft-cap threshold (e.g., 15.0).
+        threshold = 15.0
+        sigma_safe = torch.where(sigma > threshold, threshold + threshold * torch.log(sigma / threshold), sigma)
 
         # Clamp before sinh to prevent float32 overflow.
         # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000

@@ -14,6 +14,7 @@ from .spotlight_loss_huber import SpotlightLossHuber
 from .spotlight_loss_power_law import SpotlightLossPowerLaw
 from .spotlight_focal_loss import SpotlightFocalLoss
 from .sentinel_loss import SentinelLoss
+from .charbonnier_loss import CharbonnierLoss
 
 __all__ = [
     "ShrinkageLoss",
@@ -32,4 +33,5 @@ __all__ = [
     "SpotlightLossPowerLaw",
     "SpotlightFocalLoss",
     "SentinelLoss",
+    "CharbonnierLoss",
 ]

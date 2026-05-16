@@ -16,6 +16,7 @@ from views_r2darts2.math.spotlight_loss_asinh import SpotlightLossAsinh
 from views_r2darts2.math.spotlight_loss_power_law import SpotlightLossPowerLaw
 from views_r2darts2.math.spotlight_focal_loss import SpotlightFocalLoss
 from views_r2darts2.math.sentinel_loss import SentinelLoss
+from views_r2darts2.math.charbonnier_loss import CharbonnierLoss
 
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ class LossCatalog:
             "SpotlightLossPowerLaw": SpotlightLossPowerLaw,
             "SpotlightFocalLoss": SpotlightFocalLoss,
             "SentinelLoss": SentinelLoss,
+            "CharbonnierLoss": CharbonnierLoss,
             "MSELoss": torch.nn.MSELoss,
             "L1Loss": torch.nn.L1Loss,
             "HuberLoss": torch.nn.HuberLoss,

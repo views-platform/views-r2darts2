@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "views-r2darts2"
+name = "views_r2darts2"
 version = "0.1.0"
 description = ""
 authors = [

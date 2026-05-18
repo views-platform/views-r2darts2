@@ -106,9 +106,11 @@ class ModelCatalog:
         if extra_callbacks:
             callbacks.extend(extra_callbacks)
 
+        is_test = self.config.get("run_type") == "test"
+        
         return {
             "accelerator": "gpu",
-            "logger": WandbLogger(log_model="all"),
+            "logger": False if is_test else WandbLogger(log_model="all"),
             "gradient_clip_val": self.config.get("gradient_clip_val"),
             "callbacks": callbacks,
             "enable_progress_bar": True,

@@ -303,13 +303,6 @@ def apply_rinorm_compression_patch():
     if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
 
-    _original_init = RINorm.__init__
-
-    def _no_affine_init(self, input_dim, eps=1e-5, affine=True):
-        _original_init(self, input_dim, eps=eps, affine=False)
-
-    RINorm.__init__ = _no_affine_init
-
     def _raw_space_forward(self, x: torch.Tensor):
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
@@ -356,8 +349,8 @@ def apply_rinorm_compression_patch():
         # Prevents RevIN denorm from amplifying extreme-conflict series
         # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
         # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
+        sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
+        sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
 
         # Clamp before sinh to prevent float32 overflow.
         # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000

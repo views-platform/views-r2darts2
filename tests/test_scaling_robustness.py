@@ -151,7 +151,6 @@ class TestScalingRobustness:
         from views_r2darts2.transformers.views_dataset_darts import _ViewsDatasetDarts
         from unittest.mock import MagicMock
 
-<<<<<<< HEAD
         dataset = MagicMock(spec=_ViewsDatasetDarts)
         dataset.features = []
         dataset.targets = ["target"]
@@ -161,10 +160,6 @@ class TestScalingRobustness:
              patch("torch.serialization.add_safe_globals"):
             catalog = ModelCatalog(config=config)
             model = catalog.get_model("NBEATSModel")
-=======
-        catalog = ModelCatalog(config=config)
-        model = catalog.get_model("NBEATSModel")
->>>>>>> origin/development
 
         multi_ts = [
             TimeSeries.from_times_and_values(

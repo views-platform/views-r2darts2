@@ -364,7 +364,7 @@ class TestModelCatalogInitialization:
         assert lr_scheduler_args["min_lr"] == 1e-6
 
 
-        assert lr_scheduler_args["monitor"] == "train_loss"
+        assert lr_scheduler_args["monitor"] == "val_loss"
 
 
 

@@ -321,10 +321,9 @@ class TestDartsForecaster:
 
         results = forecaster._process_predictions([mock_pred])
 
-        # Check that negative value was clipped to eps (1e-8)
+        # Check that negative value was clipped to 0.0
         # When there's 1 sample, it returns a list with 1 element
-        eps = 1e-8
-        assert abs(results[0]["pred_target1"][0] - eps) < 1e-10
+        assert abs(results[0]["pred_target1"][0] - 0.0) < 1e-10
         assert results[0]["pred_target2"] == [2.0]
 
     def test_process_predictions_raises_on_nans(self, forecaster):

@@ -68,7 +68,7 @@ Proper data scaling is critical for neural network training. For conflict data �
 
 | Scaler | Formula | Best For | Notes |
 |--------|---------|----------|-------|
-| **AsinhTransform** | $y = \operatorname{asinh}(x)$ | Zero-inflated counts, data with negatives | ⭐ **Recommended for all fatality data**. Handles zeros and extreme outliers. Near-linear below 1. |
+| **AsinhTransform** | $y = \text{asinh}(x)$ | Zero-inflated counts, data with negatives | ⭐ **Recommended for all fatality data**. Handles zeros and extreme outliers. Near-linear below 1. |
 | **MaxAbsScaler** | $y = x / \max(\|x\|)$ | Cross-entity normalization after element-wise transform | Maps to $[-1,1]$. Preserves ordinal rank. Required after AsinhTransform for static covariate injection in concatenation-based models. |
 | **StandardScaler** | $y = (x - \mu)/\sigma$ | Roughly normal data | Zero-mean, unit-variance. Poor choice for zero-inflated distributions. |
 | **MinMaxScaler** | $y = (x - x_{\min})/(x_{\max} - x_{\min})$ | Bounded data (0–1, 0–100) | Best for V-Dem indices and WDI percentages. |

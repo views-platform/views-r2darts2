@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 import pandas as pd
+from unittest.mock import patch, MagicMock
 from darts import TimeSeries
 from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.catalogs.model_catalog import ModelCatalog
@@ -118,6 +119,8 @@ class TestScalingRobustness:
             "layer_widths": 64,
             "activation": "LeakyReLU",
             "generic_architecture": True,
+            "expansion_coefficient_dim": 5,
+            "trend_polynomial_degree": 2,
             "dropout": 0.3,
             "batch_size": 8,
             "n_epochs": 1,
@@ -125,6 +128,7 @@ class TestScalingRobustness:
             "weight_decay": 0.0003,
             "loss_function": "WeightedPenaltyHuberLoss",
             "optimizer_cls": "Adam",
+            "lr_scheduler_cls": "ReduceLROnPlateau",
             "delta": 0.025,
             "zero_threshold": 0.01,
             "non_zero_weight": 7.0,
@@ -147,8 +151,15 @@ class TestScalingRobustness:
         from views_r2darts2.transformers.views_dataset_darts import _ViewsDatasetDarts
         from unittest.mock import MagicMock
 
-        catalog = ModelCatalog(config=config)
-        model = catalog.get_model("NBEATSModel")
+        dataset = MagicMock(spec=_ViewsDatasetDarts)
+        dataset.features = []
+        dataset.targets = ["target"]
+
+        with patch("views_r2darts2.catalogs.model_catalog.WandbLogger"), \
+             patch("views_r2darts2.catalogs.model_catalog.DartsForecaster.get_device", return_value="cpu"), \
+             patch("torch.serialization.add_safe_globals"):
+            catalog = ModelCatalog(config=config)
+            model = catalog.get_model("NBEATSModel")
 
         multi_ts = [
             TimeSeries.from_times_and_values(

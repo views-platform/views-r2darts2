@@ -102,6 +102,7 @@ class TestReproducibilityInfra:
             "early_stopping_patience": 1,
             "early_stopping_min_delta": 0.01,
             "loss_function": "MSELoss",
+            "lr_scheduler_cls": "ReduceLROnPlateau",
             "num_samples": 50,
             "mc_dropout": True,
         }

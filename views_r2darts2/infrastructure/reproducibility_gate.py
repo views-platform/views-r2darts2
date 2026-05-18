@@ -52,15 +52,24 @@ class ReproducibilityGate:
             "batch_size",
             "n_epochs",
             "optimizer_cls",
-            "lr_scheduler_factor",
-            "lr_scheduler_patience",
-            "lr_scheduler_min_lr",
+            "lr_scheduler_cls",
             "early_stopping_patience",
             "early_stopping_min_delta",
             "gradient_clip_val",
             "num_samples",
             "mc_dropout",
         ]
+
+        # Parameters that are allowed to be explicitly None (valid Darts configurations)
+        NULLABLE_PARAMS = {
+            "hidden_fc_sizes",      # BlockRNNModel: None = no FC layers after RNN
+            "pooling_kernel_sizes", # NHiTSModel: None = Darts auto-computes from input_chunk_length
+            "n_freq_downsample",    # NHiTSModel: None = Darts auto-computes from output_chunk_length
+            "categorical_embedding_sizes",  # TFTModel: None = no categorical embeddings
+            "temporal_hidden_size_past",    # TiDEModel: None = defaults to hidden_size
+            "temporal_hidden_size_future",  # TiDEModel: None = defaults to hidden_size
+            # "static_covariate_stats",       # All models: None = inject stats in raw space (backward compat)
+        }
 
         # Algorithm-specific genes (Only audited if the algorithm matches)
         ALGORITHM_GENOMES = {
@@ -72,10 +81,13 @@ class ReproducibilityGate:
                 "num_blocks",
                 "num_layers",
                 "layer_widths",
+                "expansion_coefficient_dim",
+                "trend_polynomial_degree",
                 "activation",
                 "dropout",
                 "generic_architecture",
                 "force_reset",
+                "use_reversible_instance_norm",
             ],
             "NHiTSModel": [
                 "input_chunk_length",
@@ -100,15 +112,16 @@ class ReproducibilityGate:
                 "hidden_size",
                 "lstm_layers",
                 "num_attention_heads",
-                "dropout",
-                "feed_forward",
-                "add_relative_index",
-                "use_static_covariates",
                 "full_attention",
-                "use_reversible_instance_norm",
-                "norm_type",
-                "skip_interpolation",
+                "feed_forward",
+                "dropout",
                 "hidden_continuous_size",
+                "categorical_embedding_sizes",
+                "add_relative_index",
+                "skip_interpolation",
+                "norm_type",
+                "use_static_covariates",
+                "use_reversible_instance_norm",
             ],
             "TiDEModel": [
                 "input_chunk_length",
@@ -120,6 +133,8 @@ class ReproducibilityGate:
                 "hidden_size",
                 "temporal_width_past",
                 "temporal_width_future",
+                "temporal_hidden_size_past",
+                "temporal_hidden_size_future",
                 "temporal_decoder_hidden",
                 "use_layer_norm",
                 "dropout",
@@ -167,7 +182,10 @@ class ReproducibilityGate:
                 "rnn_type",
                 "hidden_dim",
                 "n_rnn_layers",
+                "hidden_fc_sizes",
                 "dropout",
+                "activation",
+                "use_static_covariates",
                 "use_reversible_instance_norm",
             ],
             "TransformerModel": [
@@ -191,7 +209,9 @@ class ReproducibilityGate:
                 "output_chunk_shift",
                 "kernel_size",
                 "num_filters",
+                "num_layers",
                 "dilation_base",
+                "weight_norm",
                 "dropout",
                 "use_reversible_instance_norm",
             ],
@@ -201,8 +221,31 @@ class ReproducibilityGate:
         OPTIMIZER_GENOMES = {
             "Adam": ["lr", "weight_decay"],
             "AdamW": ["lr", "weight_decay"],
+            "RAdam": ["lr", "weight_decay"],
             "SGD": ["lr", "weight_decay", "momentum"],
             "RMSprop": ["lr", "weight_decay", "momentum", "alpha"],
+        }
+
+        # Scheduler-specific genes
+        SCHEDULER_GENOMES = {
+            "ReduceLROnPlateau": [
+                "lr_scheduler_factor",
+                "lr_scheduler_patience",
+                "lr_scheduler_min_lr",
+            ],
+            "CosineAnnealingWarmRestarts": [
+                "lr_scheduler_T_0",
+                "lr_scheduler_T_mult",
+                "lr_scheduler_eta_min",
+            ],
+            "WarmupCAWR": [
+                "lr_scheduler_warmup_epochs",
+                "lr_scheduler_T_0",
+                "lr_scheduler_T_mult",
+                "lr_scheduler_eta_min",
+            ],
+            "StepLR": ["lr_scheduler_step_size", "lr_scheduler_gamma"],
+            "ExponentialLR": ["lr_scheduler_gamma"],
         }
 
         # Loss-specific genes
@@ -239,6 +282,15 @@ class ReproducibilityGate:
                 "eps",
             ],
             "ShrinkageLoss": ["a", "c"],
+            "PrismLoss": ["non_zero_threshold", "delta"],
+            "SpotlightLoss": ["delta", "non_zero_threshold"],
+            "SpotlightLossLogcosh": ["non_zero_threshold"],
+            "SpotlightLossHuber": ["delta", "non_zero_threshold"],
+            "SpotlightLossPowerLaw": ["delta", "non_zero_threshold"],
+            "SpotlightLossAsinh": ["non_zero_threshold"],
+            "CharbonnierLoss": [],
+            "SpotlightFocalLoss": ["gamma", "delta", "non_zero_threshold"],
+            "SentinelLoss": ["alpha", "beta", "kappa", "delta", "gamma"],
             "MSELoss": [],
             "L1Loss": [],
             "HuberLoss": ["delta"],
@@ -302,7 +354,28 @@ class ReproducibilityGate:
                 logger.error(error_msg)
                 raise MissingHyperparameterError(error_msg)
 
-            # 4. Identify Loss & Audit Loss Genome
+            # 4. Identify Scheduler & Audit Scheduler Genome
+            sched = config.get("lr_scheduler_cls")
+            available_scheds = list(ReproducibilityGate.Config.SCHEDULER_GENOMES.keys())
+            if sched in ReproducibilityGate.Config.SCHEDULER_GENOMES:
+                sched_genome = ReproducibilityGate.Config.SCHEDULER_GENOMES[sched]
+                missing_sched = [k for k in sched_genome if k not in config]
+                if missing_sched:
+                    error_msg = (
+                        f"REPRODUCIBILITY CONTRACT VIOLATED: Scheduler '{sched}' "
+                        f"requires missing parameters: {missing_sched}"
+                    )
+                    logger.error(error_msg)
+                    raise MissingHyperparameterError(error_msg)
+            else:
+                error_msg = (
+                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown or unregistered scheduler '{sched}'.\n"
+                    f"Registered schedulers: {available_scheds}"
+                )
+                logger.error(error_msg)
+                raise MissingHyperparameterError(error_msg)
+
+            # 5. Identify Loss & Audit Loss Genome
             loss = config.get("loss_function")
             available_losses = list(ReproducibilityGate.Config.LOSS_GENOMES.keys())
             if loss in ReproducibilityGate.Config.LOSS_GENOMES:
@@ -323,14 +396,15 @@ class ReproducibilityGate:
                 logger.error(error_msg)
                 raise MissingHyperparameterError(error_msg)
 
-            # 5. Check for None values in ALL required keys (Core + Algo + Opt + Loss)
+            # 6. Check for None values in ALL required keys (Core + Algo + Opt + Sched + Loss)
             all_required = (
                 ReproducibilityGate.Config.CORE_GENOME
                 + algo_genome
                 + ReproducibilityGate.Config.OPTIMIZER_GENOMES.get(opt, [])
+                + ReproducibilityGate.Config.SCHEDULER_GENOMES.get(sched, [])
                 + ReproducibilityGate.Config.LOSS_GENOMES.get(loss, [])
             )
-            explicit_nones = [k for k in all_required if config.get(k) is None]
+            explicit_nones = [k for k in all_required if config.get(k) is None and k not in ReproducibilityGate.Config.NULLABLE_PARAMS]
             if explicit_nones:
                 error_msg = (
                     "REPRODUCIBILITY CONTRACT VIOLATED: Mandatory parameters set to None: "

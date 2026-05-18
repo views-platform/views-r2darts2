@@ -171,7 +171,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=self._get_cached_data_path(),
+            cached_path=None,
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
@@ -192,6 +192,13 @@ class DartsForecastingModelManager(ForecastingModelManager):
             target_scaler=active_config.get("target_scaler", None),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
             random_state=active_config["random_state"],
+            static_covariate_stats=(
+                active_config.get("static_covariate_stats", None)
+                if active_config.get("use_static_covariates", False)
+                else None
+            ),
+            checkpoint_mode=active_config.get("checkpoint_mode", "best"),
+            use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
         )
         forecaster.train()
 
@@ -262,7 +269,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=self._get_cached_data_path(),
+            cached_path=None,
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
@@ -278,6 +285,12 @@ class DartsForecastingModelManager(ForecastingModelManager):
             log_features=active_config.get("log_features", []),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
             random_state=active_config["random_state"],
+            static_covariate_stats=(
+                active_config.get("static_covariate_stats", None)
+                if active_config.get("use_static_covariates", False)
+                else None
+            ),
+            use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
         )
         forecaster.load_model(path=path_artifact)
 
@@ -389,7 +402,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=self._get_cached_data_path(),
+            cached_path=None,
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
@@ -405,6 +418,12 @@ class DartsForecastingModelManager(ForecastingModelManager):
             log_features=active_config.get("log_features", []),
             feature_scaler_map=active_config.get("feature_scaler_map", None),
             random_state=active_config["random_state"],
+            static_covariate_stats=(
+                active_config.get("static_covariate_stats", None)
+                if active_config.get("use_static_covariates", False)
+                else None
+            ),
+            use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
         )
         forecaster.load_model(path=path_artifact)
 

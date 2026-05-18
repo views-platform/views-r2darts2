@@ -10,7 +10,6 @@ from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.callbacks import LearningRateMonitor
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from pytorch_lightning.loggers import WandbLogger
 import torch
 import logging
@@ -18,8 +17,21 @@ import logging
 from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
 from views_r2darts2.catalogs.optimizer_catalog import OptimizerCatalog
+from views_r2darts2.catalogs.scheduler_catalog import SchedulerCatalog
+from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
-from views_r2darts2.infrastructure.callbacks import GradientHealthCallback
+from views_r2darts2.infrastructure.callbacks import (
+    TrainingStepPatchCallback,
+    GradientHealthCallback,
+    NaNDetectionCallback,
+    WeightNormCallback,
+    RevINMonitorCallback,
+    PredictionSanityCallback,
+    LossStabilityCallback,
+    EpochTimingCallback,
+    YHatBarCallback,
+    ValMetricsCallback,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -67,32 +79,38 @@ class ModelCatalog:
         # DELEGATION: Specialized catalogs handle genomic translation
         self.loss_fn = LossCatalog(self.config).get_loss()
         self.opt_catalog = OptimizerCatalog(self.config)
-
-        self.lr_scheduler_args = {
-            "mode": "min",
-            "factor": self.config.get("lr_scheduler_factor"),
-            "patience": self.config.get("lr_scheduler_patience"),
-            "min_lr": self.config.get("lr_scheduler_min_lr"),
-            "monitor": "train_loss",
-        }
+        self.sched_catalog = SchedulerCatalog(self.config)
 
     def _get_common_pl_trainer_kwargs(self, extra_callbacks=None):
         callbacks = [
+            TrainingStepPatchCallback(),  # MUST be first: patches training_step to expose predictions
             EarlyStopping(
-                monitor="train_loss",
+                monitor="val_loss",
                 patience=self.config.get("early_stopping_patience"),
                 min_delta=self.config.get("early_stopping_min_delta"),
                 mode="min",
             ),
-            LearningRateMonitor(log_momentum=True),
+            LearningRateMonitor(log_momentum=True, log_weight_decay=True),
             GradientHealthCallback(),
+            NaNDetectionCallback(),
+            WeightNormCallback(),
+            RevINMonitorCallback(),
+            PredictionSanityCallback(),
+            LossStabilityCallback(),
+            EpochTimingCallback(),
+            YHatBarCallback(
+                target_scaler=self.config.get("target_scaler"),
+                non_zero_threshold=self.config.get("non_zero_threshold", 0.88),
+            ),
         ]
         if extra_callbacks:
             callbacks.extend(extra_callbacks)
 
+        is_test = self.config.get("run_type") == "test"
+        
         return {
             "accelerator": "gpu",
-            "logger": WandbLogger(log_model="all"),
+            "logger": False if is_test else WandbLogger(log_model="all"),
             "gradient_clip_val": self.config.get("gradient_clip_val"),
             "callbacks": callbacks,
             "enable_progress_bar": True,
@@ -115,12 +133,48 @@ class ModelCatalog:
             "model_name": self.config.get("name"),
             "random_state": self.config.get("random_state"),
             "force_reset": True,
+            "save_checkpoints": True,
+            # Checkpointing picks the lowest val-loss epoch, which can be a CAWR restart spike
+            # rather than a genuinely converged state. Final epoch is more representative of
+            # where the model actually settled after all scheduled training.
             "pl_trainer_kwargs": self._get_common_pl_trainer_kwargs(),
             "optimizer_cls": self.opt_catalog.get_optimizer_cls(),
             "optimizer_kwargs": self.opt_catalog.get_optimizer_kwargs(),
-            "lr_scheduler_cls": ReduceLROnPlateau,
-            "lr_scheduler_kwargs": self.lr_scheduler_args,
+            "lr_scheduler_cls": self.sched_catalog.get_scheduler_cls(),
+            "lr_scheduler_kwargs": self.sched_catalog.get_scheduler_kwargs(),
+            "add_encoders": self._resolve_add_encoders(),
         }
+
+    def _resolve_add_encoders(self) -> dict | None:
+        """Return the add_encoders dict for this run.
+
+        Priority:
+        1. Explicit ``add_encoders`` key in config — returned as-is.
+        2. ``use_cyclic_encoders: True`` flag — selects encoder functions
+           automatically from ``config['level']`` (e.g. 'cm', 'pgd', 'cw')
+           so the sweep config stays JSON-serialisable (no function objects).
+           The temporal resolution is inferred from the last character:
+             m → month-of-year (period 12)
+             w → week-of-year  (period 52)
+             d → day-of-week (period 7) + day-of-year (period 365)
+             y → no cyclic encoding (yearly data has no intra-year cycle)
+        3. Neither set — returns None.
+        """
+        if self.config.get("add_encoders") is not None:
+            return self.config["add_encoders"]
+
+        if self.config.get("use_cyclic_encoders", False):
+            level = self.config.get("level", "cm")
+            resolution = level[-1]  # 'cm' → 'm', 'pgd' → 'd', etc.
+            encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
+            if not encoders:
+                return None
+            return {
+                "custom": {"past": encoders, "future": encoders},
+                "position": {"past": ["relative"], "future": ["relative"]},
+            }
+
+        return None
 
     def get_model(self, model_name: str):
         """
@@ -156,18 +210,19 @@ class ModelCatalog:
 
         return TFTModel(
             **self._get_common_model_args(),
-            feed_forward=self.config.get("feed_forward"),
-            add_relative_index=self.config.get("add_relative_index"),
-            use_static_covariates=self.config.get("use_static_covariates"),
-            full_attention=self.config.get("full_attention"),
+            hidden_size=self.config.get("hidden_size"),
             lstm_layers=self.config.get("lstm_layers"),
             num_attention_heads=self.config.get("num_attention_heads"),
-            hidden_size=self.config.get("hidden_size"),
+            full_attention=self.config.get("full_attention"),
+            feed_forward=self.config.get("feed_forward"),
             dropout=self.config.get("dropout"),
-            norm_type=self.config.get("norm_type"),
-            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
-            skip_interpolation=self.config.get("skip_interpolation"),
             hidden_continuous_size=self.config.get("hidden_continuous_size"),
+            categorical_embedding_sizes=self.config.get("categorical_embedding_sizes"),
+            add_relative_index=self.config.get("add_relative_index"),
+            skip_interpolation=self.config.get("skip_interpolation"),
+            norm_type=self.config.get("norm_type"),
+            use_static_covariates=self.config.get("use_static_covariates"),
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_nbeats(self):
@@ -180,8 +235,11 @@ class ModelCatalog:
             num_blocks=self.config.get("num_blocks"),
             num_layers=self.config.get("num_layers"),
             layer_widths=self.config.get("layer_widths"),
+            expansion_coefficient_dim=self.config.get("expansion_coefficient_dim"),
+            trend_polynomial_degree=self.config.get("trend_polynomial_degree"),
             activation=self.config.get("activation"),
             dropout=self.config.get("dropout"),
+            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
     def _get_nhits(self):
@@ -209,7 +267,9 @@ class ModelCatalog:
             **self._get_common_model_args(),
             kernel_size=self.config.get("kernel_size"),
             num_filters=self.config.get("num_filters"),
+            num_layers=self.config.get("num_layers"),
             dilation_base=self.config.get("dilation_base"),
+            weight_norm=self.config.get("weight_norm"),
             dropout=self.config.get("dropout"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
@@ -221,9 +281,11 @@ class ModelCatalog:
             **self._get_common_model_args(),
             model=self.config.get("rnn_type"),
             hidden_dim=self.config.get("hidden_dim"),
-            activation=self.config.get("activation"),
             n_rnn_layers=self.config.get("n_rnn_layers"),
+            hidden_fc_sizes=self.config.get("hidden_fc_sizes"),
             dropout=self.config.get("dropout"),
+            activation=self.config.get("activation"),
+            use_static_covariates=self.config.get("use_static_covariates"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )
 
@@ -281,6 +343,8 @@ class ModelCatalog:
             hidden_size=self.config.get("hidden_size"),
             temporal_width_past=self.config.get("temporal_width_past"),
             temporal_width_future=self.config.get("temporal_width_future"),
+            temporal_hidden_size_past=self.config.get("temporal_hidden_size_past"),
+            temporal_hidden_size_future=self.config.get("temporal_hidden_size_future"),
             temporal_decoder_hidden=self.config.get("temporal_decoder_hidden"),
             use_layer_norm=self.config.get("use_layer_norm"),
             dropout=self.config.get("dropout"),

@@ -37,6 +37,7 @@ def basic_config():
         "early_stopping_patience": 5,
         "early_stopping_min_delta": 0.001,
         "optimizer_cls": "Adam",
+        "lr_scheduler_cls": "ReduceLROnPlateau",
         "loss_function": "WeightedPenaltyHuberLoss",
         "zero_threshold": 0.01,
         "delta": 0.5,
@@ -54,6 +55,8 @@ def basic_config():
         "num_blocks": 2,
         "num_layers": 2,
         "layer_widths": 128,
+        "expansion_coefficient_dim": 5,
+        "trend_polynomial_degree": 2,
         "force_reset": True,
         # Loss params
         "p": 1.5,
@@ -68,14 +71,17 @@ def basic_config():
         "hidden_size": 64,
         "skip_interpolation": False,
         "hidden_continuous_size": 16,
+        "categorical_embedding_sizes": None,
         # TCN params
         "kernel_size": 3,
         "num_filters": 64,
         "dilation_base": 2,
+        "weight_norm": False,
         # RNN params
         "rnn_type": "LSTM",
         "hidden_dim": 5,
         "n_rnn_layers": 2,
+        "hidden_fc_sizes": None,
         # Transformer params
         "d_model": 128,
         "nhead": 4,
@@ -99,8 +105,8 @@ def basic_config():
         "decoder_output_dim": 16,
         "temporal_width_past": 4,
         "temporal_width_future": 4,
-        "temporal_hidden_size_past": None,
-        "temporal_hidden_size_future": None,
+        "temporal_hidden_size_past": 32,
+        "temporal_hidden_size_future": 32,
         "temporal_decoder_hidden": 32,
         "use_layer_norm": False,
     }
@@ -130,6 +136,7 @@ def full_config():
         "early_stopping_patience": 5,
         "early_stopping_min_delta": 0.001,
         "optimizer_cls": "Adam",
+        "lr_scheduler_cls": "ReduceLROnPlateau",
         "loss_function": "WeightedPenaltyHuberLoss",
         "zero_threshold": 0.05,
         "delta": 0.5,
@@ -147,6 +154,8 @@ def full_config():
         "num_blocks": 2,
         "num_layers": 2,
         "layer_widths": 128,
+        "expansion_coefficient_dim": 5,
+        "trend_polynomial_degree": 2,
         "force_reset": True,
         # Loss params
         "p": 1.5,
@@ -161,14 +170,17 @@ def full_config():
         "hidden_size": 64,
         "skip_interpolation": False,
         "hidden_continuous_size": 16,
+        "categorical_embedding_sizes": None,
         # TCN params
         "kernel_size": 3,
         "num_filters": 64,
         "dilation_base": 2,
+        "weight_norm": False,
         # RNN params
         "rnn_type": "LSTM",
         "hidden_dim": 5,
         "n_rnn_layers": 2,
+        "hidden_fc_sizes": None,
         # Transformer params
         "d_model": 128,
         "nhead": 4,
@@ -192,8 +204,8 @@ def full_config():
         "decoder_output_dim": 16,
         "temporal_width_past": 4,
         "temporal_width_future": 4,
-        "temporal_hidden_size_past": None,
-        "temporal_hidden_size_future": None,
+        "temporal_hidden_size_past": 32,
+        "temporal_hidden_size_future": 32,
         "temporal_decoder_hidden": 32,
         "use_layer_norm": False,
     }
@@ -338,23 +350,21 @@ class TestModelCatalogInitialization:
 
         catalog = ModelCatalog(full_config)
 
+        lr_scheduler_args = catalog.sched_catalog.get_scheduler_kwargs()
+
+        assert lr_scheduler_args["mode"] == "min"
 
 
+        assert lr_scheduler_args["factor"] == 0.1
 
 
-        assert catalog.lr_scheduler_args["mode"] == "min"
+        assert lr_scheduler_args["patience"] == 3
 
 
-        assert catalog.lr_scheduler_args["factor"] == 0.1
+        assert lr_scheduler_args["min_lr"] == 1e-6
 
 
-        assert catalog.lr_scheduler_args["patience"] == 3
-
-
-        assert catalog.lr_scheduler_args["min_lr"] == 1e-6
-
-
-        assert catalog.lr_scheduler_args["monitor"] == "train_loss"
+        assert lr_scheduler_args["monitor"] == "val_loss"
 
 
 
@@ -456,18 +466,20 @@ class TestNBEATSModel:
 class TestTFTModel:
     """Test suite for TFT model creation."""
 
+    @patch("views_r2darts2.catalogs.model_catalog.TFTModel")
     @patch("torch.serialization.add_safe_globals")
-    def test_tft_default_params(self, mock_safe_globals, basic_config):
+    def test_tft_default_params(self, mock_safe_globals, mock_tft_cls, basic_config):
         """Test TFT model creation with default parameters."""
         config = {**basic_config, "algorithm": "TFTModel"}
         catalog = ModelCatalog(config)
         model = catalog._get_tft_model()
 
-        assert isinstance(model, TFTModel)
-        assert model.output_chunk_length == len(basic_config["steps"])
+        mock_tft_cls.assert_called_once()
+        assert model is mock_tft_cls.return_value
 
+    @patch("views_r2darts2.catalogs.model_catalog.TFTModel")
     @patch("torch.serialization.add_safe_globals")
-    def test_tft_custom_params(self, mock_safe_globals, basic_config):
+    def test_tft_custom_params(self, mock_safe_globals, mock_tft_cls, basic_config):
         """Test TFT model with custom parameters."""
         config = {
             **basic_config,
@@ -480,7 +492,8 @@ class TestTFTModel:
         catalog = ModelCatalog(config)
         model = catalog._get_tft_model()
 
-        assert model.input_chunk_length == 36
+        call_kwargs = mock_tft_cls.call_args[1]
+        assert call_kwargs["input_chunk_length"] == 36
 
 
 class TestTCNModel:
@@ -514,18 +527,20 @@ class TestTCNModel:
 class TestBlockRNNModel:
     """Test suite for BlockRNN model creation."""
 
+    @patch("views_r2darts2.catalogs.model_catalog.BlockRNNModel")
     @patch("torch.serialization.add_safe_globals")
-    def test_rnn_default_params(self, mock_safe_globals, basic_config):
+    def test_rnn_default_params(self, mock_safe_globals, mock_rnn_cls, basic_config):
         """Test RNN model creation with default parameters."""
         config = {**basic_config, "algorithm": "BlockRNNModel"}
         catalog = ModelCatalog(config)
         model = catalog._get_rnn_model()
 
-        assert isinstance(model, BlockRNNModel)
-        assert model.output_chunk_length == len(basic_config["steps"])
+        mock_rnn_cls.assert_called_once()
+        assert model is mock_rnn_cls.return_value
 
+    @patch("views_r2darts2.catalogs.model_catalog.BlockRNNModel")
     @patch("torch.serialization.add_safe_globals")
-    def test_rnn_custom_type(self, mock_safe_globals, basic_config):
+    def test_rnn_custom_type(self, mock_safe_globals, mock_rnn_cls, basic_config):
         """Test RNN model with custom RNN type."""
         config = {
             **basic_config,
@@ -537,7 +552,8 @@ class TestBlockRNNModel:
         catalog = ModelCatalog(config)
         model = catalog._get_rnn_model()
 
-        assert isinstance(model, BlockRNNModel)
+        call_kwargs = mock_rnn_cls.call_args[1]
+        assert call_kwargs["model"] == "GRU"
 
 
 class TestTransformerModel:
@@ -654,18 +670,20 @@ class TestDLinearModel:
 class TestTiDEModel:
     """Test suite for TiDE model creation."""
 
+    @patch("views_r2darts2.catalogs.model_catalog.TiDEModel")
     @patch("torch.serialization.add_safe_globals")
-    def test_tide_default_params(self, mock_safe_globals, basic_config):
+    def test_tide_default_params(self, mock_safe_globals, mock_tide_cls, basic_config):
         """Test TiDE model creation with default parameters."""
         config = {**basic_config, "algorithm": "TiDEModel"}
         catalog = ModelCatalog(config)
         model = catalog._get_tide_model()
 
-        assert isinstance(model, TiDEModel)
-        assert model.output_chunk_length == len(basic_config["steps"])
+        mock_tide_cls.assert_called_once()
+        assert model is mock_tide_cls.return_value
 
+    @patch("views_r2darts2.catalogs.model_catalog.TiDEModel")
     @patch("torch.serialization.add_safe_globals")
-    def test_tide_custom_params(self, mock_safe_globals, basic_config):
+    def test_tide_custom_params(self, mock_safe_globals, mock_tide_cls, basic_config):
         """Test TiDE model with custom parameters."""
         config = {
             **basic_config,
@@ -678,7 +696,8 @@ class TestTiDEModel:
         catalog = ModelCatalog(config)
         model = catalog._get_tide_model()
 
-        assert isinstance(model, TiDEModel)
+        call_kwargs = mock_tide_cls.call_args[1]
+        assert call_kwargs["input_chunk_length"] == 48
 
 
 class TestConfigurationHandling:

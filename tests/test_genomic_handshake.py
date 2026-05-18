@@ -1,5 +1,6 @@
 import pytest
 import torch
+from unittest.mock import patch, MagicMock
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
 from views_r2darts2.catalogs.optimizer_catalog import OptimizerCatalog
 from views_r2darts2.catalogs.model_catalog import ModelCatalog
@@ -35,21 +36,24 @@ def test_loss_catalog_genome_enforcement():
 
 def test_model_catalog_delegation():
     """Green Team: Verify ModelCatalog delegation."""
-    config = {
-        "algorithm": "NLinearModel", "name": "test_model", "random_state": 42,
-        "loss_function": "MSELoss", "optimizer_cls": "Adam", "lr": 0.001, "weight_decay": 0.0,
-        "batch_size": 32, "n_epochs": 1, "input_chunk_length": 12, "output_chunk_length": 1,
-        "output_chunk_shift": 0, "shared_weights": True, "const_init": True, "normalize": False,
-        "use_static_covariates": False, "use_reversible_instance_norm": False,
-        "early_stopping_patience": 5, "early_stopping_min_delta": 0.0,
-        "lr_scheduler_factor": 0.1, "lr_scheduler_patience": 3, "lr_scheduler_min_lr": 1e-6,
-        "gradient_clip_val": 1.0, "steps": [1], "run_type": "test", "num_samples": 1, "mc_dropout": False
-    }
-    catalog = ModelCatalog(config)
-    model = catalog.get_model("NLinearModel")
-    assert isinstance(model.model_params["loss_fn"], torch.nn.MSELoss)
-    assert model.model_params["optimizer_cls"] == torch.optim.Adam
-    print("✓ Model Catalog Delegation Verified.")
+    with patch("views_r2darts2.catalogs.model_catalog.WandbLogger"), \
+         patch("views_r2darts2.catalogs.model_catalog.DartsForecaster.get_device", return_value="cpu"), \
+         patch("torch.serialization.add_safe_globals"):
+        config = {
+            "algorithm": "NLinearModel", "name": "test_model", "random_state": 42,
+            "loss_function": "MSELoss", "optimizer_cls": "Adam", "lr_scheduler_cls": "ReduceLROnPlateau", "lr": 0.001, "weight_decay": 0.0,
+            "batch_size": 32, "n_epochs": 1, "input_chunk_length": 12, "output_chunk_length": 1,
+            "output_chunk_shift": 0, "shared_weights": True, "const_init": True, "normalize": False,
+            "use_static_covariates": False, "use_reversible_instance_norm": False,
+            "early_stopping_patience": 5, "early_stopping_min_delta": 0.0,
+            "lr_scheduler_factor": 0.1, "lr_scheduler_patience": 3, "lr_scheduler_min_lr": 1e-6,
+            "gradient_clip_val": 1.0, "steps": [1], "run_type": "test", "num_samples": 1, "mc_dropout": False
+        }
+        catalog = ModelCatalog(config)
+        model = catalog.get_model("NLinearModel")
+        assert isinstance(model.model_params["loss_fn"], torch.nn.MSELoss)
+        assert model.model_params["optimizer_cls"] == torch.optim.Adam
+        print("✓ Model Catalog Delegation Verified.")
 
 if __name__ == "__main__":
     try:

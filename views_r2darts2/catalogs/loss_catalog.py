@@ -8,6 +8,16 @@ from views_r2darts2.math.weighted_penalty_huber_loss import WeightedPenaltyHuber
 from views_r2darts2.math.tweedie_loss import TweedieLoss
 from views_r2darts2.math.asymmetric_quantile_loss import AsymmetricQuantileLoss
 from views_r2darts2.math.zero_inflated_loss import ZeroInflatedLoss
+from views_r2darts2.math.prism_loss import PrismLoss
+from views_r2darts2.math.spotlight_loss import SpotlightLoss
+from views_r2darts2.math.spotlight_loss_logcosh import SpotlightLossLogcosh
+from views_r2darts2.math.spotlight_loss_huber import SpotlightLossHuber
+from views_r2darts2.math.spotlight_loss_asinh import SpotlightLossAsinh
+from views_r2darts2.math.spotlight_loss_power_law import SpotlightLossPowerLaw
+from views_r2darts2.math.spotlight_focal_loss import SpotlightFocalLoss
+from views_r2darts2.math.sentinel_loss import SentinelLoss
+from views_r2darts2.math.charbonnier_loss import CharbonnierLoss
+
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +34,7 @@ class LossCatalog:
         
         self._all_potential_args = {
             "zero_threshold": self.config.get("zero_threshold"),
+            "non_zero_threshold": self.config.get("non_zero_threshold"),
             "delta": self.config.get("delta"),
             "non_zero_weight": self.config.get("non_zero_weight"),
             "false_negative_weight": self.config.get("false_negative_weight"),
@@ -39,6 +50,10 @@ class LossCatalog:
             "p": self.config.get("p"),
             "eps": self.config.get("eps"),
             "decay_factor": self.config.get("decay_factor"),
+            "beta": self.config.get("beta"),
+            "kappa": self.config.get("kappa"),
+            "event_weight": self.config.get("event_weight"),
+            "dual_mean": self.config.get("dual_mean"),
         }
 
     def get_loss(self) -> torch.nn.Module:
@@ -53,6 +68,15 @@ class LossCatalog:
             "AsymmetricQuantileLoss": AsymmetricQuantileLoss,
             "ZeroInflatedLoss": ZeroInflatedLoss,
             "ShrinkageLoss": ShrinkageLoss,
+            "PrismLoss": PrismLoss,
+            "SpotlightLoss": SpotlightLoss,
+            "SpotlightLossLogcosh": SpotlightLossLogcosh,
+            "SpotlightLossHuber": SpotlightLossHuber,
+            "SpotlightLossAsinh": SpotlightLossAsinh,
+            "SpotlightLossPowerLaw": SpotlightLossPowerLaw,
+            "SpotlightFocalLoss": SpotlightFocalLoss,
+            "SentinelLoss": SentinelLoss,
+            "CharbonnierLoss": CharbonnierLoss,
             "MSELoss": torch.nn.MSELoss,
             "L1Loss": torch.nn.L1Loss,
             "HuberLoss": torch.nn.HuberLoss,

@@ -33,6 +33,9 @@ jobs:
         poetry install 
 
     - name: Run tests
+      env:
+        WANDB_MODE: offline
+        WANDB_SILENT: "true"
       run: |
         set -e
         poetry run pytest tests/

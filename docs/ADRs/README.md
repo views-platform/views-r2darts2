@@ -65,6 +65,12 @@ ADRs numbered 010 and above define specific infrastructure, mathematical, and do
 - **ADR-013** — Physical Symmetrical Architecture  
   Mandates the 1-Class-1-File Zen standard for file organization.
 
+- **ADR-014** — Technical Risk Register  
+  Adopts a durable risk register as a first-class governance artifact.
+
+- **ADR-015** — Artifact-Prediction Timestamp Contract  
+  Documents the correct timestamp extraction pattern (satellite of views-pipeline-core ADR-052).
+
 These must comply with the constitutional ADRs above.
 
 ---
@@ -84,5 +90,7 @@ These must comply with the constitutional ADRs above.
 - **Testing (005)** verifies system integrity.
 - **Intent Contracts (006)** bind class-level behavior.
 - **Automation Governance (007)** constrains silicon-based agents.
+- **Risk Register (014)** tracks known risks durably.
+- **Timestamp Contract (015)** preserves artifact-prediction traceability.
 
 Together, these define the invariant layer of the Fortress architecture.

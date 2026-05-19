@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-05-19
-**Deciders:** Simon, VIEWS platform team
+**Deciders:** Simon Polichinel von der Maase
 **Consulted:** views-pipeline-core ADR-052 (central contract)
 
 ---
@@ -71,7 +71,6 @@ Not applicable — the implementation is already correct. This ADR documents exi
 
 ## Validation & Monitoring
 
-- **Existing tests:** The r2darts2 test suite validates the evaluate and forecast flows.
 - **Failure signal:** Ensemble evaluation failing with "prediction file not found" for r2darts2 constituents would indicate a regression.
 
 ---

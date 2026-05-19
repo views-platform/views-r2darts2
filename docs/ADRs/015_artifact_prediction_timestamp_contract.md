@@ -60,7 +60,7 @@ Not applicable — the implementation is already correct. This ADR documents exi
 ## Implementation Notes
 
 - **No code changes required.**
-- **Actual pattern** (from `darts_forecasting_model_manager.py:265-266,398-399`):
+- **Actual pattern** (in `_evaluate_model_artifact()` and `_forecast_model_artifact()`):
   ```python
   timestamp = path_artifact.stem[-15:]
   self._config_manager.add_config({"timestamp": timestamp})

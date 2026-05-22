@@ -197,22 +197,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _windowed_level_loss(self, e: torch.Tensor, T: int) -> torch.Tensor:
-        """Windowed log_cosh level anchor (uniform aggregation).
+        """Windowed log_cosh level anchor with hierarchical DRO.
 
         Splits the T-length error into non-overlapping windows of width
-        max(6, T//3) (~3 wide windows), computes log_cosh_proportional on
-        per-window means, then averages uniformly.  Scaled by T: necessary
-        to overcome the 90% zero-cell majority pulling the DC component
-        toward zero.  Empirically, √T is insufficient — both TsMixer and
-        TiDE flatlined with it because level never converged and shape had
-        no stable DC base to refine.
+        max(6, T//3) (~3 wide windows).  Two-level DRO:
+          Level 1 (within-series): which windows are worst per country?
+          Level 2 (cross-series): which countries have worst level error?
+        Returns unscaled — caller applies adaptive ratio.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
+        # (B, n_windows)
         level_losses = self._log_cosh_proportional(window_means)
-        return T * level_losses.mean()
+
+        # Within-series DRO: which windows matter for each country
+        w_within = self._dro_weights_2d(level_losses)  # (B, n_windows)
+        series_level = (w_within * level_losses).mean(dim=1)  # (B,)
+
+        # Cross-series DRO: which countries need more level gradient
+        w_series = self._dro_weights(series_level)  # (B,)
+        w_series = w_series / w_series.mean().clamp(min=1e-8)
+
+        return (w_series * series_level).mean()
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Soft-weighted temporal gradient matching — fully data-driven.
@@ -315,7 +323,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            total = total + self._log_cosh(mag_pred - mag_true).mean()
+            # total = total + self._log_cosh(mag_pred - mag_true).mean()
+            total = total + self._log_cosh_proportional(mag_pred - mag_true).mean()
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -349,11 +358,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         event_mag = log_ratio / (1.0 + log_ratio)
         w_compound = 1.0 + 4.0 * difficulty * event_mag
 
-        # ── Weighted shape loss (compound only, no DRO) ──────────────────
-        w_total = w_compound / w_compound.mean().clamp(min=1e-8)
-        loss_shape = (w_total * cell_loss).mean()
+        # ── Hierarchical shape DRO ───────────────────────────────────────
+        # Level 1: within-series DRO (which timesteps for THIS country)
+        w_dro_within = self._dro_weights_2d(cell_loss)            # (B, T)
+        w_within = w_compound * w_dro_within
+        w_within = w_within / w_within.mean(dim=1, keepdim=True).clamp(min=1e-8)
+        series_loss = (w_within * cell_loss).mean(dim=1)          # (B,)
 
-        # ── Windowed level anchor ─────────────────────────────────────
+        # Level 2: cross-series DRO (which countries need more gradient)
+        w_series = self._dro_weights(series_loss)                  # (B,)
+        w_series = w_series / w_series.mean().clamp(min=1e-8)
+        loss_shape = (w_series * series_loss).mean()
+
+        # ── Windowed level anchor (hierarchical DRO, no ratio pin) ───
         loss_level = self._windowed_level_loss(e, T)
 
         # ── Curriculum gate for regularisers ────────────────────────

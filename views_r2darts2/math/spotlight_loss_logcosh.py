@@ -197,24 +197,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _windowed_level_loss(self, e: torch.Tensor, T: int) -> torch.Tensor:
-        """Windowed log_cosh level anchor with DRO aggregation.
+        """Windowed log_cosh level anchor (uniform aggregation).
 
         Splits the T-length error into non-overlapping windows of width
-        max(6, T//3) (~3 wide windows), computes log_cosh on per-window
-        means, then aggregates with DRO weights.  Scaled by T: necessary
+        max(6, T//3) (~3 wide windows), computes log_cosh_proportional on
+        per-window means, then averages uniformly.  Scaled by T: necessary
         to overcome the 90% zero-cell majority pulling the DC component
         toward zero.  Empirically, √T is insufficient — both TsMixer and
         TiDE flatlined with it because level never converged and shape had
-        no stable DC base to refine.  The flat-minimum-at-window-mean is
-        broken by ungated STFT instead of weakening level.
+        no stable DC base to refine.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
         level_losses = self._log_cosh_proportional(window_means)
-        w = self._dro_weights(level_losses.flatten()).view_as(level_losses)
-        return T * (w * level_losses).mean()
+        return T * level_losses.mean()
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Soft-weighted temporal gradient matching — fully data-driven.
@@ -345,14 +343,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_e = torch.abs(e_shape.detach())
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         difficulty = 1.0 - torch.exp(-abs_e)
-        event_mag = abs_max / (self.non_zero_threshold + abs_max)
+        # Log-damped event_mag: spreads dynamic range across mid-to-high
+        # conflict magnitudes instead of saturating at low deaths.
+        log_ratio = torch.log1p(abs_max / self.non_zero_threshold)
+        event_mag = log_ratio / (1.0 + log_ratio)
         w_compound = 1.0 + 4.0 * difficulty * event_mag
 
-        # ── Shape DRO (global) ─────────────────────────────────────────
-        w_dro = self._dro_weights(cell_loss.flatten()).view_as(cell_loss)
-        w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean()
-        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
+        # ── Weighted shape loss (compound only, no DRO) ──────────────────
+        w_total = w_compound / w_compound.mean().clamp(min=1e-8)
         loss_shape = (w_total * cell_loss).mean()
 
         # ── Windowed level anchor ─────────────────────────────────────

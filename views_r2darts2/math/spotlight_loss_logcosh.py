@@ -43,22 +43,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
        event_mag > 0.5.  w_compound = 1 + 4 × difficulty × event_mag
        ∈ [1, 5).  Self-correcting: as |e|→0, w→1.
 
-    3. **KL-DRO tail aggregation (log-space)** — parameter-free.
+    3. **Hierarchical regret-DRO aggregation (log-space)** — parameter-free.
 
-       Z-score log(cell_loss) globally across all B×T cells, apply
-       concave log1p weights, soft alpha-blend toward uniform when
-       variance is small.  Detects *proportional* outliers across
-       the 90/10 peace/event split.
+       Within each country, DRO selects difficult timesteps/windows.
+       Across countries, DRO is applied to relative regret versus each
+       country's own target signal, so high-intensity countries do not
+       dominate solely by absolute magnitude.  Baseline floor prevents
+       peace countries (zero target) from inflating regret.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window
-       mean error with DRO aggregation.
+    4. **Windowed level anchor** — event-aware log_cosh_proportional on
+       per-window mean error with hierarchical regret-DRO aggregation.
 
        Only mechanism that can shift per-series means (shape loss is
        structurally DC-blind).  Windows of width max(6, T//3) (~3 wide
-       windows) catch intra-horizon level drift.  Scaled by T: necessary
-       to overcome the 90% zero-cell majority.  √T empirically caused
-       flatlines (TsMixer + TiDE) because DC never converged.  The
-       flat-window-mean attractor is broken by ungated STFT instead.
+       windows) catch intra-horizon level drift.  Event-aware within-
+       series DRO ensures low/medium conflict windows are not treated as
+       ordinary peace-window noise.
 
     5. **Temporal gradient matching** — log_cosh on first-difference
        errors (∂ŷ/∂t − ∂y/∂t).  Soft-weighted, fully data-driven.
@@ -75,16 +75,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
        differences at three (n_fft, hop) resolutions, AC bins only.
        DC bin masked (level anchor handles DC).  Safe magnitude
        sqrt(re²+im²+ε) avoids gradient blowup at |z|→0.  Only series
-       with signal above τ are included.  Always on, no hyperparameters.
+       with signal above τ are included.  Per-series RMS-normalized so
+       contribution is invariant to signal magnitude.  Gradient budget
+       is tied dynamically to shape loss.
 
-    ── Base cell loss: log_cosh × (1 + log(1+|x|³))  (proportional) ───
+    ── Base cell loss: log_cosh × (1 + log(1+|x|²))  (proportional) ───
 
-    Multiplies log_cosh by (1 + log(1+|x|³)) to restore proportional
-    sensitivity for large errors.  For |x|<1: ≈0.5x² (cubic interior
-    shrinks faster toward zero, so noise cells are quieter).
-    For |x|>2: ≈|x|·3·ln|x|, ~50% steeper than x² variant while
-    remaining in the same O(ln) growth class (non-explosive).
-    Gradient = tanh(x)·(1+log1p(|x|³)) + log_cosh(x)·3x²·sign(x)/(1+|x|³).
+    Multiplies log_cosh by (1 + log(1+|x|²)) to restore proportional
+    sensitivity for large errors without letting extreme-country errors
+    dominate low/medium-intensity conflict.  Asinh-space errors are
+    already approximately log-ratio errors, so the squared multiplier is
+    MSLE-aligned and milder than the earlier cubic variant.
+    For |x|<1: ≈0.5x² with mild proportional correction.
+    For |x|>2: ≈|x|·2·ln|x|.
+    Gradient = tanh(x)·(1+log1p(|x|²)) + log_cosh(x)·2x/(1+|x|²).
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -118,11 +122,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
-        # Curriculum gating: regularisers activate as core loss converges.
-        # persistent=False: excluded from state_dict — resets each training
-        # run, no checkpoint mismatch on load.
-        self.register_buffer('_core_ema', torch.tensor(float('inf')), persistent=False)
-        self.register_buffer('_core_peak', torch.tensor(0.0), persistent=False)
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -139,18 +138,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _log_cosh_proportional(x: torch.Tensor) -> torch.Tensor:
         """log_cosh with proportional sensitivity correction.
 
-        log_cosh(x) × (1 + log(1 + |x|³)).
+        log_cosh(x) × (1 + log(1 + |x|²)).
 
-        For |x| < 1: ≈ 0.5x² (cubic interior shrinks faster toward zero,
-            so noise cells are quieter than the old x² variant).
-        For |x| > 2: ≈ |x| × 3·ln|x| (~50% steeper than x² formula).
+        For |x| < 1: ≈ 0.5x² with mild proportional correction.
+        For |x| > 2: ≈ |x| × 2·ln|x|.  Asinh-space errors are already
+            approximately log-ratio errors, so this reinforces MSLE
+            sensitivity without letting extreme countries monopolise
+            gradients.
 
-        Gradient = tanh(x)·(1 + log1p(|x|³))
-                   + log_cosh(x)·3x²·sign(x)/(1+|x|³).
+        Gradient = tanh(x)·(1 + log1p(|x|²))
+                   + log_cosh(x)·2x·sign(x)/(1+|x|²).
         """
         abs_x = torch.abs(x)
         lc = abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
-        return lc * (1.0 + torch.log1p(abs_x * abs_x * abs_x))
+        return lc * (1.0 + torch.log1p(abs_x * abs_x))
 
     @staticmethod
     def _dro_weights(losses: torch.Tensor) -> torch.Tensor:
@@ -196,14 +197,34 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w = alpha * w + (1.0 - alpha)
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
-    def _windowed_level_loss(self, e: torch.Tensor, T: int) -> torch.Tensor:
-        """Windowed log_cosh level anchor with hierarchical DRO.
+    def _event_magnitude(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Continuous union eventness in transformed space.
+
+        A cell is event-relevant if conflict appears in either y_true or
+        y_pred.  The prediction branch is detached so false positives can
+        receive corrective weighting without creating a second gradient
+        path through the weights.
+        """
+        abs_union = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        log_ratio = torch.log1p(abs_union / self.non_zero_threshold)
+        return log_ratio / (1.0 + log_ratio)
+
+    def _windowed_level_loss(
+        self,
+        e: torch.Tensor,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        T: int,
+    ) -> torch.Tensor:
+        """Windowed log_cosh level anchor with event-aware hierarchical DRO.
 
         Splits the T-length error into non-overlapping windows of width
         max(6, T//3) (~3 wide windows).  Two-level DRO:
-          Level 1 (within-series): which windows are worst per country?
-          Level 2 (cross-series): which countries have worst level error?
-        Returns unscaled — caller applies adaptive ratio.
+          Level 1 (within-series): event-aware — windows containing
+              conflict get DRO priority over peace-noise windows.
+          Level 2 (cross-series): regret-based — prioritises countries
+              proportionally underfit vs their own target signal, with
+              baseline floor to prevent peace-country inflation.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
@@ -212,12 +233,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # (B, n_windows)
         level_losses = self._log_cosh_proportional(window_means)
 
-        # Within-series DRO: which windows matter for each country
-        w_within = self._dro_weights_2d(level_losses)  # (B, n_windows)
+        # Event-awareness: per-window max event magnitude
+        event_cell = self._event_magnitude(y_pred, y_true)
+        window_event = torch.stack(
+            [ew.amax(dim=1) for ew in event_cell.split(W, dim=1)], dim=1
+        )
+
+        # Within-series DRO score: event-aware window difficulty
+        level_score = level_losses.detach() * (1.0 + window_event.detach())
+        w_within = self._dro_weights_2d(level_score)  # (B, n_windows)
         series_level = (w_within * level_losses).mean(dim=1)  # (B,)
 
-        # Cross-series DRO: which countries need more level gradient
-        w_series = self._dro_weights(series_level)  # (B,)
+        # Cross-series regret DRO with baseline floor
+        target_window_means = torch.stack(
+            [yw.mean(dim=1) for yw in y_true.split(W, dim=1)], dim=1
+        )
+        level_baseline = self._log_cosh_proportional(target_window_means).mean(dim=1).detach()
+        level_baseline = level_baseline.clamp(min=self.non_zero_threshold * 0.01)
+
+        series_score = series_level.detach() / (
+            series_level.detach() + level_baseline + 1e-8
+        )
+        w_series = self._dro_weights(series_score)  # (B,)
         w_series = w_series / w_series.mean().clamp(min=1e-8)
 
         return (w_series * series_level).mean()
@@ -323,8 +360,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            # total = total + self._log_cosh(mag_pred - mag_true).mean()
-            total = total + self._log_cosh_proportional(mag_pred - mag_true).mean()
+            # Per-series RMS normalization: makes spectral loss measure
+            # relative shape mismatch, invariant to signal magnitude.
+            rms = mag_true.norm(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+            total = total + self._log_cosh((mag_pred - mag_true) / rms).mean()
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -350,12 +389,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Compound weighting ────────────────────────────────────────
         abs_e = torch.abs(e_shape.detach())
-        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         difficulty = 1.0 - torch.exp(-abs_e)
-        # Log-damped event_mag: spreads dynamic range across mid-to-high
-        # conflict magnitudes instead of saturating at low deaths.
-        log_ratio = torch.log1p(abs_max / self.non_zero_threshold)
-        event_mag = log_ratio / (1.0 + log_ratio)
+        event_mag = self._event_magnitude(y_pred, y_true)
         w_compound = 1.0 + 4.0 * difficulty * event_mag
 
         # ── Hierarchical shape DRO ───────────────────────────────────────
@@ -365,46 +400,46 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_within = w_within / w_within.mean(dim=1, keepdim=True).clamp(min=1e-8)
         series_loss = (w_within * cell_loss).mean(dim=1)          # (B,)
 
-        # Level 2: cross-series DRO (which countries need more gradient)
-        w_series = self._dro_weights(series_loss)                  # (B,)
+        # Level 2: cross-series regret DRO — decouple compound from
+        # the ranking path to prevent high-intensity feedback loop.
+        # Score uses DRO-only weights (no compound amplification).
+        w_score_within = w_dro_within / w_dro_within.mean(
+            dim=1, keepdim=True
+        ).clamp(min=1e-8)
+        series_score_loss = (w_score_within * cell_loss).mean(dim=1).detach()
+
+        # Regret: how underfit is this country relative to its own
+        # target signal complexity?  Baseline floor prevents peace
+        # countries (baseline≈0) from getting infinite regret.
+        target_shape = y_true - y_true.mean(dim=1, keepdim=True)
+        shape_baseline = self._log_cosh_proportional(target_shape).mean(dim=1).detach()
+        shape_baseline = shape_baseline.clamp(min=self.non_zero_threshold * 0.01)
+
+        regret = series_score_loss / (series_score_loss + shape_baseline + 1e-8)
+        w_series = self._dro_weights(regret)                       # (B,)
         w_series = w_series / w_series.mean().clamp(min=1e-8)
         loss_shape = (w_series * series_loss).mean()
 
-        # ── Windowed level anchor (hierarchical DRO, no ratio pin) ───
-        loss_level = self._windowed_level_loss(e, T)
+        # ── Windowed level anchor (event-aware hierarchical DRO) ─────
+        loss_level = self._windowed_level_loss(e, y_pred, y_true, T)
 
-        # ── Curriculum gate for regularisers ────────────────────────
-        # Track EMA of core (shape+level) loss and its peak.
-        # gate = fraction of peak loss recovered: 0.05 at start, opens as
-        # core converges. If core spikes (bad batch / interference),
-        # gate contracts automatically.  Prevents timing/spectral
-        # gradients from competing with shape+level during early learning.
-        # Leaky peak (×0.999/batch, half-life ≈ 693 batches) avoids
-        # permanent inflation from outlier batches.
-        core_det = (loss_shape + loss_level).detach()
-        if self.training:
-            with torch.no_grad():
-                if torch.isinf(self._core_ema):
-                    self._core_ema.fill_(core_det)
-                else:
-                    self._core_ema.lerp_(core_det, 0.05)
-                self._core_peak.copy_(torch.max(self._core_peak * 0.999, self._core_ema))
-        if torch.isinf(self._core_ema) or self._core_peak < 1e-8:
-            gate = core_det.new_tensor(0.05)
-        else:
-            gate = (1.0 - self._core_ema / (self._core_peak + 1e-8)).clamp(0.05, 1.0)
-
-        # ── Temporal gradient matching (gated) ─────────────────────
+        # ── Temporal gradient matching ──────────────────────────────
         loss_grad = y_pred.new_tensor(0.0)
         if self._TEMPORAL_GRADIENT and T >= 2:
             loss_grad = self._temporal_gradient_loss(y_pred, y_true)
 
-        # ── Multi-resolution spectral loss (gated) ─────────────────
+        # ── Multi-resolution spectral loss (shape-budgeted) ─────────
         loss_spec = y_pred.new_tensor(0.0)
+        spec_coeff = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
+            # Dynamic budget: STFT gets more weight as shape converges,
+            # shrinks when STFT would overwhelm shape. Stateless.
+            spec_coeff = loss_shape.detach() / (
+                loss_shape.detach() + loss_spec.detach() + 1e-8
+            )
 
-        total_loss = loss_shape + loss_level + gate * (0.5 * loss_grad + 0.5 * loss_spec)
+        total_loss = loss_shape + loss_level + loss_grad + spec_coeff * loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
@@ -415,10 +450,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         logger.debug(
             "SpotlightLossLogcosh | shape=%.6f level=%.6f grad=%.6f "
-            "spec=%.6f gate=%.4f total=%.6f",
+            "spec=%.6f spec_coeff=%.4f total=%.6f",
             loss_shape.item(), loss_level.item(),
             loss_grad.item(), loss_spec.item(),
-            gate.item(), total_loss.item(),
+            spec_coeff.item(), total_loss.item(),
         )
         return total_loss
 

@@ -62,14 +62,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     5. **Temporal gradient matching** — log_cosh on first-difference
        errors (∂ŷ/∂t − ∂y/∂t).  Soft-weighted, fully data-driven.
-
-       Continuous relevance weight w = 1 − exp(−r) where
-       r = |Δy_raw|/max(midpoint_raw, 1) is the proportional raw-space
-       change magnitude (via sinh inversion).  Plateau transitions get
-       w≈0 naturally; onset/offset ~0.63; doublings ~0.63; major events
-       ~0.86.  No hardcoded thresholds — the raw-space proportional
-       change is the only signal.  Combined with log1p error-curriculum.
-       O(T) computation.
+       Primary anti-flat mechanism in the time domain: a flat prediction
+       always has dy_pred/dt = 0, so every non-plateau in truth fires
+       the loss proportionally.
 
     6. **Multi-resolution STFT loss** — log_cosh on log-magnitude
        differences ``log1p(mag_pred) − log1p(mag_true)`` at three
@@ -82,14 +77,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
        gradient at |z|→0.  Series weighted by continuous event
        magnitude; additive unit-coefficient contribution.
 
-    7. **Amplitude anchor (anti-flat)** — direct asymmetric penalty on
-       per-series log-amplitude shortfall:
-           err = relu( log1p(std_true) − log1p(std_pred) )
-           loss = mean_event_weighted( log_cosh_proportional(err) )
-       Targets the failure mode where shape/spec gradients vanish
-       because the model finds a flat-at-correct-level equilibrium.
-       Asymmetric by construction (relu): over-variance is not
-       penalised here — shape/spec handle that direction.
+    7. **Temporal gradient matching** (enabled) — log_cosh on first-
+       difference errors (∂ŷ/∂t − ∂y/∂t).  Soft-weighted, fully data-
+       driven.  Directly penalises flat predictions where truth has
+       dynamics: if dy_pred/dt = 0 but dy_true/dt ≠ 0, loss fires
+       proportionally.  Complementary to STFT (frequency-domain anti-
+       flat): temporal gradient catches onsets/offsets/escalation while
+       STFT catches missing periodicity and spectral energy.
 
     ── Base cell loss: log_cosh × (1 + log(1+|x|²))  (proportional) ───
 
@@ -120,7 +114,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _TEMPORAL_GRADIENT = False
+    _TEMPORAL_GRADIENT = True
     _STFT = True
 
     def __init__(
@@ -435,35 +429,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         return total / max(n_valid, 1)
 
-    def _amplitude_anchor(
-        self, y_pred: torch.Tensor, y_true: torch.Tensor
-    ) -> torch.Tensor:
-        """Direct anti-flat term: penalises predicting lower variance than truth.
-
-        Per-series log-amplitude shortfall:
-            err = relu( log1p(std_true) − log1p(std_pred) )
-
-        Asymmetric by construction (relu): only under-variance is
-        penalised.  Over-variance is left to the shape/spec losses —
-        we don't want to discourage non-flat predictions even if they
-        slightly overshoot truth amplitude.  Event-weighted so peace
-        series (low std) contribute negligibly.  Uses
-        ``_log_cosh_proportional`` so the penalty grows with shortfall
-        magnitude in MSLE-aligned fashion.
-        """
-        std_true = y_true.std(dim=1, unbiased=False)
-        std_pred = y_pred.std(dim=1, unbiased=False)
-        # Asymmetric: only penalise undervariance (anti-flat)
-        amp_shortfall = F.relu(torch.log1p(std_true) - torch.log1p(std_pred))
-        cell_loss = self._log_cosh_proportional(amp_shortfall)
-
-        # Event weight per series (max event_mag across timesteps)
-        series_event = self._event_magnitude(y_pred, y_true).amax(dim=1).detach()
-        denom = series_event.sum().clamp(min=1e-8)
-        if denom < 1e-6:
-            return y_pred.new_tensor(0.0)
-        return (series_event * cell_loss).sum() / denom
-
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -534,35 +499,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
         loss_level = self._windowed_level_loss(e, y_pred, y_true, T)
 
         # ── Multi-resolution spectral loss (additive, unit weight) ───
-        # Previously gated by `spec_coeff = shape / (shape + spec)`,
-        # which shrinks STFT exactly when the model is flat-at-level
-        # (shape loss small, spec loss large) — the opposite of what's
-        # needed.  Log-magnitude STFT is now MSLE-aligned and bounded
-        # by signal scale, so additive unit weight is appropriate.
+        # Log-magnitude STFT is MSLE-aligned and unbounded for flat
+        # predictions — no budget gating needed.
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        # ── Amplitude anchor (anti-flat) ──────────────────────────────
-        # Direct asymmetric penalty for under-variance.  Targets the
-        # specific failure mode where shape/spec gradients vanish
-        # (model flat at correct level) but std(ŷ) ≪ std(y).
-        loss_amp = self._amplitude_anchor(y_pred, y_true)
+        # ── Temporal gradient loss (anti-flat in time domain) ─────────
+        # Directly penalises dy_pred/dt = 0 where dy_true/dt ≠ 0.
+        # Complementary to STFT (frequency-domain anti-flat): temporal
+        # gradient catches missed onsets/offsets/escalation, STFT
+        # catches missing periodicity and spectral energy.
+        loss_tgrad = y_pred.new_tensor(0.0)
+        if self._TEMPORAL_GRADIENT and T >= 2:
+            loss_tgrad = self._temporal_gradient_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + loss_spec + loss_amp
+        total_loss = loss_shape + loss_level + loss_spec + loss_tgrad
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: shape={loss_shape.item():.6f} "
                 f"level={loss_level.item():.6f} "
-                f"spec={loss_spec.item():.6f} amp={loss_amp.item():.6f}"
+                f"spec={loss_spec.item():.6f} tgrad={loss_tgrad.item():.6f}"
             )
 
         logger.debug(
             "SpotlightLossLogcosh | shape=%.6f level=%.6f "
-            "spec=%.6f amp=%.6f total=%.6f",
+            "spec=%.6f tgrad=%.6f total=%.6f",
             loss_shape.item(), loss_level.item(),
-            loss_spec.item(), loss_amp.item(), total_loss.item(),
+            loss_spec.item(), loss_tgrad.item(), total_loss.item(),
         )
         return total_loss
 

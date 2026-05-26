@@ -37,11 +37,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
     2. **Adaptive compound weighting** — magnitude-proportional, parameter-free.
 
        difficulty = 1 − exp(−|e|): how wrong this cell is (curriculum).
-       event_mag = max(|y|, |ŷ_sg|) / (τ + max(|y|, |ŷ_sg|)): continuous
-       magnitude signal ∈ [0, 1).  Syria (500 deaths) gets ~0.998,
-       Chad (2 deaths) ~0.72.  Union semantics: false positives get
-       event_mag > 0.5.  w_compound = 1 + 4 × difficulty × event_mag
-       ∈ [1, 5).  Self-correcting: as |e|→0, w→1.
+       event_mag = r/(1+r) where r = log1p(max(|y|,|ŷ_sg|)/τ): log-damped
+       continuous magnitude signal ∈ [0, 1).  Syria (500 deaths) ≈ 0.685,
+       Chad (2 deaths) ≈ 0.493.  Union semantics: false positives also
+       receive event weighting.  w_compound = 1 + 4 × difficulty ×
+       event_mag.  Self-correcting: as |e|→0, w→1.
 
     3. **Hierarchical regret-DRO aggregation (log-space)** — parameter-free.
 
@@ -71,13 +71,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
        change is the only signal.  Combined with log1p error-curriculum.
        O(T) computation.
 
-    6. **Multi-resolution STFT loss** — log_cosh on magnitude-spectrum
-       differences at three (n_fft, hop) resolutions, AC bins only.
-       DC bin masked (level anchor handles DC).  Safe magnitude
-       sqrt(re²+im²+ε) avoids gradient blowup at |z|→0.  Only series
-       with signal above τ are included.  Per-series RMS-normalized so
-       contribution is invariant to signal magnitude.  Gradient budget
-       is tied dynamically to shape loss.
+    6. **Multi-resolution STFT loss** — log_cosh on log-magnitude
+       differences ``log1p(mag_pred) − log1p(mag_true)`` at three
+       (n_fft, hop) resolutions, AC bins only.  DC bin masked (level
+       anchor handles DC).  Log-magnitude is unbounded for under-
+       prediction (mag_pred→0 ⇒ loss grows with signal energy) and
+       MSLE-aligned in the spectral domain — eliminates the prior
+       failure mode where RMS-normalised diff capped the flat-prediction
+       penalty at ~0.43/bin.  Safe magnitude sqrt(re²+im²+ε) bounds
+       gradient at |z|→0.  Series weighted by continuous event
+       magnitude; additive unit-coefficient contribution.
+
+    7. **Amplitude anchor (anti-flat)** — direct asymmetric penalty on
+       per-series log-amplitude shortfall:
+           err = relu( log1p(std_true) − log1p(std_pred) )
+           loss = mean_event_weighted( log_cosh_proportional(err) )
+       Targets the failure mode where shape/spec gradients vanish
+       because the model finds a flat-at-correct-level equilibrium.
+       Asymmetric by construction (relu): over-variance is not
+       penalised here — shape/spec handle that direction.
 
     ── Base cell loss: log_cosh × (1 + log(1+|x|²))  (proportional) ───
 
@@ -345,14 +357,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return (w * cell_grad).sum() / denom
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Multi-resolution STFT magnitude comparison (AC bins only).
+        """Multi-resolution STFT log-magnitude loss (AC bins only).
 
         - Per-series demeaning removes DC before transform so spectral
           loss does not redundantly penalise level offsets (handled by
           level anchor).
-        - Symmetric RMS normalization ``max(rms_true, rms_pred)`` makes
-          loss invariant to magnitude in BOTH directions — false
-          positives on flat series no longer dominate.
+        - **Log-magnitude comparison** ``log1p(mag_pred) − log1p(mag_true)``
+          replaces the previous RMS-normalised difference.  The old
+          ``(mag_pred − mag_true)/rms`` was bounded in [-1, 1] for fully
+          flat predictions, capping per-bin loss at ~0.43.  Log-magnitude
+          difference is unbounded for under-prediction (mag_pred→0 makes
+          the term → -log1p(mag_true), which grows with signal scale)
+          and MSLE-aligned in the spectral domain.  No normalization
+          needed — the log1p compression naturally bounds large
+          magnitudes while penalising flatness proportionally to signal
+          energy.
         - Continuous event-magnitude weighting per series replaces the
           hard threshold gate, eliminating discontinuities for
           borderline countries.
@@ -404,12 +423,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            # Symmetric per-series RMS: bounds loss in both directions
-            rms = torch.max(
-                mag_true.norm(dim=(1, 2), keepdim=True),
-                mag_pred.detach().norm(dim=(1, 2), keepdim=True),
-            ).clamp(min=1e-6)
-            cell_loss = self._log_cosh((mag_pred - mag_true) / rms)
+            # Log-magnitude difference: unbounded penalty for flat preds,
+            # naturally bounded for large magnitudes via log1p compression.
+            log_mag_err = torch.log1p(mag_pred) - torch.log1p(mag_true)
+            cell_loss = self._log_cosh(log_mag_err)
             # Continuous per-series weighting (peace series ≈ 0 weight)
             sw = series_event.view(-1, 1, 1)
             denom = (sw.sum() * cell_loss.size(1) * cell_loss.size(2)).clamp(min=1e-8)
@@ -417,6 +434,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
             n_valid += 1
 
         return total / max(n_valid, 1)
+
+    def _amplitude_anchor(
+        self, y_pred: torch.Tensor, y_true: torch.Tensor
+    ) -> torch.Tensor:
+        """Direct anti-flat term: penalises predicting lower variance than truth.
+
+        Per-series log-amplitude shortfall:
+            err = relu( log1p(std_true) − log1p(std_pred) )
+
+        Asymmetric by construction (relu): only under-variance is
+        penalised.  Over-variance is left to the shape/spec losses —
+        we don't want to discourage non-flat predictions even if they
+        slightly overshoot truth amplitude.  Event-weighted so peace
+        series (low std) contribute negligibly.  Uses
+        ``_log_cosh_proportional`` so the penalty grows with shortfall
+        magnitude in MSLE-aligned fashion.
+        """
+        std_true = y_true.std(dim=1, unbiased=False)
+        std_pred = y_pred.std(dim=1, unbiased=False)
+        # Asymmetric: only penalise undervariance (anti-flat)
+        amp_shortfall = F.relu(torch.log1p(std_true) - torch.log1p(std_pred))
+        cell_loss = self._log_cosh_proportional(amp_shortfall)
+
+        # Event weight per series (max event_mag across timesteps)
+        series_event = self._event_magnitude(y_pred, y_true).amax(dim=1).detach()
+        denom = series_event.sum().clamp(min=1e-8)
+        if denom < 1e-6:
+            return y_pred.new_tensor(0.0)
+        return (series_event * cell_loss).sum() / denom
 
     # ------------------------------------------------------------------
     # Forward
@@ -487,32 +533,36 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Windowed level anchor (event-weighted; MSLE-symmetric) ───
         loss_level = self._windowed_level_loss(e, y_pred, y_true, T)
 
-        # ── Multi-resolution spectral loss (shape-budgeted) ──────────
+        # ── Multi-resolution spectral loss (additive, unit weight) ───
+        # Previously gated by `spec_coeff = shape / (shape + spec)`,
+        # which shrinks STFT exactly when the model is flat-at-level
+        # (shape loss small, spec loss large) — the opposite of what's
+        # needed.  Log-magnitude STFT is now MSLE-aligned and bounded
+        # by signal scale, so additive unit weight is appropriate.
         loss_spec = y_pred.new_tensor(0.0)
-        spec_coeff = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
-            # Dynamic budget: STFT contribution shrinks if it would
-            # overwhelm shape.  Stateless, self-calibrating per batch.
-            spec_coeff = loss_shape.detach() / (
-                loss_shape.detach() + loss_spec.detach() + 1e-8
-            )
 
-        total_loss = loss_shape + loss_level + spec_coeff * loss_spec
+        # ── Amplitude anchor (anti-flat) ──────────────────────────────
+        # Direct asymmetric penalty for under-variance.  Targets the
+        # specific failure mode where shape/spec gradients vanish
+        # (model flat at correct level) but std(ŷ) ≪ std(y).
+        loss_amp = self._amplitude_anchor(y_pred, y_true)
+
+        total_loss = loss_shape + loss_level + loss_spec + loss_amp
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: shape={loss_shape.item():.6f} "
                 f"level={loss_level.item():.6f} "
-                f"spec={loss_spec.item():.6f}"
+                f"spec={loss_spec.item():.6f} amp={loss_amp.item():.6f}"
             )
 
         logger.debug(
             "SpotlightLossLogcosh | shape=%.6f level=%.6f "
-            "spec=%.6f spec_coeff=%.4f total=%.6f",
+            "spec=%.6f amp=%.6f total=%.6f",
             loss_shape.item(), loss_level.item(),
-            loss_spec.item(),
-            spec_coeff.item(), total_loss.item(),
+            loss_spec.item(), loss_amp.item(), total_loss.item(),
         )
         return total_loss
 

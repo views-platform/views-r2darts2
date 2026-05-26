@@ -155,21 +155,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights(losses: torch.Tensor) -> torch.Tensor:
-        """Log-space KL-DRO weights with soft alpha-blend.
+        """Log-space DRO weights, robust to bounded loss scales.
 
-        Given a flat tensor of per-element losses, returns a same-shaped
-        tensor of normalised weights (mean ≈ 1).  High-loss elements get
-        upweighted proportionally in log-space; soft alpha blends toward
-        uniform when log-loss variance is small (early training).
+        Given a flat tensor of per-element losses, returns same-shaped
+        normalised weights (mean ≈ 1).  Above-mean log-losses get
+        weight > 1; below-mean get weight ≈ 1 (uniform floor, not
+        suppressed).  ``alpha = tanh(std)`` softly blends toward
+        uniform when the log-loss spread is small — no dependence on
+        ``|mean|``, so bounded scores (regret ∈ [0,1]) behave correctly.
         """
         log_l = torch.log(losses.detach() + 1e-8)
         std = log_l.std()
         if not torch.isfinite(std) or std < 1e-8:
-            std = losses.new_tensor(0.1)
-        cv = torch.log1p(std / (log_l.mean().abs() + 1e-8))
-        alpha = cv / (cv + 1.0)
-        z = (log_l - log_l.mean()) / std.clamp(min=0.1)
-        w = torch.log1p((1.0 + z).clamp(min=0.0))
+            return torch.ones_like(losses)
+        alpha = torch.tanh(std)                              # ∈ [0, 1)
+        z = (log_l - log_l.mean()) / std.clamp(min=1e-3)
+        # Symmetric floor: weight ≥ 1 always; tail grows for z > 0
+        w = 1.0 + torch.log1p(z.clamp(min=0.0))
         w = w / w.mean().clamp(min=1e-8)
         w = alpha * w + (1.0 - alpha)
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
@@ -178,32 +180,37 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
         """Batched DRO weights along dim=1 for (B, T) input.
 
-        Equivalent to stacking _dro_weights per row, but fully
-        vectorised — no Python loop over the batch dimension.
+        Vectorised analogue of :meth:`_dro_weights` — one weight
+        distribution per row.
         """
-        log_l = torch.log(losses.detach() + 1e-8)           # (B, T)
-        std = log_l.std(dim=1, keepdim=True)                 # (B, 1)
-        std = torch.where(
+        log_l = torch.log(losses.detach() + 1e-8)            # (B, T)
+        std = log_l.std(dim=1, keepdim=True)                  # (B, 1)
+        std_safe = torch.where(
             torch.isfinite(std) & (std > 1e-8),
             std,
-            losses.new_tensor(0.1),
+            losses.new_tensor(1e-3),
         )
-        mean = log_l.mean(dim=1, keepdim=True)               # (B, 1)
-        cv = torch.log1p(std / (mean.abs() + 1e-8))
-        alpha = cv / (cv + 1.0)
-        z = (log_l - mean) / std.clamp(min=0.1)
-        w = torch.log1p((1.0 + z).clamp(min=0.0))
+        alpha = torch.tanh(std_safe)                          # (B, 1)
+        mean = log_l.mean(dim=1, keepdim=True)                # (B, 1)
+        z = (log_l - mean) / std_safe.clamp(min=1e-3)
+        w = 1.0 + torch.log1p(z.clamp(min=0.0))
         w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)
         w = alpha * w + (1.0 - alpha)
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _event_magnitude(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Continuous union eventness in transformed space.
+        """Continuous union eventness in transformed space, bounded [0, 1).
 
-        A cell is event-relevant if conflict appears in either y_true or
-        y_pred.  The prediction branch is detached so false positives can
-        receive corrective weighting without creating a second gradient
-        path through the weights.
+        ``event_mag = r / (1 + r)`` where ``r = log1p(|union| / τ)``.
+        Log-damped: spreads dynamic range across the mid-conflict band
+        instead of saturating at low-intensity events.
+        Examples (τ = 0.88, asinh-space):
+            asinh(500) ≈ 6.9 → r=2.18, event_mag≈0.685   (Syria)
+            asinh(12)  ≈ 3.2 → r=1.50, event_mag≈0.600   (mid conflict)
+            asinh(2)   ≈ 1.4 → r=0.97, event_mag≈0.493   (Chad)
+            asinh(0)   = 0.0 → r=0.00, event_mag=0.000   (peace)
+        Union semantics: false positives also receive event weighting.
+        Prediction branch detached — no second gradient path.
         """
         abs_union = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         log_ratio = torch.log1p(abs_union / self.non_zero_threshold)
@@ -216,10 +223,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         y_true: torch.Tensor,
         T: int,
     ) -> torch.Tensor:
-        """Windowed log_cosh level anchor with event-aware hierarchical DRO.
+        """Event-weighted windowed level anchor with hierarchical DRO.
 
         Splits the T-length error into non-overlapping windows of width
-        max(6, T//3) (~3 wide windows).  Two-level DRO:
+        max(6, T//3) (~3 wide windows).
+
+        **Event-weighted window mean** — the per-window error mean uses
+        ``(1 + event_cell)`` weights so missed events are not diluted by
+        surrounding peace cells.  Without this, a window with one
+        missed event of asinh(12)≈3.2 averaged over 12 zeros becomes
+        ~0.27 (small loss), while a false-positive flat prediction of
+        asinh(1)=0.88 averaged over 12 cells becomes 0.88 (large loss).
+        That asymmetry drives the model toward under-prediction.  The
+        event weighting restores symmetric treatment of false positives
+        and missed events.
+
+        Hierarchical DRO:
           Level 1 (within-series): event-aware — windows containing
               conflict get DRO priority over peace-noise windows.
           Level 2 (cross-series): regret-based — prioritises countries
@@ -227,34 +246,47 @@ class SpotlightLossLogcosh(torch.nn.Module):
               baseline floor to prevent peace-country inflation.
         """
         W = max(6, T // 3)
-        window_means = torch.stack(
-            [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
+
+        # Per-cell event weighting (detached: shapes weights, not grads)
+        event_cell = self._event_magnitude(y_pred, y_true)
+        cell_w = (1.0 + event_cell).detach()
+
+        # Event-weighted per-window mean of error
+        e_weighted = e * cell_w
+        window_num = torch.stack(
+            [ew.sum(dim=1) for ew in e_weighted.split(W, dim=1)], dim=1
         )
-        # (B, n_windows)
+        window_den = torch.stack(
+            [cw.sum(dim=1) for cw in cell_w.split(W, dim=1)], dim=1
+        ).clamp(min=1e-6)
+        window_means = window_num / window_den              # (B, n_windows)
         level_losses = self._log_cosh_proportional(window_means)
 
-        # Event-awareness: per-window max event magnitude
-        event_cell = self._event_magnitude(y_pred, y_true)
+        # Per-window max event magnitude for DRO scoring
         window_event = torch.stack(
             [ew.amax(dim=1) for ew in event_cell.split(W, dim=1)], dim=1
         )
 
         # Within-series DRO score: event-aware window difficulty
         level_score = level_losses.detach() * (1.0 + window_event.detach())
-        w_within = self._dro_weights_2d(level_score)  # (B, n_windows)
+        w_within = self._dro_weights_2d(level_score)        # (B, n_windows)
         series_level = (w_within * level_losses).mean(dim=1)  # (B,)
 
-        # Cross-series regret DRO with baseline floor
-        target_window_means = torch.stack(
-            [yw.mean(dim=1) for yw in y_true.split(W, dim=1)], dim=1
+        # Cross-series regret DRO with baseline floor.  Baseline uses
+        # the same event-weighted aggregation so it reflects the same
+        # signal complexity the loss is penalising.
+        y_true_w = y_true * cell_w
+        target_num = torch.stack(
+            [yw.sum(dim=1) for yw in y_true_w.split(W, dim=1)], dim=1
         )
+        target_window_means = target_num / window_den
         level_baseline = self._log_cosh_proportional(target_window_means).mean(dim=1).detach()
         level_baseline = level_baseline.clamp(min=self.non_zero_threshold * 0.01)
 
         series_score = series_level.detach() / (
             series_level.detach() + level_baseline + 1e-8
         )
-        w_series = self._dro_weights(series_score)  # (B,)
+        w_series = self._dro_weights(series_score)          # (B,)
         w_series = w_series / w_series.mean().clamp(min=1e-8)
 
         return (w_series * series_level).mean()
@@ -315,9 +347,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
 
-        Safe magnitude sqrt(re² + im² + ε) avoids gradient blowup at
-        |z|→0.  DC bin is masked — level anchor already handles DC.
-        Only series with signal above threshold are included.
+        - Per-series demeaning removes DC before transform so spectral
+          loss does not redundantly penalise level offsets (handled by
+          level anchor).
+        - Symmetric RMS normalization ``max(rms_true, rms_pred)`` makes
+          loss invariant to magnitude in BOTH directions — false
+          positives on flat series no longer dominate.
+        - Continuous event-magnitude weighting per series replaces the
+          hard threshold gate, eliminating discontinuities for
+          borderline countries.
+        - DC bin masked; safe magnitude sqrt(re²+im²+ε) bounds gradient
+          at |z|→0.
         """
         if y_pred.dim() == 3:
             B, T, C = y_pred.shape
@@ -327,14 +367,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
             pred = y_pred
             true = y_true
 
-        has_signal = (
-            (torch.abs(true) > self.non_zero_threshold)
-            | (torch.abs(pred.detach()) > self.non_zero_threshold)
-        ).any(dim=1)
-        if not has_signal.any():
+        # Continuous series relevance: max event_mag across the series.
+        # Bounded in [0, 1) — peace series get near-zero weight, conflict
+        # series get up to ~0.7 weight. Smooth, no threshold cliff.
+        abs_union = torch.max(torch.abs(true), torch.abs(pred.detach()))
+        log_ratio = torch.log1p(abs_union / self.non_zero_threshold)
+        series_event = (log_ratio / (1.0 + log_ratio)).amax(dim=1)  # (BC,)
+        if series_event.sum() < 1e-8:
             return pred.new_tensor(0.0)
-        pred = pred[has_signal]
-        true = true[has_signal]
+
+        # Per-series demean — kills DC contamination in low-freq AC bins
+        pred = pred - pred.mean(dim=1, keepdim=True)
+        true = true - true.mean(dim=1, keepdim=True)
 
         T = pred.size(1)
         total = pred.new_tensor(0.0)
@@ -360,10 +404,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            # Per-series RMS normalization: makes spectral loss measure
-            # relative shape mismatch, invariant to signal magnitude.
-            rms = mag_true.norm(dim=(1, 2), keepdim=True).clamp(min=1e-6)
-            total = total + self._log_cosh((mag_pred - mag_true) / rms).mean()
+            # Symmetric per-series RMS: bounds loss in both directions
+            rms = torch.max(
+                mag_true.norm(dim=(1, 2), keepdim=True),
+                mag_pred.detach().norm(dim=(1, 2), keepdim=True),
+            ).clamp(min=1e-6)
+            cell_loss = self._log_cosh((mag_pred - mag_true) / rms)
+            # Continuous per-series weighting (peace series ≈ 0 weight)
+            sw = series_event.view(-1, 1, 1)
+            denom = (sw.sum() * cell_loss.size(1) * cell_loss.size(2)).clamp(min=1e-8)
+            total = total + (sw * cell_loss).sum() / denom
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -384,29 +434,43 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Base cell loss (proportional variant for MSLE sensitivity) ─
+        # ── Base cell loss (gradient path: DC-blind) ──────────────────
         cell_loss = self._log_cosh_proportional(e_shape)
+        # Scoring proxy: full-error magnitude (DC-aware).  Used only to
+        # rank/weight cells — does not enter the gradient itself.  This
+        # lets DRO and compound see DC errors that cell_loss cannot.
+        cell_score = self._log_cosh_proportional(e).detach()
 
-        # ── Compound weighting ────────────────────────────────────────
-        abs_e = torch.abs(e_shape.detach())
-        difficulty = 1.0 - torch.exp(-abs_e)
+        # ── Compound weighting (uses full |e|, not e_shape) ───────────
+        # Difficulty must reflect total prediction error so cells in
+        # countries with DC offsets are correctly ranked as "wrong".
+        abs_e_full = torch.abs(e.detach())
+        difficulty = 1.0 - torch.exp(-abs_e_full)
         event_mag = self._event_magnitude(y_pred, y_true)
         w_compound = 1.0 + 4.0 * difficulty * event_mag
 
-        # ── Hierarchical shape DRO ───────────────────────────────────────
-        # Level 1: within-series DRO (which timesteps for THIS country)
-        w_dro_within = self._dro_weights_2d(cell_loss)            # (B, T)
-        w_within = w_compound * w_dro_within
+        # ── Hierarchical shape DRO ────────────────────────────────────
+        # Within-series DRO ranks cells by FULL error (cell_score), not
+        # DC-blind cell_loss — countries with large DC errors no longer
+        # have their gradient misdirected to random residual-around-mean
+        # timesteps.
+        w_dro_within = self._dro_weights_2d(cell_score)           # (B, T)
+
+        # Cooperative additive combination (not multiplicative).  Both
+        # weights have mean ≈ 1; sum has mean ≈ 2.  When one weight is
+        # high and the other is uniform, the cell still receives strong
+        # attention.  When BOTH are high (event AND high error), it gets
+        # extra emphasis.  Multiplicative made them compete.
+        w_within = (w_compound + w_dro_within) * 0.5
         w_within = w_within / w_within.mean(dim=1, keepdim=True).clamp(min=1e-8)
         series_loss = (w_within * cell_loss).mean(dim=1)          # (B,)
 
-        # Level 2: cross-series regret DRO — decouple compound from
-        # the ranking path to prevent high-intensity feedback loop.
-        # Score uses DRO-only weights (no compound amplification).
+        # Cross-series regret DRO — decoupled from compound to avoid
+        # high-intensity feedback loop.  Score uses DRO-only weights.
         w_score_within = w_dro_within / w_dro_within.mean(
             dim=1, keepdim=True
         ).clamp(min=1e-8)
-        series_score_loss = (w_score_within * cell_loss).mean(dim=1).detach()
+        series_score_loss = (w_score_within * cell_score).mean(dim=1).detach()
 
         # Regret: how underfit is this country relative to its own
         # target signal complexity?  Baseline floor prevents peace
@@ -420,39 +484,34 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_series = w_series / w_series.mean().clamp(min=1e-8)
         loss_shape = (w_series * series_loss).mean()
 
-        # ── Windowed level anchor (event-aware hierarchical DRO) ─────
+        # ── Windowed level anchor (event-weighted; MSLE-symmetric) ───
         loss_level = self._windowed_level_loss(e, y_pred, y_true, T)
 
-        # ── Temporal gradient matching ──────────────────────────────
-        loss_grad = y_pred.new_tensor(0.0)
-        if self._TEMPORAL_GRADIENT and T >= 2:
-            loss_grad = self._temporal_gradient_loss(y_pred, y_true)
-
-        # ── Multi-resolution spectral loss (shape-budgeted) ─────────
+        # ── Multi-resolution spectral loss (shape-budgeted) ──────────
         loss_spec = y_pred.new_tensor(0.0)
         spec_coeff = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
-            # Dynamic budget: STFT gets more weight as shape converges,
-            # shrinks when STFT would overwhelm shape. Stateless.
+            # Dynamic budget: STFT contribution shrinks if it would
+            # overwhelm shape.  Stateless, self-calibrating per batch.
             spec_coeff = loss_shape.detach() / (
                 loss_shape.detach() + loss_spec.detach() + 1e-8
             )
 
-        total_loss = loss_shape + loss_level + loss_grad + spec_coeff * loss_spec
+        total_loss = loss_shape + loss_level + spec_coeff * loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} grad={loss_grad.item():.6f} "
+                f"level={loss_level.item():.6f} "
                 f"spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | shape=%.6f level=%.6f grad=%.6f "
+            "SpotlightLossLogcosh | shape=%.6f level=%.6f "
             "spec=%.6f spec_coeff=%.4f total=%.6f",
             loss_shape.item(), loss_level.item(),
-            loss_grad.item(), loss_spec.item(),
+            loss_spec.item(),
             spec_coeff.item(), total_loss.item(),
         )
         return total_loss

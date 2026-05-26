@@ -71,19 +71,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
        (n_fft, hop) resolutions, AC bins only.  DC bin masked (level
        anchor handles DC).  Log-magnitude is unbounded for under-
        prediction (mag_pred→0 ⇒ loss grows with signal energy) and
-       MSLE-aligned in the spectral domain — eliminates the prior
-       failure mode where RMS-normalised diff capped the flat-prediction
-       penalty at ~0.43/bin.  Safe magnitude sqrt(re²+im²+ε) bounds
-       gradient at |z|→0.  Series weighted by continuous event
-       magnitude; additive unit-coefficient contribution.
+       MSLE-aligned in the spectral domain.
 
-    7. **Temporal gradient matching** (enabled) — log_cosh on first-
-       difference errors (∂ŷ/∂t − ∂y/∂t).  Soft-weighted, fully data-
-       driven.  Directly penalises flat predictions where truth has
-       dynamics: if dy_pred/dt = 0 but dy_true/dt ≠ 0, loss fires
-       proportionally.  Complementary to STFT (frequency-domain anti-
-       flat): temporal gradient catches onsets/offsets/escalation while
-       STFT catches missing periodicity and spectral energy.
+       **No per-series demeaning** — this is critical.  With demean,
+       gradients flow through the centering matrix J = I − 11'/T,
+       making STFT structurally DC-blind (Σ ∂L/∂ŷ_i = 0).  Since
+       shape loss is already DC-blind by design, demeaned STFT
+       provided zero additional force for breaking flat equilibria.
+       Without demean, STFT is the only component whose gradients
+       can increase prediction variance (not constrained to zero-sum).
+       DC leakage into adjacent bins cancels in the difference when
+       pred and truth share similar mean (the observed scenario).
+
+       Series weighted by continuous event magnitude; additive unit-
+       coefficient contribution.
 
     ── Base cell loss: log_cosh × (1 + log(1+|x|²))  (proportional) ───
 
@@ -114,7 +115,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _TEMPORAL_GRADIENT = True
+    _TEMPORAL_GRADIENT = False
     _STFT = True
 
     def __init__(
@@ -353,24 +354,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT log-magnitude loss (AC bins only).
 
-        - Per-series demeaning removes DC before transform so spectral
-          loss does not redundantly penalise level offsets (handled by
-          level anchor).
+        - **No per-series demeaning** — gradient flows directly through
+          ŷ (identity Jacobian).  This is critical: with demean, the
+          gradient goes through the centering matrix J = I − 11'/T,
+          making STFT structurally DC-blind (Σ ∂L/∂ŷ_i = 0).  Since
+          the shape loss is already DC-blind by design, demeaned STFT
+          provided zero additional force for breaking flat equilibria.
+          Without demean, STFT gradient CAN increase prediction
+          variance — it's the only component not constrained to zero-
+          sum gradients.
+        - DC bin 0 is masked (level anchor handles DC).  Any DC leakage
+          into bin 1 from Hann windowing cancels in the difference when
+          pred and truth share similar mean (the observed scenario).
         - **Log-magnitude comparison** ``log1p(mag_pred) − log1p(mag_true)``
-          replaces the previous RMS-normalised difference.  The old
-          ``(mag_pred − mag_true)/rms`` was bounded in [-1, 1] for fully
-          flat predictions, capping per-bin loss at ~0.43.  Log-magnitude
-          difference is unbounded for under-prediction (mag_pred→0 makes
-          the term → -log1p(mag_true), which grows with signal scale)
-          and MSLE-aligned in the spectral domain.  No normalization
-          needed — the log1p compression naturally bounds large
-          magnitudes while penalising flatness proportionally to signal
-          energy.
-        - Continuous event-magnitude weighting per series replaces the
-          hard threshold gate, eliminating discontinuities for
-          borderline countries.
-        - DC bin masked; safe magnitude sqrt(re²+im²+ε) bounds gradient
-          at |z|→0.
+          is unbounded for under-prediction and MSLE-aligned.
+        - Continuous event-magnitude weighting per series.
+        - Safe magnitude sqrt(re²+im²+ε) bounds gradient at |z|→0.
         """
         if y_pred.dim() == 3:
             B, T, C = y_pred.shape
@@ -388,10 +387,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         series_event = (log_ratio / (1.0 + log_ratio)).amax(dim=1)  # (BC,)
         if series_event.sum() < 1e-8:
             return pred.new_tensor(0.0)
-
-        # Per-series demean — kills DC contamination in low-freq AC bins
-        pred = pred - pred.mean(dim=1, keepdim=True)
-        true = true - true.mean(dim=1, keepdim=True)
 
         T = pred.size(1)
         total = pred.new_tensor(0.0)
@@ -499,35 +494,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
         loss_level = self._windowed_level_loss(e, y_pred, y_true, T)
 
         # ── Multi-resolution spectral loss (additive, unit weight) ───
-        # Log-magnitude STFT is MSLE-aligned and unbounded for flat
-        # predictions — no budget gating needed.
+        # STFT is the only component with non-DC-blind gradient (no
+        # centering matrix in path).  This is the primary force capable
+        # of breaking the flat equilibrium — it can push prediction
+        # variance up without the zero-sum constraint.
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        # ── Temporal gradient loss (anti-flat in time domain) ─────────
-        # Directly penalises dy_pred/dt = 0 where dy_true/dt ≠ 0.
-        # Complementary to STFT (frequency-domain anti-flat): temporal
-        # gradient catches missed onsets/offsets/escalation, STFT
-        # catches missing periodicity and spectral energy.
-        loss_tgrad = y_pred.new_tensor(0.0)
-        if self._TEMPORAL_GRADIENT and T >= 2:
-            loss_tgrad = self._temporal_gradient_loss(y_pred, y_true)
-
-        total_loss = loss_shape + loss_level + loss_spec + loss_tgrad
+        total_loss = loss_shape + loss_level + loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: shape={loss_shape.item():.6f} "
                 f"level={loss_level.item():.6f} "
-                f"spec={loss_spec.item():.6f} tgrad={loss_tgrad.item():.6f}"
+                f"spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
             "SpotlightLossLogcosh | shape=%.6f level=%.6f "
-            "spec=%.6f tgrad=%.6f total=%.6f",
+            "spec=%.6f total=%.6f",
             loss_shape.item(), loss_level.item(),
-            loss_spec.item(), loss_tgrad.item(), total_loss.item(),
+            loss_spec.item(), total_loss.item(),
         )
         return total_loss
 

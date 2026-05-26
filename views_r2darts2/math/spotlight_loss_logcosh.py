@@ -43,13 +43,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
        receive event weighting.  w_compound = 1 + 4 × difficulty ×
        event_mag.  Self-correcting: as |e|→0, w→1.
 
-    3. **Hierarchical regret-DRO aggregation (log-space)** — parameter-free.
+    3. **Hierarchical DRO aggregation (log-space)** — parameter-free.
 
-       Within each country, DRO selects difficult timesteps/windows.
-       Across countries, DRO is applied to relative regret versus each
-       country's own target signal, so high-intensity countries do not
-       dominate solely by absolute magnitude.  Baseline floor prevents
-       peace countries (zero target) from inflating regret.
+       Within each country, DRO selects difficult timesteps via full-
+       error scoring.  Across countries, DRO is applied directly to
+       per-series aggregated loss — countries with high remaining error
+       get priority.  No regret normalization; the proportional base
+       loss + compound weighting already prevent peace countries from
+       inflating series loss, so raw-loss DRO correctly focuses on
+       spike countries with blunted/under-fit predictions.
 
     4. **Windowed level anchor** — event-aware log_cosh_proportional on
        per-window mean error with hierarchical regret-DRO aggregation.
@@ -471,22 +473,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_within = w_within / w_within.mean(dim=1, keepdim=True).clamp(min=1e-8)
         series_loss = (w_within * cell_loss).mean(dim=1)          # (B,)
 
-        # Cross-series regret DRO — decoupled from compound to avoid
-        # high-intensity feedback loop.  Score uses DRO-only weights.
-        w_score_within = w_dro_within / w_dro_within.mean(
-            dim=1, keepdim=True
-        ).clamp(min=1e-8)
-        series_score_loss = (w_score_within * cell_score).mean(dim=1).detach()
-
-        # Regret: how underfit is this country relative to its own
-        # target signal complexity?  Baseline floor prevents peace
-        # countries (baseline≈0) from getting infinite regret.
-        target_shape = y_true - y_true.mean(dim=1, keepdim=True)
-        shape_baseline = self._log_cosh_proportional(target_shape).mean(dim=1).detach()
-        shape_baseline = shape_baseline.clamp(min=self.non_zero_threshold * 0.01)
-
-        regret = series_score_loss / (series_score_loss + shape_baseline + 1e-8)
-        w_series = self._dro_weights(regret)                       # (B,)
+        # Cross-series DRO — applied directly to series_loss.
+        # Countries with high aggregated loss (blunted spikes, large
+        # residual errors) get DRO priority.  No regret normalization;
+        # the old regret formula regret=score/(score+baseline) made it
+        # impossible for high-complexity countries to exceed regret 0.5
+        # because their baseline dominated.  This starved spike
+        # countries of gradient budget as training progressed, causing
+        # the model to spend gradient on perfecting peace-country zeros
+        # instead of sharpening conflict spikes.
+        # Compound weighting already suppresses peace-country series_loss
+        # (event_mag ≈ 0 → w_compound ≈ 1, cell_loss ≈ 0 for zeros), so
+        # DRO on raw series_loss naturally focuses on countries that
+        # genuinely have large remaining errors.
+        w_series = self._dro_weights(series_loss)                  # (B,)
         w_series = w_series / w_series.mean().clamp(min=1e-8)
         loss_shape = (w_series * series_loss).mean()
 

@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v37 — full-error + inverse-frequency + log-mag STFT.
+    SpotlightLoss v38 — DC/AC split with temporal-gradient shape loss.
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -16,69 +16,49 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Architecture ─────────────────────────────────────────────────────
 
-    Three components, no hardcoded constants.  All weights are derived
-    from per-batch data statistics.
+    Three components.  DC and AC are separated by construction (not by
+    demeaning), eliminating the zero-sum gradient problem of v36.
 
-    1. **Full-error cell loss** — `log_cosh_proportional(e)` on the raw
-       error `e = ŷ − y` at every (series, timestep) cell.
+    1. **Level loss (DC)** — `log_cosh_proportional(mean(ŷ − y))` per
+       series.  Penalises mean prediction offset directly.  DRO-weighted
+       so conflict countries get priority.
 
-       No DC/AC decomposition.  Earlier versions demeaned the error to
-       prevent RevIN DC offset amplification.  Hybrid RevIN v3 has
-       bounded Jacobian ∈ [1, σ_c] with no exponential amplification,
-       making that defence obsolete.  The DC/AC split forces
-       Σᵢ ∂L/∂ŷᵢ = 0 per series — the model CANNOT increase prediction
-       variance.  Flat predictions receive zero net gradient.  Removing
-       the split restores non-zero net gradient per series and allows
-       the model to learn levels directly from cell_loss.
+    2. **Temporal gradient loss (AC)** — the PRIMARY shape signal.
+       `log_cosh_proportional(Δŷ − Δy)` where Δ is first difference.
 
-    2. **Inverse-frequency compound weighting** — parameter-free.
+       Why this works where e_shape failed:
+       - DC-free by construction (first-difference annihilates constants)
+       - NOT zero-sum: gradient telescopes to `loss'(d_1) − loss'(d_T)`,
+         which is generally non-zero.  Model CAN increase output variance.
+       - 13× stronger signal at onsets than pointwise cell_loss:
+         flat prediction at onset (Δy=3, Δŷ=0) → proportional loss ≈ 9.5
+         vs cell_loss on same cell with error ≈ 1 → loss ≈ 0.7
+       - Zero gradient at plateaus: Δy=0, Δŷ≈0 → loss≈0.
+         No wasted gradient on the 90% peace-cell desert.
+       - Transition-event weighted: adjacent pairs near events get full
+         weight; peace-peace pairs get near-zero weight.
+       - Inverse-frequency rebalancing per series (same as v37).
 
-       Equalises total gradient mass between event and peace cells
-       within each series, regardless of class imbalance.
+    3. **Log-magnitude multi-resolution STFT** — secondary shape signal.
+       Catches periodic/seasonal patterns that single-step gradient
+       matching might miss (e.g. a 6-month conflict cycle where the
+       model gets individual transitions right but misses the period).
+       Same formulation as v37: `log_cosh(log1p(mag_pred) − log1p(mag_true))`
+       with event-magnitude series weighting.
 
-       Derivation: given event_mag ∈ [0, 1) per cell, let
-       p = mean(event_mag) be the per-series event density.  Then:
-           w_i = event_mag_i / p + (1 − event_mag_i) / (1 − p)
-       This produces:
-           Σ_event w_i ≈ Σ_peace w_i   (equalized mass)
-       No hardcoded multiplier.  Automatically adapts to series with
-       many events (Sudan: p≈0.4) vs few (Luxembourg: p≈0.01).
-       Falls back to uniform (w=2) for series with p→0 or p→1.
+    ── Cross-series DRO (per component) ─────────────────────────────────
 
-    3. **Log-magnitude multi-resolution STFT** — the only
-       non-pointwise signal.
-
-       `log_cosh(log1p(mag_pred) − log1p(mag_true))` at three
-       spectral resolutions.  Properties:
-       - Unbounded penalty for flat predictions (log1p(0)≈0 vs
-         log1p(mag_true) which grows with signal energy).
-       - Monotonically ordered: perfect < shaped < flat.
-       - MSLE-aligned in spectrogram domain.
-       - No demean, no DC mask, no RMS normalization.  Gradient flows
-         through identity Jacobian — no zero-sum constraint.
-       - Breaks the symmetric-pointwise-loss trap: spectral magnitude
-         is a distributional match (Parseval), so the model is penalised
-         for lacking energy at the right frequencies even when pointwise
-         timing is uncertain.
-       - Event-magnitude series weighting (continuous, no threshold).
-
-    ── Cross-series DRO (additive regret) ───────────────────────────────
-
-    Regret = relu(series_loss − baseline).  Baseline is the irreducible
-    loss on each country's own target shape:
-        baseline_i = log_cosh_proportional(y_i − mean(y_i))
-    Peace countries have baseline ≈ 0 AND series_loss ≈ 0 → regret ≈ 0.
-    Conflict countries with high remaining error get regret > 0 and
-    receive DRO upweighting.  No baseline floor needed — additive regret
-    naturally handles the zero-target case.
+    Each component (level, shape) has its own additive-regret DRO:
+    - Level DRO: upweights countries with large DC offset
+    - Shape DRO: upweights countries with worst temporal-gradient fit
+    Baselines are component-specific irreducible losses.
 
     ── Base cell loss: log_cosh × (1 + log(1+|x|²))  (proportional) ───
 
     Sub-linear proportional correction.  For |x| > 2, gradient grows as
     ≈ 1 + 2·ln|x| — fast enough to attend to large errors but
     sub-linear enough to prevent extreme-country errors from monopolising
-    the aggregate gradient (which would cause overprediction via baseline
-    drift).
+    the aggregate gradient.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -227,6 +207,63 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return total / max(n_valid, 1)
 
     # ------------------------------------------------------------------
+    # Temporal gradient (shape) loss
+    # ------------------------------------------------------------------
+
+    def _shape_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Temporal-gradient matching — the primary shape-learning signal.
+
+        Computes first differences Δŷ and Δy and penalises their
+        element-wise disagreement with `log_cosh_proportional`.
+
+        Properties:
+        • DC-free by construction — first-difference kills any constant
+          offset, so level errors do NOT dilute shape learning.
+        • NOT zero-sum — gradient at timestep t receives independent
+          contributions from the (t−1,t) and (t,t+1) pairs.  The model
+          IS free to increase output variance (unlike demeaned e_shape).
+        • Sharp at transitions — for a flat prediction at an onset
+          (Δy=3, Δŷ=0), the proportional loss gives ≈9.5.  For the same
+          cell under pointwise cell_loss with error ≈1, loss ≈0.7.
+          That's a 13× gradient amplification at the cells that matter.
+        • Silent on plateaus — when Δy=0 and Δŷ≈0, loss≈0. No wasted
+          gradient on peace-cell deserts.
+
+        Weighting: transition-event curriculum.  Each adjacent pair gets
+        weight proportional to the max(event_mag) of the two cells in the
+        pair.  Event onsets (0→high) get full weight.  Peace-peace pairs
+        (0→0) get near-zero weight.  Inverse-frequency rebalancing
+        ensures conflict transitions aren't diluted by peace mass.
+        """
+        # First differences: (B, T-1)
+        dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
+        dy_true = y_true[:, 1:] - y_true[:, :-1]
+
+        # Shape error at each transition
+        shape_err = self._log_cosh_proportional(dy_pred - dy_true)
+
+        # Transition-event weighting: max event_mag of each adjacent pair
+        event_mag = self._event_magnitude(y_pred, y_true)
+        pair_event = torch.max(event_mag[:, 1:], event_mag[:, :-1])  # (B, T-1)
+
+        # Inverse-frequency rebalancing per series
+        p_pair = pair_event.mean(dim=1, keepdim=True).clamp(min=1e-4, max=1.0 - 1e-4)
+        w_shape = pair_event / p_pair + (1.0 - pair_event) / (1.0 - p_pair)
+        w_shape = w_shape / w_shape.mean(dim=1, keepdim=True).clamp(min=1e-8)
+
+        series_shape = (w_shape * shape_err).mean(dim=1)  # (B,)
+
+        # Cross-series DRO: prioritise countries where shape is worst
+        # Baseline: irreducible shape loss (target's own gradient variance)
+        target_shape_err = self._log_cosh_proportional(dy_true)
+        baseline = (w_shape.detach() * target_shape_err).mean(dim=1).detach()
+        regret = torch.relu(series_shape.detach() - baseline)
+        w_series = self._dro_weights(regret)
+        w_series = w_series / w_series.mean().clamp(min=1e-8)
+
+        return (w_series * series_shape).mean()
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -236,54 +273,49 @@ class SpotlightLossLogcosh(torch.nn.Module):
             y_true = y_true.squeeze(-1)
 
         T = y_pred.size(1)
-        e = y_pred - y_true
 
-        # ── Base cell loss on FULL error ──────────────────────────────
-        cell_loss = self._log_cosh_proportional(e)
+        # ── Level loss (DC) ───────────────────────────────────────────
+        # Penalises per-series mean offset.  Simple and direct — the
+        # model must predict the correct average level per country.
+        # DRO-weighted so conflict countries (that matter) get priority.
+        e_mean = (y_pred - y_true).mean(dim=1)                    # (B,)
+        level_cell = self._log_cosh_proportional(e_mean)
+        # DRO on level: countries with large DC offset get upweighted
+        level_regret = torch.relu(
+            level_cell.detach() - self._log_cosh_proportional(
+                y_true.mean(dim=1)
+            ).detach()
+        )
+        w_level = self._dro_weights(level_regret)
+        w_level = w_level / w_level.mean().clamp(min=1e-8)
+        loss_level = (w_level * level_cell).mean()
 
-        # ── Inverse-frequency compound weighting ──────────────────────
-        # Equalises total gradient mass between event and peace cells.
-        # Let p = mean(event_mag) per series.  Then:
-        #   w_i = event_mag_i / p + (1 − event_mag_i) / (1 − p)
-        # This ensures Σ_event w ≈ Σ_peace w regardless of count
-        # imbalance.  No hardcoded multipliers.
-        event_mag = self._event_magnitude(y_pred, y_true)
-        p_series = event_mag.mean(dim=1, keepdim=True).clamp(min=1e-4, max=1.0 - 1e-4)
-        w_compound = event_mag / p_series + (1.0 - event_mag) / (1.0 - p_series)
-        # Normalize to mean=1 per series (preserves total loss scale)
-        w_compound = w_compound / w_compound.mean(dim=1, keepdim=True).clamp(min=1e-8)
-        series_loss = (w_compound * cell_loss).mean(dim=1)        # (B,)
-
-        # ── Cross-series DRO (additive regret) ────────────────────────
-        # Baseline: irreducible loss on target shape (cannot do better
-        # than reproducing the target's own variability around its mean).
-        baseline = self._log_cosh_proportional(
-            y_true - y_true.mean(dim=1, keepdim=True)
-        ).mean(dim=1).detach()
-        # Regret: excess loss above baseline.  Peace countries have
-        # series_loss ≈ 0 and baseline ≈ 0 → regret ≈ 0.  Conflict
-        # countries with structural errors get regret > 0.
-        regret = torch.relu(series_loss.detach() - baseline)
-        w_series = self._dro_weights(regret)                       # (B,)
-        w_series = w_series / w_series.mean().clamp(min=1e-8)
-        loss_cell = (w_series * series_loss).mean()
+        # ── Shape loss (AC via temporal gradients) ────────────────────
+        # Primary shape signal.  Gradient ≈13× stronger at transitions
+        # than pointwise cell_loss.  DC-immune, not zero-sum.
+        loss_shape = self._shape_loss(y_pred, y_true)
 
         # ── Log-magnitude multi-resolution STFT ───────────────────────
+        # Secondary shape signal — penalises missing spectral energy at
+        # multiple time-scales.  Catches periodic patterns that single-
+        # step gradient matching might miss.
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_cell + loss_spec
+        total_loss = loss_level + loss_shape + loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
-                f"NaN in SpotlightLossLogcosh: cell={loss_cell.item():.6f} "
-                f"spec={loss_spec.item():.6f}"
+                f"NaN in SpotlightLossLogcosh: level={loss_level.item():.6f} "
+                f"shape={loss_shape.item():.6f} spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | cell=%.6f spec=%.6f total=%.6f",
-            loss_cell.item(), loss_spec.item(), total_loss.item(),
+            "SpotlightLossLogcosh | level=%.6f shape=%.6f "
+            "spec=%.6f total=%.6f",
+            loss_level.item(), loss_shape.item(),
+            loss_spec.item(), total_loss.item(),
         )
         return total_loss
 

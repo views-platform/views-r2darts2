@@ -420,9 +420,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_series = w_series / w_series.mean().clamp(min=1e-8)
         loss_shape = (w_series * series_loss).mean()
 
-        # ── Windowed level anchor (event-weighted) ────────────────────
-        loss_level = self._windowed_level_loss(e, y_pred, y_true, T)
-
         # ── Multi-resolution spectral loss (shape-budgeted) ──────────
         loss_spec = y_pred.new_tensor(0.0)
         spec_coeff = y_pred.new_tensor(0.0)
@@ -432,19 +429,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 loss_shape.detach() + loss_spec.detach() + 1e-8
             )
 
-        total_loss = loss_shape + loss_level + spec_coeff * loss_spec
+        total_loss = loss_shape + spec_coeff * loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} "
                 f"spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | shape=%.6f level=%.6f "
+            "SpotlightLossLogcosh | shape=%.6f "
             "spec=%.6f spec_coeff=%.4f total=%.6f",
-            loss_shape.item(), loss_level.item(),
+            loss_shape.item(),
             loss_spec.item(),
             spec_coeff.item(), total_loss.item(),
         )

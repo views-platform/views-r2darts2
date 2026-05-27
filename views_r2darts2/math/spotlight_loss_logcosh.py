@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v38 — DC/AC split with temporal-gradient shape loss.
+    SpotlightLoss v39 — plain log_cosh + dual shape (gradient + AC).
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -16,49 +16,54 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Architecture ─────────────────────────────────────────────────────
 
-    Three components.  DC and AC are separated by construction (not by
-    demeaning), eliminating the zero-sum gradient problem of v36.
+    Four components.  All use plain `log_cosh` (saturating gradient at
+    ±1).  No proportional correction — prioritization is handled
+    exclusively by inverse-frequency weights and DRO, giving clean
+    orthogonal control without magnitude-dependent interference.
 
-    1. **Level loss (DC)** — `log_cosh_proportional(mean(ŷ − y))` per
-       series.  Penalises mean prediction offset directly.  DRO-weighted
-       so conflict countries get priority.
+    1. **Multi-scale windowed level loss (DC)** — `log_cosh(mean(e))`
+       at windows of 4, 12, and 36 months.  Catches level offsets at
+       local, seasonal, and global scales.  Event-magnitude weighted
+       per window with inverse-frequency rebalancing + DRO.
 
-    2. **Temporal gradient loss (AC)** — the PRIMARY shape signal.
-       `log_cosh_proportional(Δŷ − Δy)` where Δ is first difference.
+    2. **Temporal gradient loss** — `log_cosh(Δŷ − Δy)`.
+       Sparse (active only at transition boundaries), NOT zero-sum.
+       Breaks the flat-prediction equilibrium: model gets strong signal
+       to create jumps at onset/offset boundaries.  Detached zero
+       gradient at plateaus.
 
-       Why this works where e_shape failed:
-       - DC-free by construction (first-difference annihilates constants)
-       - NOT zero-sum: gradient telescopes to `loss'(d_1) − loss'(d_T)`,
-         which is generally non-zero.  Model CAN increase output variance.
-       - 13× stronger signal at onsets than pointwise cell_loss:
-         flat prediction at onset (Δy=3, Δŷ=0) → proportional loss ≈ 9.5
-         vs cell_loss on same cell with error ≈ 1 → loss ≈ 0.7
-       - Zero gradient at plateaus: Δy=0, Δŷ≈0 → loss≈0.
-         No wasted gradient on the 90% peace-cell desert.
-       - Transition-event weighted: adjacent pairs near events get full
-         weight; peace-peace pairs get near-zero weight.
-       - Inverse-frequency rebalancing per series (same as v37).
+    3. **Demeaned error (AC sustain) loss** — `log_cosh(ŷ_AC − y_AC)`
+       where AC = signal − series_mean.
+       Dense (active at all cells), zero-sum.  Sustains correct relative
+       heights BETWEEN transitions.  Gradient pushes event-cells UP and
+       peace-cells DOWN simultaneously.  Only effective once the temporal
+       gradient has broken the flat fixed-point (at which point the
+       zero-sum pathology no longer applies).
 
-    3. **Log-magnitude multi-resolution STFT** — secondary shape signal.
-       Catches periodic/seasonal patterns that single-step gradient
-       matching might miss (e.g. a 6-month conflict cycle where the
-       model gets individual transitions right but misses the period).
-       Same formulation as v37: `log_cosh(log1p(mag_pred) − log1p(mag_true))`
-       with event-magnitude series weighting.
+    4. **Log-magnitude multi-resolution STFT** — catches periodic
+       patterns that pointwise losses miss (e.g. 6-month conflict
+       cycles).  Same formulation: `log_cosh(log1p(mag_pred) −
+       log1p(mag_true))` with event-magnitude series weighting.
+
+    ── Why plain log_cosh ───────────────────────────────────────────────
+
+    Previous `log_cosh_proportional` had growing gradient (≈ 1+2ln|x|)
+    for large errors.  This sounds beneficial but:
+    - It gives hardest countries (Syria, |e|=5) 1.75× more per-cell
+      gradient than moderate conflicts (Nigeria, |e|=2)
+    - The model over-focuses on unpredictable extremes at the expense
+      of learnable patterns in moderate conflicts
+    - Interferes with explicit inverse-frequency weights (redundant
+      magnitude-dependent reweighting)
+
+    Plain log_cosh saturates at ±1.  Once wrong (|e|>2), all cells get
+    equal gradient magnitude.  DRO + inverse-frequency then cleanly
+    control which cells/series matter without interference.
 
     ── Cross-series DRO (per component) ─────────────────────────────────
 
-    Each component (level, shape) has its own additive-regret DRO:
-    - Level DRO: upweights countries with large DC offset
-    - Shape DRO: upweights countries with worst temporal-gradient fit
+    Each of the four components has its own additive-regret DRO.
     Baselines are component-specific irreducible losses.
-
-    ── Base cell loss: log_cosh × (1 + log(1+|x|²))  (proportional) ───
-
-    Sub-linear proportional correction.  For |x| > 2, gradient grows as
-    ≈ 1 + 2·ln|x| — fast enough to attend to large errors but
-    sub-linear enough to prevent extreme-country errors from monopolising
-    the aggregate gradient.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -210,37 +215,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # Temporal gradient (shape) loss
     # ------------------------------------------------------------------
 
-    def _shape_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Temporal-gradient matching — the primary shape-learning signal.
+    def _gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Temporal-gradient matching — breaks the flat equilibrium.
 
         Computes first differences Δŷ and Δy and penalises their
-        element-wise disagreement with `log_cosh_proportional`.
+        element-wise disagreement with `log_cosh`.
 
-        Properties:
-        • DC-free by construction — first-difference kills any constant
-          offset, so level errors do NOT dilute shape learning.
-        • NOT zero-sum — gradient at timestep t receives independent
-          contributions from the (t−1,t) and (t,t+1) pairs.  The model
-          IS free to increase output variance (unlike demeaned e_shape).
-        • Sharp at transitions — for a flat prediction at an onset
-          (Δy=3, Δŷ=0), the proportional loss gives ≈9.5.  For the same
-          cell under pointwise cell_loss with error ≈1, loss ≈0.7.
-          That's a 13× gradient amplification at the cells that matter.
-        • Silent on plateaus — when Δy=0 and Δŷ≈0, loss≈0. No wasted
-          gradient on peace-cell deserts.
+        Role: provides non-zero-sum gradient that BREAKS OUT of flat
+        predictions.  Sparse (active only at transition boundaries)
+        but with high per-cell magnitude at onsets/offsets.
 
         Weighting: transition-event curriculum.  Each adjacent pair gets
         weight proportional to the max(event_mag) of the two cells in the
-        pair.  Event onsets (0→high) get full weight.  Peace-peace pairs
-        (0→0) get near-zero weight.  Inverse-frequency rebalancing
-        ensures conflict transitions aren't diluted by peace mass.
+        pair.  Inverse-frequency rebalancing per series.
         """
         # First differences: (B, T-1)
         dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
         dy_true = y_true[:, 1:] - y_true[:, :-1]
 
         # Shape error at each transition
-        shape_err = self._log_cosh_proportional(dy_pred - dy_true)
+        shape_err = self._log_cosh(dy_pred - dy_true)
 
         # Transition-event weighting: max event_mag of each adjacent pair
         event_mag = self._event_magnitude(y_pred, y_true)
@@ -253,15 +247,138 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         series_shape = (w_shape * shape_err).mean(dim=1)  # (B,)
 
-        # Cross-series DRO: prioritise countries where shape is worst
-        # Baseline: irreducible shape loss (target's own gradient variance)
-        target_shape_err = self._log_cosh_proportional(dy_true)
+        # Cross-series DRO
+        target_shape_err = self._log_cosh(dy_true)
         baseline = (w_shape.detach() * target_shape_err).mean(dim=1).detach()
         regret = torch.relu(series_shape.detach() - baseline)
         w_series = self._dro_weights(regret)
         w_series = w_series / w_series.mean().clamp(min=1e-8)
 
         return (w_series * series_shape).mean()
+
+    # ------------------------------------------------------------------
+    # Demeaned error (sustained shape) loss
+    # ------------------------------------------------------------------
+
+    def _ac_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Demeaned-error shape loss — sustains levels between transitions.
+
+        Computes AC components: ŷ_AC = ŷ − mean(ŷ), y_AC = y − mean(y),
+        then penalises per-cell difference with `log_cosh`.
+
+        Role: provides DENSE gradient at all cells simultaneously.
+        Ensures the model SUSTAINS correct relative heights during
+        conflict plateaus (t=11-14), not just transitions (t=10, t=15).
+
+        The zero-sum constraint (Σ grad = 0 per series) is acceptable
+        here because:
+        - Level is handled independently by _level_loss
+        - Temporal gradient (_gradient_loss) has already broken any
+          flat equilibrium, so this loss operates on non-flat predictions
+          where the zero-sum pathology doesn't apply
+
+        Weighting: per-cell event magnitude with inverse-frequency
+        rebalancing.  Conflict cells get full weight, peace cells
+        get near-zero weight (their AC component is ~0 anyway).
+        """
+        # AC components
+        pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
+        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
+        ac_err = self._log_cosh(pred_ac - true_ac)
+
+        # Event-magnitude weighting per cell
+        event_mag = self._event_magnitude(y_pred, y_true)
+        p_cell = event_mag.mean(dim=1, keepdim=True).clamp(min=1e-4, max=1.0 - 1e-4)
+        w_ac = event_mag / p_cell + (1.0 - event_mag) / (1.0 - p_cell)
+        w_ac = w_ac / w_ac.mean(dim=1, keepdim=True).clamp(min=1e-8)
+
+        series_ac = (w_ac * ac_err).mean(dim=1)  # (B,)
+
+        # Cross-series DRO
+        target_ac_err = self._log_cosh(true_ac)
+        baseline = (w_ac.detach() * target_ac_err).mean(dim=1).detach()
+        regret = torch.relu(series_ac.detach() - baseline)
+        w_series = self._dro_weights(regret)
+        w_series = w_series / w_series.mean().clamp(min=1e-8)
+
+        return (w_series * series_ac).mean()
+
+    # ------------------------------------------------------------------
+    # Multi-scale windowed level loss
+    # ------------------------------------------------------------------
+
+    _LEVEL_WINDOWS = (4, 12, 36)
+
+    def _level_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Multi-scale windowed level loss.
+
+        Computes non-overlapping window means at 3 scales (4, 12, 36
+        months) and penalises every (series, window) mean-error with
+        plain `log_cosh` (saturating gradient — no magnitude interference
+        with the explicit inverse-frequency weights).
+
+        Multi-scale rationale:
+        • W=4  — catches local level shifts (regime onset within a
+          quarter).
+        • W=12 — seasonal level.
+        • W=36 — global DC.
+
+        Event-magnitude weighting per window + inverse-frequency
+        rebalancing + cross-series DRO.
+        """
+        T = y_pred.size(1)
+        e = y_pred - y_true                                       # (B, T)
+        event_mag = self._event_magnitude(y_pred, y_true)         # (B, T)
+
+        all_window_losses = []
+        all_window_weights = []
+
+        for W in self._LEVEL_WINDOWS:
+            if T < W:
+                continue
+            # Non-overlapping window means of error
+            n_windows = T // W
+            e_trunc = e[:, :n_windows * W].view(e.size(0), n_windows, W)
+            window_mean_err = e_trunc.mean(dim=2)                 # (B, n_win)
+            wloss = self._log_cosh(window_mean_err)               # (B, n_win)
+
+            # Event weight per window: max event_mag within
+            em_trunc = event_mag[:, :n_windows * W].view(e.size(0), n_windows, W)
+            window_event = em_trunc.amax(dim=2)                   # (B, n_win)
+
+            all_window_losses.append(wloss)
+            all_window_weights.append(window_event)
+
+        if not all_window_losses:
+            return y_pred.new_tensor(0.0)
+
+        # Concatenate across all scales: (B, total_windows)
+        cat_loss = torch.cat(all_window_losses, dim=1)
+        cat_event = torch.cat(all_window_weights, dim=1)
+
+        # Inverse-frequency rebalancing per series
+        p_win = cat_event.mean(dim=1, keepdim=True).clamp(min=1e-4, max=1.0 - 1e-4)
+        w_level = cat_event / p_win + (1.0 - cat_event) / (1.0 - p_win)
+        w_level = w_level / w_level.mean(dim=1, keepdim=True).clamp(min=1e-8)
+
+        series_level = (w_level * cat_loss).mean(dim=1)           # (B,)
+
+        # Cross-series DRO
+        target_windows = []
+        for W in self._LEVEL_WINDOWS:
+            if T < W:
+                continue
+            n_windows = T // W
+            yt_trunc = y_true[:, :n_windows * W].view(y_true.size(0), n_windows, W)
+            target_windows.append(self._log_cosh(yt_trunc.mean(dim=2)))
+        cat_baseline = torch.cat(target_windows, dim=1)
+        baseline = (w_level.detach() * cat_baseline).mean(dim=1).detach()
+
+        regret = torch.relu(series_level.detach() - baseline)
+        w_series = self._dro_weights(regret)
+        w_series = w_series / w_series.mean().clamp(min=1e-8)
+
+        return (w_series * series_level).mean()
 
     # ------------------------------------------------------------------
     # Forward
@@ -274,47 +391,43 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         T = y_pred.size(1)
 
-        # ── Level loss (DC) ───────────────────────────────────────────
-        # Penalises per-series mean offset.  Simple and direct — the
-        # model must predict the correct average level per country.
-        # DRO-weighted so conflict countries (that matter) get priority.
-        e_mean = (y_pred - y_true).mean(dim=1)                    # (B,)
-        level_cell = self._log_cosh_proportional(e_mean)
-        # DRO on level: countries with large DC offset get upweighted
-        level_regret = torch.relu(
-            level_cell.detach() - self._log_cosh_proportional(
-                y_true.mean(dim=1)
-            ).detach()
-        )
-        w_level = self._dro_weights(level_regret)
-        w_level = w_level / w_level.mean().clamp(min=1e-8)
-        loss_level = (w_level * level_cell).mean()
+        # ── Multi-scale level loss (DC) ───────────────────────────────
+        # Penalises local, seasonal, and global mean offset.  Event-
+        # weighted so conflict epochs dominate.  Multiple scales catch
+        # regime shifts that a single 36-month mean would wash out.
+        loss_level = self._level_loss(y_pred, y_true)
 
-        # ── Shape loss (AC via temporal gradients) ────────────────────
-        # Primary shape signal.  Gradient ≈13× stronger at transitions
-        # than pointwise cell_loss.  DC-immune, not zero-sum.
-        loss_shape = self._shape_loss(y_pred, y_true)
+        # ── Temporal gradient loss ────────────────────────────────────
+        # Sparse, non-zero-sum.  Breaks the flat equilibrium by
+        # providing strong gradient at transition boundaries.
+        loss_grad = self._gradient_loss(y_pred, y_true)
+
+        # ── Demeaned error (AC sustain) loss ──────────────────────────
+        # Dense, zero-sum.  Sustains correct relative heights between
+        # transitions.  Only effective once gradient loss has broken
+        # the flat fixed-point.
+        loss_ac = self._ac_loss(y_pred, y_true)
 
         # ── Log-magnitude multi-resolution STFT ───────────────────────
-        # Secondary shape signal — penalises missing spectral energy at
-        # multiple time-scales.  Catches periodic patterns that single-
-        # step gradient matching might miss.
+        # Penalises missing spectral energy at multiple time-scales.
+        # Catches periodic patterns.
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_level + loss_shape + loss_spec
+        total_loss = loss_level + loss_grad + loss_ac + loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: level={loss_level.item():.6f} "
-                f"shape={loss_shape.item():.6f} spec={loss_spec.item():.6f}"
+                f"grad={loss_grad.item():.6f} ac={loss_ac.item():.6f} "
+                f"spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | level=%.6f shape=%.6f "
+            "SpotlightLossLogcosh | level=%.6f grad=%.6f ac=%.6f "
             "spec=%.6f total=%.6f",
-            loss_level.item(), loss_shape.item(),
+            loss_level.item(), loss_grad.item(), loss_ac.item(),
             loss_spec.item(), total_loss.item(),
         )
         return total_loss

@@ -349,8 +349,8 @@ def apply_rinorm_compression_patch():
         # Prevents RevIN denorm from amplifying extreme-conflict series
         # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
         # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
-        sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
+        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
+        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
 
         # Clamp before sinh to prevent float32 overflow.
         # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000

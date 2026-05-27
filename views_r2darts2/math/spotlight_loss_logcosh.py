@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v39 — plain log_cosh + dual shape (gradient + AC).
+    SpotlightLoss v40 — plain log_cosh, level + AC + STFT (no temporal gradient).
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
@@ -16,54 +16,61 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Architecture ─────────────────────────────────────────────────────
 
-    Four components.  All use plain `log_cosh` (saturating gradient at
-    ±1).  No proportional correction — prioritization is handled
-    exclusively by inverse-frequency weights and DRO, giving clean
-    orthogonal control without magnitude-dependent interference.
+    Three components.  All use plain `log_cosh` (saturating gradient at
+    ±1).  Prioritization handled exclusively by inverse-frequency weights
+    and DRO — no magnitude-dependent correction.
 
     1. **Multi-scale windowed level loss (DC)** — `log_cosh(mean(e))`
        at windows of 4, 12, and 36 months.  Catches level offsets at
-       local, seasonal, and global scales.  Event-magnitude weighted
-       per window with inverse-frequency rebalancing + DRO.
+       local, seasonal, and global scales.  W=4 windows provide the
+       "break out of flat" signal: if prediction is flat but a quarter
+       has events, this gives direct "raise your mean here" gradient.
+       Event-magnitude weighted per window + inverse-frequency + DRO.
 
-    2. **Temporal gradient loss** — `log_cosh(Δŷ − Δy)`.
-       Sparse (active only at transition boundaries), NOT zero-sum.
-       Breaks the flat-prediction equilibrium: model gets strong signal
-       to create jumps at onset/offset boundaries.  Detached zero
-       gradient at plateaus.
-
-    3. **Demeaned error (AC sustain) loss** — `log_cosh(ŷ_AC − y_AC)`
+    2. **Demeaned error (AC shape) loss** — `log_cosh(ŷ_AC − y_AC)`
        where AC = signal − series_mean.
-       Dense (active at all cells), zero-sum.  Sustains correct relative
-       heights BETWEEN transitions.  Gradient pushes event-cells UP and
-       peace-cells DOWN simultaneously.  Only effective once the temporal
-       gradient has broken the flat fixed-point (at which point the
-       zero-sum pathology no longer applies).
+       Dense per-cell shape signal.  Pushes event cells UP and peace
+       cells DOWN relative to series mean.  Together with level, fully
+       specifies the target: level sets the mean per window, AC sets
+       the relative heights within.  Event-magnitude weighted + DRO.
 
-    4. **Log-magnitude multi-resolution STFT** — catches periodic
-       patterns that pointwise losses miss (e.g. 6-month conflict
-       cycles).  Same formulation: `log_cosh(log1p(mag_pred) −
+    3. **Log-magnitude multi-resolution STFT** — catches periodic
+       patterns that pointwise losses miss.  `log_cosh(log1p(mag_pred) −
        log1p(mag_true))` with event-magnitude series weighting.
+
+    ── Why no temporal gradient loss ────────────────────────────────────
+
+    Temporal gradient (Δŷ − Δy) was removed because:
+    - log_cosh saturates at ±1: model gets SAME gradient whether off by
+      2 or 5 at a transition → can't learn to make BIG jumps for high-
+      variance countries
+    - Zero signal on plateaus (Δy=0): exactly where high-variance
+      countries need gradient most (must sustain level, not just jump)
+    - Creates competing smoothness pressure on plateaus where level+AC
+      want the model to stay high
+    - Redundant with level(W=4) + AC: level provides onset detection at
+      quarterly scale, AC provides dense per-cell refinement
+
+    ── Why no σ cap in RevIN ────────────────────────────────────────────
+
+    Previous versions capped per-series σ at 5× batch-mean to prevent
+    forecast runaway via proportional-loss amplification.  With plain
+    log_cosh, that amplification loop is broken (saturating gradient).
+    The cap PREVENTS high-variance countries from expressing full dynamic
+    range: Syria (σ=200) capped to 75 → model can output max ≈ 6.3 when
+    target needs 6.9.  Removed — the ±50 ẑ clamp provides sufficient
+    float32 overflow protection.
 
     ── Why plain log_cosh ───────────────────────────────────────────────
 
-    Previous `log_cosh_proportional` had growing gradient (≈ 1+2ln|x|)
-    for large errors.  This sounds beneficial but:
-    - It gives hardest countries (Syria, |e|=5) 1.75× more per-cell
-      gradient than moderate conflicts (Nigeria, |e|=2)
-    - The model over-focuses on unpredictable extremes at the expense
-      of learnable patterns in moderate conflicts
-    - Interferes with explicit inverse-frequency weights (redundant
-      magnitude-dependent reweighting)
+    Previous `log_cosh_proportional` gave growing gradient (≈ 1+2ln|x|)
+    for large errors.  This makes the model over-focus on unpredictable
+    extremes (Syria) at the expense of learnable moderate conflicts
+    (Nigeria).  Interferes with explicit inverse-frequency weights.
 
-    Plain log_cosh saturates at ±1.  Once wrong (|e|>2), all cells get
-    equal gradient magnitude.  DRO + inverse-frequency then cleanly
-    control which cells/series matter without interference.
-
-    ── Cross-series DRO (per component) ─────────────────────────────────
-
-    Each of the four components has its own additive-regret DRO.
-    Baselines are component-specific irreducible losses.
+    Plain log_cosh: once wrong (|e|>2), all cells get equal gradient
+    magnitude ≈1.  DRO + inverse-frequency cleanly control which cells/
+    series matter without interference.
 
     ─────────────────────────────────────────────────────────────────────
 
@@ -395,17 +402,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Penalises local, seasonal, and global mean offset.  Event-
         # weighted so conflict epochs dominate.  Multiple scales catch
         # regime shifts that a single 36-month mean would wash out.
+        # W=4 windows provide the "break out of flat" signal: if the
+        # model is flat but a 4-month window has events, level loss at
+        # that window gives direct "raise your mean here" gradient.
         loss_level = self._level_loss(y_pred, y_true)
 
-        # ── Temporal gradient loss ────────────────────────────────────
-        # Sparse, non-zero-sum.  Breaks the flat equilibrium by
-        # providing strong gradient at transition boundaries.
-        loss_grad = self._gradient_loss(y_pred, y_true)
-
-        # ── Demeaned error (AC sustain) loss ──────────────────────────
-        # Dense, zero-sum.  Sustains correct relative heights between
-        # transitions.  Only effective once gradient loss has broken
-        # the flat fixed-point.
+        # ── Demeaned error (AC shape) loss ────────────────────────────
+        # Dense per-cell shape signal.  Pushes every event cell up and
+        # every peace cell down relative to series mean.  Together with
+        # level loss, fully specifies the target: level sets the mean
+        # per window, AC sets the relative heights within.
+        #
+        # No temporal gradient loss: it gives constant ±1 gradient
+        # regardless of error magnitude (saturating log_cosh), so the
+        # model gets no MORE incentive to make a 5-unit jump than a
+        # 2-unit jump.  On sustained plateaus (Δy=0), it contributes
+        # zero signal — exactly where high-variance countries need
+        # gradient the most.  Redundant with level + AC and creates
+        # competing smoothness pressure on plateaus.
         loss_ac = self._ac_loss(y_pred, y_true)
 
         # ── Log-magnitude multi-resolution STFT ───────────────────────
@@ -415,19 +429,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_level + loss_grad + loss_ac + loss_spec
+        total_loss = loss_level + loss_ac + loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: level={loss_level.item():.6f} "
-                f"grad={loss_grad.item():.6f} ac={loss_ac.item():.6f} "
-                f"spec={loss_spec.item():.6f}"
+                f"ac={loss_ac.item():.6f} spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | level=%.6f grad=%.6f ac=%.6f "
+            "SpotlightLossLogcosh | level=%.6f ac=%.6f "
             "spec=%.6f total=%.6f",
-            loss_level.item(), loss_grad.item(), loss_ac.item(),
+            loss_level.item(), loss_ac.item(),
             loss_spec.item(), total_loss.item(),
         )
         return total_loss

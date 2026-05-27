@@ -291,59 +291,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         return (w_series * series_level).mean()
 
-    def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Soft-weighted temporal gradient matching — fully data-driven.
-
-        Replaces all binary thresholds (τ onset, _ESCALATION_FRAC) with a
-        single continuous relevance weight derived from the proportional
-        raw-space change magnitude:
-
-            r = |Δy_raw| / max(midpoint(|y_raw_a|, |y_raw_b|), 1)
-            w_rel = 1 − exp(−max(r_true, r_pred))
-
-        Properties:
-        • Plateau (Δy=0)           → w=0.  Silent, no smoothness pressure.
-        • Mild escalation (18%)    → w≈0.17.  Proportional penalty.
-        • Moderate escalation (27%) → w≈0.24.
-        • Onset 0→1 death          → w≈0.63.  (raw_local clamps to 1.)
-        • Major event 0→100        → w≈0.86.
-
-        Inflection at ~100% raw change (doubling),
-        which is a natural scale anchor.  Combined with log1p error-
-        curriculum weighting: total_w = w_rel × (1 + log1p(|de|)).
-        """
-        _CLAMP = 10.0  # sinh(10) ≈ 11 013, numerical safety only
-
-        # ── Proportional raw-space change magnitude ────────────────────
-        def _rel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            raw_a = torch.sinh(a.clamp(-_CLAMP, _CLAMP))
-            raw_b = torch.sinh(b.clamp(-_CLAMP, _CLAMP))
-            raw_mid = (raw_a.abs() + raw_b.abs()).mul(0.5).clamp(min=1.0)
-            return (raw_b - raw_a).abs() / raw_mid
-
-        rel_true = _rel(y_true[:, :-1], y_true[:, 1:])
-        rel_pred = _rel(y_pred[:, :-1].detach(), y_pred[:, 1:].detach())
-
-        # Soft relevance weight: 0 at plateaus, →1 for large changes.
-        soft_w = 1.0 - torch.exp(-torch.max(rel_true, rel_pred))  # (B, T-1)
-
-        if soft_w.sum() < 1e-8:
-            return y_pred.new_tensor(0.0)
-
-        # ── Temporal gradient error ────────────────────────────────────
-        dy_pred = y_pred[:, 1:] - y_pred[:, :-1]
-        dy_true = y_true[:, 1:] - y_true[:, :-1]
-        de = dy_pred - dy_true
-
-        cell_grad = self._log_cosh(de)
-
-        # Combined weight: data-driven relevance × error curriculum.
-        abs_de = torch.abs(de.detach())
-        w = soft_w * (1.0 + torch.log1p(abs_de))
-        denom = w.sum().clamp(min=1e-8)
-
-        return (w * cell_grad).sum() / denom
-
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
 
@@ -430,61 +377,50 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── DC/AC decomposition ───────────────────────────────────────
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
+        # ── Base cell loss on FULL error (no DC/AC split) ─────────────
+        # The DC/AC split (e_shape = e − mean(e)) forces Σᵢ ∂L/∂ŷᵢ = 0
+        # per series — the model cannot increase overall prediction
+        # variance, producing flat forecasts.  Full error restores
+        # non-zero net gradient per series.
+        #
+        # Sub-linear proportional correction (1 + log(1+|x|²)) is kept:
+        # it damps gradient growth for extreme errors, preventing event
+        # cells (|e|=3–5) from dominating peace cells (|e|≈0) in the
+        # aggregate gradient.  This controls overprediction naturally —
+        # the model can't just raise its baseline to cheaply reduce
+        # event-cell loss without paying proportional penalty on peace.
+        cell_loss = self._log_cosh_proportional(e)
 
-        # ── Base cell loss (gradient path: DC-blind) ──────────────────
-        cell_loss = self._log_cosh_proportional(e_shape)
-        # Scoring proxy: full-error magnitude (DC-aware).  Used only to
-        # rank/weight cells — does not enter the gradient itself.  This
-        # lets DRO and compound see DC errors that cell_loss cannot.
-        cell_score = self._log_cosh_proportional(e).detach()
-
-        # ── Compound weighting (uses full |e|, not e_shape) ───────────
-        # Difficulty must reflect total prediction error so cells in
-        # countries with DC offsets are correctly ranked as "wrong".
-        abs_e_full = torch.abs(e.detach())
-        difficulty = 1.0 - torch.exp(-abs_e_full)
+        # ── Compound weighting (event-aware, mild) ────────────────────
+        # With full error and sub-linear proportional, the gradient
+        # already naturally attends to event cells (they have larger
+        # |e|).  Compound only needs to prevent the 30:1 peace/event
+        # COUNT ratio from completely diluting event signals.
+        # event_mag alone (no difficulty, no multiplier) gives mild
+        # emphasis: w ∈ [1.0, ~1.7) before normalization.
         event_mag = self._event_magnitude(y_pred, y_true)
-        w_compound = 1.0 + 4.0 * difficulty * event_mag
+        w_compound = 1.0 + event_mag
+        w_compound = w_compound / w_compound.mean(dim=1, keepdim=True).clamp(min=1e-8)
+        series_loss = (w_compound * cell_loss).mean(dim=1)        # (B,)
 
-        # ── Hierarchical shape DRO ────────────────────────────────────
-        # Within-series DRO ranks cells by FULL error (cell_score), not
-        # DC-blind cell_loss — countries with large DC errors no longer
-        # have their gradient misdirected to random residual-around-mean
-        # timesteps.
-        w_dro_within = self._dro_weights_2d(cell_score)           # (B, T)
-
-        # Cooperative additive combination (not multiplicative).  Both
-        # weights have mean ≈ 1; sum has mean ≈ 2.  When one weight is
-        # high and the other is uniform, the cell still receives strong
-        # attention.  When BOTH are high (event AND high error), it gets
-        # extra emphasis.  Multiplicative made them compete.
-        w_within = (w_compound + w_dro_within) * 0.5
-        w_within = w_within / w_within.mean(dim=1, keepdim=True).clamp(min=1e-8)
-        series_loss = (w_within * cell_loss).mean(dim=1)          # (B,)
-
-        # Cross-series regret DRO — decoupled from compound to avoid
-        # high-intensity feedback loop.  Score uses DRO-only weights.
-        w_score_within = w_dro_within / w_dro_within.mean(
-            dim=1, keepdim=True
-        ).clamp(min=1e-8)
-        series_score_loss = (w_score_within * cell_score).mean(dim=1).detach()
-
-        # Regret: how underfit is this country relative to its own
-        # target signal complexity?  Baseline floor prevents peace
-        # countries (baseline≈0) from getting infinite regret.
-        target_shape = y_true - y_true.mean(dim=1, keepdim=True)
-        shape_baseline = self._log_cosh_proportional(target_shape).mean(dim=1).detach()
+        # ── Cross-series DRO (regret-based) ───────────────────────────
+        # Prioritises countries with high remaining loss relative to
+        # their own target complexity.  Uses series_loss directly (no
+        # separate score path needed since cell_loss is already on full
+        # error).
+        shape_baseline = self._log_cosh_proportional(
+            y_true - y_true.mean(dim=1, keepdim=True)
+        ).mean(dim=1).detach()
         shape_baseline = shape_baseline.clamp(min=self.non_zero_threshold * 0.01)
 
-        regret = series_score_loss / (series_score_loss + shape_baseline + 1e-8)
+        regret = series_loss.detach() / (
+            series_loss.detach() + shape_baseline + 1e-8
+        )
         w_series = self._dro_weights(regret)                       # (B,)
         w_series = w_series / w_series.mean().clamp(min=1e-8)
         loss_shape = (w_series * series_loss).mean()
 
-        # ── Windowed level anchor (event-weighted; MSLE-symmetric) ───
+        # ── Windowed level anchor (event-weighted) ────────────────────
         loss_level = self._windowed_level_loss(e, y_pred, y_true, T)
 
         # ── Multi-resolution spectral loss (shape-budgeted) ──────────
@@ -492,8 +428,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         spec_coeff = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
-            # Dynamic budget: STFT contribution shrinks if it would
-            # overwhelm shape.  Stateless, self-calibrating per batch.
             spec_coeff = loss_shape.detach() / (
                 loss_shape.detach() + loss_spec.detach() + 1e-8
             )

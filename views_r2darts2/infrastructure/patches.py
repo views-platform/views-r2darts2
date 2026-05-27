@@ -360,15 +360,25 @@ def apply_rinorm_compression_patch():
         # Expand and denormalize.
         # When using a likelihood (e.g. Gaussian/Laplace), Darts passes the raw
         # parameter tensor of shape (..., nr_params) through this inverse BEFORE
-        # loss computation. Only the LOCATION parameter (index 0) should receive
-        # the mean shift (+ μ_asinh). SCALE parameters (index 1+) must not — adding
-        # μ_asinh to a scale makes it ≈ μ_asinh for high-conflict series, destroying
-        # per-series calibration and suppressing the NLL scale gradient.
+        # loss computation.  Only the LOCATION parameter (index 0) should receive
+        # the full nonlinear inverse (asinh(sinh(x)×σ) + μ).
+        #
+        # SCALE parameters (index 1+) must NOT go through asinh(sinh(·)×σ).
+        # Reason: σ_raw for high-conflict series can be 100+.  The transform
+        # asinh(sinh(1.0)×100) ≈ 5.5, producing a Laplace b ≈ 5.5 in asinh-space.
+        # The 5% tail samples then land at μ±16.5 in asinh-space → sinh(16.5) ≈
+        # 7.3 million deaths.  But the ENTIRE target range in asinh-space is
+        # only ~7 (asinh(500)≈6.9).  The natural uncertainty scale is O(1-3).
+        #
+        # Fix: scale parameters pass through as IDENTITY.  The model learns the
+        # absolute scale of uncertainty directly in target (asinh) space.  The
+        # NLL gradient naturally calibrates scale to the empirical residual
+        # magnitude (~0.3 for peace, ~1-3 for conflict).  No σ amplification.
         if x.dim() == 4 and x.shape[-1] > 1:
-            # x[..., 0]: location parameter — full inverse with mean re-centering
+            # x[..., 0]: location parameter — full nonlinear inverse
             loc = torch.asinh(torch.sinh(x[..., :1]) * sigma) + mu
-            # x[..., 1+]: scale/dispersion parameters — scale component only, no shift
-            sca = torch.asinh(torch.sinh(x[..., 1:]) * sigma)
+            # x[..., 1+]: scale/dispersion — identity (model learns in target space)
+            sca = x[..., 1:]
             x = torch.cat([loc, sca], dim=-1)
         else:
             # Point forecasting (nr_params == 1) — full inverse as before

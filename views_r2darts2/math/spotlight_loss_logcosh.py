@@ -484,7 +484,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # event_mag redundant and over-emphasising spikes that are
         # still poorly fit (positive feedback into hard cases).
         event_mag = self._event_magnitude(y_pred, y_true)
-        w_compound = 1.0 + 4.0 * event_mag
+        w_compound = 1.0 + event_mag
         w_compound = w_compound / w_compound.mean(dim=1, keepdim=True).clamp(min=1e-8)
         series_loss = (w_compound * cell_loss).mean(dim=1)        # (B,)
 

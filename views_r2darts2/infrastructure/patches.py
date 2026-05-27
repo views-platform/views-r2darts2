@@ -357,10 +357,22 @@ def apply_rinorm_compression_patch():
         # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
         x = torch.clamp(x, -50.0, 50.0)
 
-        # Expand: sinh(ẑ) · σ_c gives centered-raw prediction
-        # Compress: asinh wraps it back into asinh-space
-        # Shift: + μ_asinh re-centers (additive, no amplification)
-        x = torch.asinh(torch.sinh(x) * sigma) + mu
+        # Expand and denormalize.
+        # When using a likelihood (e.g. Gaussian/Laplace), Darts passes the raw
+        # parameter tensor of shape (..., nr_params) through this inverse BEFORE
+        # loss computation. Only the LOCATION parameter (index 0) should receive
+        # the mean shift (+ μ_asinh). SCALE parameters (index 1+) must not — adding
+        # μ_asinh to a scale makes it ≈ μ_asinh for high-conflict series, destroying
+        # per-series calibration and suppressing the NLL scale gradient.
+        if x.dim() == 4 and x.shape[-1] > 1:
+            # x[..., 0]: location parameter — full inverse with mean re-centering
+            loc = torch.asinh(torch.sinh(x[..., :1]) * sigma) + mu
+            # x[..., 1+]: scale/dispersion parameters — scale component only, no shift
+            sca = torch.asinh(torch.sinh(x[..., 1:]) * sigma)
+            x = torch.cat([loc, sca], dim=-1)
+        else:
+            # Point forecasting (nr_params == 1) — full inverse as before
+            x = torch.asinh(torch.sinh(x) * sigma) + mu
 
         return x
 

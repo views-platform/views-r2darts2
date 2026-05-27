@@ -14,8 +14,37 @@ from pytorch_lightning.loggers import WandbLogger
 import torch
 import logging
 
+from darts.utils.likelihood_models import (
+    GaussianLikelihood,
+    LaplaceLikelihood,
+    PoissonLikelihood,
+    NegativeBinomialLikelihood,
+    BetaLikelihood,
+    CauchyLikelihood,
+    ExponentialLikelihood,
+    GumbelLikelihood,
+    LogNormalLikelihood,
+    WeibullLikelihood,
+    QuantileRegression,
+)
 from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
+
+# Darts likelihood objects keyed by config string.
+# When one of these is selected, loss_fn must be None.
+_LIKELIHOOD_REGISTRY = {
+    "GaussianLikelihood": GaussianLikelihood,
+    "LaplaceLikelihood": LaplaceLikelihood,
+    "PoissonLikelihood": PoissonLikelihood,
+    "NegativeBinomialLikelihood": NegativeBinomialLikelihood,
+    "BetaLikelihood": BetaLikelihood,
+    "CauchyLikelihood": CauchyLikelihood,
+    "ExponentialLikelihood": ExponentialLikelihood,
+    "GumbelLikelihood": GumbelLikelihood,
+    "LogNormalLikelihood": LogNormalLikelihood,
+    "WeibullLikelihood": WeibullLikelihood,
+    "QuantileRegression": QuantileRegression,
+}
 from views_r2darts2.catalogs.optimizer_catalog import OptimizerCatalog
 from views_r2darts2.catalogs.scheduler_catalog import SchedulerCatalog
 from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
@@ -76,8 +105,18 @@ class ModelCatalog:
         self.config = config
         self.device = DartsForecaster.get_device()
 
-        # DELEGATION: Specialized catalogs handle genomic translation
-        self.loss_fn = LossCatalog(self.config).get_loss()
+        # DELEGATION: Specialized catalogs handle genomic translation.
+        # Darts Likelihood objects are mutually exclusive with loss_fn —
+        # when one is selected, loss_fn must be None and the likelihood
+        # instance is passed directly to the model constructor instead.
+        loss_name = self.config.get("loss_function", "")
+        if loss_name in _LIKELIHOOD_REGISTRY:
+            self.loss_fn = None
+            self.likelihood = _LIKELIHOOD_REGISTRY[loss_name]()
+            logger.info("Using Darts likelihood: %s (loss_fn=None)", loss_name)
+        else:
+            self.loss_fn = LossCatalog(self.config).get_loss()
+            self.likelihood = None
         self.opt_catalog = OptimizerCatalog(self.config)
         self.sched_catalog = SchedulerCatalog(self.config)
 
@@ -130,6 +169,7 @@ class ModelCatalog:
             "batch_size": self.config.get("batch_size"),
             "n_epochs": self.config.get("n_epochs"),
             "loss_fn": self.loss_fn,
+            "likelihood": self.likelihood,
             "model_name": self.config.get("name"),
             "random_state": self.config.get("random_state"),
             "force_reset": True,

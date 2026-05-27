@@ -295,6 +295,19 @@ class ReproducibilityGate:
             "L1Loss": [],
             "HuberLoss": ["delta"],
             "PoissonNLLLoss": [],
+            # Darts Likelihood objects — loss_fn is set to None; the
+            # likelihood is passed directly to the model constructor.
+            "GaussianLikelihood": [],
+            "LaplaceLikelihood": [],
+            "PoissonLikelihood": [],
+            "NegativeBinomialLikelihood": [],
+            "BetaLikelihood": [],
+            "CauchyLikelihood": [],
+            "ExponentialLikelihood": [],
+            "GumbelLikelihood": [],
+            "LogNormalLikelihood": [],
+            "WeibullLikelihood": [],
+            "QuantileRegression": [],
         }
 
         @staticmethod

@@ -66,6 +66,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """log(cosh(x)), numerically stable. Gradient saturates at ±1."""
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
+    
+    @staticmethod
+    def _log_cosh_proportional(x: torch.Tensor) -> torch.Tensor:
+        """log_cosh with proportional sensitivity correction.
+
+        log_cosh(x) × (1 + log(1 + |x|²)).
+
+        For |x| < 1: ≈ 0.5x² with mild proportional correction.
+        For |x| > 2: ≈ |x| × 2·ln|x|.  Asinh-space errors are already
+            approximately log-ratio errors, so this reinforces MSLE
+            sensitivity without letting extreme countries monopolise
+            gradients.
+
+        Gradient = tanh(x)·(1 + log1p(|x|²))
+                   + log_cosh(x)·2x·sign(x)/(1+|x|²).
+        """
+        abs_x = torch.abs(x)
+        lc = abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
+        return lc * (1.0 + torch.log1p(abs_x * abs_x))
 
     def _event_magnitude(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Sharp sigmoid event/peace mask with 1% floor.
@@ -84,7 +103,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     def _pointwise_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Event-weighted log_cosh per cell. Primary training signal."""
-        cell_err = self._log_cosh(y_pred - y_true)
+        cell_err = self._log_cosh_proportional(y_pred - y_true)
         event_mag = self._event_magnitude(y_pred, y_true)
         # Weighted mean: event cells dominate via ~58:1 sigmoid ratio
         return (event_mag * cell_err).sum() / event_mag.sum().clamp(min=1e-8)
@@ -111,7 +130,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 continue
             n_win = T // W
             e_win = e[:, :n_win * W].view(e.size(0), n_win, W)
-            window_err = self._log_cosh(e_win.mean(dim=2))
+            window_err = self._log_cosh_proportional(e_win.mean(dim=2))
 
             em_win = event_mag[:, :n_win * W].view(e.size(0), n_win, W)
             window_event = em_win.amax(dim=2)
@@ -168,7 +187,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = torch.sqrt(S_true.real ** 2 + S_true.imag ** 2 + 1e-8)
 
             log_mag_err = torch.log1p(mag_pred) - torch.log1p(mag_true)
-            cell_loss = self._log_cosh(log_mag_err)
+            cell_loss = self._log_cosh_proportional(log_mag_err)
             # DC mask: skip bin 0
             cell_loss = cell_loss[:, 1:, :]
 
@@ -191,23 +210,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
 
         loss_pw = self._pointwise_loss(y_pred, y_true)
-        loss_level = self._level_loss(y_pred, y_true)
+        # loss_level = self._level_loss(y_pred, y_true)
 
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_pw + 0.2 * loss_level + 0.2 * loss_spec
+        total_loss = loss_pw + loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: pw={loss_pw.item():.6f} "
-                f"level={loss_level.item():.6f} spec={loss_spec.item():.6f}"
+                # f"level={loss_level.item():.6f} spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
             "SpotlightLossLogcosh | pw=%.6f level=%.6f spec=%.6f total=%.6f",
-            loss_pw.item(), loss_level.item(),
+            # loss_pw.item(), loss_level.item(),
             loss_spec.item(), total_loss.item(),
         )
         return total_loss

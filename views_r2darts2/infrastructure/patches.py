@@ -358,9 +358,10 @@ def apply_rinorm_compression_patch():
         #
         # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
         # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
-        sigma_med = sigma.median(dim=0, keepdim=True).values.clamp(min=1e-6)
-        log_ratio = torch.log(sigma / sigma_med.clamp(min=1e-6))
-        sigma = sigma_med * torch.exp(torch.tanh(log_ratio))
+        
+        # sigma_med = sigma.median(dim=0, keepdim=True).values.clamp(min=1e-6)
+        # log_ratio = torch.log(sigma / sigma_med.clamp(min=1e-6))
+        # sigma = sigma_med * torch.exp(torch.tanh(log_ratio))
 
         # Clamp before sinh to prevent float32 overflow.
         # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000

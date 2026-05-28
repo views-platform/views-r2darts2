@@ -213,6 +213,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             log_mag_err = torch.log1p(mag_pred) - torch.log1p(mag_true)
             cell_loss = self._log_cosh(log_mag_err)
 
+            # DC mask: skip frequency bin 0 — level/pointwise already
+            # handle mean offsets; STFT focuses on temporal patterns only
+            cell_loss = cell_loss[:, 1:, :]
+
             # Event-weighted series aggregation
             sw = series_event.view(-1, 1, 1)
             denom = (sw.sum() * cell_loss.size(1) * cell_loss.size(2)).clamp(min=1e-8)

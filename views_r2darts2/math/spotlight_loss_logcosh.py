@@ -88,7 +88,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _cell_dro_weights(losses: torch.Tensor) -> torch.Tensor:
-        """Cell-level DRO with bounded amplification — anti-fixation.
+        """Cell-level DRO with bounded amplification
 
         Returns per-element weights (mean=1, range ~[0.5, 2.0]).
 

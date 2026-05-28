@@ -101,7 +101,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
-        self._hp_cache: dict[int, torch.Tensor] = {}  # T -> H matrix
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -268,63 +267,61 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return (w_series * series_shape).mean()
 
     # ------------------------------------------------------------------
-    # Hodrick-Prescott high-pass filter
+    # Local moving-average trend subtraction (shape extraction)
     # ------------------------------------------------------------------
 
-    def _hp_highpass(self, x: torch.Tensor) -> torch.Tensor:
-        """HP high-pass: extract shape component (no zero-sum constraint).
+    def _shape_residual(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract shape via centered moving-average subtraction.
 
-        λ is derived from T so that the -3 dB cutoff period = T/3.
-        The (T×T) filter matrix H is precomputed and cached.
+        Kernel size = min(_LEVEL_WINDOWS), making the shape loss the
+        exact complement of the finest-scale level loss: level handles
+        window means, shape handles within-window variation.
+
+        No global zero-sum constraint — only local coupling within k
+        cells.  Reflect-padded to avoid boundary artifacts.
         """
-        T = x.size(1)
-        if T not in self._hp_cache or self._hp_cache[T].device != x.device:
-            # Derive λ from T: cutoff period P_c = T/3
-            omega_c = 2.0 * math.pi * 3.0 / T
-            lam = 1.0 / (2.0 - 2.0 * math.cos(omega_c)) ** 2
-            # Build second-difference matrix D2: (T-2, T)
-            D2 = torch.zeros(T - 2, T, device=x.device, dtype=x.dtype)
-            for i in range(T - 2):
-                D2[i, i] = 1.0
-                D2[i, i + 1] = -2.0
-                D2[i, i + 2] = 1.0
-            I = torch.eye(T, device=x.device, dtype=x.dtype)
-            # H = I - (I + λ D2ᵀD2)⁻¹  (high-pass matrix)
-            H = I - torch.linalg.solve(I + lam * D2.T @ D2, I)
-            self._hp_cache[T] = H
-        H = self._hp_cache[T]
-        # Batched matmul: (B, T) @ (T, T)ᵀ → (B, T)
-        return x @ H.T
+        k = min(self._LEVEL_WINDOWS)
+        # (B, T) → (B, 1, T) for conv1d
+        x_3d = x.unsqueeze(1)
+        # Reflect-pad for centered MA: (k-1)//2 left, k//2 right
+        pad_left = (k - 1) // 2
+        pad_right = k // 2
+        x_padded = F.pad(x_3d, (pad_left, pad_right), mode='reflect')
+        # Uniform averaging kernel
+        kernel = x.new_ones(1, 1, k) / k
+        trend = F.conv1d(x_padded, kernel).squeeze(1)  # (B, T)
+        return x - trend
 
     # ------------------------------------------------------------------
-    # Shape (HP high-pass) loss
+    # Shape (moving-average residual) loss
     # ------------------------------------------------------------------
 
     def _ac_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """HP-filtered shape loss — per-cell deviations from smooth trend.
+        """Shape loss via local moving-average residual.
 
-        Uses the Hodrick-Prescott high-pass filter to extract the
-        shape component.  Unlike full-series demeaning, this imposes
-        NO global zero-sum constraint — each timestep's gradient
-        couples only locally (exponential decay with distance).
+        Subtracts a centered moving average (kernel = min level window)
+        from both prediction and target, then penalises per-cell
+        differences.  Unlike full-series demeaning, the zero-sum
+        constraint is confined to k cells (not T=36), preserving
+        country-specific temporal patterns.
 
-        λ is derived automatically from T (cutoff period = T/3), so
-        no additional hyperparameters.  For T=36: trend captures
-        >12-month dynamics, shape captures monthly-to-annual patterns.
+        The kernel size is derived from min(_LEVEL_WINDOWS), creating
+        an orthogonal decomposition: level loss controls "what should
+        the W-month mean be?", shape loss controls "given that mean,
+        how are cells distributed within?"
 
         Role: provides DENSE gradient at all cells simultaneously.
         Ensures the model SUSTAINS correct relative heights during
-        conflict plateaus, with country-specific temporal patterns
-        (no shared global template forced by zero-sum).
+        conflict plateaus with no shared global template.
 
         Weighting: per-cell event magnitude with inverse-frequency
         rebalancing.  Conflict cells get full weight, peace cells
         get near-zero weight.
         """
-        # HP high-pass shape components (no zero-sum constraint)
-        pred_ac = self._hp_highpass(y_pred)
-        true_ac = self._hp_highpass(y_true)
-        ac_err = self._log_cosh_proportional(pred_ac - true_ac)
+        # Shape = deviation from local trend
+        pred_shape = self._shape_residual(y_pred)
+        true_shape = self._shape_residual(y_true)
+        ac_err = self._log_cosh_proportional(pred_shape - true_shape)
 
         # Event-magnitude weighting per cell
         event_mag = self._event_magnitude(y_pred, y_true)
@@ -337,9 +334,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Cross-series DRO — bounded scoring (plain log_cosh) to
         # prevent feedback loop where hard-to-predict series (Sudan)
         # monopolize budget via proportional amplification.
-        ac_err_bounded = self._log_cosh(pred_ac - true_ac)
+        ac_err_bounded = self._log_cosh(pred_shape - true_shape)
         series_score = (w_ac.detach() * ac_err_bounded).mean(dim=1)
-        target_ac_err = self._log_cosh(true_ac)
+        target_ac_err = self._log_cosh(true_shape)
         baseline = (w_ac.detach() * target_ac_err).mean(dim=1).detach()
         regret = torch.relu(series_score.detach() - baseline)
         w_series = self._dro_weights(regret)

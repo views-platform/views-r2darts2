@@ -221,13 +221,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: pw={loss_pw.item():.6f} "
-                # f"level={loss_level.item():.6f} spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | pw=%.6f level=%.6f spec=%.6f total=%.6f",
-            # loss_pw.item(), loss_level.item(),
-            loss_spec.item(), total_loss.item(),
+            "SpotlightLossLogcosh | pw=%.6f spec=%.6f total=%.6f",
+            loss_pw.item(), loss_spec.item(), total_loss.item(),
         )
         return total_loss
 

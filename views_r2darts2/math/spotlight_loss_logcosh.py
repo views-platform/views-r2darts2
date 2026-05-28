@@ -86,6 +86,44 @@ class SpotlightLossLogcosh(torch.nn.Module):
         lc = abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
         return lc * (1.0 + torch.log1p(abs_x * abs_x))
 
+    @staticmethod
+    def _cell_dro_weights(losses: torch.Tensor) -> torch.Tensor:
+        """Cell-level DRO with bounded amplification — anti-fixation.
+
+        Returns per-element weights (mean=1, range ~[0.5, 2.0]).
+
+        Triple-bounded against outlier fixation:
+        1. log-compression of raw losses: a cell with loss=100 vs loss=1
+           becomes log(100)=4.6 vs log(1)=0. Tail outliers don't dominate
+           z-score statistics.
+        2. tanh(relu(z)) bounds boost ∈ [0, 1]: even infinite z-score
+           gives boost=1, so max weight = 2× mean. One catastrophic cell
+           can take at most 2× share of gradient, never 10× or 100×.
+        3. alpha=tanh(std) soft-blends toward uniform when log-loss
+           spread is small. Early training (all cells equally bad) →
+           uniform weights → no premature focus on noise.
+
+        Effect: creates a self-correcting curriculum across cells.
+        Cells with current biggest residual get up to 2× weight →
+        model focuses there → those errors shrink → other cells become
+        relatively worst → focus shifts. Drives away from flat solutions
+        (flat has uniform error → uniform weights → no anti-flat pressure
+        from DRO alone, but combined with event_mag this still works).
+        """
+        log_l = torch.log(losses.detach() + 1e-8)
+        std = log_l.std()
+        if not torch.isfinite(std) or std < 1e-6:
+            return torch.ones_like(losses)
+        z = (log_l - log_l.mean()) / std.clamp(min=1e-3)
+        # tanh(relu(z)): max boost = 1 → max weight = 2
+        boost = torch.tanh(F.relu(z))
+        w = 1.0 + boost
+        # alpha-blend: low log-std → mostly uniform
+        alpha = torch.tanh(std)
+        w = alpha * w + (1.0 - alpha)
+        w = w / w.mean().clamp(min=1e-8)
+        return torch.nan_to_num(w, nan=1.0, posinf=2.0, neginf=0.0)
+
     def _event_magnitude(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Sharp sigmoid event/peace mask with 1% floor.
 
@@ -102,11 +140,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _pointwise_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Event-weighted log_cosh per cell. Primary training signal."""
+        """Event-weighted log_cosh per cell with cell-level DRO.
+
+        Weighting stack:
+          event_mag (sigmoid mask): event/peace discrimination (~58:1)
+          cell_dro (bounded): up to 2× boost for currently-worst cells
+          combined → applied to log_cosh_proportional per-cell error
+
+        DRO is computed on the RAW per-cell loss (before event_mag) so
+        it sees true error magnitudes. Then event_mag gates the combined
+        weight: peace cells with high DRO weight still get suppressed
+        because event_mag ≈ 0.017.
+        """
         cell_err = self._log_cosh_proportional(y_pred - y_true)
         event_mag = self._event_magnitude(y_pred, y_true)
-        # Weighted mean: event cells dominate via ~58:1 sigmoid ratio
-        return (event_mag * cell_err).sum() / event_mag.sum().clamp(min=1e-8)
+        # Cell DRO on raw loss (bounded, max 2× boost per cell)
+        dro_w = self._cell_dro_weights(cell_err)
+        combined = event_mag * dro_w
+        return (combined * cell_err).sum() / combined.sum().clamp(min=1e-8)
 
     # ------------------------------------------------------------------
     # Level loss
@@ -151,7 +202,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Multi-resolution STFT loss, DC bin masked. Series-weighted."""
+        """Multi-resolution STFT loss, DC-masked. Cell-level DRO + series gate.
+
+        Weighting stack:
+          series_event: per-series gate (peace-only series ≈ 0). Same as
+            before — prevents spectral matching for series with no signal.
+          cell_dro (bounded): per (series, freq_bin, frame) boost up to
+            2×. Targets specific frequency-time bins where prediction is
+            spectrally worst, rather than weighting all bins of a series
+            uniformly. "Focus on the frequency components you're missing."
+
+        WHY cell DRO over per-bin matters:
+        Without it: model satisfies STFT by matching average spectrum
+        across all frames. With it: bins where model is most wrong
+        (e.g., missing energy at 6-month cycle, frame 2) get up to 2×
+        gradient → forces matching at the SPECIFIC time-frequency
+        locations of error.
+        """
         if y_pred.dim() == 3:
             B, T, C = y_pred.shape
             pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
@@ -160,7 +227,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             pred = y_pred
             true = y_true
 
-        # Series-level event relevance
+        # Series-level event relevance (gate: peace series contribute ≈0)
         abs_union = torch.max(torch.abs(true), torch.abs(pred.detach()))
         log_ratio = torch.log1p(abs_union / self.non_zero_threshold)
         series_event = (log_ratio / (1.0 + log_ratio)).amax(dim=1)
@@ -191,9 +258,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             # DC mask: skip bin 0
             cell_loss = cell_loss[:, 1:, :]
 
+            # Per-cell DRO across (series, freq_bin, frame)
+            dro_w = self._cell_dro_weights(cell_loss)
+            # Series gate (broadcasts across freq, frame)
             sw = series_event.view(-1, 1, 1)
-            denom = (sw.sum() * cell_loss.size(1) * cell_loss.size(2)).clamp(min=1e-8)
-            total = total + (sw * cell_loss).sum() / denom
+            combined = sw * dro_w
+
+            total = total + (combined * cell_loss).sum() / combined.sum().clamp(min=1e-8)
             n_valid += 1
 
         return total / max(n_valid, 1)

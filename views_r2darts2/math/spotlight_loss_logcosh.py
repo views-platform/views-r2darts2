@@ -267,61 +267,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return (w_series * series_shape).mean()
 
     # ------------------------------------------------------------------
-    # Local moving-average trend subtraction (shape extraction)
-    # ------------------------------------------------------------------
-
-    def _shape_residual(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract shape via centered moving-average subtraction.
-
-        Kernel size = min(_LEVEL_WINDOWS), making the shape loss the
-        exact complement of the finest-scale level loss: level handles
-        window means, shape handles within-window variation.
-
-        No global zero-sum constraint — only local coupling within k
-        cells.  Reflect-padded to avoid boundary artifacts.
-        """
-        k = min(self._LEVEL_WINDOWS)
-        # (B, T) → (B, 1, T) for conv1d
-        x_3d = x.unsqueeze(1)
-        # Reflect-pad for centered MA: (k-1)//2 left, k//2 right
-        pad_left = (k - 1) // 2
-        pad_right = k // 2
-        x_padded = F.pad(x_3d, (pad_left, pad_right), mode='reflect')
-        # Uniform averaging kernel
-        kernel = x.new_ones(1, 1, k) / k
-        trend = F.conv1d(x_padded, kernel).squeeze(1)  # (B, T)
-        return x - trend
-
-    # ------------------------------------------------------------------
-    # Shape (moving-average residual) loss
+    # Pointwise event-cell loss
     # ------------------------------------------------------------------
 
     def _ac_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Shape loss via local moving-average residual.
+        """Direct pointwise error at event cells.
 
-        Subtracts a centered moving average (kernel = min level window)
-        from both prediction and target, then penalises per-cell
-        differences.  Unlike full-series demeaning, the zero-sum
-        constraint is confined to k cells (not T=36), preserving
-        country-specific temporal patterns.
+        Applies `log_cosh_proportional(ŷ − y)` per cell, weighted by
+        event_magnitude (sharp sigmoid mask).  No decomposition, no
+        zero-sum constraint — dense gradient at every event cell
+        regardless of whether it's an onset, plateau interior, or
+        offset.
 
-        The kernel size is derived from min(_LEVEL_WINDOWS), creating
-        an orthogonal decomposition: level loss controls "what should
-        the W-month mean be?", shape loss controls "given that mean,
-        how are cells distributed within?"
+        Role: ensures the model matches the target at every cell where
+        conflict is present.  The level loss handles window-mean offsets;
+        this loss handles per-cell accuracy within those windows.
 
-        Role: provides DENSE gradient at all cells simultaneously.
-        Ensures the model SUSTAINS correct relative heights during
-        conflict plateaus with no shared global template.
+        The sharp sigmoid event_magnitude (ε + (1−ε)·σ(k·(|u|−τ)/τ))
+        concentrates gradient budget on clearly-active conflict cells,
+        preventing peace cells from eating budget.  Bounded DRO
+        prevents high-variance series from monopolizing.
 
         Weighting: per-cell event magnitude with inverse-frequency
-        rebalancing.  Conflict cells get full weight, peace cells
-        get near-zero weight.
+        rebalancing + cross-series DRO.
         """
-        # Shape = deviation from local trend
-        pred_shape = self._shape_residual(y_pred)
-        true_shape = self._shape_residual(y_true)
-        ac_err = self._log_cosh_proportional(pred_shape - true_shape)
+        # Direct pointwise error
+        cell_err = self._log_cosh_proportional(y_pred - y_true)
 
         # Event-magnitude weighting per cell
         event_mag = self._event_magnitude(y_pred, y_true)
@@ -329,15 +300,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_ac = event_mag / p_cell + (1.0 - event_mag) / (1.0 - p_cell)
         w_ac = w_ac / w_ac.mean(dim=1, keepdim=True).clamp(min=1e-8)
 
-        series_ac = (w_ac * ac_err).mean(dim=1)  # (B,)
+        series_ac = (w_ac * cell_err).mean(dim=1)  # (B,)
 
         # Cross-series DRO — bounded scoring (plain log_cosh) to
         # prevent feedback loop where hard-to-predict series (Sudan)
         # monopolize budget via proportional amplification.
-        ac_err_bounded = self._log_cosh(pred_shape - true_shape)
-        series_score = (w_ac.detach() * ac_err_bounded).mean(dim=1)
-        target_ac_err = self._log_cosh(true_shape)
-        baseline = (w_ac.detach() * target_ac_err).mean(dim=1).detach()
+        cell_err_bounded = self._log_cosh(y_pred - y_true)
+        series_score = (w_ac.detach() * cell_err_bounded).mean(dim=1)
+        target_err = self._log_cosh(y_true)
+        baseline = (w_ac.detach() * target_err).mean(dim=1).detach()
         regret = torch.relu(series_score.detach() - baseline)
         w_series = self._dro_weights(regret)
         w_series = w_series / w_series.mean().clamp(min=1e-8)

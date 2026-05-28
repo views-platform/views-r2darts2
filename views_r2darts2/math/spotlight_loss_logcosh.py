@@ -101,6 +101,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
+        self._hp_cache: dict[int, torch.Tensor] = {}  # T -> H matrix
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -147,15 +148,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _event_magnitude(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Continuous union eventness in transformed space, bounded [0, 1).
+        """Sharp differentiable event/peace mask via shifted sigmoid.
 
-        ``event_mag = r / (1 + r)`` where ``r = log1p(|union| / τ)``.
-        Union semantics: false positives also receive event weighting.
-        Prediction branch detached — no second gradient path.
+        ``event_mag = ε + (1−ε) · σ(k·(|union|−τ)/τ)``
+        Sharp transition around τ with small floor ε to prevent dead
+        gradient zones.  Union semantics: false positives also receive
+        event weighting.  Prediction branch detached.
         """
         abs_union = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        log_ratio = torch.log1p(abs_union / self.non_zero_threshold)
-        return log_ratio / (1.0 + log_ratio)
+        # Sigmoid with floor — k=5 gives 90% transition within ±1.2τ
+        return 0.01 + 0.99 * torch.sigmoid(
+            5.0 * (abs_union - self.non_zero_threshold) / self.non_zero_threshold
+        )
 
     # ------------------------------------------------------------------
     # Spectral loss
@@ -241,7 +245,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         dy_true = y_true[:, 1:] - y_true[:, :-1]
 
         # Shape error at each transition
-        shape_err = self._log_cosh(dy_pred - dy_true)
+        shape_err = self._log_cosh_proportional(dy_pred - dy_true)
 
         # Transition-event weighting: max event_mag of each adjacent pair
         event_mag = self._event_magnitude(y_pred, y_true)
@@ -255,7 +259,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         series_shape = (w_shape * shape_err).mean(dim=1)  # (B,)
 
         # Cross-series DRO
-        target_shape_err = self._log_cosh(dy_true)
+        target_shape_err = self._log_cosh_proportional(dy_true)
         baseline = (w_shape.detach() * target_shape_err).mean(dim=1).detach()
         regret = torch.relu(series_shape.detach() - baseline)
         w_series = self._dro_weights(regret)
@@ -264,34 +268,63 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return (w_series * series_shape).mean()
 
     # ------------------------------------------------------------------
-    # Demeaned error (sustained shape) loss
+    # Hodrick-Prescott high-pass filter
+    # ------------------------------------------------------------------
+
+    def _hp_highpass(self, x: torch.Tensor) -> torch.Tensor:
+        """HP high-pass: extract shape component (no zero-sum constraint).
+
+        λ is derived from T so that the -3 dB cutoff period = T/3.
+        The (T×T) filter matrix H is precomputed and cached.
+        """
+        T = x.size(1)
+        if T not in self._hp_cache or self._hp_cache[T].device != x.device:
+            # Derive λ from T: cutoff period P_c = T/3
+            omega_c = 2.0 * math.pi * 3.0 / T
+            lam = 1.0 / (2.0 - 2.0 * math.cos(omega_c)) ** 2
+            # Build second-difference matrix D2: (T-2, T)
+            D2 = torch.zeros(T - 2, T, device=x.device, dtype=x.dtype)
+            for i in range(T - 2):
+                D2[i, i] = 1.0
+                D2[i, i + 1] = -2.0
+                D2[i, i + 2] = 1.0
+            I = torch.eye(T, device=x.device, dtype=x.dtype)
+            # H = I - (I + λ D2ᵀD2)⁻¹  (high-pass matrix)
+            H = I - torch.linalg.solve(I + lam * D2.T @ D2, I)
+            self._hp_cache[T] = H
+        H = self._hp_cache[T]
+        # Batched matmul: (B, T) @ (T, T)ᵀ → (B, T)
+        return x @ H.T
+
+    # ------------------------------------------------------------------
+    # Shape (HP high-pass) loss
     # ------------------------------------------------------------------
 
     def _ac_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Demeaned-error shape loss — sustains levels between transitions.
+        """HP-filtered shape loss — per-cell deviations from smooth trend.
 
-        Computes AC components: ŷ_AC = ŷ − mean(ŷ), y_AC = y − mean(y),
-        then penalises per-cell difference with `log_cosh`.
+        Uses the Hodrick-Prescott high-pass filter to extract the
+        shape component.  Unlike full-series demeaning, this imposes
+        NO global zero-sum constraint — each timestep's gradient
+        couples only locally (exponential decay with distance).
+
+        λ is derived automatically from T (cutoff period = T/3), so
+        no additional hyperparameters.  For T=36: trend captures
+        >12-month dynamics, shape captures monthly-to-annual patterns.
 
         Role: provides DENSE gradient at all cells simultaneously.
         Ensures the model SUSTAINS correct relative heights during
-        conflict plateaus (t=11-14), not just transitions (t=10, t=15).
-
-        The zero-sum constraint (Σ grad = 0 per series) is acceptable
-        here because:
-        - Level is handled independently by _level_loss
-        - Temporal gradient (_gradient_loss) has already broken any
-          flat equilibrium, so this loss operates on non-flat predictions
-          where the zero-sum pathology doesn't apply
+        conflict plateaus, with country-specific temporal patterns
+        (no shared global template forced by zero-sum).
 
         Weighting: per-cell event magnitude with inverse-frequency
         rebalancing.  Conflict cells get full weight, peace cells
-        get near-zero weight (their AC component is ~0 anyway).
+        get near-zero weight.
         """
-        # AC components
-        pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
-        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        ac_err = self._log_cosh(pred_ac - true_ac)
+        # HP high-pass shape components (no zero-sum constraint)
+        pred_ac = self._hp_highpass(y_pred)
+        true_ac = self._hp_highpass(y_true)
+        ac_err = self._log_cosh_proportional(pred_ac - true_ac)
 
         # Event-magnitude weighting per cell
         event_mag = self._event_magnitude(y_pred, y_true)
@@ -301,10 +334,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         series_ac = (w_ac * ac_err).mean(dim=1)  # (B,)
 
-        # Cross-series DRO
+        # Cross-series DRO — bounded scoring (plain log_cosh) to
+        # prevent feedback loop where hard-to-predict series (Sudan)
+        # monopolize budget via proportional amplification.
+        ac_err_bounded = self._log_cosh(pred_ac - true_ac)
+        series_score = (w_ac.detach() * ac_err_bounded).mean(dim=1)
         target_ac_err = self._log_cosh(true_ac)
         baseline = (w_ac.detach() * target_ac_err).mean(dim=1).detach()
-        regret = torch.relu(series_ac.detach() - baseline)
+        regret = torch.relu(series_score.detach() - baseline)
         w_series = self._dro_weights(regret)
         w_series = w_series / w_series.mean().clamp(min=1e-8)
 
@@ -347,7 +384,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             n_windows = T // W
             e_trunc = e[:, :n_windows * W].view(e.size(0), n_windows, W)
             window_mean_err = e_trunc.mean(dim=2)                 # (B, n_win)
-            wloss = self._log_cosh(window_mean_err)               # (B, n_win)
+            wloss = self._log_cosh_proportional(window_mean_err)  # (B, n_win)
 
             # Event weight per window: max event_mag within
             em_trunc = event_mag[:, :n_windows * W].view(e.size(0), n_windows, W)
@@ -370,18 +407,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         series_level = (w_level * cat_loss).mean(dim=1)           # (B,)
 
-        # Cross-series DRO
+        # Cross-series DRO — bounded scoring (plain log_cosh) to
+        # prevent proportional feedback loop.
+        bounded_window_losses = []
         target_windows = []
         for W in self._LEVEL_WINDOWS:
             if T < W:
                 continue
             n_windows = T // W
+            e_trunc_b = e[:, :n_windows * W].view(e.size(0), n_windows, W)
+            bounded_window_losses.append(self._log_cosh(e_trunc_b.mean(dim=2)))
             yt_trunc = y_true[:, :n_windows * W].view(y_true.size(0), n_windows, W)
             target_windows.append(self._log_cosh(yt_trunc.mean(dim=2)))
+        cat_bounded = torch.cat(bounded_window_losses, dim=1)
+        series_score = (w_level.detach() * cat_bounded).mean(dim=1)
         cat_baseline = torch.cat(target_windows, dim=1)
         baseline = (w_level.detach() * cat_baseline).mean(dim=1).detach()
 
-        regret = torch.relu(series_level.detach() - baseline)
+        regret = torch.relu(series_score.detach() - baseline)
         w_series = self._dro_weights(regret)
         w_series = w_series / w_series.mean().clamp(min=1e-8)
 

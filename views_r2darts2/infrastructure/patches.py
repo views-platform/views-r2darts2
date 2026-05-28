@@ -345,12 +345,22 @@ def apply_rinorm_compression_patch():
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Cap per-series sigma to 5× the batch-mean sigma.
-        # Prevents RevIN denorm from amplifying extreme-conflict series
-        # (e.g. Niger/Sudan with sigma_raw>100) into forecast runaway.
-        # batch mean shape: (1, 1, n_targets, 1) — capped per channel.
+        # Soft σ compression: log-space dampening beyond batch median.
+        # All σ values pass through, but extreme tails are sublinearly
+        # compressed.  This prevents Sudan (σ=200) from dominating while
+        # still allowing it to express MORE variance than average.
+        #
+        # Formula: σ_out = σ_med × exp(tanh(log(σ/σ_med)))
+        #   - At σ = σ_med: tanh(0) = 0 → σ_out = σ_med (identity)
+        #   - At σ = 5×σ_med: tanh(1.6) = 0.92 → σ_out = 2.5×σ_med
+        #   - At σ = 20×σ_med: tanh(3.0) = 0.995 → σ_out = 2.7×σ_med
+        #   - At σ = σ_med/5: tanh(-1.6) = -0.92 → σ_out = 0.4×σ_med
+        #
         # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
         # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
+        sigma_med = sigma.median(dim=0, keepdim=True).values.clamp(min=1e-6)
+        log_ratio = torch.log(sigma / sigma_med.clamp(min=1e-6))
+        sigma = sigma_med * torch.exp(torch.tanh(log_ratio))
 
         # Clamp before sinh to prevent float32 overflow.
         # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000

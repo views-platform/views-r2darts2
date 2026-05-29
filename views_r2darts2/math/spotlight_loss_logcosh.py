@@ -210,9 +210,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ratio between Syria-class and zero cells.
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
-        # event_mag at abs_max=0: sigmoid(-4.4)≈0.012 → 0.022
-        # event_mag at abs_max=τ: sigmoid(0)=0.5 → 0.505
-        # event_mag at abs_max=3τ: sigmoid(10)≈1.0 → ~1.0
+
+        # Difficulty: how wrong this cell currently is.  Gives up to 2×
+        # boost on top of event_mag for cells the model is struggling with.
+        difficulty = 1.0 - torch.exp(-torch.abs(e_shape.detach()))
+        event_mag = event_mag * (1.0 + difficulty)
 
         # ── Per-series temporal DRO ────────────────────────────────────
         # Within each series, upweight the hardest timesteps relative to

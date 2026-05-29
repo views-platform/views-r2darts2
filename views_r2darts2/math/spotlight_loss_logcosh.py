@@ -137,7 +137,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )  # (B, n_windows)
-        level_losses = self._log_cosh_proportional(window_means)
+        level_losses = self._log_cosh(window_means)
 
         # Per-series event magnitude: max |y_true| across time → sigmoid
         series_mag = y_true.abs().max(dim=1).values  # (B,)

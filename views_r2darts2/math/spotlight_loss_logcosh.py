@@ -92,31 +92,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
-        """Per-series power-law DRO weights (B, T).
+        """Per-series softmax DRO with geometric-mean temperature (B, T).
 
-        Weights each timestep proportionally to (ℓ_i / μ)^α where μ is
-        the per-series mean loss and α=2 (quadratic focus).
+        Uses τ = geometric mean of per-series losses, i.e.
+        τ = exp(mean(log(ℓ))).
 
-        Unlike exponential/softmax DRO where a cell at 5× mean gets
-        exp(5)≈148× weight (unbounded, causes overprediction of spikes),
-        power-law gives that cell 5²=25× weight — strong focus but
-        bounded and predictable.
+        - For uniform-error series (all losses similar):
+          geo ≈ arith mean → τ is high → DRO is mild (nothing to focus on).
+        - For bursty series (few spikes among easy cells):
+          geo << arith (pulled down by many small losses) → τ is low →
+          spikes get strong upweight.
 
-        Properties:
-          - Scale-invariant: dividing by μ makes it independent of
-            absolute loss magnitude.
-          - Self-correcting: if model overpredicts uniformly → all
-            losses equalise → all weights → 1 (no runaway).
-          - Bounded: max_weight/min_weight = (max_loss/min_loss)^α,
-            typically 20-50× for our data vs 1000+× with softmax.
+        The ratio arith/geo = exp(Var(log ℓ) / 2), so the sharpening
+        is controlled entirely by the *heterogeneity* of each series'
+        loss distribution.  No hardcoded multiplier, percentile, or α.
 
-        Returns weights with mean = 1 per series, shape (B, T).
+        Self-correcting: if model overpredicts uniformly → all losses
+        rise together → Var(log ℓ) drops → geo ≈ arith → DRO softens.
+
+        Returns weights with mean ≈ 1 per series, shape (B, T).
         """
         l = losses.detach()                                  # (B, T)
-        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1)
-        # Normalise to per-series mean, then raise to power α=2
-        normalized = l / mu                                   # (B, T)
-        w = normalized * normalized                           # (B, T) — α=2
+        # Geometric mean in log-space
+        log_l = torch.log(l.clamp(min=1e-8))                 # (B, T)
+        tau = torch.exp(log_l.mean(dim=1, keepdim=True))     # (B, 1)
+        tau = tau.clamp(min=1e-6)
+        # Softmax DRO
+        logits = l / tau                                     # (B, T)
+        logits = logits - logits.max(dim=1, keepdim=True).values  # stability
+        w = torch.exp(logits)                                # (B, T)
         w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 

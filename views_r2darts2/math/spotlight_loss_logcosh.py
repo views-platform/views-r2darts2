@@ -8,32 +8,36 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v43 — scaled-cosh pointwise + spectral.
-
-    ── Core idea ────────────────────────────────────────────────────────
-
-    Pointwise loss = 4·(cosh(e/2) − 1), gradient = 2·sinh(e/2).
-    Near zero: ≈ x²/2 (MSE). In tail: grows as 2·exp(|e|/2).
-    Super-linear gradient means the flat-prediction equilibrium sits
-    at ~0.35 in asinh space — well below τ=0.88. So event_mag stays
-    discriminative and non-flat solutions are energetically favoured.
-
-    Previous log_cosh/proportional saturated at gradient ±1 (or ~2ln|x|)
-    → flat at the right level was a stable equilibrium.
+    SpotlightLoss v44 — pointwise log_cosh + CCC shape enforcement.
 
     ── Components ───────────────────────────────────────────────────────
 
-    1. Pointwise: scaled_cosh(ŷ − y) per cell, weighted by event_mag
-       + cell-level DRO (bounded 2×). Primary signal.
+    1. Pointwise: log_cosh_proportional(ŷ − y) per cell, weighted by
+       event_magnitude sigmoid mask (~58:1 event/peace). Per-cell
+       accuracy signal: "each timestep should be at the right value."
 
-    2. STFT (DC-masked): log-magnitude spectral loss at 3 resolutions.
-       Uses log_cosh_proportional (log-mag diffs are small ≈ O(1)).
-       Series-weighted by max event relevance + cell-level DRO.
+    2. CCC (Concordance Correlation Coefficient): per-series shape loss.
+       1 − CCC penalises flat predictions directly:
+         - Flat → var(ŷ) = 0 → CCC = 0 → loss = 1.0 (maximum)
+         - Perfect tracking → CCC = 1.0 → loss = 0
+       Computed only over event-relevant series (series_event gate).
+       Weighted by pointwise_loss.detach() so it always contributes
+       at the same magnitude as pointwise — never drowned out.
+
+    ── Why CCC breaks flatness ──────────────────────────────────────────
+
+    CCC = 2·cov(ŷ,y) / (var(ŷ) + var(y) + (μ_ŷ − μ_y)²)
+
+    Flat prediction: var(ŷ) = 0, cov = 0 → CCC = 0 regardless of level.
+    The model MUST produce temporal variation correlated with truth to
+    reduce CCC loss. This is orthogonal to pointwise which only says
+    "be at the right level per cell" and is satisfied by flat-at-mean.
 
     ── Weighting ────────────────────────────────────────────────────────
 
-    event_mag = 0.01 + 0.99 · σ(5·(|union| − τ) / τ)
-    cell_dro: log-space z-score → tanh(relu(·)) → alpha-blend, max 2×.
+    event_magnitude: 0.01 + 0.99 · σ(5·(|union| − τ) / τ)
+    series_event gate: log1p ratio, gates CCC to event series only.
+    CCC scale: multiplied by pw_loss.detach() for self-balancing.
 
     Args:
         non_zero_threshold: Event boundary in transformed space.
@@ -82,54 +86,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         lc = abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
         return lc * (1.0 + torch.log1p(abs_x * abs_x))
 
-    @staticmethod
-    def _scaled_cosh(x: torch.Tensor) -> torch.Tensor:
-        """Scaled cosh loss: 4·(cosh(x/2) − 1).
-
-        Near zero: ≈ x²/2 (MSE behaviour).
-        In tails: grows as 2·exp(|x|/2), super-linear.
-        Gradient: 2·sinh(x/2) — grows without bound.
-        """
-        return 4.0 * (torch.cosh(x * 0.5) - 1.0)
-
-    @staticmethod
-    def _cell_dro_weights(losses: torch.Tensor) -> torch.Tensor:
-        """Cell-level DRO with bounded amplification
-
-        Returns per-element weights (mean=1, range ~[0.5, 2.0]).
-
-        Triple-bounded against outlier fixation:
-        1. log-compression of raw losses: a cell with loss=100 vs loss=1
-           becomes log(100)=4.6 vs log(1)=0. Tail outliers don't dominate
-           z-score statistics.
-        2. tanh(relu(z)) bounds boost ∈ [0, 1]: even infinite z-score
-           gives boost=1, so max weight = 2× mean. One catastrophic cell
-           can take at most 2× share of gradient, never 10× or 100×.
-        3. alpha=tanh(std) soft-blends toward uniform when log-loss
-           spread is small. Early training (all cells equally bad) →
-           uniform weights → no premature focus on noise.
-
-        Effect: creates a self-correcting curriculum across cells.
-        Cells with current biggest residual get up to 2× weight →
-        model focuses there → those errors shrink → other cells become
-        relatively worst → focus shifts. Drives away from flat solutions
-        (flat has uniform error → uniform weights → no anti-flat pressure
-        from DRO alone, but combined with event_mag this still works).
-        """
-        log_l = torch.log(losses.detach() + 1e-8)
-        std = log_l.std()
-        if not torch.isfinite(std) or std < 1e-6:
-            return torch.ones_like(losses)
-        z = (log_l - log_l.mean()) / std.clamp(min=1e-3)
-        # tanh(relu(z)): max boost = 1 → max weight = 2
-        boost = torch.tanh(F.relu(z))
-        w = 1.0 + boost
-        # alpha-blend: low log-std → mostly uniform
-        alpha = torch.tanh(std)
-        w = alpha * w + (1.0 - alpha)
-        w = w / w.mean().clamp(min=1e-8)
-        return torch.nan_to_num(w, nan=1.0, posinf=2.0, neginf=0.0)
-
     def _event_magnitude(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Sharp sigmoid event/peace mask with 1% floor.
 
@@ -146,51 +102,64 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _pointwise_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Event-weighted scaled-cosh per cell with cell-level DRO.
-
-        Core loss: 4·(cosh(e/2) − 1), gradient = 2·sinh(e/2).
-        Super-linear tail: forces flat equilibrium below τ=0.88 so
-        event_mag stays discriminative. MSE-like near zero.
-
-        Weighting stack:
-          event_mag (sigmoid mask): event/peace discrimination (~58:1)
-          cell_dro (bounded): up to 2× boost for currently-worst cells
-          combined → applied to scaled_cosh per-cell error
-
-        DRO is computed on the RAW per-cell loss (before event_mag) so
-        it sees true error magnitudes. Then event_mag gates the combined
-        weight: peace cells with high DRO weight still get suppressed
-        because event_mag ≈ 0.017.
-        """
-        cell_err = self._scaled_cosh(y_pred - y_true)
+        """Event-weighted log_cosh per cell. Primary training signal."""
+        cell_err = self._log_cosh_proportional(y_pred - y_true)
         event_mag = self._event_magnitude(y_pred, y_true)
-        # Cell DRO on raw loss (bounded, max 2× boost per cell)
-        dro_w = self._cell_dro_weights(cell_err)
-        combined = event_mag * dro_w
-        return (combined * cell_err).sum() / combined.sum().clamp(min=1e-8)
+        # Weighted mean: event cells dominate via ~58:1 sigmoid ratio
+        return (event_mag * cell_err).sum() / event_mag.sum().clamp(min=1e-8)
 
     # ------------------------------------------------------------------
-    # Spectral loss (DC-masked)
+    # Level loss
     # ------------------------------------------------------------------
 
-    def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Multi-resolution STFT loss, DC-masked. Cell-level DRO + series gate.
+    def _level_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Multi-scale windowed level loss at W=4, 12, 36.
 
-        Weighting stack:
-          series_event: per-series gate (peace-only series ≈ 0). Same as
-            before — prevents spectral matching for series with no signal.
-          cell_dro (bounded): per (series, freq_bin, frame) boost up to
-            2×. Targets specific frequency-time bins where prediction is
-            spectrally worst, rather than weighting all bins of a series
-            uniformly. "Focus on the frequency components you're missing."
-
-        WHY cell DRO over per-bin matters:
-        Without it: model satisfies STFT by matching average spectrum
-        across all frames. With it: bins where model is most wrong
-        (e.g., missing energy at 6-month cycle, frame 2) get up to 2×
-        gradient → forces matching at the SPECIFIC time-frequency
-        locations of error.
+        Provides smooth curriculum + boundary gradient leakage.
+        Weighted by max(event_mag) per window.
         """
+        T = y_pred.size(1)
+        e = y_pred - y_true
+        event_mag = self._event_magnitude(y_pred, y_true)
+
+        all_losses = []
+        all_weights = []
+
+        for W in self._LEVEL_WINDOWS:
+            if T < W:
+                continue
+            n_win = T // W
+            e_win = e[:, :n_win * W].view(e.size(0), n_win, W)
+            window_err = self._log_cosh_proportional(e_win.mean(dim=2))
+
+            em_win = event_mag[:, :n_win * W].view(e.size(0), n_win, W)
+            window_event = em_win.amax(dim=2)
+
+            all_losses.append(window_err)
+            all_weights.append(window_event)
+
+        if not all_losses:
+            return y_pred.new_tensor(0.0)
+
+        cat_loss = torch.cat(all_losses, dim=1)
+        cat_weight = torch.cat(all_weights, dim=1)
+
+        return (cat_weight * cat_loss).sum() / cat_weight.sum().clamp(min=1e-8)
+
+    # ------------------------------------------------------------------
+    # CCC (Concordance Correlation Coefficient) loss
+    # ------------------------------------------------------------------
+
+    def _ccc_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Per-series CCC loss, gated to event-relevant series.
+
+        CCC = 2·cov(ŷ,y) / (var(ŷ) + var(y) + (μ_ŷ − μ_y)²)
+        Loss = 1 − CCC, bounded [0, 2].
+
+        Flat prediction → var(ŷ)=0, cov=0 → CCC=0 → loss=1.
+        Returns event-weighted mean (1 − CCC) across series.
+        """
+        # Flatten to (N_series, T)
         if y_pred.dim() == 3:
             B, T, C = y_pred.shape
             pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
@@ -199,7 +168,47 @@ class SpotlightLossLogcosh(torch.nn.Module):
             pred = y_pred
             true = y_true
 
-        # Series-level event relevance (gate: peace series contribute ≈0)
+        # Series-level event gate (same logic as spectral)
+        abs_union = torch.max(torch.abs(true), torch.abs(pred.detach()))
+        log_ratio = torch.log1p(abs_union / self.non_zero_threshold)
+        series_event = (log_ratio / (1.0 + log_ratio)).amax(dim=1)
+        if series_event.sum() < 1e-8:
+            return pred.new_tensor(0.0)
+
+        # Per-series statistics
+        mu_p = pred.mean(dim=1)
+        mu_t = true.mean(dim=1)
+        # Variance (unbiased not needed — relative magnitudes matter)
+        var_p = pred.var(dim=1)
+        var_t = true.var(dim=1)
+        # Covariance
+        cov_pt = ((pred - mu_p.unsqueeze(1)) * (true - mu_t.unsqueeze(1))).mean(dim=1)
+
+        # CCC per series
+        denom = var_p + var_t + (mu_p - mu_t) ** 2
+        ccc = (2.0 * cov_pt) / denom.clamp(min=1e-8)
+        # Clamp to [-1, 1] for numerical safety
+        ccc = ccc.clamp(-1.0, 1.0)
+
+        # Loss = 1 - CCC, weighted by series_event
+        loss_per_series = 1.0 - ccc
+        return (series_event * loss_per_series).sum() / series_event.sum().clamp(min=1e-8)
+
+    # ------------------------------------------------------------------
+    # Spectral loss (DC-masked) — retained but unused in forward
+    # ------------------------------------------------------------------
+
+    def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Multi-resolution STFT loss, DC bin masked. Series-weighted."""
+        if y_pred.dim() == 3:
+            B, T, C = y_pred.shape
+            pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
+            true = y_true.permute(0, 2, 1).reshape(B * C, T)
+        else:
+            pred = y_pred
+            true = y_true
+
+        # Series-level event relevance
         abs_union = torch.max(torch.abs(true), torch.abs(pred.detach()))
         log_ratio = torch.log1p(abs_union / self.non_zero_threshold)
         series_event = (log_ratio / (1.0 + log_ratio)).amax(dim=1)
@@ -226,17 +235,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = torch.sqrt(S_true.real ** 2 + S_true.imag ** 2 + 1e-8)
 
             log_mag_err = torch.log1p(mag_pred) - torch.log1p(mag_true)
-            cell_loss = self._scaled_cosh(log_mag_err)
+            cell_loss = self._log_cosh_proportional(log_mag_err)
             # DC mask: skip bin 0
             cell_loss = cell_loss[:, 1:, :]
 
-            # Per-cell DRO across (series, freq_bin, frame)
-            dro_w = self._cell_dro_weights(cell_loss)
-            # Series gate (broadcasts across freq, frame)
             sw = series_event.view(-1, 1, 1)
-            combined = sw * dro_w
-
-            total = total + (combined * cell_loss).sum() / combined.sum().clamp(min=1e-8)
+            denom = (sw.sum() * cell_loss.size(1) * cell_loss.size(2)).clamp(min=1e-8)
+            total = total + (sw * cell_loss).sum() / denom
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -250,25 +255,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
-        T = y_pred.size(1)
-
         loss_pw = self._pointwise_loss(y_pred, y_true)
-        # loss_level = self._level_loss(y_pred, y_true)
 
-        loss_spec = y_pred.new_tensor(0.0)
-        if self._STFT and T >= 6:
-            loss_spec = self._spectral_loss(y_pred, y_true)
+        # CCC shape loss, scaled by pointwise magnitude so it can never
+        # be drowned out regardless of training stage or error scale.
+        loss_ccc = self._ccc_loss(y_pred, y_true)
+        loss_ccc_scaled = loss_ccc * loss_pw.detach()
 
-        total_loss = loss_pw + loss_spec
+        total_loss = loss_pw + loss_ccc_scaled
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: pw={loss_pw.item():.6f} "
+                f"ccc={loss_ccc.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | pw=%.6f spec=%.6f total=%.6f",
-            loss_pw.item(), loss_spec.item(), total_loss.item(),
+            "SpotlightLossLogcosh | pw=%.6f ccc=%.6f ccc_scaled=%.6f total=%.6f",
+            loss_pw.item(), loss_ccc.item(), loss_ccc_scaled.item(), total_loss.item(),
         )
         return total_loss
 

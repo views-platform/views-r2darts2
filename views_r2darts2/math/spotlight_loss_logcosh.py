@@ -137,7 +137,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )  # (B, n_windows)
-        level_losses = self._log_cosh(window_means)
+        level_losses = self._log_cosh_proportional(window_means)
 
         # Per-series event magnitude: max |y_true| across time → sigmoid
         series_mag = y_true.abs().max(dim=1).values  # (B,)
@@ -198,7 +198,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            total = total + self._log_cosh(mag_pred - mag_true).mean()
+            total = total + self._log_cosh_proportional(mag_pred - mag_true).mean()
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -220,7 +220,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_shape = e - e_mean
 
         # ── Base cell loss (proportional variant for MSLE sensitivity) ─
-        cell_loss = self._log_cosh(e_shape)
+        cell_loss = self._log_cosh_proportional(e_shape)
 
         # ── Sigmoid event-magnitude weighting ─────────────────────────
         # Steep sigmoid: peace cells (abs_max ≈ 0) → ~0.01, moderate

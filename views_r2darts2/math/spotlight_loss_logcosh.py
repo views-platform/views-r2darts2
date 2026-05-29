@@ -16,8 +16,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Components ───────────────────────────────────────────────────────
 
-    1. **DC/AC decomposition** — prevents RevIN DC offset amplification.
-       e_shape = e − mean(e).  Shape gradient sums to zero per series.
+    1. **DC/AC decomposition** — per-window demeaning (same windows as level).
+       e_shape = e − window_mean(e).  Shape and level are orthogonal:
+       shape handles within-window patterns, level handles per-window DC.
 
     2. **Sigmoid event-magnitude weighting** — ~50:1 contrast ratio.
        event_mag = 0.01 + 0.99 × σ(5 × (abs_max − τ)).  Peace → ~0.02,
@@ -110,7 +111,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         Returns weights with mean ≈ 1 per series, reshaped to (B, T).
         """
         l = losses.detach()                                  # (B, T)
-        tau = l.mean(dim=1, keepdim=True).clamp(min=1e-6)    # (B, 1)
+        tau = 0.5 * l.mean(dim=1, keepdim=True).clamp(min=1e-6)  # (B, 1)
         # Softmax in log-space for numerical stability
         logits = l / tau                                     # (B, T)
         logits = logits - logits.max(dim=1, keepdim=True).values  # stability
@@ -137,7 +138,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )  # (B, n_windows)
-        level_losses = self._log_cosh_proportional(window_means)
+        level_losses = self._log_cosh(window_means)
 
         # Per-series event magnitude: max |y_true| across time → sigmoid
         series_mag = y_true.abs().max(dim=1).values  # (B,)
@@ -198,7 +199,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            total = total + self._log_cosh_proportional(mag_pred - mag_true).mean()
+            total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -215,12 +216,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── DC/AC decomposition ───────────────────────────────────────
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
+        # ── Per-window DC/AC decomposition ────────────────────────────
+        # Demean within each non-overlapping window (same W as level anchor).
+        # This makes shape and level orthogonal: shape handles within-window
+        # patterns, level handles per-window DC.  No shared frequencies.
+        W = max(6, T // 3)
+        windows = list(e.split(W, dim=1))  # list of (B, W_i)
+        e_shape = torch.cat(
+            [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
+        )  # (B, T) — zero-mean within each window
 
         # ── Base cell loss (proportional variant for MSLE sensitivity) ─
-        cell_loss = self._log_cosh_proportional(e_shape)
+        cell_loss = self._log_cosh(e_shape)
 
         # ── Sigmoid event-magnitude weighting ─────────────────────────
         # Steep sigmoid: peace cells (abs_max ≈ 0) → ~0.01, moderate

@@ -162,7 +162,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Weight each series' level loss
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-        return T * weighted.mean()
+        return weighted.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -246,19 +246,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Steep sigmoid: peace cells (abs_max ≈ 0) → ~0.01, moderate
         # events → ~0.5, high-conflict → ~1.0.  Gives ~50:1 contrast
         # ratio between Syria-class and zero cells.
+        # STATIC only — no model-state-dependent weighting (difficulty,
+        # DRO, etc.) to avoid positive feedback → memorization → eval
+        # overprediction.
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
 
-        # Difficulty: how wrong this cell currently is.  Gives up to 2×
-        # boost on top of event_mag for cells the model is struggling with.
-        difficulty = 1.0 - torch.exp(-torch.abs(e_shape.detach()))
-        event_mag = event_mag * (1.0 + difficulty)
-
         # ── Weighted shape loss ────────────────────────────────────────
-        # event_mag alone provides ~100:1 contrast (50:1 sigmoid × 2×
-        # difficulty).  No DRO — softmax reweighting based on the model's
-        # own errors creates a positive feedback loop that memorises
-        # training spike patterns → overpredicts on eval.
+        # event_mag alone provides ~50:1 contrast (purely static —
+        # depends only on signal magnitude, NOT on model errors).
+        # Any model-state-dependent weighting (DRO, difficulty) creates
+        # a positive feedback loop → memorisation → eval overprediction.
         w_total = event_mag / event_mag.mean().clamp(min=1e-8)
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
         loss_shape = (w_total * cell_loss).mean()

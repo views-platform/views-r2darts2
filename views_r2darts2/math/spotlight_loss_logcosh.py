@@ -8,36 +8,55 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v44 — pointwise log_cosh + CCC shape enforcement.
+    SpotlightLoss v45 — pointwise accuracy + first-difference dynamics.
+
+    ── Design ───────────────────────────────────────────────────────────
+
+    L = L_pointwise + L_dynamics
+
+    Both terms use identical machinery: log_cosh_proportional per cell,
+    weighted by event_magnitude sigmoid mask. This makes them naturally
+    commensurable — no scaling coefficient needed.
 
     ── Components ───────────────────────────────────────────────────────
 
-    1. Pointwise: log_cosh_proportional(ŷ − y) per cell, weighted by
-       event_magnitude sigmoid mask (~58:1 event/peace). Per-cell
-       accuracy signal: "each timestep should be at the right value."
+    1. Pointwise (L_pointwise):
+       log_cosh_proportional(ŷ − y), weighted by event_mag.
+       "Each cell should be at the right value."
 
-    2. CCC (Concordance Correlation Coefficient): per-series shape loss.
-       1 − CCC penalises flat predictions directly:
-         - Flat → var(ŷ) = 0 → CCC = 0 → loss = 1.0 (maximum)
-         - Perfect tracking → CCC = 1.0 → loss = 0
-       Computed only over event-relevant series (series_event gate).
-       Weighted by pointwise_loss.detach() so it always contributes
-       at the same magnitude as pointwise — never drowned out.
+    2. First-difference dynamics (L_dynamics):
+       log_cosh_proportional(Δŷ − Δy), weighted by event_mag on Δ.
+       "Each transition should match the true transition."
 
-    ── Why CCC breaks flatness ──────────────────────────────────────────
+       Anti-flatness guarantee: flat prediction → Δŷ ≡ 0 → loss =
+       log_cosh_proportional(Δy) at every onset/offset. Gradient =
+       tanh(Δy)·(1+log1p(Δy²)) ≈ 0.96 at event onsets. This is a
+       PERMANENT, per-cell, per-series gradient that never vanishes
+       regardless of pointwise error magnitude or series variance.
 
-    CCC = 2·cov(ŷ,y) / (var(ŷ) + var(y) + (μ_ŷ − μ_y)²)
+    ── Why this breaks flatness ─────────────────────────────────────────
 
-    Flat prediction: var(ŷ) = 0, cov = 0 → CCC = 0 regardless of level.
-    The model MUST produce temporal variation correlated with truth to
-    reduce CCC loss. This is orthogonal to pointwise which only says
-    "be at the right level per cell" and is satisfied by flat-at-mean.
+    Pointwise alone: flat-at-mean minimises average cell error (the
+    conditional median/mean is achievable without temporal variation).
+    Dynamics term: flat has Δŷ=0, so every cell where truth changes
+    (|Δy| > 0) contributes irreducible loss. The model MUST reproduce
+    temporal changes to reduce this term. Per-series, per-cell — no
+    template risk, no vanishing gradient for high-variance series.
+
+    ── Why no template induction ────────────────────────────────────────
+
+    Every operation is per-cell within each series. No batch-level
+    aggregation, no frequency-domain matching, no windowed means.
+    Different series can have arbitrarily different temporal structure
+    and the loss treats each independently.
 
     ── Weighting ────────────────────────────────────────────────────────
 
-    event_magnitude: 0.01 + 0.99 · σ(5·(|union| − τ) / τ)
-    series_event gate: log1p ratio, gates CCC to event series only.
-    CCC scale: multiplied by pw_loss.detach() for self-balancing.
+    event_mag = 0.01 + 0.99 · σ(5·(|union| − τ) / τ)
+    Applied to BOTH terms: pointwise uses |y_true|, |y_pred| union;
+    dynamics uses |Δy_true|, |Δy_pred| union. A transition of ≥1
+    fatality (|Δy| > τ) gets full weight; sub-threshold transitions
+    get 1% floor.
 
     Args:
         non_zero_threshold: Event boundary in transformed space.
@@ -109,92 +128,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return (event_mag * cell_err).sum() / event_mag.sum().clamp(min=1e-8)
 
     # ------------------------------------------------------------------
-    # Level loss
-    # ------------------------------------------------------------------
-
-    def _level_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Multi-scale windowed level loss at W=4, 12, 36.
-
-        Provides smooth curriculum + boundary gradient leakage.
-        Weighted by max(event_mag) per window.
-        """
-        T = y_pred.size(1)
-        e = y_pred - y_true
-        event_mag = self._event_magnitude(y_pred, y_true)
-
-        all_losses = []
-        all_weights = []
-
-        for W in self._LEVEL_WINDOWS:
-            if T < W:
-                continue
-            n_win = T // W
-            e_win = e[:, :n_win * W].view(e.size(0), n_win, W)
-            window_err = self._log_cosh_proportional(e_win.mean(dim=2))
-
-            em_win = event_mag[:, :n_win * W].view(e.size(0), n_win, W)
-            window_event = em_win.amax(dim=2)
-
-            all_losses.append(window_err)
-            all_weights.append(window_event)
-
-        if not all_losses:
-            return y_pred.new_tensor(0.0)
-
-        cat_loss = torch.cat(all_losses, dim=1)
-        cat_weight = torch.cat(all_weights, dim=1)
-
-        return (cat_weight * cat_loss).sum() / cat_weight.sum().clamp(min=1e-8)
-
-    # ------------------------------------------------------------------
-    # CCC (Concordance Correlation Coefficient) loss
-    # ------------------------------------------------------------------
-
-    def _ccc_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Per-series CCC loss, gated to event-relevant series.
-
-        CCC = 2·cov(ŷ,y) / (var(ŷ) + var(y) + (μ_ŷ − μ_y)²)
-        Loss = 1 − CCC, bounded [0, 2].
-
-        Flat prediction → var(ŷ)=0, cov=0 → CCC=0 → loss=1.
-        Returns event-weighted mean (1 − CCC) across series.
-        """
-        # Flatten to (N_series, T)
-        if y_pred.dim() == 3:
-            B, T, C = y_pred.shape
-            pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
-            true = y_true.permute(0, 2, 1).reshape(B * C, T)
-        else:
-            pred = y_pred
-            true = y_true
-
-        # Series-level event gate (same logic as spectral)
-        abs_union = torch.max(torch.abs(true), torch.abs(pred.detach()))
-        log_ratio = torch.log1p(abs_union / self.non_zero_threshold)
-        series_event = (log_ratio / (1.0 + log_ratio)).amax(dim=1)
-        if series_event.sum() < 1e-8:
-            return pred.new_tensor(0.0)
-
-        # Per-series statistics
-        mu_p = pred.mean(dim=1)
-        mu_t = true.mean(dim=1)
-        # Variance (unbiased not needed — relative magnitudes matter)
-        var_p = pred.var(dim=1)
-        var_t = true.var(dim=1)
-        # Covariance
-        cov_pt = ((pred - mu_p.unsqueeze(1)) * (true - mu_t.unsqueeze(1))).mean(dim=1)
-
-        # CCC per series
-        denom = var_p + var_t + (mu_p - mu_t) ** 2
-        ccc = (2.0 * cov_pt) / denom.clamp(min=1e-8)
-        # Clamp to [-1, 1] for numerical safety
-        ccc = ccc.clamp(-1.0, 1.0)
-
-        # Loss = 1 - CCC, weighted by series_event
-        loss_per_series = 1.0 - ccc
-        return (series_event * loss_per_series).sum() / series_event.sum().clamp(min=1e-8)
-
-    # ------------------------------------------------------------------
     # Spectral loss (DC-masked) — retained but unused in forward
     # ------------------------------------------------------------------
 
@@ -247,6 +180,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return total / max(n_valid, 1)
 
     # ------------------------------------------------------------------
+    # Dynamics loss (first-difference matching)
+    # ------------------------------------------------------------------
+
+    def _dynamics_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """First-difference matching weighted by LEVEL at each transition.
+
+        Anti-flatness: flat prediction (Δŷ=0) pays log_cosh_proportional(Δy)
+        at every onset/offset with full event-weight.
+
+        Weighting by max(|y_true[t]|, |y_true[t-1]|, |y_pred[t]|, |y_pred[t-1]|)
+        ensures within-conflict dynamics (e.g., 100→200 deaths, Δy≈0.7 < τ)
+        still get full weight because the LEVEL is above τ. Weighting by
+        difference magnitude alone would give such transitions only 1% weight.
+        """
+        d_pred = y_pred[:, 1:] - y_pred[:, :-1]
+        d_true = y_true[:, 1:] - y_true[:, :-1]
+        cell_err = self._log_cosh_proportional(d_pred - d_true)
+        # Weight by max LEVEL flanking each step (not difference magnitude)
+        level_true = torch.max(y_true[:, 1:].abs(), y_true[:, :-1].abs())
+        level_pred = torch.max(y_pred[:, 1:].abs(), y_pred[:, :-1].abs())
+        event_mag = self._event_magnitude(level_pred, level_true)
+        return (event_mag * cell_err).sum() / event_mag.sum().clamp(min=1e-8)
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -257,22 +214,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         loss_pw = self._pointwise_loss(y_pred, y_true)
 
-        # CCC shape loss, scaled by pointwise magnitude so it can never
-        # be drowned out regardless of training stage or error scale.
-        loss_ccc = self._ccc_loss(y_pred, y_true)
-        loss_ccc_scaled = loss_ccc * loss_pw.detach()
+        loss_dyn = y_pred.new_tensor(0.0)
+        if y_pred.size(1) >= 2:
+            loss_dyn = self._dynamics_loss(y_pred, y_true)
 
-        total_loss = loss_pw + loss_ccc_scaled
+        total_loss = loss_pw + loss_dyn
 
         if torch.isnan(total_loss):
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: pw={loss_pw.item():.6f} "
-                f"ccc={loss_ccc.item():.6f}"
+                f"dyn={loss_dyn.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | pw=%.6f ccc=%.6f ccc_scaled=%.6f total=%.6f",
-            loss_pw.item(), loss_ccc.item(), loss_ccc_scaled.item(), total_loss.item(),
+            "SpotlightLossLogcosh | pw=%.6f dyn=%.6f total=%.6f",
+            loss_pw.item(), loss_dyn.item(), total_loss.item(),
         )
         return total_loss
 

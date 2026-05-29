@@ -92,30 +92,38 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
-        """Per-series softmax DRO with geometric-mean temperature (B, T).
+        """Per-series DRO via variance-dampened softmax (B, T).
 
-        Uses τ = geometric mean of per-series losses, i.e.
-        τ = exp(mean(log(ℓ))).
+        Temperature:  τ = μ × (1 + Var(log ℓ))
 
-        - For uniform-error series (all losses similar):
-          geo ≈ arith mean → τ is high → DRO is mild (nothing to focus on).
-        - For bursty series (few spikes among easy cells):
-          geo << arith (pulled down by many small losses) → τ is low →
-          spikes get strong upweight.
+        Intuition: Var(log ℓ) measures loss heterogeneity in log-space.
 
-        The ratio arith/geo = exp(Var(log ℓ) / 2), so the sharpening
-        is controlled entirely by the *heterogeneity* of each series'
-        loss distribution.  No hardcoded multiplier, percentile, or α.
+        - Uniform-error series (Var(log ℓ) ≈ 0): τ ≈ μ → standard
+          softmax DRO with moderate spike focus (~exp(2)=7× for a cell
+          at 3× mean).
+        - Bursty series (Var(log ℓ) ≈ 3-5): τ = μ × 4-6 → DRO is
+          GENTLER.  Logic: bursty series already get heavy weighting
+          from event_mag.  DRO's job is fine-grained redistribution
+          within that already-upweighted set, not further amplification
+          that causes memorization → eval overprediction.
 
-        Self-correcting: if model overpredicts uniformly → all losses
-        rise together → Var(log ℓ) drops → geo ≈ arith → DRO softens.
+        Why this is the inverse of geometric-mean tau:
+        - Geo-mean sharpened bursty series (τ << μ) → overprediction.
+        - This dampens bursty series (τ >> μ) → generalisation.
+        - For uniform series both converge to τ ≈ μ.
+
+        Self-correcting: if model overpredicts uniformly → losses
+        homogenise → Var(log ℓ) → 0 → τ ≈ μ → standard DRO sharpness.
 
         Returns weights with mean ≈ 1 per series, shape (B, T).
         """
         l = losses.detach()                                  # (B, T)
-        # Geometric mean in log-space
+        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1)
+        # Log-space variance: robust heterogeneity measure
         log_l = torch.log(l.clamp(min=1e-8))                 # (B, T)
-        tau = torch.exp(log_l.mean(dim=1, keepdim=True))     # (B, 1)
+        var_log = log_l.var(dim=1, keepdim=True)              # (B, 1)
+        # τ grows with heterogeneity → gentler on bursty series
+        tau = mu * (1.0 + var_log)                            # (B, 1)
         tau = tau.clamp(min=1e-6)
         # Softmax DRO
         logits = l / tau                                     # (B, T)

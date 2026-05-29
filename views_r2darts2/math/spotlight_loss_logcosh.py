@@ -92,41 +92,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
-        """Per-series softmax-temperature DRO weights (B, T).
+        """Per-series power-law DRO weights (B, T).
 
-        True KL-constrained DRO: the optimal adversarial distribution over
-        timesteps within each series is the Gibbs/softmax distribution
-        q_i ∝ exp(ℓ_i / τ).  This is the closed-form solution to:
+        Weights each timestep proportionally to (ℓ_i / μ)^α where μ is
+        the per-series mean loss and α=2 (quadratic focus).
 
-            max_{q: KL(q||uniform) ≤ ρ}  E_q[ℓ]
+        Unlike exponential/softmax DRO where a cell at 5× mean gets
+        exp(5)≈148× weight (unbounded, causes overprediction of spikes),
+        power-law gives that cell 5²=25× weight — strong focus but
+        bounded and predictable.
 
-        where τ is the Lagrange multiplier for the KL constraint.  Rather
-        than tuning τ, we set it adaptively as the per-series mean loss,
-        which makes the weighting scale-invariant: a series with mean
-        loss 0.01 gets τ=0.01, so a cell at 0.03 gets exp(2)≈7.4× weight;
-        a series with mean loss 5.0 gets τ=5.0, so a cell at 15.0 also
-        gets exp(2)≈7.4×.  Equal proportional sensitivity across all
-        series regardless of their absolute loss level.
+        Properties:
+          - Scale-invariant: dividing by μ makes it independent of
+            absolute loss magnitude.
+          - Self-correcting: if model overpredicts uniformly → all
+            losses equalise → all weights → 1 (no runaway).
+          - Bounded: max_weight/min_weight = (max_loss/min_loss)^α,
+            typically 20-50× for our data vs 1000+× with softmax.
 
-        Returns weights with mean ≈ 1 per series, reshaped to (B, T).
+        Returns weights with mean = 1 per series, shape (B, T).
         """
         l = losses.detach()                                  # (B, T)
-        # Adaptive τ scaled by coefficient of variation (CV = σ/μ).
-        # Bursty series (high CV: few spikes among easy cells) → smaller τ
-        # → sharper focus on spikes.  Uniform-error series (low CV: model
-        # is uniformly wrong) → τ ≈ mean → mild DRO, no runaway.
-        # Self-correcting: overprediction raises all losses uniformly →
-        # CV drops → DRO softens automatically.
         mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1)
-        sigma = l.std(dim=1, keepdim=True).clamp(min=0.0)    # (B, 1)
-        cv = sigma / mu                                       # (B, 1)
-        tau = mu / (1.0 + cv)                                 # (B, 1)
-        tau = tau.clamp(min=1e-6)
-        # Softmax in log-space for numerical stability
-        logits = l / tau                                     # (B, T)
-        logits = logits - logits.max(dim=1, keepdim=True).values  # stability
-        w = torch.exp(logits)                                # (B, T)
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # normalize to mean=1
+        # Normalise to per-series mean, then raise to power α=2
+        normalized = l / mu                                   # (B, T)
+        w = normalized * normalized                           # (B, T) — α=2
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _windowed_level_loss(

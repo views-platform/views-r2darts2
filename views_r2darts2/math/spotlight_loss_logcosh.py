@@ -184,23 +184,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _dynamics_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """First-difference matching weighted by LEVEL at each transition.
+        """First-difference matching weighted by transition magnitude.
 
         Anti-flatness: flat prediction (Δŷ=0) pays log_cosh_proportional(Δy)
         at every onset/offset with full event-weight.
 
-        Weighting by max(|y_true[t]|, |y_true[t-1]|, |y_pred[t]|, |y_pred[t-1]|)
-        ensures within-conflict dynamics (e.g., 100→200 deaths, Δy≈0.7 < τ)
-        still get full weight because the LEVEL is above τ. Weighting by
-        difference magnitude alone would give such transitions only 1% weight.
+        Weighting by event_mag on the DIFFERENCES (not levels) concentrates
+        the denominator on steps with actual transitions (|Δy| > τ). This
+        prevents dilution: sustained-conflict series with 35 high-level
+        steps but only 3 transitions would get loss ≈ error/35 with
+        level-weighting (10% of pointwise — drowned out). With difference-
+        weighting: loss ≈ error/3 (60% of pointwise — competitive).
         """
         d_pred = y_pred[:, 1:] - y_pred[:, :-1]
         d_true = y_true[:, 1:] - y_true[:, :-1]
         cell_err = self._log_cosh_proportional(d_pred - d_true)
-        # Weight by max LEVEL flanking each step (not difference magnitude)
-        level_true = torch.max(y_true[:, 1:].abs(), y_true[:, :-1].abs())
-        level_pred = torch.max(y_pred[:, 1:].abs(), y_pred[:, :-1].abs())
-        event_mag = self._event_magnitude(level_pred, level_true)
+        # Weight by transition magnitude: concentrates on actual changes
+        event_mag = self._event_magnitude(d_pred, d_true)
         return (event_mag * cell_err).sum() / event_mag.sum().clamp(min=1e-8)
 
     # ------------------------------------------------------------------

@@ -246,18 +246,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Steep sigmoid: peace cells (abs_max ≈ 0) → ~0.01, moderate
         # events → ~0.5, high-conflict → ~1.0.  Gives ~50:1 contrast
         # ratio between Syria-class and zero cells.
-        # STATIC only — no model-state-dependent weighting (difficulty,
-        # DRO, etc.) to avoid positive feedback → memorization → eval
-        # overprediction.
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
 
-        # ── Weighted shape loss ────────────────────────────────────────
-        # event_mag alone provides ~50:1 contrast (purely static —
-        # depends only on signal magnitude, NOT on model errors).
-        # Any model-state-dependent weighting (DRO, difficulty) creates
-        # a positive feedback loop → memorisation → eval overprediction.
-        w_total = event_mag / event_mag.mean().clamp(min=1e-8)
+        # ── Per-series temporal DRO ────────────────────────────────────
+        # DRO handles difficulty (upweighting hard timesteps within each
+        # series) — no need for explicit difficulty multiplier on event_mag.
+        # Within each series, upweight the hardest timesteps relative to
+        # that series' own loss distribution.  Between-series importance
+        # is handled by event_mag above.
+        w_dro = self._dro_weights_2d(cell_loss)  # (B, T)
+        w_total = event_mag * w_dro
+        w_total = w_total / w_total.mean()
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
         loss_shape = (w_total * cell_loss).mean()
 

@@ -91,46 +91,64 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
-        """Per-series temporal DRO weights along dim=1 for (B, T) input.
+        """Per-series softmax-temperature DRO weights (B, T).
 
-        Within each series, upweights timesteps that are proportionally
-        harder relative to that series' own loss distribution.  This avoids
-        cross-series interference while providing within-series "shock
-        therapy" — each country gets pushed hardest at the timesteps where
-        it's failing relative to its own baseline.
+        True KL-constrained DRO: the optimal adversarial distribution over
+        timesteps within each series is the Gibbs/softmax distribution
+        q_i ∝ exp(ℓ_i / τ).  This is the closed-form solution to:
 
-        Fully vectorised — no Python loop over the batch dimension.
+            max_{q: KL(q||uniform) ≤ ρ}  E_q[ℓ]
+
+        where τ is the Lagrange multiplier for the KL constraint.  Rather
+        than tuning τ, we set it adaptively as the per-series mean loss,
+        which makes the weighting scale-invariant: a series with mean
+        loss 0.01 gets τ=0.01, so a cell at 0.03 gets exp(2)≈7.4× weight;
+        a series with mean loss 5.0 gets τ=5.0, so a cell at 15.0 also
+        gets exp(2)≈7.4×.  Equal proportional sensitivity across all
+        series regardless of their absolute loss level.
+
+        Returns weights with mean ≈ 1 per series, reshaped to (B, T).
         """
-        log_l = torch.log(losses.detach() + 1e-8)           # (B, T)
-        std = log_l.std(dim=1, keepdim=True)                 # (B, 1)
-        std = torch.where(
-            torch.isfinite(std) & (std > 1e-8),
-            std,
-            losses.new_tensor(0.1),
-        )
-        mean = log_l.mean(dim=1, keepdim=True)               # (B, 1)
-        cv = torch.log1p(std / (mean.abs() + 1e-8))
-        alpha = cv / (cv + 1.0)
-        z = (log_l - mean) / std.clamp(min=0.1)
-        w = torch.log1p((1.0 + z).clamp(min=0.0))
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)
-        w = alpha * w + (1.0 - alpha)
+        l = losses.detach()                                  # (B, T)
+        tau = l.mean(dim=1, keepdim=True).clamp(min=1e-6)    # (B, 1)
+        # Softmax in log-space for numerical stability
+        logits = l / tau                                     # (B, T)
+        logits = logits - logits.max(dim=1, keepdim=True).values  # stability
+        w = torch.exp(logits)                                # (B, T)
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # normalize to mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
-    def _windowed_level_loss(self, e: torch.Tensor, T: int) -> torch.Tensor:
-        """Windowed log_cosh level anchor.
+    def _windowed_level_loss(
+        self, e: torch.Tensor, y_true: torch.Tensor, T: int,
+    ) -> torch.Tensor:
+        """Event-magnitude-weighted windowed level anchor.
 
-        Splits the T-length error into non-overlapping windows of width
-        max(6, T//3) (~3 wide windows), computes log_cosh on per-window
-        means.  Scaled by T: necessary to overcome the 90% zero-cell
-        majority pulling the DC component toward zero.
+        Splits the T-length error into non-overlapping windows, computes
+        log_cosh_proportional on per-window means, then weights each
+        series by its event magnitude.  Without this weighting, the 76%
+        peace series (with near-zero DC error) dilute the level gradient
+        that event series need to correct their systematic underprediction.
+
+        Uses proportional loss to avoid gradient saturation: plain
+        log_cosh has gradient tanh(x) → 1 for |x| > 2, meaning a 2×
+        underprediction gets the same gradient as a 10× underprediction.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
-        )
-        level_losses = self._log_cosh(window_means)
-        return T * level_losses.mean()
+        )  # (B, n_windows)
+        level_losses = self._log_cosh_proportional(window_means)
+
+        # Per-series event magnitude: max |y_true| across time → sigmoid
+        series_mag = y_true.abs().max(dim=1).values  # (B,)
+        series_w = 0.01 + 0.99 * torch.sigmoid(
+            5.0 * (series_mag - self.non_zero_threshold)
+        )  # (B,)
+        series_w = series_w / series_w.mean().clamp(min=1e-8)
+
+        # Weight each series' level loss
+        weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
+        return T * weighted.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -227,7 +245,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         loss_shape = (w_total * cell_loss).mean()
 
         # ── Windowed level anchor ─────────────────────────────────────
-        loss_level = self._windowed_level_loss(e, T)
+        loss_level = self._windowed_level_loss(e, y_true, T)
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)

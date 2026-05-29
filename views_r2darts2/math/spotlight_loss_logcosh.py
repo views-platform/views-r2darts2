@@ -129,7 +129,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
-        level_losses = self._log_cosh_proportional(window_means)
+        level_losses = self._log_cosh(window_means)
         return T * level_losses.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -202,7 +202,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_shape = e - e_mean
 
         # ── Base cell loss (proportional variant for MSLE sensitivity) ─
-        cell_loss = self._log_cosh_proportional(e_shape)
+        cell_loss = self._log_cosh(e_shape)
 
         # ── Sigmoid event-magnitude weighting ─────────────────────────
         # Steep sigmoid: peace cells (abs_max ≈ 0) → ~0.01, moderate

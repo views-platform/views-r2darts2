@@ -111,7 +111,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         Returns weights with mean ≈ 1 per series, reshaped to (B, T).
         """
         l = losses.detach()                                  # (B, T)
-        tau = 0.5 * l.mean(dim=1, keepdim=True).clamp(min=1e-6)  # (B, 1)
+        # Adaptive τ scaled by coefficient of variation (CV = σ/μ).
+        # Bursty series (high CV: few spikes among easy cells) → smaller τ
+        # → sharper focus on spikes.  Uniform-error series (low CV: model
+        # is uniformly wrong) → τ ≈ mean → mild DRO, no runaway.
+        # Self-correcting: overprediction raises all losses uniformly →
+        # CV drops → DRO softens automatically.
+        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1)
+        sigma = l.std(dim=1, keepdim=True).clamp(min=0.0)    # (B, 1)
+        cv = sigma / mu                                       # (B, 1)
+        tau = mu / (1.0 + cv)                                 # (B, 1)
+        tau = tau.clamp(min=1e-6)
         # Softmax in log-space for numerical stability
         logits = l / tau                                     # (B, T)
         logits = logits - logits.max(dim=1, keepdim=True).values  # stability

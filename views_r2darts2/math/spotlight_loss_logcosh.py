@@ -254,13 +254,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         difficulty = 1.0 - torch.exp(-torch.abs(e_shape.detach()))
         event_mag = event_mag * (1.0 + difficulty)
 
-        # ── Per-series temporal DRO ────────────────────────────────────
-        # Within each series, upweight the hardest timesteps relative to
-        # that series' own loss distribution.  Between-series importance
-        # is handled by event_mag above.
-        w_dro = self._dro_weights_2d(cell_loss)  # (B, T)
-        w_total = event_mag * w_dro
-        w_total = w_total / w_total.mean()
+        # ── Weighted shape loss ────────────────────────────────────────
+        # event_mag alone provides ~100:1 contrast (50:1 sigmoid × 2×
+        # difficulty).  No DRO — softmax reweighting based on the model's
+        # own errors creates a positive feedback loop that memorises
+        # training spike patterns → overpredicts on eval.
+        w_total = event_mag / event_mag.mean().clamp(min=1e-8)
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
         loss_shape = (w_total * cell_loss).mean()
 

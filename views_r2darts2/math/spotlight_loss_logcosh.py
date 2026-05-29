@@ -92,19 +92,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
-        """Per-series DRO with τ = 0.5 × μ (aggressive spike focus).
+        """Per-series DRO with τ = μ (moderate spike focus).
 
-        Temperature at half the mean loss sharpens the softmax so that
-        cells with loss at 2× mean get ~exp(2)≈7× weight, and cells at
-        3× mean get ~exp(4)≈55× weight.  This forces the model to
-        prioritise the hardest timesteps (spikes) within each series.
+        Temperature at the mean loss gives moderate sharpening:
+        cells at 2× mean get ~exp(2)≈7× weight, cells at 3× mean get
+        ~exp(3)≈20× weight.  Enough to focus on hard timesteps without
+        penalising the model for attempting spikes.
 
         Returns weights with mean ≈ 1 per series, shape (B, T).
         """
         l = losses.detach()                                  # (B, T)
-        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1)
-        tau = 0.5 * mu                                       # (B, 1)
-        tau = tau.clamp(min=1e-6)
+        tau = l.mean(dim=1, keepdim=True).clamp(min=1e-6)    # (B, 1)
         # Softmax DRO
         logits = l / tau                                     # (B, T)
         logits = logits - logits.max(dim=1, keepdim=True).values  # stability

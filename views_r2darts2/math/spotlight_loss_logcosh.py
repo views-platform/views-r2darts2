@@ -207,18 +207,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── Per-window DC/AC decomposition ────────────────────────────
-        # Demean within each non-overlapping window (same W as level anchor).
-        # This makes shape and level orthogonal: shape handles within-window
-        # patterns, level handles per-window DC.  No shared frequencies.
-        W = max(6, T // 3)
-        windows = list(e.split(W, dim=1))  # list of (B, W_i)
-        e_shape = torch.cat(
-            [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
-        )  # (B, T) — zero-mean within each window
-
-        # ── Base cell loss (proportional variant for MSLE sensitivity) ─
-        cell_loss = self._log_cosh(e_shape)
+        # ── Base cell loss on raw error (no DC/AC split) ──────────────
+        # Direct log_cosh on the full error penalises both level and shape
+        # errors in a single unified term.  event_mag + DRO handle the
+        # relative importance of each cell.
+        cell_loss = self._log_cosh(e)
 
         # ── Sigmoid event-magnitude weighting ─────────────────────────
         # Steep sigmoid: peace cells (abs_max ≈ 0) → ~0.01, moderate
@@ -228,39 +221,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
 
         # ── Per-series temporal DRO ────────────────────────────────────
-        # DRO handles difficulty (upweighting hard timesteps within each
-        # series) — no need for explicit difficulty multiplier on event_mag.
-        # Within each series, upweight the hardest timesteps relative to
-        # that series' own loss distribution.  Between-series importance
-        # is handled by event_mag above.
+        # Upweights the hardest timesteps within each series (τ = μ).
+        # Between-series importance handled by event_mag.
         w_dro = self._dro_weights_2d(cell_loss)  # (B, T)
         w_total = event_mag * w_dro
         w_total = w_total / w_total.mean()
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-        loss_shape = (w_total * cell_loss).mean()
-
-        # ── Windowed level anchor ─────────────────────────────────────
-        loss_level = self._windowed_level_loss(e, y_true, T)
+        loss_main = (w_total * cell_loss).mean()
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + loss_spec
+        total_loss = loss_main + loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
-                f"NaN in SpotlightLossLogcosh: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} "
+                f"NaN in SpotlightLossLogcosh: main={loss_main.item():.6f} "
                 f"spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | shape=%.6f level=%.6f "
-            "spec=%.6f total=%.6f",
-            loss_shape.item(), loss_level.item(),
-            loss_spec.item(), total_loss.item(),
+            "SpotlightLossLogcosh | main=%.6f spec=%.6f total=%.6f",
+            loss_main.item(), loss_spec.item(), total_loss.item(),
         )
         return total_loss
 

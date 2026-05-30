@@ -92,39 +92,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Per-series DRO with exponential-decay τ (B, T).
+        """Per-series self-reweighting.
 
-        τ_i = μ_i × exp(-σ_target_i / σ_target_mean)
+        w_it = loss_it / mean_i(loss)
 
-        Exponentially sharper DRO for high-variance series.  No saturation.
-        Information-geometrically natural (optimal transport on simplex).
+        Each timestep's weight IS its own loss relative to the series mean.
+        Equivalent to optimizing E[loss²] — automatically concentrates
+        gradient on the hardest cells proportional to their difficulty.
 
-        Example τ values (assuming σ_mean ≈ 1):
-          Peace (σ≈0):   τ ≈ μ        → gentle (weights ≈ uniform)
-          Medium (σ=1):  τ = 0.37μ    → moderate spike focus
-          High (σ=2):    τ = 0.14μ    → strong spike focus
-          Syria (σ=3):   τ = 0.05μ    → extreme spike focus
-
-        τ depends only on y_true statistics — no feedback loop.
+        No temperature, no tuning, no data-dependent scaling.
+        A timestep 5× harder than average gets 5× the gradient.
 
         Returns weights with mean ≈ 1 per series, shape (B, T).
         """
         l = losses.detach()                                  # (B, T)
         mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1)
-
-        # Per-series target std (data-driven, no model dependency)
-        sigma_target = y_true.std(dim=1, keepdim=True)       # (B, 1)
-        sigma_mean = sigma_target.mean().clamp(min=1e-6)     # scalar
-
-        # Exponential decay: bursty → very sharp, calm → gentle
-        tau = mu * torch.exp(-sigma_target / sigma_mean)     # (B, 1)
-        tau = tau.clamp(min=1e-6)
-
-        # Softmax DRO
-        logits = l / tau                                     # (B, T)
-        logits = logits - logits.max(dim=1, keepdim=True).values  # stability
-        w = torch.exp(logits)                                # (B, T)
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # mean=1
+        w = l / mu                                           # (B, T), mean ≈ 1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _windowed_level_loss(
@@ -157,7 +140,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Weight each series' level loss
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-        return math.sqrt(T) * weighted.mean()
+        return T * weighted.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

@@ -92,22 +92,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Per-series self-reweighting.
+        """Per-series sqrt self-reweighting (zero hyperparameters).
 
-        w_it = loss_it / mean_i(loss)
+        w_it = sqrt(loss_it / mean_i(loss))
 
-        Each timestep's weight IS its own loss relative to the series mean.
-        Equivalent to optimizing E[loss²] — automatically concentrates
-        gradient on the hardest cells proportional to their difficulty.
-
-        No temperature, no tuning, no data-dependent scaling.
-        A timestep 5× harder than average gets 5× the gradient.
+        Sublinear concentration: a cell 16× harder than average gets 4×
+        the gradient (not 16×).  Redistributes enough signal to fix
+        systematic bias while still focusing on spikes.
 
         Returns weights with mean ≈ 1 per series, shape (B, T).
         """
         l = losses.detach()                                  # (B, T)
         mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1)
-        w = l / mu                                           # (B, T), mean ≈ 1
+        w = torch.sqrt(l / mu)                               # (B, T)
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _windowed_level_loss(

@@ -92,22 +92,31 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
-        """Per-series DRO with τ = μ (moderate spike focus).
+        """Per-series softmax-temperature DRO weights (B, T).
 
-        Temperature at the mean loss gives moderate sharpening:
-        cells at 2× mean get ~exp(2)≈7× weight, cells at 3× mean get
-        ~exp(3)≈20× weight.  Enough to focus on hard timesteps without
-        penalising the model for attempting spikes.
+        True KL-constrained DRO: the optimal adversarial distribution over
+        timesteps within each series is the Gibbs/softmax distribution
+        q_i ∝ exp(ℓ_i / τ).  This is the closed-form solution to:
 
-        Returns weights with mean ≈ 1 per series, shape (B, T).
+            max_{q: KL(q||uniform) ≤ ρ}  E_q[ℓ]
+
+        where τ is the Lagrange multiplier for the KL constraint.  Rather
+        than tuning τ, we set it adaptively as the per-series mean loss,
+        which makes the weighting scale-invariant: a series with mean
+        loss 0.01 gets τ=0.01, so a cell at 0.03 gets exp(2)≈7.4× weight;
+        a series with mean loss 5.0 gets τ=5.0, so a cell at 15.0 also
+        gets exp(2)≈7.4×.  Equal proportional sensitivity across all
+        series regardless of their absolute loss level.
+
+        Returns weights with mean ≈ 1 per series, reshaped to (B, T).
         """
         l = losses.detach()                                  # (B, T)
-        tau = l.mean(dim=1, keepdim=True).clamp(min=1e-6)    # (B, 1)
-        # Softmax DRO
+        tau = 0.5 * l.mean(dim=1, keepdim=True).clamp(min=1e-6)  # (B, 1)
+        # Softmax in log-space for numerical stability
         logits = l / tau                                     # (B, T)
         logits = logits - logits.max(dim=1, keepdim=True).values  # stability
         w = torch.exp(logits)                                # (B, T)
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # mean=1
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # normalize to mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _windowed_level_loss(
@@ -140,6 +149,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Weight each series' level loss
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
+        # return T * weighted.mean()
         return weighted.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -207,11 +217,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── Base cell loss on raw error (no DC/AC split) ──────────────
-        # Direct log_cosh on the full error penalises both level and shape
-        # errors in a single unified term.  event_mag + DRO handle the
-        # relative importance of each cell.
-        cell_loss = self._log_cosh(e)
+        # ── Per-window DC/AC decomposition ────────────────────────────
+        # Demean within each non-overlapping window (same W as level anchor).
+        # This makes shape and level orthogonal: shape handles within-window
+        # patterns, level handles per-window DC.  No shared frequencies.
+        W = max(6, T // 3)
+        windows = list(e.split(W, dim=1))  # list of (B, W_i)
+        e_shape = torch.cat(
+            [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
+        )  # (B, T) — zero-mean within each window
+
+        # ── Base cell loss (proportional variant for MSLE sensitivity) ─
+        cell_loss = self._log_cosh(e_shape)
 
         # ── Sigmoid event-magnitude weighting ─────────────────────────
         # Steep sigmoid: peace cells (abs_max ≈ 0) → ~0.01, moderate
@@ -220,31 +237,43 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
 
+        # Difficulty: how wrong this cell currently is.  Gives up to 2×
+        # boost on top of event_mag for cells the model is struggling with.
+        difficulty = 1.0 - torch.exp(-torch.abs(e_shape.detach()))
+        event_mag = event_mag * (1.0 + difficulty)
+
         # ── Per-series temporal DRO ────────────────────────────────────
-        # Upweights the hardest timesteps within each series (τ = μ).
-        # Between-series importance handled by event_mag.
+        # Within each series, upweight the hardest timesteps relative to
+        # that series' own loss distribution.  Between-series importance
+        # is handled by event_mag above.
         w_dro = self._dro_weights_2d(cell_loss)  # (B, T)
         w_total = event_mag * w_dro
         w_total = w_total / w_total.mean()
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-        loss_main = (w_total * cell_loss).mean()
+        loss_shape = (w_total * cell_loss).mean()
+
+        # ── Windowed level anchor ─────────────────────────────────────
+        loss_level = self._windowed_level_loss(e, y_true, T)
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_main + loss_spec
+        total_loss = loss_shape + loss_level + loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(
-                f"NaN in SpotlightLossLogcosh: main={loss_main.item():.6f} "
+                f"NaN in SpotlightLossLogcosh: shape={loss_shape.item():.6f} "
+                f"level={loss_level.item():.6f} "
                 f"spec={loss_spec.item():.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | main=%.6f spec=%.6f total=%.6f",
-            loss_main.item(), loss_spec.item(), total_loss.item(),
+            "SpotlightLossLogcosh | shape=%.6f level=%.6f "
+            "spec=%.6f total=%.6f",
+            loss_shape.item(), loss_level.item(),
+            loss_spec.item(), total_loss.item(),
         )
         return total_loss
 

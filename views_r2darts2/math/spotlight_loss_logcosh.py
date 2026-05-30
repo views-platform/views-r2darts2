@@ -157,7 +157,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Weight each series' level loss
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-        return T * weighted.mean()
+        return math.sqrt(T) * weighted.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

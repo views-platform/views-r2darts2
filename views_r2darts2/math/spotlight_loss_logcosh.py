@@ -92,7 +92,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Per-series sqrt self-reweighting (zero hyperparameters).
+        """Per-series sqrt self-reweighting
 
         w_it = sqrt(loss_it / mean_i(loss))
 
@@ -127,7 +127,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )  # (B, n_windows)
-        level_losses = self._log_cosh(window_means)
+        level_losses = self._log_cosh_proportional(window_means)
 
         # Per-series event magnitude: max |y_true| across time → sigmoid
         series_mag = y_true.abs().max(dim=1).values  # (B,)
@@ -138,7 +138,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Weight each series' level loss
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-        return T * weighted.mean()
+        return weighted.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

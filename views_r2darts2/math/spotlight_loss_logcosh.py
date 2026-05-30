@@ -92,19 +92,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Per-series DRO with inverse target-variance-scaled τ (B, T).
+        """Per-series DRO with exponential-decay τ (B, T).
 
-        τ_i = μ_i × σ_mean / (σ_mean + σ_target_i)
+        τ_i = μ_i × exp(-σ_target_i / σ_target_mean)
 
-        Intuition: high-variance countries (Syria, Ukraine) have large
-        σ_target → smaller τ → sharper DRO → model forced to match spike
-        shapes precisely.  Low-variance countries (peaceful) have
-        σ_target ≈ 0 → τ ≈ μ → standard DRO (gentle, less focus needed).
+        Exponentially sharper DRO for high-variance series.  No saturation.
+        Information-geometrically natural (optimal transport on simplex).
 
         Example τ values (assuming σ_mean ≈ 1):
-          Syria (σ=3): τ = μ × 1/4 = 0.25μ → exp(4)≈55× on hardest cell
-          Medium (σ=1): τ = μ × 1/2 = 0.5μ → exp(2)≈7× on hardest cell
-          Peace (σ≈0): τ ≈ μ → exp(1)≈2.7× on hardest cell
+          Peace (σ≈0):   τ ≈ μ        → gentle (weights ≈ uniform)
+          Medium (σ=1):  τ = 0.37μ    → moderate spike focus
+          High (σ=2):    τ = 0.14μ    → strong spike focus
+          Syria (σ=3):   τ = 0.05μ    → extreme spike focus
+
+        τ depends only on y_true statistics — no feedback loop.
 
         Returns weights with mean ≈ 1 per series, shape (B, T).
         """
@@ -115,8 +116,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         sigma_target = y_true.std(dim=1, keepdim=True)       # (B, 1)
         sigma_mean = sigma_target.mean().clamp(min=1e-6)     # scalar
 
-        # τ shrinks with target variability: bursty → sharp, calm → gentle
-        tau = mu * sigma_mean / (sigma_mean + sigma_target)  # (B, 1)
+        # Exponential decay: bursty → very sharp, calm → gentle
+        tau = mu * torch.exp(-sigma_target / sigma_mean)     # (B, 1)
         tau = tau.clamp(min=1e-6)
 
         # Softmax DRO

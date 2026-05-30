@@ -356,8 +356,8 @@ def apply_rinorm_compression_patch():
         #   - At σ = 20×σ_med: tanh(3.0) = 0.995 → σ_out = 2.7×σ_med
         #   - At σ = σ_med/5: tanh(-1.6) = -0.92 → σ_out = 0.4×σ_med
         #
-        sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
+        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
+        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
         
         # sigma_med = sigma.median(dim=0, keepdim=True).values.clamp(min=1e-6)
         # log_ratio = torch.log(sigma / sigma_med.clamp(min=1e-6))

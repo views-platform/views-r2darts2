@@ -91,32 +91,39 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return lc * (1.0 + torch.log1p(abs_x * abs_x * abs_x))
 
     @staticmethod
-    def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
-        """Per-series softmax-temperature DRO weights (B, T).
+    def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Per-series DRO with inverse target-variance-scaled τ (B, T).
 
-        True KL-constrained DRO: the optimal adversarial distribution over
-        timesteps within each series is the Gibbs/softmax distribution
-        q_i ∝ exp(ℓ_i / τ).  This is the closed-form solution to:
+        τ_i = μ_i × σ_mean / (σ_mean + σ_target_i)
 
-            max_{q: KL(q||uniform) ≤ ρ}  E_q[ℓ]
+        Intuition: high-variance countries (Syria, Ukraine) have large
+        σ_target → smaller τ → sharper DRO → model forced to match spike
+        shapes precisely.  Low-variance countries (peaceful) have
+        σ_target ≈ 0 → τ ≈ μ → standard DRO (gentle, less focus needed).
 
-        where τ is the Lagrange multiplier for the KL constraint.  Rather
-        than tuning τ, we set it adaptively as the per-series mean loss,
-        which makes the weighting scale-invariant: a series with mean
-        loss 0.01 gets τ=0.01, so a cell at 0.03 gets exp(2)≈7.4× weight;
-        a series with mean loss 5.0 gets τ=5.0, so a cell at 15.0 also
-        gets exp(2)≈7.4×.  Equal proportional sensitivity across all
-        series regardless of their absolute loss level.
+        Example τ values (assuming σ_mean ≈ 1):
+          Syria (σ=3): τ = μ × 1/4 = 0.25μ → exp(4)≈55× on hardest cell
+          Medium (σ=1): τ = μ × 1/2 = 0.5μ → exp(2)≈7× on hardest cell
+          Peace (σ≈0): τ ≈ μ → exp(1)≈2.7× on hardest cell
 
-        Returns weights with mean ≈ 1 per series, reshaped to (B, T).
+        Returns weights with mean ≈ 1 per series, shape (B, T).
         """
         l = losses.detach()                                  # (B, T)
-        tau = 0.5 * l.mean(dim=1, keepdim=True).clamp(min=1e-6)  # (B, 1)
-        # Softmax in log-space for numerical stability
+        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1)
+
+        # Per-series target std (data-driven, no model dependency)
+        sigma_target = y_true.std(dim=1, keepdim=True)       # (B, 1)
+        sigma_mean = sigma_target.mean().clamp(min=1e-6)     # scalar
+
+        # τ shrinks with target variability: bursty → sharp, calm → gentle
+        tau = mu * sigma_mean / (sigma_mean + sigma_target)  # (B, 1)
+        tau = tau.clamp(min=1e-6)
+
+        # Softmax DRO
         logits = l / tau                                     # (B, T)
         logits = logits - logits.max(dim=1, keepdim=True).values  # stability
         w = torch.exp(logits)                                # (B, T)
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # normalize to mean=1
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def _windowed_level_loss(
@@ -149,8 +156,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Weight each series' level loss
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-        # return T * weighted.mean()
-        return weighted.mean()
+        return T * weighted.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -246,7 +252,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Within each series, upweight the hardest timesteps relative to
         # that series' own loss distribution.  Between-series importance
         # is handled by event_mag above.
-        w_dro = self._dro_weights_2d(cell_loss)  # (B, T)
+        w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T)
         w_total = event_mag * w_dro
         w_total = w_total / w_total.mean()
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)

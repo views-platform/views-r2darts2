@@ -244,11 +244,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
 
-        # Difficulty: how wrong this cell currently is.  Gives up to 2×
-        # boost on top of event_mag for cells the model is struggling with.
-        difficulty = 1.0 - torch.exp(-torch.abs(e_shape.detach()))
-        event_mag = event_mag * (1.0 + difficulty)
-
         # ── Per-series temporal DRO ────────────────────────────────────
         # Within each series, upweight the hardest timesteps relative to
         # that series' own loss distribution.  Between-series importance

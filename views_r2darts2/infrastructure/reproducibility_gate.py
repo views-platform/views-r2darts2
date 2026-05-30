@@ -101,6 +101,7 @@ class ReproducibilityGate:
                 "n_freq_downsample",
                 "activation",
                 "max_pool_1d",
+                "batch_norm",
                 "dropout",
                 "use_reversible_instance_norm",
                 "force_reset",

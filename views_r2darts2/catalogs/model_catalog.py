@@ -296,6 +296,7 @@ class ModelCatalog:
             n_freq_downsample=self.config.get("n_freq_downsample"),
             activation=self.config.get("activation"),
             MaxPool1d=self.config.get("max_pool_1d"),
+            batch_norm=self.config.get("batch_norm"),
             dropout=self.config.get("dropout"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
         )

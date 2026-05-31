@@ -406,11 +406,85 @@ def apply_rinorm_compression_patch():
     )
 
 
+# --- 5. TCN Tanh Activation Patch ---
+#
+# TCN's _ResidualBlock uses hardcoded F.relu (not configurable via any parameter).
+# With 4 residual blocks stacking additively, outputs accumulate to ~20+ in
+# normalized space. RevIN inverse then multiplies by σ_c (up to 458 for
+# extreme-conflict entities), and sinh() explodes to infinity.
+#
+# Fix: replace F.relu with torch.tanh in the forward pass.
+# - Tanh bounds each conv path to [-1, 1]
+# - After 4 blocks with residual: max output ≈ |input| + 4 ≈ 6-7
+# - vs ReLU: |input| + 4*5 ≈ 22 (observed: pred_sanity/max = 23.6)
+#
+# Tanh is appropriate here because:
+# 1. The data is already centered (RevIN forward subtracts μ_asinh)
+# 2. Negative predictions are meaningful (below-mean states)
+# 3. The bounded [-1,1] per-layer prevents accumulation explosion
+# 4. Weight norm ensures gradients don't vanish at saturation
+#
+# Note: the LAST block already skips the second ReLU in the original code
+# (only applies activation to intermediate blocks). We apply tanh uniformly
+# to both positions — the last block's conv2 output passes through tanh too,
+# giving a bounded final output before the residual add.
+
+
+def _patched_tcn_residual_forward(self, x):
+    """TCN _ResidualBlock.forward with Tanh replacing ReLU."""
+    residual = x
+
+    # first step
+    left_padding = (self.dilation_base ** self.nr_blocks_below) * (
+        self.kernel_size - 1
+    )
+    x = F.pad(x, (left_padding, 0))
+    x = self.dropout1(torch.tanh(self.conv1(x)))
+
+    # second step
+    x = F.pad(x, (left_padding, 0))
+    x = torch.tanh(self.conv2(x))
+    x = self.dropout2(x)
+
+    # add residual
+    if self.conv1.in_channels != self.conv2.out_channels:
+        residual = self.conv3(residual)
+    x = x + residual
+
+    return x
+
+
+def apply_tcn_tanh_patch():
+    """
+    Patches Darts TCN _ResidualBlock to use Tanh instead of ReLU.
+
+    Bounds each block's conv path output to [-1, 1], preventing the
+    additive residual accumulation from reaching values that overflow
+    when RevIN denormalizes by σ_c (which can be 400+ for extreme entities).
+
+    With 4 blocks: max normalized output ≈ 7 (vs 23+ with ReLU).
+    sinh(7) × σ_c=458 ≈ 251K → asinh(251K) ≈ 12.8 (recoverable)
+    vs sinh(23) × 458 ≈ 4.8 × 10¹² (overflow → infinity).
+    """
+    from darts.models.forecasting.tcn_model import _ResidualBlock
+
+    if getattr(_ResidualBlock.forward, '_tcn_tanh_patched', False):
+        return
+
+    _patched_tcn_residual_forward._tcn_tanh_patched = True
+    _ResidualBlock.forward = _patched_tcn_residual_forward
+    logger.info(
+        "[TCN patch] ✅ Replaced ReLU with Tanh in _ResidualBlock.forward. "
+        "Output per block bounded to [-1, 1] + residual."
+    )
+
+
 # --- Initialize All Patches ---
 
 def apply_all_patches():
     apply_torch_load_patch()
     apply_rinorm_compression_patch()
+    apply_tcn_tanh_patch()
     apply_tide_mc_dropout_patch()
     # apply_nbeats_patch()
 

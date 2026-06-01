@@ -60,6 +60,8 @@ from views_r2darts2.infrastructure.callbacks import (
     EpochTimingCallback,
     YHatBarCallback,
     ValMetricsCallback,
+    InputBatchMonitorCallback,
+    LossComponentCallback,
 )
 
 
@@ -121,26 +123,23 @@ class ModelCatalog:
         self.sched_catalog = SchedulerCatalog(self.config)
 
     def _get_common_pl_trainer_kwargs(self, extra_callbacks=None):
+        """
+        Returns a dictionary of common PyTorch Lightning Trainer keyword arguments.
+        """
+        # Fortress standard callbacks
         callbacks = [
             TrainingStepPatchCallback(),  # MUST be first: patches training_step to expose predictions
-            EarlyStopping(
-                monitor="val_loss",
-                patience=self.config.get("early_stopping_patience"),
-                min_delta=self.config.get("early_stopping_min_delta"),
-                mode="min",
-            ),
-            LearningRateMonitor(log_momentum=True, log_weight_decay=True),
-            GradientHealthCallback(),
             NaNDetectionCallback(),
+            GradientHealthCallback(),
             WeightNormCallback(),
             RevINMonitorCallback(),
             PredictionSanityCallback(),
             LossStabilityCallback(),
             EpochTimingCallback(),
-            YHatBarCallback(
-                target_scaler=self.config.get("target_scaler"),
-                non_zero_threshold=self.config.get("non_zero_threshold", 0.88),
-            ),
+            YHatBarCallback(),
+            ValMetricsCallback(),
+            InputBatchMonitorCallback(),
+            # LossComponentCallback(),
         ]
         if extra_callbacks:
             callbacks.extend(extra_callbacks)

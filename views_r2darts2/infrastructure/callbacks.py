@@ -1158,3 +1158,103 @@ class ValMetricsCallback(Callback):
             f"MSLE={msle:.5f}  RMSLE={rmsle:.4f}  MSE={mse:.2f}"
         )
 
+
+# ---------------------------------------------------------------------------
+# Input Batch Monitor
+# ---------------------------------------------------------------------------
+
+
+class InputBatchMonitorCallback(Callback):
+    """
+    Logs key statistics about the input batch data.
+
+    This helps correlate training dynamics (e.g., loss spikes) with the
+    composition of the data being processed.
+    """
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        """Log statistics of the training batch."""
+        if not hasattr(pl_module, "log"):
+            return
+
+        past_target = batch["past_target"]
+        if past_target is None:
+            return
+
+        # Assuming past_target is a tensor of shape (batch_size, sequence_length, features)
+        # Flatten over sequence_length and features for batch-wide stats
+        flat_targets = past_target.view(past_target.size(0), -1)
+
+        # --- Key Metrics ---
+        # Sparsity: fraction of zero values
+        sparsity = (flat_targets == 0).float().mean()
+
+        # Magnitude stats
+        mean_val = flat_targets.mean()
+        max_val = flat_targets.max()
+        
+        # Number of "event" series (at least one non-zero value)
+        event_series_mask = torch.any(flat_targets != 0, dim=1)
+        n_event_series = event_series_mask.sum()
+        
+        # Log metrics to WandB
+        pl_module.log(
+            "input_batch/sparsity",
+            sparsity,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+        pl_module.log(
+            "input_batch/mean",
+            mean_val,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+        pl_module.log(
+            "input_batch/max",
+            max_val,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+        pl_module.log(
+            "input_batch/n_event_series",
+            n_event_series,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Loss Component Monitor
+# ---------------------------------------------------------------------------
+
+
+class LossComponentCallback(Callback):
+    """
+    Logs the individual components of a composite loss function.
+
+    This is useful for debugging and understanding the behavior of custom
+    losses with multiple terms (e.g., shape, level, spectral).
+    """
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Log loss components if they exist in outputs."""
+        if "loss_components" in outputs and hasattr(pl_module, "log"):
+            for name, value in outputs["loss_components"].items():
+                pl_module.log(
+                    f"loss_components/{name}",
+                    value,
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                    logger=True,
+                )
+

@@ -1177,7 +1177,9 @@ class InputBatchMonitorCallback(Callback):
         if not hasattr(pl_module, "log"):
             return
 
-        past_target = batch["past_target"]
+        # For Darts PL modules, the batch is a tuple/list.
+        # (past_target, past_covariates, ..., future_target)
+        past_target = batch[0]
         if past_target is None:
             return
 

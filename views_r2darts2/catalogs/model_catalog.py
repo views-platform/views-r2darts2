@@ -141,6 +141,23 @@ class ModelCatalog:
             InputBatchMonitorCallback(),
             # LossComponentCallback(),
         ]
+        # Wire EarlyStopping if patience is set in config
+        early_stopping_patience = self.config.get("early_stopping_patience", None)
+        early_stopping_min_delta = self.config.get("early_stopping_min_delta", 0.0)
+        if early_stopping_patience is not None:
+            callbacks.append(
+                EarlyStopping(
+                    monitor="val_loss",
+                    patience=early_stopping_patience,
+                    min_delta=early_stopping_min_delta,
+                    mode="min",
+                    verbose=True,
+                )
+            )
+
+        # LearningRateMonitor makes LR reductions visible in WandB
+        callbacks.append(LearningRateMonitor(logging_interval="epoch"))
+
         if extra_callbacks:
             callbacks.extend(extra_callbacks)
 

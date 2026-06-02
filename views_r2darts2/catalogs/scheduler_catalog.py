@@ -109,7 +109,17 @@ class SchedulerCatalog:
             logger.critical(error_msg)
             raise ValueError(error_msg)
 
-        # Inject any static kwargs for the scheduler
+        # Pass through any extra kwargs defined in the nested lr_scheduler_kwargs
+        # block (e.g. threshold, threshold_mode, cooldown). Genome-validated keys
+        # already in kwargs take precedence — they are not overwritten here.
+        extra_kwargs = self.config.get("lr_scheduler_kwargs", {})
+        if isinstance(extra_kwargs, dict):
+            for k, v in extra_kwargs.items():
+                if k not in kwargs:
+                    kwargs[k] = v
+
+        # Inject static kwargs last — these are mandatory for Darts/PL integration
+        # and must not be overridden by config values.
         kwargs.update(self._STATIC_KWARGS.get(self.sched_name, {}))
 
         return kwargs

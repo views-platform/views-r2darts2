@@ -443,7 +443,9 @@ def _patched_tcn_residual_forward(self, x):
 
     # second step
     x = F.pad(x, (left_padding, 0))
-    x = torch.tanh(self.conv2(x))
+    x = self.conv2(x)
+    if self.nr_blocks_below < self.num_layers - 1:
+        x = torch.tanh(x)
     x = self.dropout2(x)
 
     # add residual

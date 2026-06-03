@@ -48,7 +48,7 @@ class _MultiQueryTransformerModule(_TransformerModule):
 
     @io_processor
     def forward(self, x_in: tuple):
-        data, _ = x_in
+        data, *_ = x_in
         src, tgt = self._create_transformer_inputs(data)
 
         src = self.encoder(src) * math.sqrt(self.input_size)

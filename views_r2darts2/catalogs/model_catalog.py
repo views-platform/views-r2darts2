@@ -4,7 +4,6 @@ from darts.models.forecasting.tft_model import TFTModel
 from darts.models.forecasting.tcn_model import TCNModel
 from darts.models.forecasting.block_rnn_model import BlockRNNModel
 from darts.models.forecasting.transformer_model import TransformerModel
-from views_r2darts2.catalogs.multi_query_transformer import MultiQueryTransformerModel
 from darts.models.forecasting.tsmixer_model import TSMixerModel
 from darts.models.forecasting.nlinear import NLinearModel
 from darts.models.forecasting.tide_model import TiDEModel
@@ -100,7 +99,6 @@ class ModelCatalog:
             "TCNModel": self._get_tcn_model,
             "BlockRNNModel": self._get_rnn_model,
             "TransformerModel": self._get_transformer_model,
-            "MultiQueryTransformerModel": self._get_multi_query_transformer_model,
             "NLinearModel": self._get_nlinear_model,
             "TiDEModel": self._get_tide_model,
             "DLinearModel": self._get_dlinear_model,
@@ -352,23 +350,6 @@ class ModelCatalog:
         ReproducibilityGate.Config.audit_architecture(self.config)
 
         return TransformerModel(
-            **self._get_common_model_args(),
-            d_model=self.config.get("d_model"),
-            nhead=self.config.get("nhead"),
-            num_encoder_layers=self.config.get("num_encoder_layers"),
-            num_decoder_layers=self.config.get("num_decoder_layers"),
-            dim_feedforward=self.config.get("dim_feedforward"),
-            dropout=self.config.get("dropout"),
-            activation=self.config.get("activation"),
-            norm_type=self.config.get("norm_type"),
-            use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
-        )
-
-    def _get_multi_query_transformer_model(self):
-        torch.serialization.add_safe_globals([MultiQueryTransformerModel, LossCatalog])
-        ReproducibilityGate.Config.audit_architecture(self.config)
-
-        return MultiQueryTransformerModel(
             **self._get_common_model_args(),
             d_model=self.config.get("d_model"),
             nhead=self.config.get("nhead"),

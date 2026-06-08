@@ -203,6 +203,21 @@ class ReproducibilityGate:
                 "use_reversible_instance_norm",
                 "detect_anomaly",
             ],
+            "MultiQueryTransformerModel": [
+                "input_chunk_length",
+                "output_chunk_length",
+                "output_chunk_shift",
+                "d_model",
+                "nhead",
+                "num_encoder_layers",
+                "num_decoder_layers",
+                "dim_feedforward",
+                "dropout",
+                "activation",
+                "norm_type",
+                "use_reversible_instance_norm",
+                "detect_anomaly",
+            ],
             "TCNModel": [
                 "input_chunk_length",
                 "output_chunk_length",
@@ -295,6 +310,19 @@ class ReproducibilityGate:
             "L1Loss": [],
             "HuberLoss": ["delta"],
             "PoissonNLLLoss": [],
+            # Darts Likelihood objects — loss_fn is set to None; the
+            # likelihood is passed directly to the model constructor.
+            "GaussianLikelihood": [],
+            "LaplaceLikelihood": [],
+            "PoissonLikelihood": [],
+            "NegativeBinomialLikelihood": [],
+            "BetaLikelihood": [],
+            "CauchyLikelihood": [],
+            "ExponentialLikelihood": [],
+            "GumbelLikelihood": [],
+            "LogNormalLikelihood": [],
+            "WeibullLikelihood": [],
+            "QuantileRegression": [],
         }
 
         @staticmethod

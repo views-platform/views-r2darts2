@@ -510,7 +510,9 @@ def _patched_transformer_forward(self, x_in: tuple):
     We decode one token per forecast step, then extract the diagonal across
     decoder-token index and horizon index to produce step-aligned outputs.
     """
-    data, _ = x_in
+    # io_processor may pass (past_target, past_covariates, future_covariates, static_covariates, ...).
+    # Transformer consumes only the first tensor (past features).
+    data = x_in[0]
     src, tgt = self._create_transformer_inputs(data)
 
     src = self.encoder(src) * (self.input_size ** 0.5)

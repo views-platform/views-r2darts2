@@ -482,12 +482,101 @@ def apply_tcn_tanh_patch():
     )
 
 
+# --- 6. Transformer Multi-Token Decoder Patch ---
+
+def _patched_transformer_create_inputs(self, data: torch.Tensor):
+    """Create multi-token decoder input aligned to forecast horizon.
+
+    Original Darts Transformer uses a single decoder token (last encoder step),
+    which tends to produce weak horizon conditioning. This patch feeds
+    `output_chunk_length` tokens to the decoder and uses a causal mask.
+    """
+    src = data.permute(1, 0, 2)  # (input_chunk_length, batch, input_size)
+    tgt_len = self.target_length
+
+    if src.size(0) >= tgt_len:
+        tgt = src[-tgt_len:, :, :]
+    else:
+        # Rare fallback for tiny input windows: left-pad with first token.
+        pad = src[:1, :, :].expand(tgt_len - src.size(0), -1, -1)
+        tgt = torch.cat([pad, src], dim=0)
+
+    return src, tgt
+
+
+def _patched_transformer_forward(self, x_in: tuple):
+    """Forward pass with multi-token decoder + causal mask.
+
+    We decode one token per forecast step, then extract the diagonal across
+    decoder-token index and horizon index to produce step-aligned outputs.
+    """
+    data, _ = x_in
+    src, tgt = self._create_transformer_inputs(data)
+
+    src = self.encoder(src) * (self.input_size ** 0.5)
+    src = self.positional_encoding(src)
+
+    tgt = self.encoder(tgt) * (self.input_size ** 0.5)
+    tgt = self.positional_encoding(tgt)
+
+    tgt_len = tgt.size(0)
+    tgt_mask = torch.triu(
+        torch.full((tgt_len, tgt_len), float("-inf"), device=tgt.device),
+        diagonal=1,
+    )
+
+    x = self.transformer(src=src, tgt=tgt, tgt_mask=tgt_mask)
+    out = self.decoder(x)
+
+    # out: (tgt_len, batch, target_length * target_size * nr_params)
+    out = out.view(tgt_len, out.shape[1], self.target_length, self.target_size, self.nr_params)
+
+    # Step-aligned readout: token i predicts horizon i.
+    diag_len = min(tgt_len, self.target_length)
+    diag_idx = torch.arange(diag_len, device=out.device)
+    predictions = out[diag_idx, :, diag_idx, :, :]  # (diag_len, batch, target, nr_params)
+    predictions = predictions.permute(1, 0, 2, 3).contiguous()  # (batch, diag_len, target, nr_params)
+
+    if diag_len < self.target_length:
+        pad = predictions[:, -1:, :, :].expand(-1, self.target_length - diag_len, -1, -1)
+        predictions = torch.cat([predictions, pad], dim=1)
+
+    return predictions
+
+
+def apply_transformer_multitoken_decoder_patch():
+    """Patch Darts Transformer to use multi-token decoder queries.
+
+    This addresses the single-token decoder limitation by:
+    1) feeding `output_chunk_length` decoder tokens,
+    2) applying a causal decoder self-attention mask,
+    3) using a step-aligned diagonal readout.
+    """
+    from darts.models.forecasting.transformer_model import _TransformerModule
+    from darts.models.forecasting.pl_forecasting_module import io_processor
+
+    if getattr(_TransformerModule.forward, "_multitoken_decoder_patched", False):
+        return
+
+    _TransformerModule._create_transformer_inputs = _patched_transformer_create_inputs
+
+    wrapped_forward = io_processor(_patched_transformer_forward)
+    wrapped_forward._multitoken_decoder_patched = True
+    _TransformerModule.forward = wrapped_forward
+
+    logger.info(
+        "[Transformer patch] ✅ Multi-token decoder enabled: "
+        "tgt length = output_chunk_length with causal mask and step-aligned readout."
+    )
+
+
 # --- Initialize All Patches ---
 
 def apply_all_patches():
     apply_torch_load_patch()
     apply_rinorm_compression_patch()
     apply_tcn_tanh_patch()
+    apply_transformer_multitoken_decoder_patch()
     apply_tide_mc_dropout_patch()
     # apply_nbeats_patch()
 

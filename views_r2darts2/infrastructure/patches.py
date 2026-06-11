@@ -578,7 +578,7 @@ def apply_all_patches():
     apply_torch_load_patch()
     apply_rinorm_compression_patch()
     apply_tcn_tanh_patch()
-    apply_transformer_multitoken_decoder_patch()
+    # apply_transformer_multitoken_decoder_patch()
     apply_tide_mc_dropout_patch()
     # apply_nbeats_patch()
 

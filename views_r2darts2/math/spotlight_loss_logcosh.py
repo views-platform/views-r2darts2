@@ -61,6 +61,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
+
+        # Learnable homoscedastic uncertainty weights (Kendall & Gal 2018).
+        # total = Σ_i  0.5·exp(-s_i)·L_i + 0.5·s_i,   s_i = log σ_i².
+        # The s_i are model parameters optimised by SGD over the whole
+        # trajectory (darts registers the loss as a submodule, so these land
+        # in self.parameters()). The balance therefore adapts to TRAINING
+        # DYNAMICS — which term is reducible vs. irreducible noise — rather
+        # than to any single sparse, unreliable batch's statistics. A term the
+        # model can reduce shrinks its σ and is up-weighted; a noisy term
+        # grows its σ and self-down-weights. The 0.5·s_i regularizer blocks the
+        # trivial all-zero-weight solution; existing weight_decay supplies a
+        # gentle pull toward equal weighting as a stabilising prior.
+        # Init at 0 → all three terms start equally weighted.
+        self.log_var_shape = torch.nn.Parameter(torch.zeros(()))
+        self.log_var_level = torch.nn.Parameter(torch.zeros(()))
+        self.log_var_spec = torch.nn.Parameter(torch.zeros(()))
+
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -74,21 +91,31 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     @staticmethod
-    def _log_cosh_proportional(x: torch.Tensor) -> torch.Tensor:
-        """log_cosh with proportional sensitivity correction.
+    def _uncertainty_weight(loss: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """Homoscedastic-uncertainty reweighting of one loss term.
 
-        log_cosh(x) × (1 + log(1 + |x|³)).
-
-        For |x| < 1: ≈ 0.5x² (cubic interior shrinks faster toward zero,
-            so noise cells are quieter than the old x² variant).
-        For |x| > 2: ≈ |x| × 3·ln|x| (~50% steeper than x² formula).
-
-        Gradient = tanh(x)·(1 + log1p(|x|³))
-                   + log_cosh(x)·3x²·sign(x)/(1+|x|³).
+        Returns 0.5·exp(-log_var)·loss + 0.5·log_var  (Kendall & Gal 2018,
+        regression form).  The precision exp(-log_var) is the adaptive weight;
+        the 0.5·log_var term regularises it away from the degenerate zero.
         """
-        abs_x = torch.abs(x)
-        lc = abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
-        return lc * (1.0 + torch.log1p(abs_x * abs_x * abs_x))
+        return 0.5 * torch.exp(-log_var) * loss + 0.5 * log_var
+
+    # @staticmethod
+    # def _log_cosh_proportional(x: torch.Tensor) -> torch.Tensor:
+    #     """log_cosh with proportional sensitivity correction.
+
+    #     log_cosh(x) × (1 + log(1 + |x|³)).
+
+    #     For |x| < 1: ≈ 0.5x² (cubic interior shrinks faster toward zero,
+    #         so noise cells are quieter than the old x² variant).
+    #     For |x| > 2: ≈ |x| × 3·ln|x| (~50% steeper than x² formula).
+
+    #     Gradient = tanh(x)·(1 + log1p(|x|³))
+    #                + log_cosh(x)·3x²·sign(x)/(1+|x|³).
+    #     """
+    #     abs_x = torch.abs(x)
+    #     lc = abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
+    #     return lc * (1.0 + torch.log1p(abs_x * abs_x * abs_x))
 
     @staticmethod
     def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -136,9 +163,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )  # (B,)
         series_w = series_w / series_w.mean().clamp(min=1e-8)
 
-        # Weight each series' level loss
+        # Weight each series' level loss.  No explicit T scaling: inter-term
+        # balance is now handled adaptively by the learnable uncertainty
+        # weights in forward(), so a fixed T× multiplier would only bias the
+        # learned σ_level and is redundant.
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-        return T * weighted.mean()
+        return weighted.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -243,7 +273,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + loss_spec
+        # ── Adaptive inter-term balancing (learnable uncertainty weights) ──
+        # Each term is rescaled by its own learned precision so none can
+        # dominate by raw magnitude; the balance is driven by training
+        # dynamics, not per-batch statistics.
+        total_loss = (
+            self._uncertainty_weight(loss_shape, self.log_var_shape)
+            + self._uncertainty_weight(loss_level, self.log_var_level)
+            + self._uncertainty_weight(loss_spec, self.log_var_spec)
+        )
 
         if torch.isnan(total_loss):
             raise RuntimeError(
@@ -253,10 +291,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | shape=%.6f level=%.6f "
-            "spec=%.6f total=%.6f",
-            loss_shape.item(), loss_level.item(),
-            loss_spec.item(), total_loss.item(),
+            "SpotlightLossLogcosh | shape=%.6f level=%.6f spec=%.6f "
+            "| log_var(shape/level/spec)=%.3f/%.3f/%.3f total=%.6f",
+            loss_shape.item(), loss_level.item(), loss_spec.item(),
+            self.log_var_shape.item(), self.log_var_level.item(),
+            self.log_var_spec.item(), total_loss.item(),
         )
         return total_loss
 

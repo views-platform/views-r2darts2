@@ -36,10 +36,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
     6. **Per-channel multi-task balancing (multivariate only)** — on the
        joint sb/ns/os objective each channel's shape+level loss is reduced
        within its own channel (per-channel DRO normalisation) and the
-       channels are combined with learnable homoscedastic uncertainty
-       weights (Kendall & Gal 2018) so the high-magnitude sb channel cannot
-       dominate the summed loss by raw scale.  The single-target path is
-       unchanged.
+       channels are combined with inverse-EMA scale normalisation so the
+       high-magnitude sb channel cannot dominate the summed loss by raw
+       scale.  Each channel is divided by a slow exponential moving average
+       of its own loss magnitude (detached, parameter-free), which neutralises
+       cross-channel scale without reading the loss *trend* — so it stays
+       compatible with DRO's non-monotonic, hard-example-switching dynamics.
+       The single-target path is unchanged.
 
     ── Base cell loss: log_cosh × (1 + log(1+|x|³))  (proportional) ───
 
@@ -57,9 +60,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
     _STFT = True
-    # Capacity of the per-channel uncertainty-weight bank (see __init__).
-    # Covers any realistic multi-target setup (sb/ns/os = 3).
-    _MAX_CHANNELS = 8
+    # Cross-channel scale-balancing EMA (see _combine_channels).  beta close
+    # to 1 makes the per-channel scale estimate slow relative to DRO's
+    # hard-example switching, so a transient loss spike is not mistaken for a
+    # scale change.  eps guards the division for a channel whose loss → 0.
+    _EMA_BETA = 0.99
+    _EMA_EPS = 1e-6
 
     def __init__(
         self,
@@ -73,19 +79,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # Per-channel homoscedastic uncertainty weights (Kendall & Gal 2018),
-        # used ONLY on the multivariate (C>1) path to balance the joint
-        # sb/ns/os objective so the high-magnitude sb channel cannot dominate
-        # the summed loss purely by its raw scale.  s_c = log σ_c²; the
-        # combination is  Σ_c [0.5·exp(-s_c)·L_c + 0.5·s_c]  (regression form).
-        # Allocated as a fixed-capacity bank at construction time: the channel
-        # count C is unknown until the first forward, but the optimizer is
-        # built from the parameters present when the torch module is created
-        # (the loss is a registered submodule), so a lazily-created parameter
-        # would be excluded from optimisation.  Unused bank entries receive no
-        # gradient and are skipped by the optimizer.  Init 0 → channels start
-        # equally weighted.
-        self.channel_log_var = torch.nn.Parameter(torch.zeros(self._MAX_CHANNELS))
+        # Per-channel running scale estimate for the multivariate (C>1) path.
+        # A plain Python list (NOT an nn.Parameter or registered buffer): it is
+        # detached training state, so it must stay out of state_dict — Darts
+        # deep-copies the loss into criterion/train_criterion/val_criterion and
+        # strict checkpoint loading fails on any extra serialised key.  None
+        # until the first multivariate forward, then length-C.
+        self._loss_ema: list[float] | None = None
 
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
@@ -165,22 +165,43 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return (w_total * cell_loss).mean()                      # scalar
 
     def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses with learnable homoscedastic uncertainty
-        weights:  Σ_c [0.5·exp(-s_c)·L_c + 0.5·s_c].
+        """Combine per-channel losses with inverse-EMA scale normalisation.
 
-        Each channel is normalised by its own learned scale s_c before
-        summing, so a high-magnitude channel (sb) cannot dominate the joint
-        objective purely by its loss magnitude.  The s_c adapt to training
-        dynamics via SGD (a reducible channel shrinks its σ and is
-        up-weighted; a noisy channel self-down-weights).  The 0.5·s_c term
-        regularises the weights away from the degenerate all-zero solution.
+        Each channel is divided by a slow exponential moving average of its
+        own loss magnitude and the result is summed:
+
+            w_c = (1 / (EMA(L_c) + eps)),  normalised to mean 1
+            combined = Σ_c  w_c · L_c
+
+        so the high-magnitude sb channel cannot dominate the joint objective
+        by raw scale.  The EMA is detached and parameter-free (a Python list,
+        not an nn.Parameter/buffer) so it adds no gradient pathway and nothing
+        to state_dict.
+
+        Crucially this reads only the channel *scale*, never the loss *trend*,
+        with a horizon (beta → 1) much slower than DRO's hard-example
+        switching.  A DRO spike raises L_c instantaneously but the EMA lags,
+        so the channel's contribution rises briefly above 1 and self-corrects
+        as the EMA catches up — no runaway, fully DRO-compatible.
         """
         C = per_channel_loss.shape[0]
-        if C > self.channel_log_var.numel():
-            # More channels than the bank: fall back to equal weighting.
-            return per_channel_loss.sum()
-        s = self.channel_log_var[:C]
-        return (0.5 * torch.exp(-s) * per_channel_loss + 0.5 * s).sum()
+        losses_det = per_channel_loss.detach()
+
+        # Update the per-channel running scale (plain Python floats).  Re-init
+        # if the channel count changed (e.g. switching target configs).
+        if self._loss_ema is None or len(self._loss_ema) != C:
+            self._loss_ema = losses_det.clamp(min=self._EMA_EPS).tolist()
+        else:
+            beta = self._EMA_BETA
+            for c in range(C):
+                self._loss_ema[c] = (
+                    beta * self._loss_ema[c] + (1.0 - beta) * float(losses_det[c])
+                )
+
+        ema = per_channel_loss.new_tensor(self._loss_ema)
+        w = 1.0 / (ema + self._EMA_EPS)
+        w = (w / w.mean()).detach()                 # mean 1 → preserve loss scale
+        return (w * per_channel_loss).sum()
 
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
@@ -302,8 +323,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Core objective ────────────────────────────────────────────
         # Univariate: original sum (unchanged).  Multivariate: combine the
-        # per-channel shape+level objectives with learnable uncertainty
-        # weights so the sb channel's magnitude cannot dominate ns/os.
+        # per-channel shape+level objectives with inverse-EMA scale
+        # normalisation so the sb channel's magnitude cannot dominate ns/os.
         if loss_shape_pc.dim() == 0:
             loss_shape = loss_shape_pc
             loss_level = loss_level_pc

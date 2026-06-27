@@ -323,6 +323,14 @@ class WeightNormCallback(Callback):
         for name, param in pl_module.named_parameters():
             if not param.requires_grad:
                 continue
+            # Skip loss-criterion parameters (e.g. SpotlightLoss channel_log_var):
+            # these are learnable loss hyperparameters, not model weights. They are
+            # zero-initialized by design (e.g. log-variance 0 = equal channel
+            # weighting) and only the training-criterion copy receives gradients,
+            # so a zero norm on the criterion/val_criterion copies is expected and
+            # is not a layer collapse.
+            if "criterion" in name:
+                continue
             norm = param.data.detach().norm().item()
             weight_norms.append(norm)
 

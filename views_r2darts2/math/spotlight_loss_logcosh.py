@@ -33,7 +33,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
 
-    6. **Per-channel multi-task balancing (multivariate only)** — on the
+    6. **Inverse-EMA term balancing (always on)** — the level anchor is
+       T-scaled (×36), which would otherwise make it ~80% of the loss and
+       starve the within-window shape learner (~7%).  Each of the three terms
+       (shape / level / spectral) is divided by a slow, detached EMA of its own
+       magnitude and renormalised to mean 1, so they contribute on comparable
+       footing regardless of the fixed T multiplier.  Parameter-free and
+       DRO-safe (tracks term scale, not the loss trend); applies to both the
+       single-target and multivariate paths.
+
+    7. **Per-channel multi-task balancing (multivariate only)** — on the
        joint sb/ns/os objective each channel's shape+level+spectral loss is
        reduced within its own channel (per-channel DRO normalisation) and the
        channels are combined with inverse-EMA scale normalisation so the
@@ -88,6 +97,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # strict checkpoint loading fails on any extra serialised key.  None
         # until the first multivariate forward, then length-C.
         self._loss_ema: list[float] | None = None
+        # Per-term running scale estimate (shape / level / spectral) for the
+        # inverse-EMA *term* balancing in _combine_terms.  Same parameter-free,
+        # DRO-safe slow-EMA mechanism as _loss_ema but applied across the three
+        # loss terms instead of across channels, so the T-scaled level anchor
+        # cannot dominate the within-window shape learner.  Plain Python list of
+        # length 3 ([shape, level, spec]); None until the first forward.
+        self._term_ema: list[float] | None = None
         # Detached per-forward telemetry for LossComponentCallback (plain
         # Python, never Parameter/buffer → stays out of state_dict).  Holds the
         # per-channel shape/level/spectral split, the inverse-EMA channel
@@ -96,6 +112,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # visible in wandb.  None until the first forward.
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
+        self._last_term_weights: list[float] | None = None
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -212,6 +229,56 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w = (w / w.mean()).detach()                 # mean 1 → preserve loss scale
         self._last_weights = w.tolist()             # logging only (plain floats)
         return (w * per_channel_loss).sum()
+
+    def _combine_terms(
+        self,
+        shape_l: torch.Tensor,
+        level_l: torch.Tensor,
+        spec_l: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Scale-normalise the three loss terms (shape / level / spectral).
+
+        The windowed level anchor is multiplied by T (≈36) which makes its raw
+        magnitude ~80% of every channel's loss, drowning the within-window
+        shape learner (~7%) and starving the temporal signal.  This applies the
+        *same* inverse-EMA scale normalisation used across channels, but across
+        the three terms:
+
+            s_k  = mean|L_k|                         (detached per-term scale)
+            w_k  = (1 / (EMA(s_k) + eps)),  normalised to mean 1 over k
+            L_k' = w_k · L_k
+
+        so shape, level and spectral contribute on comparable footing
+        regardless of the fixed T multiplier — no new constant, no learnable
+        parameter, fully adaptive to the realised term scales.
+
+        The EMA is detached and parameter-free (a Python list, not an
+        nn.Parameter/buffer → nothing in state_dict) and slow (beta → 1) so it
+        tracks term *scale*, never the loss *trend*, staying compatible with
+        DRO's hard-example switching.  Works for both scalar (single target)
+        and (C,) per-channel term tensors: the scale reduces with mean over all
+        elements, so there is one shared weight per term across channels and
+        the cross-channel balancing still happens afterwards in
+        _combine_channels.
+        """
+        terms = (shape_l, level_l, spec_l)
+        scales = [float(t.detach().abs().mean()) for t in terms]
+
+        # Update the per-term running scale (plain Python floats).
+        if self._term_ema is None:
+            self._term_ema = [max(s, self._EMA_EPS) for s in scales]
+        else:
+            beta = self._EMA_BETA
+            for k in range(3):
+                self._term_ema[k] = (
+                    beta * self._term_ema[k] + (1.0 - beta) * scales[k]
+                )
+
+        ema = shape_l.new_tensor(self._term_ema)
+        w = 1.0 / (ema + self._EMA_EPS)
+        w = (w / w.mean()).detach()                 # mean 1 → preserve loss scale
+        self._last_term_weights = w.tolist()        # logging only (plain floats)
+        return w[0] * shape_l, w[1] * level_l, w[2] * spec_l
 
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
@@ -344,12 +411,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if self._STFT and T >= 6:
             loss_spec_pc = self._spectral_loss(y_pred, y_true)
 
+        # ── Inverse-EMA term balancing (shape / level / spectral) ─────
+        # The level anchor's ×T scaling otherwise makes it ~80% of the loss,
+        # starving the shape learner (~7%).  Equalise the three term scales
+        # with the same parameter-free slow-EMA mechanism used across channels
+        # so shape/level/spec contribute comparably.  Applies to both the
+        # single-target and multivariate paths (the ×T domination is identical
+        # in both).
+        loss_shape_pc, loss_level_pc, loss_spec_pc = self._combine_terms(
+            loss_shape_pc, loss_level_pc, loss_spec_pc
+        )
+        term_weights = self._last_term_weights or [1.0, 1.0, 1.0]
+        term_ema = list(self._term_ema) if self._term_ema else [float("nan")] * 3
+
         # ── Core objective ────────────────────────────────────────────
-        # Univariate: original sum (unchanged).  Multivariate: combine the
-        # per-channel shape+level+spectral objectives with inverse-EMA scale
-        # normalisation so the sb channel's magnitude cannot dominate ns/os.
-        # The spectral term is balanced through the *same* combine as
-        # shape+level so no part of the objective bypasses the balancing.
+        # Univariate: sum of the term-balanced shape+level+spectral.
+        # Multivariate: combine the per-channel term-balanced objectives with
+        # inverse-EMA scale normalisation so the sb channel's magnitude cannot
+        # dominate ns/os.  The spectral term is balanced through the *same*
+        # combine as shape+level so no part of the objective bypasses the
+        # balancing.
         if loss_shape_pc.dim() == 0:
             loss_shape = loss_shape_pc
             loss_level = loss_level_pc
@@ -362,6 +443,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "spec": [float(loss_spec.detach())],
                 "ema": [float("nan")],     # no cross-channel balance here
                 "weight": [1.0],
+                "term_weight": list(term_weights),
+                "term_ema": term_ema,
             }
         else:
             per_channel_total = loss_shape_pc + loss_level_pc + loss_spec_pc
@@ -372,9 +455,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 loss_spec_pc.sum().detach()
                 if loss_spec_pc.dim() else loss_spec_pc
             )
-            # ── Telemetry (multivariate): per-channel term split + the ──
-            # inverse-EMA balance.  spec may be a shared scalar if STFT is
-            # off (T<6); broadcast it across channels for a uniform schema.
+            # ── Telemetry (multivariate): per-channel term split (after ──
+            # term balancing) + the inverse-EMA channel balance.  spec may be a
+            # shared scalar if STFT is off (T<6); broadcast it across channels
+            # for a uniform schema.
             C = per_channel_total.shape[0]
             spec_list = (
                 loss_spec_pc.detach().tolist()
@@ -387,6 +471,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "spec": spec_list,
                 "ema": list(self._loss_ema) if self._loss_ema else [float("nan")] * C,
                 "weight": weights,
+                "term_weight": list(term_weights),
+                "term_ema": term_ema,
                 # weighted contribution of each channel to total_loss
                 "contribution": [
                     weights[c] * float(per_channel_total.detach()[c])

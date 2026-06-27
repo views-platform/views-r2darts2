@@ -1293,6 +1293,15 @@ class LossComponentCallback(Callback):
         ema = comp.get("ema", [float("nan")] * C)
         contribution = comp.get("contribution")
 
+        # Inverse-EMA term balancing weights (shape/level/spec) — shared across
+        # channels.  ~1.0 each means the three terms contribute comparably; a
+        # term weight ≪1 means that term's raw scale is being suppressed (e.g.
+        # the ×T level anchor), which is exactly what the balancing should do.
+        term_weight = comp.get("term_weight")
+        if term_weight is not None and len(term_weight) == 3:
+            for name, tw in zip(("shape", "level", "spec"), term_weight):
+                self._buf[f"loss_components/term_weight/{name}"].append(tw)
+
         for c in range(C):
             tot_c = shape[c] + level[c] + spec[c]
             denom = tot_c if abs(tot_c) > 1e-12 else 1e-12
@@ -1339,10 +1348,18 @@ class LossComponentCallback(Callback):
             )
         spread = metrics.get("loss_components/contribution_spread")
         spread_str = f" | spread={spread:.2f}" if spread is not None else ""
+        tw_sh = metrics.get("loss_components/term_weight/shape")
+        tw_lv = metrics.get("loss_components/term_weight/level")
+        tw_sp = metrics.get("loss_components/term_weight/spec")
+        tw_str = (
+            f" | termW[sh={tw_sh:.2f} lv={tw_lv:.2f} sp={tw_sp:.2f}]"
+            if tw_sh is not None else ""
+        )
         logger.info(
             f"[Epoch {trainer.current_epoch}] LossComponents | "
             + " ".join(parts)
             + spread_str
+            + tw_str
         )
 
         self._buf.clear()

@@ -33,6 +33,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
 
+    6. **Per-channel multi-task balancing (multivariate only)** — on the
+       joint sb/ns/os objective each channel's shape+level loss is reduced
+       within its own channel (per-channel DRO normalisation) and the
+       channels are combined with learnable homoscedastic uncertainty
+       weights (Kendall & Gal 2018) so the high-magnitude sb channel cannot
+       dominate the summed loss by raw scale.  The single-target path is
+       unchanged.
+
     ── Base cell loss: log_cosh × (1 + log(1+|x|³))  (proportional) ───
 
     Args:
@@ -49,6 +57,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
     _STFT = True
+    # Capacity of the per-channel uncertainty-weight bank (see __init__).
+    # Covers any realistic multi-target setup (sb/ns/os = 3).
+    _MAX_CHANNELS = 8
 
     def __init__(
         self,
@@ -61,6 +72,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
+
+        # Per-channel homoscedastic uncertainty weights (Kendall & Gal 2018),
+        # used ONLY on the multivariate (C>1) path to balance the joint
+        # sb/ns/os objective so the high-magnitude sb channel cannot dominate
+        # the summed loss purely by its raw scale.  s_c = log σ_c²; the
+        # combination is  Σ_c [0.5·exp(-s_c)·L_c + 0.5·s_c]  (regression form).
+        # Allocated as a fixed-capacity bank at construction time: the channel
+        # count C is unknown until the first forward, but the optimizer is
+        # built from the parameters present when the torch module is created
+        # (the loss is a registered submodule), so a lazily-created parameter
+        # would be excluded from optimisation.  Unused bank entries receive no
+        # gradient and are skipped by the optimizer.  Init 0 → channels start
+        # equally weighted.
+        self.channel_log_var = torch.nn.Parameter(torch.zeros(self._MAX_CHANNELS))
+
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -108,6 +134,54 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
+    def _shape_loss(
+        self, e_shape: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor,
+    ) -> torch.Tensor:
+        """Event-magnitude- and DRO-weighted shape loss.
+
+        Returns a scalar for 2D (B, T) input (single target) and a
+        per-channel vector (C,) for 3D (B, T, C) input.  The per-series sqrt
+        DRO reduces along the time axis and is therefore already
+        channel-independent; for 3D the final weight normalisation and
+        reduction are done per channel so the result is each channel's own
+        shape loss, ready for cross-channel uncertainty weighting.  The 2D
+        branch is identical to the original inlined computation.
+        """
+        cell_loss = self._log_cosh(e_shape)
+        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        event_mag = 0.01 + 0.99 * torch.sigmoid(
+            5.0 * (abs_max - self.non_zero_threshold)
+        )
+        w_dro = self._dro_weights_2d(cell_loss, y_true)
+        w_total = event_mag * w_dro
+
+        if cell_loss.dim() == 3:
+            w_total = w_total / w_total.mean(dim=(0, 1), keepdim=True).clamp(min=1e-8)
+            w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
+            return (w_total * cell_loss).mean(dim=(0, 1))         # (C,)
+
+        w_total = w_total / w_total.mean()
+        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
+        return (w_total * cell_loss).mean()                      # scalar
+
+    def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
+        """Combine per-channel losses with learnable homoscedastic uncertainty
+        weights:  Σ_c [0.5·exp(-s_c)·L_c + 0.5·s_c].
+
+        Each channel is normalised by its own learned scale s_c before
+        summing, so a high-magnitude channel (sb) cannot dominate the joint
+        objective purely by its loss magnitude.  The s_c adapt to training
+        dynamics via SGD (a reducible channel shrinks its σ and is
+        up-weighted; a noisy channel self-down-weights).  The 0.5·s_c term
+        regularises the weights away from the degenerate all-zero solution.
+        """
+        C = per_channel_loss.shape[0]
+        if C > self.channel_log_var.numel():
+            # More channels than the bank: fall back to equal weighting.
+            return per_channel_loss.sum()
+        s = self.channel_log_var[:C]
+        return (0.5 * torch.exp(-s) * per_channel_loss + 0.5 * s).sum()
+
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
     ) -> torch.Tensor:
@@ -130,12 +204,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_losses = self._log_cosh(window_means)
 
         # Per-series event magnitude: max |y_true| across time → sigmoid
-        series_mag = y_true.abs().max(dim=1).values  # (B,)
+        series_mag = y_true.abs().max(dim=1).values  # (B,) | (B, C)
         series_w = 0.01 + 0.99 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
-        )  # (B,)
-        series_w = series_w / series_w.mean().clamp(min=1e-8)
+        )  # (B,) | (B, C)
 
+        if level_losses.dim() == 3:
+            # Per-channel level anchor: normalise event weights within each
+            # channel and reduce per channel for cross-channel combination.
+            series_w = series_w / series_w.mean(dim=0, keepdim=True).clamp(min=1e-8)
+            weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
+            return T * weighted.mean(dim=(0, 1))             # (C,)
+
+        series_w = series_w / series_w.mean().clamp(min=1e-8)
         # Weight each series' level loss
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
         return T * weighted.mean()
@@ -215,35 +296,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
             [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
         )  # (B, T) — zero-mean within each window
 
-        # ── Base cell loss (proportional variant for MSLE sensitivity) ─
-        cell_loss = self._log_cosh(e_shape)
+        # ── Shape + level losses (per-channel when multivariate) ──────
+        loss_shape_pc = self._shape_loss(e_shape, y_true, y_pred)   # scalar | (C,)
+        loss_level_pc = self._windowed_level_loss(e, y_true, T)     # scalar | (C,)
 
-        # ── Sigmoid event-magnitude weighting ─────────────────────────
-        # Steep sigmoid: peace cells (abs_max ≈ 0) → ~0.01, moderate
-        # events → ~0.5, high-conflict → ~1.0.  Gives ~50:1 contrast
-        # ratio between Syria-class and zero cells.
-        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
-
-        # ── Per-series temporal DRO ────────────────────────────────────
-        # Within each series, upweight the hardest timesteps relative to
-        # that series' own loss distribution.  Between-series importance
-        # is handled by event_mag above.
-        w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T)
-        w_total = event_mag * w_dro
-        w_total = w_total / w_total.mean()
-        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-        loss_shape = (w_total * cell_loss).mean()
-
-        # ── Windowed level anchor ─────────────────────────────────────
-        loss_level = self._windowed_level_loss(e, y_true, T)
+        # ── Core objective ────────────────────────────────────────────
+        # Univariate: original sum (unchanged).  Multivariate: combine the
+        # per-channel shape+level objectives with learnable uncertainty
+        # weights so the sb channel's magnitude cannot dominate ns/os.
+        if loss_shape_pc.dim() == 0:
+            loss_shape = loss_shape_pc
+            loss_level = loss_level_pc
+            core = loss_shape + loss_level
+        else:
+            core = self._combine_channels(loss_shape_pc + loss_level_pc)
+            loss_shape = loss_shape_pc.sum().detach()  # logging only
+            loss_level = loss_level_pc.sum().detach()  # logging only
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + loss_spec
+        total_loss = core + loss_spec
 
         if torch.isnan(total_loss):
             raise RuntimeError(

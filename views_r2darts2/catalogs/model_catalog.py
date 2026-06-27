@@ -139,7 +139,7 @@ class ModelCatalog:
             YHatBarCallback(),
             ValMetricsCallback(),
             InputBatchMonitorCallback(),
-            # LossComponentCallback(),
+            LossComponentCallback(),
         ]
         # Wire EarlyStopping if patience is set in config
         early_stopping_patience = self.config.get("early_stopping_patience", None)

@@ -34,11 +34,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
        log_cosh on magnitude-spectrum differences.  DC bin masked.
 
     6. **Per-channel multi-task balancing (multivariate only)** — on the
-       joint sb/ns/os objective each channel's shape+level loss is reduced
-       within its own channel (per-channel DRO normalisation) and the
+       joint sb/ns/os objective each channel's shape+level+spectral loss is
+       reduced within its own channel (per-channel DRO normalisation) and the
        channels are combined with inverse-EMA scale normalisation so the
        high-magnitude sb channel cannot dominate the summed loss by raw
-       scale.  Each channel is divided by a slow exponential moving average
+       scale.  The spectral term is computed per channel and balanced through
+       the *same* combine as shape+level, so no part of the objective bypasses
+       the balancing.  Each channel is divided by a slow exponential moving average
        of its own loss magnitude (detached, parameter-free), which neutralises
        cross-channel scale without reading the loss *trend* — so it stays
        compatible with DRO's non-monotonic, hard-example-switching dynamics.
@@ -86,7 +88,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # strict checkpoint loading fails on any extra serialised key.  None
         # until the first multivariate forward, then length-C.
         self._loss_ema: list[float] | None = None
-
+        # Detached per-forward telemetry for LossComponentCallback (plain
+        # Python, never Parameter/buffer → stays out of state_dict).  Holds the
+        # per-channel shape/level/spectral split, the inverse-EMA channel
+        # weights, and each channel's weighted contribution to total_loss, so
+        # the cross-channel balance and the within-channel term mix are both
+        # visible in wandb.  None until the first forward.
+        self._last_components: dict | None = None
+        self._last_weights: list[float] | None = None
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -201,6 +210,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ema = per_channel_loss.new_tensor(self._loss_ema)
         w = 1.0 / (ema + self._EMA_EPS)
         w = (w / w.mean()).detach()                 # mean 1 → preserve loss scale
+        self._last_weights = w.tolist()             # logging only (plain floats)
         return (w * per_channel_loss).sum()
 
     def _windowed_level_loss(
@@ -250,12 +260,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         Only series with signal above threshold are included.
         """
         if y_pred.dim() == 3:
-            B, T, C = y_pred.shape
-            pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
-            true = y_true.permute(0, 2, 1).reshape(B * C, T)
-        else:
-            pred = y_pred
-            true = y_true
+            # Per-channel spectral loss so it folds into the same inverse-EMA
+            # channel balancing as shape+level.  Pooling all channels into one
+            # flat mean (the previous behaviour) is dominated by the
+            # high-magnitude sb channel and bypasses the cross-channel
+            # balancing entirely, letting sb re-dominate the joint objective
+            # through the frequency term.
+            C = y_pred.shape[-1]
+            return torch.stack(
+                [self._spectral_loss(y_pred[..., c], y_true[..., c]) for c in range(C)]
+            )                                                        # (C,)
+
+        pred = y_pred
+        true = y_true
 
         has_signal = (
             (torch.abs(true) > self.non_zero_threshold)
@@ -321,25 +338,61 @@ class SpotlightLossLogcosh(torch.nn.Module):
         loss_shape_pc = self._shape_loss(e_shape, y_true, y_pred)   # scalar | (C,)
         loss_level_pc = self._windowed_level_loss(e, y_true, T)     # scalar | (C,)
 
+        # ── Multi-resolution spectral loss (always on) ──────────────
+        # scalar (single target) | (C,) per-channel (multivariate)
+        loss_spec_pc = y_pred.new_tensor(0.0)
+        if self._STFT and T >= 6:
+            loss_spec_pc = self._spectral_loss(y_pred, y_true)
+
         # ── Core objective ────────────────────────────────────────────
         # Univariate: original sum (unchanged).  Multivariate: combine the
-        # per-channel shape+level objectives with inverse-EMA scale
+        # per-channel shape+level+spectral objectives with inverse-EMA scale
         # normalisation so the sb channel's magnitude cannot dominate ns/os.
+        # The spectral term is balanced through the *same* combine as
+        # shape+level so no part of the objective bypasses the balancing.
         if loss_shape_pc.dim() == 0:
             loss_shape = loss_shape_pc
             loss_level = loss_level_pc
-            core = loss_shape + loss_level
+            loss_spec = loss_spec_pc
+            total_loss = loss_shape + loss_level + loss_spec
+            # ── Telemetry (single target): one "channel" ──────────────
+            self._last_components = {
+                "shape": [float(loss_shape.detach())],
+                "level": [float(loss_level.detach())],
+                "spec": [float(loss_spec.detach())],
+                "ema": [float("nan")],     # no cross-channel balance here
+                "weight": [1.0],
+            }
         else:
-            core = self._combine_channels(loss_shape_pc + loss_level_pc)
+            per_channel_total = loss_shape_pc + loss_level_pc + loss_spec_pc
+            total_loss = self._combine_channels(per_channel_total)
             loss_shape = loss_shape_pc.sum().detach()  # logging only
             loss_level = loss_level_pc.sum().detach()  # logging only
-
-        # ── Multi-resolution spectral loss (always on) ──────────────
-        loss_spec = y_pred.new_tensor(0.0)
-        if self._STFT and T >= 6:
-            loss_spec = self._spectral_loss(y_pred, y_true)
-
-        total_loss = core + loss_spec
+            loss_spec = (
+                loss_spec_pc.sum().detach()
+                if loss_spec_pc.dim() else loss_spec_pc
+            )
+            # ── Telemetry (multivariate): per-channel term split + the ──
+            # inverse-EMA balance.  spec may be a shared scalar if STFT is
+            # off (T<6); broadcast it across channels for a uniform schema.
+            C = per_channel_total.shape[0]
+            spec_list = (
+                loss_spec_pc.detach().tolist()
+                if loss_spec_pc.dim() else [float(loss_spec_pc)] * C
+            )
+            weights = self._last_weights or [1.0] * C
+            self._last_components = {
+                "shape": loss_shape_pc.detach().tolist(),
+                "level": loss_level_pc.detach().tolist(),
+                "spec": spec_list,
+                "ema": list(self._loss_ema) if self._loss_ema else [float("nan")] * C,
+                "weight": weights,
+                # weighted contribution of each channel to total_loss
+                "contribution": [
+                    weights[c] * float(per_channel_total.detach()[c])
+                    for c in range(C)
+                ],
+            }
 
         if torch.isnan(total_loss):
             raise RuntimeError(

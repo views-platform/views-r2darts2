@@ -1,8 +1,9 @@
 import time
+import math
 import torch
 import numpy as np
 import logging
-from collections import deque
+from collections import deque, defaultdict
 from pytorch_lightning.callbacks import Callback
 
 logger = logging.getLogger(__name__)
@@ -1249,22 +1250,100 @@ class InputBatchMonitorCallback(Callback):
 
 class LossComponentCallback(Callback):
     """
-    Logs the individual components of a composite loss function.
+    Per-channel composite-loss component auditor (SpotlightLossLogcosh).
 
-    This is useful for debugging and understanding the behavior of custom
-    losses with multiple terms (e.g., shape, level, spectral).
+    Intent Contract:
+        - Purpose: Make the internal structure of the multi-task loss visible —
+          for each target channel, how big its shape / level / spectral terms
+          are, what fraction of that channel each term contributes (the lever
+          for the level anchor's ``×T`` scaling), the inverse-EMA cross-channel
+          weight + running scale, and each channel's weighted contribution to
+          the total loss.  This surfaces both the within-channel term mix and
+          whether the cross-channel balance is actually equalising sb/ns/os.
+        - Guarantees: Reads only detached, parameter-free telemetry stashed on
+          ``pl_module.train_criterion._last_components`` (never touches the
+          graph), accumulates per batch, and pushes per-epoch means to wandb.
+          No-op for losses that do not expose ``_last_components``.
+        - Non-Goals: Does not modify the loss or training.
+
+    wandb keys (per channel c, 0-indexed = sb/ns/os):
+        loss_components/ch_{c}/{shape,level,spec}        raw term magnitudes
+        loss_components/ch_{c}/frac_{shape,level,spec}   within-channel share
+        loss_components/ch_{c}/{weight,ema,contribution} cross-channel balance
+        loss_components/contribution_spread              max/min contribution
     """
 
+    def __init__(self):
+        super().__init__()
+        self._buf = defaultdict(list)
+
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        """Log loss components if they exist in outputs."""
-        if "loss_components" in outputs and hasattr(pl_module, "log"):
-            for name, value in outputs["loss_components"].items():
-                pl_module.log(
-                    f"loss_components/{name}",
-                    value,
-                    on_step=True,
-                    on_epoch=False,
-                    prog_bar=False,
-                    logger=True,
-                )
+        crit = getattr(pl_module, "train_criterion", None)
+        comp = getattr(crit, "_last_components", None) if crit is not None else None
+        if not comp:
+            return
+
+        shape = comp.get("shape", [])
+        level = comp.get("level", [])
+        spec = comp.get("spec", [])
+        C = len(shape)
+        if C == 0:
+            return
+        weight = comp.get("weight", [1.0] * C)
+        ema = comp.get("ema", [float("nan")] * C)
+        contribution = comp.get("contribution")
+
+        for c in range(C):
+            tot_c = shape[c] + level[c] + spec[c]
+            denom = tot_c if abs(tot_c) > 1e-12 else 1e-12
+            self._buf[f"loss_components/ch_{c}/shape"].append(shape[c])
+            self._buf[f"loss_components/ch_{c}/level"].append(level[c])
+            self._buf[f"loss_components/ch_{c}/spec"].append(spec[c])
+            self._buf[f"loss_components/ch_{c}/frac_shape"].append(shape[c] / denom)
+            self._buf[f"loss_components/ch_{c}/frac_level"].append(level[c] / denom)
+            self._buf[f"loss_components/ch_{c}/frac_spec"].append(spec[c] / denom)
+            self._buf[f"loss_components/ch_{c}/weight"].append(weight[c])
+            if not math.isnan(ema[c]):
+                self._buf[f"loss_components/ch_{c}/ema"].append(ema[c])
+            if contribution is not None:
+                self._buf[f"loss_components/ch_{c}/contribution"].append(contribution[c])
+
+        # How equal are the channel contributions after balancing?  ~1.0 means
+        # the inverse-EMA combine is doing its job; ≫1 means one channel still
+        # dominates the joint gradient.
+        if contribution is not None and len(contribution) > 1:
+            cmax = max(contribution)
+            cmin = min(contribution)
+            self._buf["loss_components/contribution_spread"].append(
+                cmax / (abs(cmin) + 1e-12)
+            )
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not self._buf:
+            return
+
+        metrics = {k: float(np.mean(v)) for k, v in self._buf.items() if v}
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        # Concise per-channel summary line for the console.
+        n_ch = sum(1 for k in metrics if k.endswith("/shape"))
+        parts = []
+        for c in range(n_ch):
+            sh = metrics.get(f"loss_components/ch_{c}/shape", float("nan"))
+            lv = metrics.get(f"loss_components/ch_{c}/level", float("nan"))
+            sp = metrics.get(f"loss_components/ch_{c}/spec", float("nan"))
+            wt = metrics.get(f"loss_components/ch_{c}/weight", float("nan"))
+            parts.append(
+                f"ch{c}[sh={sh:.2f} lv={lv:.2f} sp={sp:.2f} w={wt:.2f}]"
+            )
+        spread = metrics.get("loss_components/contribution_spread")
+        spread_str = f" | spread={spread:.2f}" if spread is not None else ""
+        logger.info(
+            f"[Epoch {trainer.current_epoch}] LossComponents | "
+            + " ".join(parts)
+            + spread_str
+        )
+
+        self._buf.clear()
 

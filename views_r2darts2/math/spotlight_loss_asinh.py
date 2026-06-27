@@ -108,6 +108,9 @@ class SpotlightLossAsinh(torch.nn.Module):
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
     _TEMPORAL_GRADIENT = False
     _STFT = True
+    # Capacity of the per-channel uncertainty-weight bank (see __init__).
+    # Covers any realistic multi-target setup (sb/ns/os = 3).
+    _MAX_CHANNELS = 8
 
     def __init__(
         self,
@@ -120,6 +123,21 @@ class SpotlightLossAsinh(torch.nn.Module):
 
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
+
+        # Per-channel homoscedastic uncertainty weights (Kendall & Gal 2018),
+        # used ONLY on the multivariate (C>1) path to balance the joint
+        # sb/ns/os objective so the high-magnitude sb channel cannot dominate
+        # the summed loss purely by its raw scale.  s_c = log σ_c²; the
+        # combination is  Σ_c [0.5·exp(-s_c)·L_c + 0.5·s_c]  (regression form).
+        # Allocated as a fixed-capacity bank at construction time: the channel
+        # count C is unknown until the first forward, but the optimizer is
+        # built from the parameters present when the torch module is created
+        # (the loss is a registered submodule), so a lazily-created parameter
+        # would be excluded from optimisation.  Unused bank entries receive no
+        # gradient and are skipped by the optimizer.  Init 0 → channels start
+        # equally weighted.
+        self.channel_log_var = torch.nn.Parameter(torch.zeros(self._MAX_CHANNELS))
+
         # Curriculum gating: regularisers activate as core loss converges.
         # persistent=False: excluded from state_dict — resets each training
         # run, no checkpoint mismatch on load.
@@ -194,6 +212,85 @@ class SpotlightLossAsinh(torch.nn.Module):
         w = alpha * w + (1.0 - alpha)
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
+    @staticmethod
+    def _dro_weights_channelwise(losses: torch.Tensor) -> torch.Tensor:
+        """Per-channel DRO weights for (B, T, C) input.
+
+        Identical log-space KL-DRO math to ``_dro_weights``, but every
+        statistic (mean, std, cv, alpha, normalisation) is computed WITHIN
+        each channel — reduction over the batch and time axes with the
+        channel axis kept.  This makes 'hardest cells' relative to each
+        channel's own loss distribution, so the magnitude-dominant sb channel
+        can no longer monopolise the DRO tail and starve ns/os.  Returns
+        weights with per-channel mean ≈ 1, shape (B, T, C).
+        """
+        dims = (0, 1)
+        log_l = torch.log(losses.detach() + 1e-8)                 # (B, T, C)
+        std = log_l.std(dim=dims, keepdim=True)                   # (1, 1, C)
+        std = torch.where(
+            torch.isfinite(std) & (std > 1e-8),
+            std,
+            losses.new_tensor(0.1),
+        )
+        mean = log_l.mean(dim=dims, keepdim=True)                 # (1, 1, C)
+        cv = torch.log1p(std / (mean.abs() + 1e-8))
+        alpha = cv / (cv + 1.0)
+        z = (log_l - mean) / std.clamp(min=0.1)
+        w = torch.log1p((1.0 + z).clamp(min=0.0))
+        w = w / w.mean(dim=dims, keepdim=True).clamp(min=1e-8)
+        w = alpha * w + (1.0 - alpha)
+        return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
+
+    def _shape_loss(
+        self, e_shape: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compound-weighted, DRO-aggregated shape loss.
+
+        Returns a scalar for 2D (B, T) input (single target) and a
+        per-channel vector (C,) for 3D (B, T, C) input.  When 3D, the DRO
+        aggregation and weight normalisation are computed per channel so the
+        result is each channel's own shape loss, ready for cross-channel
+        uncertainty weighting.  The 2D branch is identical to the original
+        inlined computation.
+        """
+        cell_loss = self._asinh_integral_loss(e_shape)
+        abs_e = torch.abs(e_shape.detach())
+        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        difficulty = 1.0 - torch.exp(-abs_e)
+        event_mag = abs_max / (self.non_zero_threshold + abs_max)
+        w_compound = 1.0 + 4.0 * difficulty * event_mag
+
+        if cell_loss.dim() == 3:
+            w_dro = self._dro_weights_channelwise(cell_loss)
+            w_total = w_compound * w_dro
+            w_total = w_total / w_total.mean(dim=(0, 1), keepdim=True).clamp(min=1e-8)
+            w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
+            return (w_total * cell_loss).mean(dim=(0, 1))          # (C,)
+
+        w_dro = self._dro_weights(cell_loss.flatten()).view_as(cell_loss)
+        w_total = w_compound * w_dro
+        w_total = w_total / w_total.mean()
+        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
+        return (w_total * cell_loss).mean()                       # scalar
+
+    def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
+        """Combine per-channel losses with learnable homoscedastic uncertainty
+        weights:  Σ_c [0.5·exp(-s_c)·L_c + 0.5·s_c].
+
+        Each channel is normalised by its own learned scale s_c before
+        summing, so a high-magnitude channel (sb) cannot dominate the joint
+        objective purely by its loss magnitude.  The s_c adapt to training
+        dynamics via SGD (a reducible channel shrinks its σ and is
+        up-weighted; a noisy channel self-down-weights).  The 0.5·s_c term
+        regularises the weights away from the degenerate all-zero solution.
+        """
+        C = per_channel_loss.shape[0]
+        if C > self.channel_log_var.numel():
+            # More channels than the bank: fall back to equal weighting.
+            return per_channel_loss.sum()
+        s = self.channel_log_var[:C]
+        return (0.5 * torch.exp(-s) * per_channel_loss + 0.5 * s).sum()
+
     def _windowed_level_loss(self, e: torch.Tensor, T: int) -> torch.Tensor:
         """Windowed log_cosh level anchor with DRO aggregation.
 
@@ -211,8 +308,12 @@ class SpotlightLossAsinh(torch.nn.Module):
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
         level_losses = self._asinh_integral_loss(window_means)
+        if level_losses.dim() == 3:
+            # Per-channel level anchor: DRO and reduction within each channel.
+            w = self._dro_weights_channelwise(level_losses)
+            return T * (w * level_losses).mean(dim=(0, 1))         # (C,)
         w = self._dro_weights(level_losses.flatten()).view_as(level_losses)
-        return T * (w * level_losses).mean()
+        return T * (w * level_losses).mean()                       # scalar
 
     def _temporal_gradient_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Soft-weighted temporal gradient matching — fully data-driven.
@@ -332,29 +433,27 @@ class SpotlightLossAsinh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── DC/AC decomposition ───────────────────────────────────────
+        # ── DC/AC decomposition (per channel when multivariate) ───────
+        # e.mean over the time axis removes each channel's DC offset.
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # ── Base cell loss (asinh-integral) ───────────────────────────
-        cell_loss = self._asinh_integral_loss(e_shape)
+        # ── Shape + level losses (per-channel DRO when 3D) ────────────
+        loss_shape_pc = self._shape_loss(e_shape, y_true, y_pred)   # scalar | (C,)
+        loss_level_pc = self._windowed_level_loss(e, T)            # scalar | (C,)
 
-        # ── Compound weighting ────────────────────────────────────────
-        abs_e = torch.abs(e_shape.detach())
-        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        difficulty = 1.0 - torch.exp(-abs_e)
-        event_mag = abs_max / (self.non_zero_threshold + abs_max)
-        w_compound = 1.0 + 4.0 * difficulty * event_mag
-
-        # ── Shape DRO (global) ─────────────────────────────────────────
-        w_dro = self._dro_weights(cell_loss.flatten()).view_as(cell_loss)
-        w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean()
-        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-        loss_shape = (w_total * cell_loss).mean()
-
-        # ── Windowed level anchor ─────────────────────────────────────
-        loss_level = self._windowed_level_loss(e, T)
+        # ── Core objective ────────────────────────────────────────────
+        # Univariate: original sum (unchanged).  Multivariate: combine the
+        # per-channel shape+level objectives with learnable uncertainty
+        # weights so the sb channel's magnitude cannot dominate ns/os.
+        if loss_shape_pc.dim() == 0:
+            loss_shape = loss_shape_pc
+            loss_level = loss_level_pc
+            core = loss_shape + loss_level
+        else:
+            core = self._combine_channels(loss_shape_pc + loss_level_pc)
+            loss_shape = loss_shape_pc.sum().detach()  # logging only
+            loss_level = loss_level_pc.sum().detach()  # logging only
 
         # ── Curriculum gate for regularisers ────────────────────────
         # Track EMA of core (shape+level) loss and its peak.
@@ -364,7 +463,7 @@ class SpotlightLossAsinh(torch.nn.Module):
         # gradients from competing with shape+level during early learning.
         # Leaky peak (×0.999/batch, half-life ≈ 693 batches) avoids
         # permanent inflation from outlier batches.
-        core_det = (loss_shape + loss_level).detach()
+        core_det = core.detach()
         if self.training:
             with torch.no_grad():
                 if torch.isinf(self._core_ema):
@@ -387,7 +486,7 @@ class SpotlightLossAsinh(torch.nn.Module):
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + gate * (0.5 * loss_grad + 0.5 * loss_spec)
+        total_loss = core + gate * (0.5 * loss_grad + 0.5 * loss_spec)
 
         if torch.isnan(total_loss):
             raise RuntimeError(

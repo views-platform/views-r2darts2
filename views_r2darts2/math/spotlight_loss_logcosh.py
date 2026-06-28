@@ -218,36 +218,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # Loss Components
     # ------------------------------------------------------------------
 
-    def _shape_loss(
-        self,
-        e_shape: torch.Tensor,
-        y_true: torch.Tensor,
-        y_pred: torch.Tensor,
-        floor: torch.Tensor,
-    ) -> torch.Tensor:
-        """Computes the event-magnitude- and EMA-weighted shape loss."""
-        cell_loss = self._log_cosh(e_shape)
-
-        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        cmw = self._compute_cmw(abs_max)
-
-        # Broadcast floor for multivariate path
-        if floor.dim() == 1:
-            floor = floor.view(1, 1, -1)
-
-        event_mag = floor + (1.0 - floor) * cmw
-
-        mu_loss = self._update_and_get_shape_ema(cell_loss)
-        w_dro = self._compute_dro_weights(cell_loss, mu_loss)
-
-        w_total = event_mag * w_dro
-        w_total = w_total / w_total.mean(dim=1, keepdim=True).clamp(min=1e-8)
-        w_total = self._sanitize_tensor(w_total, posinf_val=1.0)
-
-        if cell_loss.dim() == 3:
-            return (w_total * cell_loss).mean(dim=(0, 1))  # (C,)
-        return (w_total * cell_loss).mean()  # scalar
-
     def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
         """Combines per-channel losses with inverse-EMA scale normalisation."""
         C = per_channel_loss.shape[0]
@@ -268,6 +238,33 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_weights = w.tolist()
         return (w * per_channel_loss).sum()
 
+    def _shape_loss(
+        self, e_shape: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor, floor: torch.Tensor
+    ) -> torch.Tensor:
+        """Computes the event-magnitude- and EMA-weighted shape loss."""
+        cell_loss = self._log_cosh(e_shape)
+        
+        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        cmw = self._compute_cmw(abs_max)
+        
+        if floor.dim() == 1:
+            floor = floor.view(1, 1, -1)
+            
+        event_mag = floor + (1.0 - floor) * cmw
+
+        mu_loss = self._update_and_get_shape_ema(cell_loss)
+        w_dro = self._compute_dro_weights(cell_loss, mu_loss)
+
+        w_total = event_mag * w_dro
+        
+        # Removed per-series mean cap. Let conflict series dominate the 
+        # batch gradient naturally, just like the old batch-driven DRO.
+        w_total = self._sanitize_tensor(w_total, posinf_val=10.0, max_val=10.0)
+
+        if cell_loss.dim() == 3:
+            return (w_total * cell_loss).mean(dim=(0, 1))  # (C,)
+        return (w_total * cell_loss).mean()  # scalar
+
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int, floor: torch.Tensor
     ) -> torch.Tensor:
@@ -279,20 +276,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         true_window_means = self._windowed_mean(y_true, W)
         cmw = self._compute_cmw(true_window_means)
 
-        # Broadcast floor for multivariate path
         if floor.dim() == 1:
             floor = floor.view(1, 1, -1)
-
+            
         mag = floor + (1.0 - floor) * cmw
 
-        # RESTORED: Per-series temporal DRO to amplify large level errors
         mu_level = level_losses.detach().mean(dim=1, keepdim=True).clamp(min=1e-6)
         w_dro = torch.sqrt(level_losses.detach() / mu_level)
         w_dro = self._sanitize_tensor(w_dro, posinf_val=10.0, max_val=10.0)
 
         w_total = mag * w_dro
-        w_total = w_total / w_total.mean(dim=1, keepdim=True).clamp(min=1e-8)
-        w_total = self._sanitize_tensor(w_total, posinf_val=1.0)
+        
+        # FIX: Removed per-series mean cap for level loss as well.
+        w_total = self._sanitize_tensor(w_total, posinf_val=10.0, max_val=10.0)
 
         if level_losses.dim() == 3:
             return T * (w_total * level_losses).mean(dim=(0, 1))  # (C,)

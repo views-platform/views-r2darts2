@@ -8,60 +8,8 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v47 — asinh + RevIN compatible, EMA-stabilized shape loss.
-
-    Operates in asinh space (AsinhTransform target scaler). Designed for
-    UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
-    four orders of magnitude in raw deaths.
-
-    ── Components ───────────────────────────────────────────────────────
-
-    1. **DC/AC decomposition** — per-window demeaning (same windows as level).
-       e_shape = e − window_mean(e).  Shape and level are orthogonal:
-       shape handles within-window patterns, level handles per-window DC.
-
-    2. **Sigmoid event-magnitude weighting** — ~50:1 contrast ratio.
-       event_mag = 0.01 + 0.99 × σ(5 × (abs_max − τ)).  Peace → ~0.02,
-       conflict → ~1.0.  No model-state dependency.
-
-    3. **EMA-normalized temporal DRO** — stable shock therapy.
-       Uses a slow EMA of the cell loss and event magnitude to normalize
-       weights instead of the batch mean, ensuring stable scaling and
-       reweighting even when batch composition is highly unreliable.
-
-    4. **Windowed level anchor** — W-scaled log_cosh on per-window means.
-       DRO has been removed; relies on raw log_cosh of window means scaled
-       by window length W.  No fixed event mask: the spotlight chases
-       level-error magnitude symmetrically and self-releasing.
-
-    5. **Multi-resolution STFT loss** — always on, ungated.
-       log_cosh on magnitude-spectrum differences.  DC bin masked.
-
-    6. **Per-channel multi-task balancing (multivariate only)** — on the
-       joint sb/ns/os objective each channel's shape+level+spectral loss is
-       reduced within its own channel (per-channel EMA normalisation) and the
-       channels are combined with inverse-EMA scale normalisation so the
-       high-magnitude sb channel cannot dominate the summed loss by raw
-       scale.  The spectral term is computed per channel and balanced through
-       the *same* combine as shape+level, so no part of the objective bypasses
-       the balancing.  Each channel is divided by a slow exponential moving average
-       of its own loss magnitude (detached, parameter-free), which neutralises
-       cross-channel scale without reading the loss *trend* — so it stays
-       compatible with DRO's non-monotonic, hard-example-switching dynamics.
-       The single-target path is unchanged.
-
-    ── Base cell loss: log_cosh × (1 + log(1+|x|³))  (proportional) ───
-
-    Args:
-        non_zero_threshold: Sigmoid center (AsinhTransform: 0.88 ≈ asinh(1))
-
-    Example:
-        >>> loss_fn = SpotlightLossLogcosh(non_zero_threshold=0.88)
-        >>> y_pred = torch.randn(8, 36)
-        >>> y_true = torch.zeros(8, 36)
-        >>> y_true[:, 10:15] = 2.5
-        >>> loss = loss_fn(y_pred, y_true)
-        >>> loss.backward()
+    SpotlightLoss v48 — asinh + RevIN compatible, EMA-stabilized shape loss,
+    with a Dynamic Hallucination Floor.
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
@@ -81,55 +29,61 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # Per-channel running scale estimate for the multivariate (C>1) path.
-        # A plain Python list (NOT an nn.Parameter or registered buffer): it is
-        # detached training state, so it must stay out of state_dict — Darts
-        # deep-copies the loss into criterion/train_criterion/val_criterion and
-        # strict checkpoint loading fails on any extra serialised key.  None
-        # until the first multivariate forward, then length-C.
         self._loss_ema: list[float] | None = None
-        
-        # EMA state for the shape loss. Replaces batch normalization to 
-        # decouple scaling from unreliable batch compositions.
         self._shape_ema: dict | None = None
-        
-        # Detached per-forward telemetry for LossComponentCallback (plain
-        # Python, never Parameter/buffer → stays out of state_dict).  Holds the
-        # per-channel shape/level/spectral split, the inverse-EMA channel
-        # weights, and each channel's weighted contribution to total_loss, so
-        # the cross-channel balance and the within-channel term mix are both
-        # visible in wandb.  None until the first forward.
+
+        # EMA state for the dynamic hallucination floor.
+        # Tracks the model's average prediction magnitude when y_true == 0.
+        self._peace_pred_ema: float = 0.0
+
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
-    # ------------------------------------------------------------------
-    # Static helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
-        """log(cosh(x)), numerically stable: |x| + softplus(−2|x|) − ln2."""
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
-    def _shape_loss(
-    self, e_shape: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor,
-) -> torch.Tensor:
-        """Event-magnitude- and EMA-weighted shape loss.
+    def _get_dynamic_floor(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+        """Calculates a dynamic floor based on model hallucinations during peace."""
+        # Find where true target is exactly zero (peace)
+        is_peace = y_true == 0.0
 
-        Uses a slow EMA of the cell loss for normalization instead of the batch mean.
-        Uses Continuous Magnitude Weighting (CMW) with a 10% floor to ensure peace
-        months have enough gradient "spring" to pull the baseline back to zero.
-        Applies per-series normalization over the time dimension to act strictly
-        as a temporal spotlight.
-        """
+        if is_peace.any():
+            # What is the model predicting during these peaceful moments?
+            peace_preds = y_pred.detach()[is_peace]
+            curr_peace_mag = peace_preds.abs().mean().item()
+        else:
+            curr_peace_mag = 0.0
+
+        # Update EMA of peaceful predictions
+        beta = self._EMA_BETA
+        self._peace_pred_ema = (
+            beta * self._peace_pred_ema + (1.0 - beta) * curr_peace_mag
+        )
+
+        # Scale the hallucination to a floor between 0.01 and 0.5
+        # If model predicts 0.0 during peace -> floor is 0.01 (1%)
+        # If model predicts 0.5 during peace -> floor is 0.25 (25%)
+        # If model predicts 1.0+ during peace -> floor caps at 0.5 (50%)
+        floor = min(0.5, self._peace_pred_ema * 0.5)
+        return max(0.01, floor)
+
+    def _shape_loss(
+        self,
+        e_shape: torch.Tensor,
+        y_true: torch.Tensor,
+        y_pred: torch.Tensor,
+    ) -> torch.Tensor:
         cell_loss = self._log_cosh(e_shape)
-        
-        # 1. Continuous Magnitude Weighting (CMW) with 10% floor
+
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         cmw = torch.log1p(abs_max) / (torch.log1p(abs_max) + 1.0)
-        event_mag = 0.1 + 0.9 * cmw
+
+        # DYNAMIC FLOOR: Replaces the hardcoded 0.1
+        floor = self._get_dynamic_floor(y_true, y_pred)
+        event_mag = floor + (1.0 - floor) * cmw
 
         beta = self._EMA_BETA
 
@@ -137,34 +91,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
             C = cell_loss.shape[-1]
             curr_loss_mean = cell_loss.detach().mean(dim=(0, 1)).clamp(min=1e-6)
 
-            # Simplified EMA: Only track loss mean (event_mag EMA is no longer needed)
             if self._shape_ema is None or len(self._shape_ema.get("loss", [])) != C:
                 self._shape_ema = {"loss": curr_loss_mean.tolist()}
             else:
                 for c in range(C):
                     self._shape_ema["loss"][c] = (
-                        beta * self._shape_ema["loss"][c] + (1.0 - beta) * curr_loss_mean[c].item()
+                        beta * self._shape_ema["loss"][c]
+                        + (1.0 - beta) * curr_loss_mean[c].item()
                     )
 
             mu_loss = cell_loss.new_tensor(self._shape_ema["loss"])
 
             w_dro = torch.sqrt(cell_loss.detach() / mu_loss.clamp(min=1e-6))
-            w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+            w_dro = w_dro.clamp(max=10.0)
+            w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=10.0, neginf=0.0)
 
             w_total = event_mag * w_dro
-            
-            # CRITICAL FIX: Per-series normalization over time (dim=1)
-            # Replaces the useless scalar division by mu_event. Gives peace months 
-            # a relative "spring" weight to pull the baseline back to zero.
             w_total = w_total / w_total.mean(dim=1, keepdim=True).clamp(min=1e-8)
             w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
-            return (w_total * cell_loss).mean(dim=(0, 1))         # (C,)
+            return (w_total * cell_loss).mean(dim=(0, 1))  # (C,)
 
         # Univariate path
         curr_loss_mean = cell_loss.detach().mean().clamp(min=1e-6)
 
-        if self._shape_ema is None or "loss" not in self._shape_ema or isinstance(self._shape_ema["loss"], list):
+        if (
+            self._shape_ema is None
+            or "loss" not in self._shape_ema
+            or isinstance(self._shape_ema["loss"], list)
+        ):
             self._shape_ema = {"loss": curr_loss_mean.item()}
         else:
             self._shape_ema["loss"] = (
@@ -174,36 +129,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         mu_loss = cell_loss.new_tensor(self._shape_ema["loss"])
 
         w_dro = torch.sqrt(cell_loss.detach() / mu_loss.clamp(min=1e-6))
-        w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+        w_dro = w_dro.clamp(max=10.0)
+        w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=10.0, neginf=0.0)
 
         w_total = event_mag * w_dro
-        
-        # CRITICAL FIX: Per-series normalization over time (dim=1)
         w_total = w_total / w_total.mean(dim=1, keepdim=True).clamp(min=1e-8)
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
-        return (w_total * cell_loss).mean()                      # scalar
+        return (w_total * cell_loss).mean()
 
     def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses with inverse-EMA scale normalisation.
-
-        Each channel is divided by a slow exponential moving average of its
-        own loss magnitude and the result is summed:
-
-            w_c = (1 / (EMA(L_c) + eps)),  normalised to mean 1
-            combined = Σ_c  w_c · L_c
-
-        so the high-magnitude sb channel cannot dominate the joint objective
-        by raw scale.  The EMA is detached and parameter-free (a Python list,
-        not an nn.Parameter/buffer) so it adds no gradient pathway and nothing
-        to state_dict.
-
-        Crucially this reads only the channel *scale*, never the loss *trend*,
-        with a horizon (beta → 1) much slower than DRO's hard-example
-        switching.  A DRO spike raises L_c instantaneously but the EMA lags,
-        so the channel's contribution rises briefly above 1 and self-corrects
-        as the EMA catches up — no runaway, fully DRO-compatible.
-        """
         C = per_channel_loss.shape[0]
         losses_det = per_channel_loss.detach()
 
@@ -212,49 +147,50 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             beta = self._EMA_BETA
             for c in range(C):
-                self._loss_ema[c] = (
-                    beta * self._loss_ema[c] + (1.0 - beta) * float(losses_det[c])
+                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(
+                    losses_det[c]
                 )
 
         ema = per_channel_loss.new_tensor(self._loss_ema)
         w = 1.0 / (ema + self._EMA_EPS)
-        w = (w / w.mean()).detach()                 # mean 1 → preserve loss scale
-        self._last_weights = w.tolist()             # logging only (plain floats)
+        w = (w / w.mean()).detach()
+        self._last_weights = w.tolist()
         return (w * per_channel_loss).sum()
 
     def _windowed_level_loss(
-    self, e: torch.Tensor, y_true: torch.Tensor, T: int,
-) -> torch.Tensor:
-        """Windowed level anchor scaled by window length and target magnitude.
-
-        Uses Continuous Magnitude Weighting (CMW) on the true window means
-        to ensure the model prioritizes matching the baseline of high-magnitude
-        conflict windows, preventing variance collapse.
-        """
+        self,
+        e: torch.Tensor,
+        y_true: torch.Tensor,
+        T: int,
+    ) -> torch.Tensor:
         W = max(6, T // 3)
-        window_means = torch.stack(
-            [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
-        )  # (B, n_windows) | (B, n_windows, C)
+        window_means = torch.stack([ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1)
         level_losses = self._log_cosh(window_means)
 
-        # Compute true window means to weight the level loss by magnitude
         true_window_means = torch.stack(
             [tw.mean(dim=1) for tw in y_true.split(W, dim=1)], dim=1
         )
-        # CMW: Scales (0, inf) -> (0, 1) smoothly
-        mag = torch.log1p(torch.abs(true_window_means)) / (torch.log1p(torch.abs(true_window_means)) + 1.0)
+
+        cmw = torch.log1p(torch.abs(true_window_means)) / (
+            torch.log1p(torch.abs(true_window_means)) + 1.0
+        )
+
+        # DYNAMIC FLOOR: Reuse the hallucination EMA for the level loss as well
+        floor = max(0.01, min(0.5, self._peace_pred_ema * 0.5))
+        mag = floor + (1.0 - floor) * cmw
 
         if level_losses.dim() == 3:
-            # Normalize magnitude weights per channel
             mag = mag / mag.mean(dim=(0, 1), keepdim=True).clamp(min=1e-6)
             mag = torch.nan_to_num(mag, nan=1.0, posinf=1.0, neginf=0.0)
-            return W * (mag * level_losses).mean(dim=(0, 1))  # Fixed: T -> W
+            return (mag * level_losses).mean(dim=(0, 1))
 
         mag = mag / mag.mean().clamp(min=1e-6)
         mag = torch.nan_to_num(mag, nan=1.0, posinf=1.0, neginf=0.0)
-        return W * (mag * level_losses).mean()  # T -> W
+        return (mag * level_losses).mean()
 
-    def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def _spectral_loss(
+        self, y_pred: torch.Tensor, y_true: torch.Tensor
+    ) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
 
         Safe magnitude sqrt(re² + im² + ε) avoids gradient blowup at
@@ -265,7 +201,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             C = y_pred.shape[-1]
             return torch.stack(
                 [self._spectral_loss(y_pred[..., c], y_true[..., c]) for c in range(C)]
-            )                                                        # (C,)
+            )  # (C,)
 
         pred = y_pred
         true = y_true
@@ -288,15 +224,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 continue
             window = torch.hann_window(n_fft, device=pred.device, dtype=pred.dtype)
             S_pred = torch.stft(
-                pred, n_fft, hop_length=hop, win_length=n_fft,
-                window=window, center=False, return_complex=True,
+                pred,
+                n_fft,
+                hop_length=hop,
+                win_length=n_fft,
+                window=window,
+                center=False,
+                return_complex=True,
             )
             S_true = torch.stft(
-                true, n_fft, hop_length=hop, win_length=n_fft,
-                window=window, center=False, return_complex=True,
+                true,
+                n_fft,
+                hop_length=hop,
+                win_length=n_fft,
+                window=window,
+                center=False,
+                return_complex=True,
             )
             # Safe magnitude — bounded gradient at |z|→0
-            mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
+            mag_pred = torch.sqrt(S_pred.real**2 + S_pred.imag**2 + 1e-8)
             mag_true = S_true.abs()
             # Mask DC bin — level is handled by the level anchor
             mag_pred = mag_pred.clone()
@@ -331,8 +277,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )  # (B, T) — zero-mean within each window
 
         # ── Shape + level losses (per-channel when multivariate) ──────
-        loss_shape_pc = self._shape_loss(e_shape, y_true, y_pred)   # scalar | (C,)
-        loss_level_pc = self._windowed_level_loss(e, y_true, T)     # scalar | (C,)
+        loss_shape_pc = self._shape_loss(e_shape, y_true, y_pred)  # scalar | (C,)
+        loss_level_pc = self._windowed_level_loss(e, y_true, T)  # scalar | (C,)
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         # scalar (single target) | (C,) per-channel (multivariate)
@@ -356,7 +302,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "shape": [float(loss_shape.detach())],
                 "level": [float(loss_level.detach())],
                 "spec": [float(loss_spec.detach())],
-                "ema": [float("nan")],     # no cross-channel balance here
+                "ema": [float("nan")],  # no cross-channel balance here
                 "weight": [1.0],
             }
         else:
@@ -365,8 +311,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = loss_shape_pc.sum().detach()  # logging only
             loss_level = loss_level_pc.sum().detach()  # logging only
             loss_spec = (
-                loss_spec_pc.sum().detach()
-                if loss_spec_pc.dim() else loss_spec_pc
+                loss_spec_pc.sum().detach() if loss_spec_pc.dim() else loss_spec_pc
             )
             # ── Telemetry (multivariate): per-channel term split + the ──
             # inverse-EMA balance.  spec may be a shared scalar if STFT is
@@ -374,7 +319,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             C = per_channel_total.shape[0]
             spec_list = (
                 loss_spec_pc.detach().tolist()
-                if loss_spec_pc.dim() else [float(loss_spec_pc)] * C
+                if loss_spec_pc.dim()
+                else [float(loss_spec_pc)] * C
             )
             weights = self._last_weights or [1.0] * C
             self._last_components = {
@@ -385,8 +331,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "weight": weights,
                 # weighted contribution of each channel to total_loss
                 "contribution": [
-                    weights[c] * float(per_channel_total.detach()[c])
-                    for c in range(C)
+                    weights[c] * float(per_channel_total.detach()[c]) for c in range(C)
                 ],
             }
 
@@ -398,10 +343,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
             )
 
         logger.debug(
-            "SpotlightLossLogcosh | shape=%.6f level=%.6f "
-            "spec=%.6f total=%.6f",
-            loss_shape.item(), loss_level.item(),
-            loss_spec.item(), total_loss.item(),
+            "SpotlightLossLogcosh | shape=%.6f level=%.6f " "spec=%.6f total=%.6f",
+            loss_shape.item(),
+            loss_level.item(),
+            loss_spec.item(),
+            total_loss.item(),
         )
         return total_loss
 

@@ -47,26 +47,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     def _get_dynamic_floor(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
         """Calculates a dynamic floor based on model hallucinations during peace."""
-        # Find where true target is exactly zero (peace)
-        is_peace = y_true == 0.0
-
+        # Use non_zero_threshold to define "peace" (0 to 1 fatalities in asinh space)
+        is_peace = (y_true.abs() < self.non_zero_threshold)
+        
         if is_peace.any():
-            # What is the model predicting during these peaceful moments?
+            # What is the model predicting during these peaceful/low-intensity moments?
             peace_preds = y_pred.detach()[is_peace]
             curr_peace_mag = peace_preds.abs().mean().item()
         else:
             curr_peace_mag = 0.0
-
+            
         # Update EMA of peaceful predictions
         beta = self._EMA_BETA
         self._peace_pred_ema = (
             beta * self._peace_pred_ema + (1.0 - beta) * curr_peace_mag
         )
-
+        
         # Scale the hallucination to a floor between 0.01 and 0.5
-        # If model predicts 0.0 during peace -> floor is 0.01 (1%)
-        # If model predicts 0.5 during peace -> floor is 0.25 (25%)
-        # If model predicts 1.0+ during peace -> floor caps at 0.5 (50%)
         floor = min(0.5, self._peace_pred_ema * 0.5)
         return max(0.01, floor)
 

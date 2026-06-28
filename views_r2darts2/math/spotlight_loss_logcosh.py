@@ -223,13 +223,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return (w * per_channel_loss).sum()
 
     def _windowed_level_loss(
-        self, e: torch.Tensor, y_true: torch.Tensor, T: int,
-    ) -> torch.Tensor:
-        """Windowed level anchor scaled by window length.
+    self, e: torch.Tensor, y_true: torch.Tensor, T: int,
+) -> torch.Tensor:
+        """Windowed level anchor scaled by window length and target magnitude.
 
-        Splits the T-length error into non-overlapping windows, computes
-        log_cosh on per-window means, and scales by the window length W.
-        DRO has been removed; relies on raw log_cosh of window means.
+        Uses Continuous Magnitude Weighting (CMW) on the true window means
+        to ensure the model prioritizes matching the baseline of high-magnitude
+        conflict windows, preventing variance collapse.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
@@ -237,10 +237,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )  # (B, n_windows) | (B, n_windows, C)
         level_losses = self._log_cosh(window_means)
 
-        if level_losses.dim() == 3:
-            return T * level_losses.mean(dim=(0, 1))             # (C,)
+        # Compute true window means to weight the level loss by magnitude
+        true_window_means = torch.stack(
+            [tw.mean(dim=1) for tw in y_true.split(W, dim=1)], dim=1
+        )
+        # CMW: Scales (0, inf) -> (0, 1) smoothly
+        mag = torch.log1p(torch.abs(true_window_means)) / (torch.log1p(torch.abs(true_window_means)) + 1.0)
 
-        return T * level_losses.mean()
+        if level_losses.dim() == 3:
+            # Normalize magnitude weights per channel
+            mag = mag / mag.mean(dim=(0, 1), keepdim=True).clamp(min=1e-6)
+            mag = torch.nan_to_num(mag, nan=1.0, posinf=1.0, neginf=0.0)
+            return W * (mag * level_losses).mean(dim=(0, 1))  # Fixed: T -> W
+
+        mag = mag / mag.mean().clamp(min=1e-6)
+        mag = torch.nan_to_num(mag, nan=1.0, posinf=1.0, neginf=0.0)
+        return W * (mag * level_losses).mean()  # T -> W
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

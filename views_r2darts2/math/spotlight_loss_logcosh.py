@@ -244,9 +244,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_losses = self._log_cosh(window_means)
 
         if level_losses.dim() == 3:
-            return W * level_losses.mean(dim=(0, 1))             # (C,)
+            return T * level_losses.mean(dim=(0, 1))             # (C,)
 
-        return W * level_losses.mean()
+        return T * level_losses.mean()
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

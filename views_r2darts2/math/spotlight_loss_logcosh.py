@@ -255,7 +255,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             series_w = series_w / series_w.mean(dim=0, keepdim=True).clamp(min=1e-8)
             series_w = torch.nan_to_num(series_w, nan=1.0, posinf=1.0, neginf=0.0)
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
-            return T * weighted.mean(dim=(0, 1))             # (C,)
+            # return T * weighted.mean(dim=(0, 1))             # (C,)
+            return weighted.mean(dim=(0, 1))   
 
         # Per-series sqrt DRO across the batch: upweight series whose level
         # error is large relative to the batch, symmetrically and without a
@@ -266,7 +267,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         series_w = series_w / series_w.mean().clamp(min=1e-8)
         series_w = torch.nan_to_num(series_w, nan=1.0, posinf=1.0, neginf=0.0)
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-        return T * weighted.mean()
+        # return T * weighted.mean()
+        return weighted.mean(dim=(0, 1))
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

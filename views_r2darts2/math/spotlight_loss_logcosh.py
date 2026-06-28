@@ -271,7 +271,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if level_losses.dim() == 3:
             mag = mag / mag.mean(dim=(0, 1), keepdim=True).clamp(min=1e-6)
             mag = self._sanitize_tensor(mag, posinf_val=1.0)
-            return T * (mag * level_losses).mean(dim=(0, 1))  # (C,)
+            # return T * (mag * level_losses).mean(dim=(0, 1))  # (C,)
+            return (mag * level_losses).mean(dim=(0, 1))
 
         mag = mag / mag.mean().clamp(min=1e-6)
         mag = self._sanitize_tensor(mag, posinf_val=1.0)

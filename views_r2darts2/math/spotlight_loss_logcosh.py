@@ -28,8 +28,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
        (based on max(y_true, y_pred)) to give exactly 1.0 weight to any
        conflict or hallucination, and 0.01 to pure peace. Applies the 
        exact v46 per-series temporal DRO spotlight, mathematically normalized 
-       to mean=1 to focus on poorly performing timesteps without arbitrary 
-       clamping or global batch dilution.
+       to mean=1 per channel to focus on poorly performing timesteps without 
+       arbitrary clamping or global batch dilution.
 
     3. **Windowed Level Loss**:
        Computes `log_cosh` on per-window means. Scaled by total sequence
@@ -40,7 +40,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
     4. **Multi-Resolution Spectral Loss**:
        Computes a multi-resolution Short-Time Fourier Transform (STFT)
        magnitude loss. The DC bin is masked. Scaled by active ratio to
-       prevent dominance over time-domain losses.
+       prevent dominance over time-domain losses. Processed independently
+       per channel.
 
     5. **Per-Channel Multi-Task Balancing**:
        For multivariate targets, each channel's shape+level+spectral loss
@@ -168,8 +169,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = self._compute_dro_weights(cell_loss)
         w_total = event_mag * w_dro
         
-        # Global batch mean normalization (exact v46 logic)
-        w_total = w_total / w_total.mean()
+        # FIX: Per-channel global batch mean normalization.
+        # This ensures sb's high variance doesn't artificially shrink ns/os DRO weights.
+        if cell_loss.dim() == 3:
+            w_total = w_total / w_total.mean(dim=(0, 1), keepdim=True).clamp(min=1e-8)
+        else:
+            w_total = w_total / w_total.mean().clamp(min=1e-8)
+            
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         if cell_loss.dim() == 3:

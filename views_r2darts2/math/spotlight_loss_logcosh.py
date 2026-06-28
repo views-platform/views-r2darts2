@@ -28,7 +28,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
        Z-scores log(cell_loss) along time axis per series.  Upweights
        proportionally harder timesteps *relative to that series*.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window means.
+    4. **Windowed level anchor** — T-scaled log_cosh on per-window means,
+       reweighted by a symmetric per-series sqrt DRO (the same shock-therapy
+       as the shape loss, applied across series instead of across time).  No
+       fixed event mask: the spotlight chases level-error magnitude in either
+       direction, so it is symmetric and self-releasing.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -216,39 +220,51 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
     ) -> torch.Tensor:
-        """Event-magnitude-weighted windowed level anchor.
+        """DRO-weighted windowed level anchor.
 
         Splits the T-length error into non-overlapping windows, computes
-        log_cosh_proportional on per-window means, then weights each
-        series by its event magnitude.  Without this weighting, the 76%
-        peace series (with near-zero DC error) dilute the level gradient
-        that event series need to correct their systematic underprediction.
+        log_cosh on per-window means, then reweights each series by a sqrt
+        self-DRO on its own level loss — the same shock-therapy principle as
+        the shape loss (`_dro_weights_2d`), applied across series instead of
+        across time.  A series whose per-window level error is k× the
+        batch-average level error receives √k× the gradient (sublinear
+        concentration), with the weights renormalised to mean 1 so the
+        overall level scale is preserved.
 
-        Uses proportional loss to avoid gradient saturation: plain
-        log_cosh has gradient tanh(x) → 1 for |x| > 2, meaning a 2×
-        underprediction gets the same gradient as a 10× underprediction.
+        This replaces the old fixed sigmoid event mask.  The spotlight is now
+        symmetric — it chases the *magnitude* of the level error in either
+        direction, so it carries no a-priori over-prediction bias the way a
+        conflict-only event weighting did — and self-releasing: a series stops
+        being up-weighted as soon as its level error returns to the batch
+        average.  It introduces no hardcoded threshold or contrast ratio.
+        log_cosh is retained as the base (not squared error) so unexplained
+        noise outliers in the windowed means cannot destabilise training.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
-        )  # (B, n_windows)
+        )  # (B, n_windows) | (B, n_windows, C)
         level_losses = self._log_cosh(window_means)
 
-        # Per-series event magnitude: max |y_true| across time → sigmoid
-        series_mag = y_true.abs().max(dim=1).values  # (B,) | (B, C)
-        series_w = 0.01 + 0.99 * torch.sigmoid(
-            5.0 * (series_mag - self.non_zero_threshold)
-        )  # (B,) | (B, C)
-
         if level_losses.dim() == 3:
-            # Per-channel level anchor: normalise event weights within each
-            # channel and reduce per channel for cross-channel combination.
+            # Per-channel level anchor: sqrt DRO across the batch within each
+            # channel, then reduce per channel for cross-channel combination.
+            series_loss = level_losses.detach().mean(dim=1)            # (B, C)
+            mu = series_loss.mean(dim=0, keepdim=True).clamp(min=1e-6)  # (1, C)
+            series_w = torch.sqrt(series_loss / mu)                    # (B, C)
             series_w = series_w / series_w.mean(dim=0, keepdim=True).clamp(min=1e-8)
+            series_w = torch.nan_to_num(series_w, nan=1.0, posinf=1.0, neginf=0.0)
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
             return T * weighted.mean(dim=(0, 1))             # (C,)
 
+        # Per-series sqrt DRO across the batch: upweight series whose level
+        # error is large relative to the batch, symmetrically and without a
+        # fixed event threshold.
+        series_loss = level_losses.detach().mean(dim=1)      # (B,)
+        mu = series_loss.mean().clamp(min=1e-6)
+        series_w = torch.sqrt(series_loss / mu)              # (B,)
         series_w = series_w / series_w.mean().clamp(min=1e-8)
-        # Weight each series' level loss
+        series_w = torch.nan_to_num(series_w, nan=1.0, posinf=1.0, neginf=0.0)
         weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
         return T * weighted.mean()
 

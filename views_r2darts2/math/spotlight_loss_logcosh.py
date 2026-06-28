@@ -275,7 +275,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         mag = mag / mag.mean().clamp(min=1e-6)
         mag = self._sanitize_tensor(mag, posinf_val=1.0)
-        return T * (mag * level_losses).mean()  # scalar
+        # return T * (mag * level_losses).mean()  # scalar
+        return (mag * level_losses).mean()
 
     def _spectral_loss(
         self, y_pred: torch.Tensor, y_true: torch.Tensor

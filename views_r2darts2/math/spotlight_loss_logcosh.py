@@ -295,9 +295,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_total = self._sanitize_tensor(w_total, posinf_val=1.0)
 
         if level_losses.dim() == 3:
-            return (w_total * level_losses).mean(dim=(0, 1))  # (C,)
+            return T * (w_total * level_losses).mean(dim=(0, 1))  # (C,)
 
-        return (w_total * level_losses).mean()  # scalar
+        return T * (w_total * level_losses).mean()  # scalar
 
     def _spectral_loss(
         self, y_pred: torch.Tensor, y_true: torch.Tensor

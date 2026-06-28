@@ -179,9 +179,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
             S_true = torch.stft(true, n_fft, hop_length=hop, win_length=n_fft,
                                 window=window, center=False, return_complex=True)
                                 
-            # Safe magnitude and DC masking
+            # Safe magnitude
             mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
             mag_true = S_true.abs()
+            
+            # Clone before in-place masking to preserve the autograd graph
+            mag_pred = mag_pred.clone()
+            mag_true = mag_true.clone()
+            
+            # Mask DC bin
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
             

@@ -114,8 +114,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     def _shape_loss(
-        self, e_shape: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor,
-    ) -> torch.Tensor:
+    self, e_shape: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor,
+) -> torch.Tensor:
         """Event-magnitude- and EMA-weighted shape loss.
 
         Uses a slow EMA of the cell loss and event magnitude for normalization
@@ -124,9 +124,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """
         cell_loss = self._log_cosh(e_shape)
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_mag = 0.01 + 0.99 * torch.sigmoid(
-            5.0 * (abs_max - self.non_zero_threshold)
-        )
+        
+        # Continuous Magnitude Weighting (CMW)
+        # Replaces sigmoid to provide continuous prioritization of rare 
+        # extreme events without hardcoded thresholds or IDW gradient explosions.
+        # Scales (0, inf) -> (0, 1) smoothly.
+        event_mag = torch.log1p(abs_max) / (torch.log1p(abs_max) + 1.0)
 
         beta = self._EMA_BETA
 

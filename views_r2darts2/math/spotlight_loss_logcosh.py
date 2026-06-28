@@ -84,17 +84,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # State for cross-channel balancing
         self._loss_ema: list[float] | None = None
-        
+
         # State for shape loss EMA-DRO
         self._shape_ema: dict | None = None
-        
+
         # State for dynamic hallucination floor (channel-aware)
         self._peace_pred_ema: list[float] | float = 0.0
-        
+
         # Telemetry for callbacks
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
-        
+
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
@@ -131,39 +131,50 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # Stateful Helpers
     # ------------------------------------------------------------------
 
-    def _get_dynamic_floor(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+    def _get_dynamic_floor(
+        self, y_true: torch.Tensor, y_pred: torch.Tensor
+    ) -> torch.Tensor:
         """Calculates a dynamic floor based on model hallucinations during peace.
-        
-        Tracks the model's average prediction magnitude per-channel when `y_true` 
+
+        Tracks the model's average prediction magnitude per-channel when `y_true`
         is below the `non_zero_threshold`.
         """
-        is_peace = (y_true.abs() < self.non_zero_threshold)
+        is_peace = y_true.abs() < self.non_zero_threshold
         beta = self._EMA_BETA
-        
+
         if y_pred.dim() == 3:
             C = y_pred.shape[-1]
-            if not isinstance(self._peace_pred_ema, list) or len(self._peace_pred_ema) != C:
+            if (
+                not isinstance(self._peace_pred_ema, list)
+                or len(self._peace_pred_ema) != C
+            ):
                 self._peace_pred_ema = [0.0] * C
-                
+
             floors = []
             for c in range(C):
                 if is_peace[..., c].any():
-                    curr_mag = y_pred.detach()[..., c][is_peace[..., c]].abs().mean().item()
+                    curr_mag = (
+                        y_pred.detach()[..., c][is_peace[..., c]].abs().mean().item()
+                    )
                 else:
                     curr_mag = 0.0
-                self._peace_pred_ema[c] = beta * self._peace_pred_ema[c] + (1.0 - beta) * curr_mag
+                self._peace_pred_ema[c] = (
+                    beta * self._peace_pred_ema[c] + (1.0 - beta) * curr_mag
+                )
                 floors.append(max(0.1, min(0.5, self._peace_pred_ema[c] * 0.5)))
-            return y_pred.new_tensor(floors) # (C,)
+            return y_pred.new_tensor(floors)  # (C,)
         else:
             if isinstance(self._peace_pred_ema, list):
                 self._peace_pred_ema = 0.0
-                
+
             if is_peace.any():
                 curr_mag = y_pred.detach()[is_peace].abs().mean().item()
             else:
                 curr_mag = 0.0
             self._peace_pred_ema = beta * self._peace_pred_ema + (1.0 - beta) * curr_mag
-            return y_pred.new_tensor(max(0.1, min(0.5, self._peace_pred_ema * 0.5))) # scalar
+            return y_pred.new_tensor(
+                max(0.1, min(0.5, self._peace_pred_ema * 0.5))
+            )  # scalar
 
     def _update_and_get_shape_ema(self, cell_loss: torch.Tensor) -> torch.Tensor:
         """Updates and retrieves the EMA of the shape loss for DRO normalization."""
@@ -181,7 +192,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                         + (1.0 - beta) * curr_loss_mean[c].item()
                     )
             return cell_loss.new_tensor(self._shape_ema["loss"])
-        
+
         # Univariate path
         curr_loss_mean = cell_loss.detach().mean().clamp(min=1e-6)
         if (
@@ -196,7 +207,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
             )
         return cell_loss.new_tensor(self._shape_ema["loss"])
 
-    def _compute_dro_weights(self, cell_loss: torch.Tensor, mu_loss: torch.Tensor) -> torch.Tensor:
+    def _compute_dro_weights(
+        self, cell_loss: torch.Tensor, mu_loss: torch.Tensor
+    ) -> torch.Tensor:
         """Calculates temporal DRO weights using sqrt self-reweighting."""
         w_dro = torch.sqrt(cell_loss.detach() / mu_loss.clamp(min=1e-6))
         return self._sanitize_tensor(w_dro, posinf_val=10.0, max_val=10.0)
@@ -206,18 +219,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _shape_loss(
-        self, e_shape: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor, floor: torch.Tensor
+        self,
+        e_shape: torch.Tensor,
+        y_true: torch.Tensor,
+        y_pred: torch.Tensor,
+        floor: torch.Tensor,
     ) -> torch.Tensor:
         """Computes the event-magnitude- and EMA-weighted shape loss."""
         cell_loss = self._log_cosh(e_shape)
-        
+
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         cmw = self._compute_cmw(abs_max)
-        
+
         # Broadcast floor for multivariate path
         if floor.dim() == 1:
             floor = floor.view(1, 1, -1)
-            
+
         event_mag = floor + (1.0 - floor) * cmw
 
         mu_loss = self._update_and_get_shape_ema(cell_loss)
@@ -254,7 +271,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int, floor: torch.Tensor
     ) -> torch.Tensor:
-        """Computes the windowed level anchor scaled by target magnitude and T."""
+        """Computes the windowed level anchor scaled by target magnitude and DRO."""
         W = max(6, T // 3)
         window_means = self._windowed_mean(e, W)
         level_losses = self._log_cosh(window_means)
@@ -265,25 +282,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Broadcast floor for multivariate path
         if floor.dim() == 1:
             floor = floor.view(1, 1, -1)
-            
+
         mag = floor + (1.0 - floor) * cmw
 
-        if level_losses.dim() == 3:
-            mag = mag / mag.mean(dim=(0, 1), keepdim=True).clamp(min=1e-6)
-            mag = self._sanitize_tensor(mag, posinf_val=1.0)
-            # return T * (mag * level_losses).mean(dim=(0, 1))  # (C,)
-            return (mag * level_losses).mean(dim=(0, 1))
+        # RESTORED: Per-series temporal DRO to amplify large level errors
+        mu_level = level_losses.detach().mean(dim=1, keepdim=True).clamp(min=1e-6)
+        w_dro = torch.sqrt(level_losses.detach() / mu_level)
+        w_dro = self._sanitize_tensor(w_dro, posinf_val=10.0, max_val=10.0)
 
-        mag = mag / mag.mean().clamp(min=1e-6)
-        mag = self._sanitize_tensor(mag, posinf_val=1.0)
-        # return T * (mag * level_losses).mean()  # scalar
-        return (mag * level_losses).mean()
+        w_total = mag * w_dro
+        w_total = w_total / w_total.mean(dim=1, keepdim=True).clamp(min=1e-8)
+        w_total = self._sanitize_tensor(w_total, posinf_val=1.0)
+
+        if level_losses.dim() == 3:
+            return (w_total * level_losses).mean(dim=(0, 1))  # (C,)
+
+        return (w_total * level_losses).mean()  # scalar
 
     def _spectral_loss(
-    self, y_pred: torch.Tensor, y_true: torch.Tensor
-) -> torch.Tensor:
+        self, y_pred: torch.Tensor, y_true: torch.Tensor
+    ) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
-        
+
         Scaled by active_ratio to match the batch-mean scaling of shape/level losses,
         preventing the spectral term from dominating when peaceful series are filtered out.
         """
@@ -301,13 +321,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             (torch.abs(true) > self.non_zero_threshold)
             | (torch.abs(pred.detach()) > self.non_zero_threshold)
         ).any(dim=1)
-        
+
         if not has_signal.any():
             return pred.new_tensor(0.0)
-        
+
         # Scale factor to align with shape/level losses which average over all B_total series
         active_ratio = has_signal.float().mean().item()
-        
+
         pred = pred[has_signal]
         true = true[has_signal]
 
@@ -319,24 +339,34 @@ class SpotlightLossLogcosh(torch.nn.Module):
             if T < n_fft:
                 continue
             window = torch.hann_window(n_fft, device=pred.device, dtype=pred.dtype)
-            
+
             S_pred = torch.stft(
-                pred, n_fft, hop_length=hop, win_length=n_fft,
-                window=window, center=False, return_complex=True,
+                pred,
+                n_fft,
+                hop_length=hop,
+                win_length=n_fft,
+                window=window,
+                center=False,
+                return_complex=True,
             )
             S_true = torch.stft(
-                true, n_fft, hop_length=hop, win_length=n_fft,
-                window=window, center=False, return_complex=True,
+                true,
+                n_fft,
+                hop_length=hop,
+                win_length=n_fft,
+                window=window,
+                center=False,
+                return_complex=True,
             )
-            
+
             mag_pred = torch.sqrt(S_pred.real**2 + S_pred.imag**2 + 1e-8)
             mag_true = S_true.abs()
-            
+
             mag_pred = mag_pred.clone()
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            
+
             total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 
@@ -359,9 +389,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── 1. Per-window DC/AC decomposition ─────────────────────────
         W = max(6, T // 3)
         windows = list(e.split(W, dim=1))
-        e_shape = torch.cat(
-            [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
-        )
+        e_shape = torch.cat([w - w.mean(dim=1, keepdim=True) for w in windows], dim=1)
 
         # Compute channel-aware dynamic floor ONCE here
         floor = self._get_dynamic_floor(y_true, y_pred)
@@ -369,7 +397,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── 2. Compute component losses ───────────────────────────────
         loss_shape_pc = self._shape_loss(e_shape, y_true, y_pred, floor)
         loss_level_pc = self._windowed_level_loss(e, y_true, T, floor)
-        
+
         loss_spec_pc = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
             loss_spec_pc = self._spectral_loss(y_pred, y_true)
@@ -381,7 +409,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_level = loss_level_pc
             loss_spec = loss_spec_pc
             total_loss = loss_shape + loss_level + loss_spec
-            
+
             self._last_components = {
                 "shape": [float(loss_shape.detach())],
                 "level": [float(loss_level.detach())],
@@ -393,13 +421,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             # Multivariate path
             per_channel_total = loss_shape_pc + loss_level_pc + loss_spec_pc
             total_loss = self._combine_channels(per_channel_total)
-            
+
             loss_shape = loss_shape_pc.sum().detach()
             loss_level = loss_level_pc.sum().detach()
             loss_spec = (
                 loss_spec_pc.sum().detach() if loss_spec_pc.dim() else loss_spec_pc
             )
-            
+
             C = per_channel_total.shape[0]
             spec_list = (
                 loss_spec_pc.detach().tolist()

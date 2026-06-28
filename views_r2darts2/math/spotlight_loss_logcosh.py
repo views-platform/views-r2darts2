@@ -26,9 +26,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
     2. **Shape Loss (Per-Series Temporal DRO)**:
        Uses `log_cosh` as the base loss. Applies a Binary Step Function
        (based on max(y_true, y_pred)) to give exactly 1.0 weight to any
-       conflict or hallucination, and 0.01 to pure peace. Applies a 
-       per-series temporal DRO spotlight to focus on poorly performing 
-       timesteps without global batch dilution.
+       conflict or hallucination, and 0.01 to pure peace. Applies the 
+       exact v46 per-series temporal DRO spotlight, mathematically normalized 
+       to mean=1 to focus on poorly performing timesteps without arbitrary 
+       clamping or global batch dilution.
 
     3. **Windowed Level Loss**:
        Computes `log_cosh` on per-window means. Scaled by total sequence
@@ -100,15 +101,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     @staticmethod
-    def _sanitize_tensor(
-        w: torch.Tensor, posinf_val: float = 1.0, max_val: float | None = None
-    ) -> torch.Tensor:
-        """Clamps, removes NaNs/Infs, and sanitizes weight tensors."""
-        if max_val is not None:
-            w = w.clamp(max=max_val)
-        return torch.nan_to_num(w, nan=1.0, posinf=posinf_val, neginf=0.0)
-
-    @staticmethod
     def _windowed_mean(x: torch.Tensor, W: int) -> torch.Tensor:
         """Splits tensor along time (dim=1) into windows of length W and means them."""
         return torch.stack([w.mean(dim=1) for w in x.split(W, dim=1)], dim=1)
@@ -117,6 +109,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _windowed_max(x: torch.Tensor, W: int) -> torch.Tensor:
         """Splits tensor along time (dim=1) into windows of length W and takes max."""
         return torch.stack([w.max(dim=1).values for w in x.split(W, dim=1)], dim=1)
+
+    @staticmethod
+    def _compute_dro_weights(losses: torch.Tensor) -> torch.Tensor:
+        """Per-series sqrt self-reweighting (exact v46 logic).
+
+        w_it = sqrt(loss_it / mean_i(loss))
+
+        Sublinear concentration: a cell 16× harder than average gets 4×
+        the gradient (not 16×).  Redistributes enough signal to fix
+        systematic bias while still focusing on spikes.
+
+        Returns weights with mean ≈ 1 per series.
+        """
+        # Calculate mean over time (dim=1) per series
+        mu = losses.detach().mean(dim=1, keepdim=True).clamp(min=1e-6)
+        w = torch.sqrt(losses.detach() / mu)
+        # Renormalize mean=1 per series along time
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)
+        return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     # ------------------------------------------------------------------
     # Loss Components
@@ -148,18 +159,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """Computes the event-magnitude- and per-series DRO-weighted shape loss."""
         cell_loss = self._log_cosh(e_shape)
         
-        # FIX: Reverted to binary step function. 
+        # Binary step function. 
         # 1.0 for conflict or hallucination, 0.01 for pure peace.
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_mag = torch.where(abs_max >= self.non_zero_threshold, 1.0, 0.01)
 
-        # Per-series temporal DRO. 
-        mu_loss = cell_loss.detach().mean(dim=1, keepdim=True).clamp(min=1e-4)
-        w_dro = torch.sqrt(cell_loss.detach() / mu_loss)
-        # w_dro = self._sanitize_tensor(w_dro, posinf_val=10.0, max_val=10.0)
-
+        # Per-series temporal DRO (exact v46 logic, no 10.0 clamps)
+        w_dro = self._compute_dro_weights(cell_loss)
         w_total = event_mag * w_dro
-        # w_total = self._sanitize_tensor(w_total, posinf_val=10.0, max_val=10.0)
+        
+        # Global batch mean normalization (exact v46 logic)
+        w_total = w_total / w_total.mean()
+        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         if cell_loss.dim() == 3:
             return (w_total * cell_loss).mean(dim=(0, 1))  # (C,)
@@ -173,15 +184,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         window_means = self._windowed_mean(e, W)
         level_losses = self._log_cosh(window_means)
 
-        # FIX: Reverted to binary step function for window magnitude.
+        # Binary step function for window magnitude.
         # If the max value in the window (true or pred) is conflict, weight is 1.0.
         true_window_max = self._windowed_max(y_true, W)
         pred_window_max = self._windowed_max(y_pred.detach(), W)
         window_abs_max = torch.max(true_window_max.abs(), pred_window_max.abs())
         mag = torch.where(window_abs_max >= self.non_zero_threshold, 1.0, 0.01)
 
-        # FIX: Removed DRO from level loss to prevent baseline hallucination.
-        w_total = self._sanitize_tensor(mag, posinf_val=1.0, max_val=1.0)
+        # DRO is removed to prevent baseline hallucination.
+        w_total = torch.nan_to_num(mag, nan=1.0, posinf=1.0, neginf=0.0)
 
         if level_losses.dim() == 3:
             return T * (w_total * level_losses).mean(dim=(0, 1))  # (C,)

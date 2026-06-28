@@ -280,9 +280,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return (mag * level_losses).mean()
 
     def _spectral_loss(
-        self, y_pred: torch.Tensor, y_true: torch.Tensor
-    ) -> torch.Tensor:
-        """Multi-resolution STFT magnitude comparison (AC bins only)."""
+    self, y_pred: torch.Tensor, y_true: torch.Tensor
+) -> torch.Tensor:
+        """Multi-resolution STFT magnitude comparison (AC bins only).
+        
+        Scaled by active_ratio to match the batch-mean scaling of shape/level losses,
+        preventing the spectral term from dominating when peaceful series are filtered out.
+        """
         if y_pred.dim() == 3:
             C = y_pred.shape[-1]
             return torch.stack(
@@ -291,13 +295,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         pred = y_pred
         true = y_true
+        B_total = pred.size(0)  # Total series in the batch
 
         has_signal = (
             (torch.abs(true) > self.non_zero_threshold)
             | (torch.abs(pred.detach()) > self.non_zero_threshold)
         ).any(dim=1)
+        
         if not has_signal.any():
             return pred.new_tensor(0.0)
+        
+        # Scale factor to align with shape/level losses which average over all B_total series
+        active_ratio = has_signal.float().mean().item()
         
         pred = pred[has_signal]
         true = true[has_signal]
@@ -331,7 +340,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 
-        return total / max(n_valid, 1)
+        # Apply the scale correction so it balances naturally with shape/level
+        return (total / max(n_valid, 1)) * active_ratio
 
     # ------------------------------------------------------------------
     # Forward Pass

@@ -118,77 +118,68 @@ class SpotlightLossLogcosh(torch.nn.Module):
 ) -> torch.Tensor:
         """Event-magnitude- and EMA-weighted shape loss.
 
-        Uses a slow EMA of the cell loss and event magnitude for normalization
-        instead of the batch mean. This ensures stable scaling and DRO
-        reweighting even when batch composition is highly unreliable.
+        Uses a slow EMA of the cell loss for normalization instead of the batch mean.
+        Uses Continuous Magnitude Weighting (CMW) with a 10% floor to ensure peace
+        months have enough gradient "spring" to pull the baseline back to zero.
+        Applies per-series normalization over the time dimension to act strictly
+        as a temporal spotlight.
         """
         cell_loss = self._log_cosh(e_shape)
-        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         
-        # Continuous Magnitude Weighting (CMW)
-        # Replaces sigmoid to provide continuous prioritization of rare 
-        # extreme events without hardcoded thresholds or IDW gradient explosions.
-        # Scales (0, inf) -> (0, 1) smoothly.
-        event_mag = torch.log1p(abs_max) / (torch.log1p(abs_max) + 1.0)
+        # 1. Continuous Magnitude Weighting (CMW) with 10% floor
+        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        cmw = torch.log1p(abs_max) / (torch.log1p(abs_max) + 1.0)
+        event_mag = 0.1 + 0.9 * cmw
 
         beta = self._EMA_BETA
 
         if cell_loss.dim() == 3:
             C = cell_loss.shape[-1]
             curr_loss_mean = cell_loss.detach().mean(dim=(0, 1)).clamp(min=1e-6)
-            curr_event_mean = event_mag.detach().mean(dim=(0, 1)).clamp(min=1e-6)
 
-            if self._shape_ema is None or len(self._shape_ema["loss"]) != C:
-                self._shape_ema = {
-                    "loss": curr_loss_mean.tolist(),
-                    "event": curr_event_mean.tolist()
-                }
+            # Simplified EMA: Only track loss mean (event_mag EMA is no longer needed)
+            if self._shape_ema is None or len(self._shape_ema.get("loss", [])) != C:
+                self._shape_ema = {"loss": curr_loss_mean.tolist()}
             else:
                 for c in range(C):
                     self._shape_ema["loss"][c] = (
                         beta * self._shape_ema["loss"][c] + (1.0 - beta) * curr_loss_mean[c].item()
                     )
-                    self._shape_ema["event"][c] = (
-                        beta * self._shape_ema["event"][c] + (1.0 - beta) * curr_event_mean[c].item()
-                    )
 
             mu_loss = cell_loss.new_tensor(self._shape_ema["loss"])
-            mu_event = cell_loss.new_tensor(self._shape_ema["event"])
 
             w_dro = torch.sqrt(cell_loss.detach() / mu_loss.clamp(min=1e-6))
             w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
             w_total = event_mag * w_dro
-            w_total = w_total / mu_event.clamp(min=1e-6)
+            
+            # CRITICAL FIX: Per-series normalization over time (dim=1)
+            # Replaces the useless scalar division by mu_event. Gives peace months 
+            # a relative "spring" weight to pull the baseline back to zero.
+            w_total = w_total / w_total.mean(dim=1, keepdim=True).clamp(min=1e-8)
             w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
             return (w_total * cell_loss).mean(dim=(0, 1))         # (C,)
 
         # Univariate path
         curr_loss_mean = cell_loss.detach().mean().clamp(min=1e-6)
-        curr_event_mean = event_mag.detach().mean().clamp(min=1e-6)
 
-        if self._shape_ema is None:
-            self._shape_ema = {
-                "loss": curr_loss_mean.item(),
-                "event": curr_event_mean.item()
-            }
+        if self._shape_ema is None or "loss" not in self._shape_ema or isinstance(self._shape_ema["loss"], list):
+            self._shape_ema = {"loss": curr_loss_mean.item()}
         else:
             self._shape_ema["loss"] = (
                 beta * self._shape_ema["loss"] + (1.0 - beta) * curr_loss_mean.item()
             )
-            self._shape_ema["event"] = (
-                beta * self._shape_ema["event"] + (1.0 - beta) * curr_event_mean.item()
-            )
 
         mu_loss = cell_loss.new_tensor(self._shape_ema["loss"])
-        mu_event = cell_loss.new_tensor(self._shape_ema["event"])
 
         w_dro = torch.sqrt(cell_loss.detach() / mu_loss.clamp(min=1e-6))
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         w_total = event_mag * w_dro
-        w_total = w_total / mu_event.clamp(min=1e-6)
+        
+        # CRITICAL FIX: Per-series normalization over time (dim=1)
+        w_total = w_total / w_total.mean(dim=1, keepdim=True).clamp(min=1e-8)
         w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         return (w_total * cell_loss).mean()                      # scalar

@@ -56,11 +56,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # State for cross-channel balancing (inverse-EMA of target RMS scale)
-        self._target_ema: list[float] | None = None
+        # Two-timescale self-referential loss tracking for progress routing.
+        # Both EMAs reuse the single _EMA_BETA constant (slow is the EMA of
+        # fast), so no extra timescale/hyperparameter is introduced.
+        self._loss_ema: list[float] | None = None       # fast EMA (~1/(1-beta))
+        self._loss_ema_slow: list[float] | None = None  # slow EMA (~2/(1-beta))
 
-        # State for tracking running EMA of scale-normalized losses
-        self._loss_ema: list[float] | None = None
+        # Running cross-batch scale of the shape-weight magnitude — keeps the
+        # event spotlight composition-invariant across batches (see forward()).
+        self._w_norm_ema: list[float] | None = None
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -101,78 +105,64 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combines per-channel losses with a dynamic Soft-Attention Gradient Routing system.
+        """Combine per-channel losses by *relative learning progress*.
 
-        Rather than standard unweighted pooling (which lets ch0 dominate) or hard argmax 
-        winner-take-all routing (which sequentially starves channels of gradients, causing 
-        long training lockouts of primary targets), we use a smooth power-law Soft-Attention 
-        mechanism.
+        Two failure modes of magnitude-based routing are avoided:
 
-        1. Target scale normalisation (AGC):
-           We track the root-mean-square target scale of each channel. To prevent zero-signal 
-           batch attenuation during long peaceful periods, we gate the EMA step to only update 
-           when the batch target contains an active signal.
-        
-        2. Scale-Normalized relative error:
-           L_norm_c = loss_c / (EMA(target_rms_c) + eps)
-           We track a smoothed rolling EMA of L_norm_c.
+        * Routing on a channel's absolute (scale-normalised) loss makes the
+          router chase whichever target has the highest *irreducible* noise
+          floor, permanently starving channels that could still improve.
+        * Dividing the loss by the physical target scale (RMS) systematically
+          down-weights the largest-signal channel — the primary target — and
+          mixes units (a W-scaled level term over an asinh-RMS is not a clean
+          relative error).
 
-        3. Soft Proportional Routing:
-           We assign gradient budget weights proportionally to the squared smoothed loss:
-               w_c = C_channels * (smooth_loss_c^2) / Sum(smooth_loss_k^2)
-           This dynamically focuses backpropagation power on worst-performing channels relative 
-           to their physical magnitude, while guaranteeing continuous non-zero learning updates 
-           for all targets, avoiding starve-gating entirely.
+        Instead each channel is compared only to *its own* history via two
+        cascaded EMAs that share the single existing smoothing constant
+        (so no extra timescale is introduced):
+
+            fast_c  = EMA_beta(loss_c)       # ~1/(1-beta) steps
+            slow_c  = EMA_beta(fast_c)       # ~2/(1-beta) steps
+            score_c = fast_c / slow_c        # dimensionless trend
+            w_c     = C * score_c / Sum_k(score_k)
+
+        score_c > 1 when channel c is regressing or lagging the others'
+        progress, ~1 when it has plateaued (incl. at its noise floor), and
+        < 1 when it is the fastest-improving channel.  Being a self-referential
+        ratio, the score stays near 1 for any converged channel, so the weights
+        cannot collapse to a winner-take-all regime (no target is starved)
+        while gradient is still tilted toward the least-improving channel.
         """
         C = per_channel_loss.shape[0]
-        # Calculate target physical scale: root-mean-square (RMS) of target series
-        # y_true has shape (B, T, C)
-        target_rms = torch.sqrt(torch.mean(y_true ** 2, dim=(0, 1)) + self._EMA_EPS)
-        rms_det = target_rms.detach()
-        rms_det = torch.nan_to_num(rms_det, nan=1.0, posinf=1.0, neginf=self._EMA_EPS)
-        rms_det = rms_det.clamp(min=self._EMA_EPS)
-
-        if self._target_ema is None or len(self._target_ema) != C:
-            self._target_ema = rms_det.tolist()
-        else:
-            beta = self._EMA_BETA
-            for c in range(C):
-                # Signal-Gated Scale EMA: Skip zero-signal batch attenuation of sparse targets.
-                # If a batch has no events for channel c, keep the last seen scale EMA active.
-                if float(rms_det[c]) > 1e-4:
-                    self._target_ema[c] = beta * self._target_ema[c] + (1.0 - beta) * float(rms_det[c])
-
-        # ── Scale-Normalized Losses ──────────────────────────────────
-        target_ema_tensor = per_channel_loss.new_tensor(self._target_ema)
-        # Normalize losses by physical target scales to make targets comparable
         batch_loss_det = per_channel_loss.detach()
-        L_norm = batch_loss_det / (target_ema_tensor + self._EMA_EPS)
+        beta = self._EMA_BETA
 
-        # Track rolling EMA of normalized losses to smooth routing decisions
-        if self._loss_ema is None or len(self._loss_ema) != C:
-            self._loss_ema = L_norm.tolist()
+        # ── Two-timescale self-referential loss tracking ─────────────
+        if (
+            self._loss_ema is None
+            or self._loss_ema_slow is None
+            or len(self._loss_ema) != C
+        ):
+            self._loss_ema = batch_loss_det.tolist()
+            self._loss_ema_slow = batch_loss_det.tolist()
         else:
-            beta = self._EMA_BETA
             for c in range(C):
-                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(L_norm[c])
+                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
+                self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
 
-        # ── Soft-Attention Proportional Gradient Routing ────────────
-        # Power-law soft-attention (alpha=2.0) focuses on worst-performing channel
-        # while preventing starve-gating of other targets.
-        loss_ema_tensor = per_channel_loss.new_tensor(self._loss_ema)
-        scores = loss_ema_tensor ** 2.0
-        scores_sum = scores.sum().clamp(min=1e-8)
-        w_soft = C * (scores / scores_sum)
+        # ── Relative-progress routing ────────────────────────────────
+        fast = per_channel_loss.new_tensor(self._loss_ema)
+        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
+        scores = fast / slow.clamp(min=self._EMA_EPS)
+        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
 
-        w_final = w_soft
         self._last_weights = w_soft.tolist()
-
-        # Telemetry storage
-        self._last_cal_ratio = L_norm.tolist()
-        self._last_cal_score = list(self._loss_ema)
+        # Telemetry (keys preserved for the callback contract):
+        self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
+        self._last_cal_score = list(self._loss_ema)  # fast EMA
         self._last_gates = w_soft.tolist()
 
-        return (w_final * per_channel_loss).sum()
+        return (w_soft * per_channel_loss).sum()
 
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
@@ -312,18 +302,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
-        w_total = event_mag * w_dro
-        
-        # FIX: Apply nan_to_num BEFORE computing loss_shape to prevent NaN propagation
-        # Also perform per-channel global batch mean normalization for 3D
+        w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+
+        # Normalize the spotlight weights by a running (cross-batch) average of
+        # their own magnitude rather than by the *current* batch mean. The
+        # per-batch mean was composition-dependent: an all-peace batch (mean
+        # weight ~= 0.01) was divided by ~0.01 and snapped back to ~1, erasing
+        # the peace/conflict contrast and handing peaceful cells full gradient.
+        # Dividing by the running mean keeps the absolute peace-vs-conflict
+        # contrast intact in every batch while holding the long-run loss_shape
+        # scale stable. The denominator is detached, so it only rescales.
+        beta = self._EMA_BETA
         if w_total.dim() == 3:
-            w_total = w_total / w_total.mean(dim=(0, 1), keepdim=True).clamp(min=1e-8)
-            w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-            loss_shape = (w_total * cell_loss).mean(dim=(0, 1))  # (C,)
+            batch_w_mean = w_total.detach().mean(dim=(0, 1))  # (C,)
+            n = batch_w_mean.numel()
+            if self._w_norm_ema is None or len(self._w_norm_ema) != n:
+                self._w_norm_ema = batch_w_mean.clamp(min=self._EMA_EPS).tolist()
+            else:
+                for c in range(n):
+                    self._w_norm_ema[c] = beta * self._w_norm_ema[c] + (1.0 - beta) * float(batch_w_mean[c])
+            denom = w_total.new_tensor(self._w_norm_ema).clamp(min=self._EMA_EPS)
+            loss_shape = (w_total / denom * cell_loss).mean(dim=(0, 1))  # (C,)
         else:
-            w_total = w_total / w_total.mean()
-            w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-            loss_shape = (w_total * cell_loss).mean()  # scalar
+            batch_w_mean = float(w_total.detach().mean())
+            if self._w_norm_ema is None or len(self._w_norm_ema) != 1:
+                self._w_norm_ema = [max(batch_w_mean, self._EMA_EPS)]
+            else:
+                self._w_norm_ema[0] = beta * self._w_norm_ema[0] + (1.0 - beta) * batch_w_mean
+            denom = max(self._w_norm_ema[0], self._EMA_EPS)
+            loss_shape = (w_total / denom * cell_loss).mean()  # scalar
 
         # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
@@ -356,7 +363,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "level": loss_level.detach().tolist(),
                 "spec": spec_list,
                 "weight": weights,
-                "ema": self._target_ema or [float("nan")] * C,
+                "ema": self._loss_ema_slow or [float("nan")] * C,
                 "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
                 "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
                 "gates": getattr(self, "_last_gates", [1.0] * C),
@@ -366,10 +373,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
             }
 
         if torch.isnan(total_loss):
+            _s = float(loss_shape.sum()) if loss_shape.dim() else float(loss_shape)
+            _l = float(loss_level.sum()) if loss_level.dim() else float(loss_level)
+            _sp = float(loss_spec.sum()) if loss_spec.dim() else float(loss_spec)
             raise RuntimeError(
-                f"NaN in SpotlightLossLogcosh: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} "
-                f"spec={loss_spec.item() if loss_spec.dim()==0 else loss_spec.sum().item():.6f}"
+                f"NaN in SpotlightLossLogcosh: shape={_s:.6f} level={_l:.6f} spec={_sp:.6f}"
             )
 
         logger.debug(

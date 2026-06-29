@@ -97,46 +97,46 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # Loss Components
     # ------------------------------------------------------------------
 
-    # def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
-    #     """Combines per-channel losses with inverse-EMA scale normalisation."""
-    #     C = per_channel_loss.shape[0]
-    #     losses_det = per_channel_loss.detach()
-
-    #     if self._loss_ema is None or len(self._loss_ema) != C:
-    #         self._loss_ema = losses_det.clamp(min=self._EMA_EPS).tolist()
-    #     else:
-    #         beta = self._EMA_BETA
-    #         for c in range(C):
-    #             self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(
-    #                 losses_det[c]
-    #             )
-
-    #     ema = per_channel_loss.new_tensor(self._loss_ema)
-    #     w = 1.0 / (ema + self._EMA_EPS)
-    #     w = (w / w.mean()).detach()  # mean 1 → preserve loss scale
-    #     self._last_weights = w.tolist()
-    #     return (w * per_channel_loss).sum()
-    
     def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
-        """Combines per-channel losses using instantaneous inverse-log scaling.
-        
-        State-free, parameter-free. Balances channels dynamically per forward pass
-        using numerically stable log-sum-exp normalization.
-        """
+        """Combines per-channel losses with inverse-EMA scale normalisation."""
+        C = per_channel_loss.shape[0]
         losses_det = per_channel_loss.detach()
-        
-        # 1. Calculate log weights: w_c ∝ 1 / L_c  =>  log(w_c) = -log(L_c)
-        log_w = -torch.log(losses_det + self._EMA_EPS)
-        
-        # 2. Numerically stable softmax (subtract max to prevent exp overflow)
-        log_w = log_w - torch.max(log_w)
-        w = torch.exp(log_w)
-        
-        # 3. Normalize to mean 1.0 to preserve the overall loss scale
-        w = (w / w.mean().clamp(min=1e-8)).detach()
-        
+
+        if self._loss_ema is None or len(self._loss_ema) != C:
+            self._loss_ema = losses_det.clamp(min=self._EMA_EPS).tolist()
+        else:
+            beta = self._EMA_BETA
+            for c in range(C):
+                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(
+                    losses_det[c]
+                )
+
+        ema = per_channel_loss.new_tensor(self._loss_ema)
+        w = 1.0 / (ema + self._EMA_EPS)
+        w = (w / w.mean()).detach()  # mean 1 → preserve loss scale
         self._last_weights = w.tolist()
         return (w * per_channel_loss).sum()
+
+    # def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
+    #     """Combines per-channel losses using instantaneous inverse-log scaling.
+        
+    #     State-free, parameter-free. Balances channels dynamically per forward pass
+    #     using numerically stable log-sum-exp normalization.
+    #     """
+    #     losses_det = per_channel_loss.detach()
+        
+    #     # 1. Calculate log weights: w_c ∝ 1 / L_c  =>  log(w_c) = -log(L_c)
+    #     log_w = -torch.log(losses_det + self._EMA_EPS)
+        
+    #     # 2. Numerically stable softmax (subtract max to prevent exp overflow)
+    #     log_w = log_w - torch.max(log_w)
+    #     w = torch.exp(log_w)
+        
+    #     # 3. Normalize to mean 1.0 to preserve the overall loss scale
+    #     w = (w / w.mean().clamp(min=1e-8)).detach()
+        
+    #     self._last_weights = w.tolist()
+    #     return (w * per_channel_loss).sum()
 
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
@@ -168,10 +168,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Weight each series' level loss
         if level_losses.dim() == 3:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
-            return W * weighted.mean(dim=(0, 1))  # (C,)
+            return weighted.mean(dim=(0, 1))  # (C,)
         else:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-            return W * weighted.mean()  # scalar
+            return weighted.mean()  # scalar
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

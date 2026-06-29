@@ -56,11 +56,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # Two-timescale self-referential loss tracking for progress routing.
-        # Both EMAs reuse the single _EMA_BETA constant (slow is the EMA of
-        # fast), so no extra timescale/hyperparameter is introduced.
-        self._loss_ema: list[float] | None = None       # fast EMA (~1/(1-beta))
-        self._loss_ema_slow: list[float] | None = None  # slow EMA (~2/(1-beta))
+        # Running EMA of each channel's raw loss scale. Near convergence the
+        # loss equals the task's irreducible noise variance, so this acts as a
+        # parameter-free estimate of Kendall & Gal's sigma_c^2 for homoscedastic
+        # channel balancing (see _combine_channels). No learnable parameters.
+        self._loss_ema: list[float] | None = None
 
         # Running cross-batch scale of the shape-weight magnitude — keeps the
         # event spotlight composition-invariant across batches (see forward()).
@@ -105,61 +105,61 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses by *relative learning progress*.
+        """Combine per-channel losses by parameter-free homoscedastic-uncertainty
+        weighting (inverse running-loss scale).
 
-        Two failure modes of magnitude-based routing are avoided:
+        Naive pooling of the per-target losses fails in two opposite ways:
 
-        * Routing on a channel's absolute (scale-normalised) loss makes the
-          router chase whichever target has the highest *irreducible* noise
-          floor, permanently starving channels that could still improve.
-        * Dividing the loss by the physical target scale (RMS) systematically
-          down-weights the largest-signal channel — the primary target — and
-          mixes units (a W-scaled level term over an asinh-RMS is not a clean
-          relative error).
+        * An unweighted sum (Sum_c L_c) lets whichever channel carries the
+          larger loss scale dominate the shared backbone, starving the minor
+          targets.
+        * A two-timescale "progress" ratio fast_c/slow_c collapses to 1 for
+          every channel once training is steady — two EMAs that share the same
+          smoothing constant beta converge together, so the ratio carries no
+          dynamic range and silently degenerates back to the unweighted sum.
 
-        Instead each channel is compared only to *its own* history via two
-        cascaded EMAs that share the single existing smoothing constant
-        (so no extra timescale is introduced):
+        Kendall & Gal (2018) show the Bayes-optimal weight for a homoscedastic
+        task is 1/(2 sigma_c^2), where sigma_c^2 is the task's irreducible noise
+        variance. Near convergence the running loss IS that variance, so we
+        estimate sigma_c^2 by an EMA of the raw loss and weight each channel by
+        its inverse — recovering uncertainty weighting WITHOUT the learnable
+        log-variance parameters (which previously broke checkpoint loading) and
+        WITHOUT any temperature / restoring-force constant:
 
-            fast_c  = EMA_beta(loss_c)       # ~1/(1-beta) steps
-            slow_c  = EMA_beta(fast_c)       # ~2/(1-beta) steps
-            score_c = fast_c / slow_c        # dimensionless trend
-            w_c     = C * score_c / Sum_k(score_k)
+            ema_c = EMA_beta(L_c)                      # estimate of sigma_c^2
+            w_c   = C * (1/ema_c) / Sum_k (1/ema_k)    # mean(w) = 1, dimensionless
 
-        score_c > 1 when channel c is regressing or lagging the others'
-        progress, ~1 when it has plateaued (incl. at its noise floor), and
-        < 1 when it is the fastest-improving channel.  Being a self-referential
-        ratio, the score stays near 1 for any converged channel, so the weights
-        cannot collapse to a winner-take-all regime (no target is starved)
-        while gradient is still tilted toward the least-improving channel.
+        Each channel's effective loss w_c * L_c then has comparable scale, so
+        the per-channel gradients reaching the shared trunk are balanced and no
+        target is starved. The +log sigma regulariser of Kendall & Gal is
+        dropped because sigma_c^2 here is *estimated*, not a free parameter that
+        could run to infinity. The EMA is a plain Python list and the weights
+        are detached, so this adds no autograd path and no state_dict keys; its
+        slow timescale (beta=0.99) keeps it DRO-safe — it tracks scale, not the
+        non-monotonic per-step DRO spikes.
         """
         C = per_channel_loss.shape[0]
         batch_loss_det = per_channel_loss.detach()
         beta = self._EMA_BETA
 
-        # ── Two-timescale self-referential loss tracking ─────────────
-        if (
-            self._loss_ema is None
-            or self._loss_ema_slow is None
-            or len(self._loss_ema) != C
-        ):
-            self._loss_ema = batch_loss_det.tolist()
-            self._loss_ema_slow = batch_loss_det.tolist()
+        # ── Running per-channel loss-scale estimate (sigma_c^2) ──────
+        if self._loss_ema is None or len(self._loss_ema) != C:
+            self._loss_ema = batch_loss_det.clamp(min=self._EMA_EPS).tolist()
         else:
             for c in range(C):
                 self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
-                self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
 
-        # ── Relative-progress routing ────────────────────────────────
-        fast = per_channel_loss.new_tensor(self._loss_ema)
-        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
-        scores = fast / slow.clamp(min=self._EMA_EPS)
-        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
+        # ── Inverse-scale (homoscedastic-uncertainty) weighting ──────
+        ema = per_channel_loss.new_tensor(self._loss_ema).clamp(min=self._EMA_EPS)
+        inv = 1.0 / ema
+        w_soft = C * inv / inv.sum().clamp(min=self._EMA_EPS)
 
         self._last_weights = w_soft.tolist()
         # Telemetry (keys preserved for the callback contract):
-        self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
-        self._last_cal_score = list(self._loss_ema)  # fast EMA
+        #   cal_ratio = scale-normalised relative loss L_c/EMA(L_c) (~1 at steady state),
+        #   cal_score = running loss-scale EMA, gates = applied channel weights.
+        self._last_cal_ratio = (batch_loss_det / ema).tolist()
+        self._last_cal_score = list(self._loss_ema)
         self._last_gates = w_soft.tolist()
 
         return (w_soft * per_channel_loss).sum()
@@ -363,7 +363,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "level": loss_level.detach().tolist(),
                 "spec": spec_list,
                 "weight": weights,
-                "ema": self._loss_ema_slow or [float("nan")] * C,
+                "ema": self._loss_ema or [float("nan")] * C,
                 "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
                 "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
                 "gates": getattr(self, "_last_gates", [1.0] * C),

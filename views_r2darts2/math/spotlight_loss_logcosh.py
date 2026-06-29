@@ -66,6 +66,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # event spotlight composition-invariant across batches (see forward()).
         self._w_norm_ema: list[float] | None = None
 
+        # Running EMA of each objective component's mean scale [shape, level, spec].
+        # Three scalars — inter-channel balance is handled by _combine_channels.
+        # Used by _assemble_objective for loss-ratio normalization.
+        self._obj_ema: list[float] | None = None
+
         # Telemetry for callbacks
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
@@ -171,14 +176,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """Event-magnitude-weighted windowed level anchor.
 
         Splits the T-length error into non-overlapping windows, computes
-        log_cosh on per-window means, then weights each series by its 
+        log_cosh on per-window means, then weights each series by its
         event magnitude. No DRO, no CMW, just the sigmoid weight.
 
-        We scale by the square root of window size W instead of sequence length T
-        or W. Because the mean operator on a window of size W reduces gradient
-        magnitude by a factor of 1/W, scaling by sqrt(W) strikes the optimal
-        balance: it partially offsets gradient attenuation without letting the
-        level loss dominate the core shape loss gradients.
+        No manual scale factor is applied — the natural scale difference
+        between this component and shape/spectral is resolved by
+        _assemble_objective's loss-ratio normalisation.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -209,14 +212,65 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             series_w = series_w / series_w.mean().clamp(min=1e-8)
 
-        # Weight each series' level loss
-        scale_factor = math.sqrt(W)
+        # Weight each series' level loss (no manual scale — handled by _assemble_objective)
+        scale_factor = 1.0
         if level_losses.dim() == 3:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
             return scale_factor * weighted.mean(dim=(0, 1))  # (C,)
         else:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
             return scale_factor * weighted.mean()  # scalar
+
+    def _assemble_objective(
+        self,
+        loss_shape: torch.Tensor,
+        loss_level: torch.Tensor,
+        loss_spec: torch.Tensor,
+    ) -> torch.Tensor:
+        """Combine Shape + Level + Spectral via loss-ratio normalization.
+
+        Each component is divided by a detached running EMA of its own magnitude
+        so that each contributes ≈ 1.0 normalised units at steady state — no
+        matter what their natural scale difference is (level is typically ~W×
+        smaller than shape due to the windowed averaging operator):
+
+            L_total = L_shape / EMA(L_shape) + L_level / EMA(L_level) + L_spec / EMA(L_spec)
+
+        Contrast with inverse-EMA weighting (w = 1/EMA, as in Kendall & Gal):
+        that multi-task heuristic down-weights a component when its loss is
+        *large* — the opposite of what is wanted here. For sub-objectives of the
+        same prediction target you want more gradient on whichever aspect the
+        model is currently failing at, not less. Loss-ratio normalisation
+        achieves this: L/EMA > 1 when the model regresses, > 1 gradient; ≈ 1
+        when converged, equal contribution; < 1 if the component is over-fitted.
+
+        Three scalar EMAs (not 3×C) — inter-channel balance is left to
+        _combine_channels (Kendall & Gal). The denominators are plain Python
+        floats (detached), so this adds no autograd path and no state_dict keys.
+        """
+        beta = self._EMA_BETA
+        eps  = self._EMA_EPS
+
+        # Scalar representative values per component (mean across channels)
+        sh_val = float(loss_shape.detach().mean() if loss_shape.dim() > 0 else loss_shape.detach())
+        lv_val = float(loss_level.detach().mean() if loss_level.dim() > 0 else loss_level.detach())
+        sp_val = float(loss_spec.detach().mean()  if loss_spec.dim()  > 0 else loss_spec.detach())
+
+        if self._obj_ema is None:
+            self._obj_ema = [max(sh_val, eps), max(lv_val, eps), max(sp_val, eps)]
+        else:
+            self._obj_ema[0] = beta * self._obj_ema[0] + (1.0 - beta) * max(sh_val, eps)
+            self._obj_ema[1] = beta * self._obj_ema[1] + (1.0 - beta) * max(lv_val, eps)
+            self._obj_ema[2] = beta * self._obj_ema[2] + (1.0 - beta) * max(sp_val, eps)
+
+        sh_denom = max(self._obj_ema[0], eps)
+        lv_denom = max(self._obj_ema[1], eps)
+        sp_denom = max(self._obj_ema[2], eps)
+
+        # Ratios stored for telemetry (≈1 at steady state, >1 when regressing)
+        self._last_obj_ratios = [sh_val / sh_denom, lv_val / lv_denom, sp_val / sp_denom]
+
+        return loss_shape / sh_denom + loss_level / lv_denom + loss_spec / sp_denom
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -342,23 +396,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_spec = self._spectral_loss(y_pred, y_true)
 
         # ── Core objective assembly & telemetry ────────────────────
+        # Loss-ratio normalisation: each component ≈ 1.0 normalised units
+        # at steady state; large errors attract proportionally more gradient.
         if loss_shape.dim() == 0:
             # Univariate path
-            total_loss = loss_shape + loss_level + loss_spec
+            total_loss = self._assemble_objective(loss_shape, loss_level, loss_spec)
+            ratios = getattr(self, "_last_obj_ratios", [1.0, 1.0, 1.0])
             self._last_components = {
                 "shape": [float(loss_shape.detach())],
                 "level": [float(loss_level.detach())],
                 "spec": [float(loss_spec.detach()) if loss_spec.dim()==0 else float(loss_spec)],
                 "weight": [1.0],
+                "obj_ema": list(self._obj_ema) if self._obj_ema else [float("nan")] * 3,
+                "obj_ratio": ratios,
             }
         else:
-            # Multivariate path
-            per_channel_total = loss_shape + loss_level + loss_spec
+            # Multivariate path: normalise within component types, then balance channels
+            per_channel_total = self._assemble_objective(loss_shape, loss_level, loss_spec)
             total_loss = self._combine_channels(per_channel_total, y_pred, y_true)
-            
+
             C = per_channel_total.shape[0]
             spec_list = loss_spec.detach().tolist() if loss_spec.dim() else [float(loss_spec)] * C
             weights = self._last_weights or [1.0] * C
+            ratios = getattr(self, "_last_obj_ratios", [1.0, 1.0, 1.0])
             self._last_components = {
                 "shape": loss_shape.detach().tolist(),
                 "level": loss_level.detach().tolist(),
@@ -368,6 +428,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
                 "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
                 "gates": getattr(self, "_last_gates", [1.0] * C),
+                "obj_ema": list(self._obj_ema) if self._obj_ema else [float("nan")] * 3,
+                "obj_ratio": ratios,
                 "contribution": [
                     weights[c] * float(per_channel_total.detach()[c]) for c in range(C)
                 ],

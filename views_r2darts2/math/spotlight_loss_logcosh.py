@@ -101,21 +101,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combines per-channel losses with a Dynamic Max-Loss Gradient Routing system.
+        """Combines per-channel losses with a dynamic Soft-Attention Gradient Routing system.
 
-        Whichever target has the highest scale-normalized loss in that moment gets 
-        100% of the active gradient budget, meaning all other targets' loss weights
-        are set to 0.
+        Rather than standard unweighted pooling (which lets ch0 dominate) or hard argmax 
+        winner-take-all routing (which sequentially starves channels of gradients, causing 
+        long training lockouts of primary targets), we use a smooth power-law Soft-Attention 
+        mechanism.
 
-        We first balance physical scales dynamically using the target RMS scale (AGC):
-            L_norm_c = per_channel_loss_c / (EMA(target_rms_c) + eps)
-        Then we track a running EMA of L_norm_c to smooth routing decisions, and route 
-        the full budget strictly to the channel representing the highest unlearned relative error.
+        1. Target scale normalisation (AGC):
+           We track the root-mean-square target scale of each channel. To prevent zero-signal 
+           batch attenuation during long peaceful periods, we gate the EMA step to only update 
+           when the batch target contains an active signal.
+        
+        2. Scale-Normalized relative error:
+           L_norm_c = loss_c / (EMA(target_rms_c) + eps)
+           We track a smoothed rolling EMA of L_norm_c.
 
-        This focuses 100% of the model's update power on the worst-performing channel. 
-        Once that channel's loss drops, the next worst channel automatically is selected 
-        to train. If negative transfer degrades a previously solved channel, its loss rises 
-        and it instantly re-claims 100% of the budget.
+        3. Soft Proportional Routing:
+           We assign gradient budget weights proportionally to the squared smoothed loss:
+               w_c = C_channels * (smooth_loss_c^2) / Sum(smooth_loss_k^2)
+           This dynamically focuses backpropagation power on worst-performing channels relative 
+           to their physical magnitude, while guaranteeing continuous non-zero learning updates 
+           for all targets, avoiding starve-gating entirely.
         """
         C = per_channel_loss.shape[0]
         # Calculate target physical scale: root-mean-square (RMS) of target series
@@ -130,9 +137,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             beta = self._EMA_BETA
             for c in range(C):
-                self._target_ema[c] = beta * self._target_ema[c] + (1.0 - beta) * float(
-                    rms_det[c]
-                )
+                # Signal-Gated Scale EMA: Skip zero-signal batch attenuation of sparse targets.
+                # If a batch has no events for channel c, keep the last seen scale EMA active.
+                if float(rms_det[c]) > 1e-4:
+                    self._target_ema[c] = beta * self._target_ema[c] + (1.0 - beta) * float(rms_det[c])
 
         # ── Scale-Normalized Losses ──────────────────────────────────
         target_ema_tensor = per_channel_loss.new_tensor(self._target_ema)
@@ -148,22 +156,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
             for c in range(C):
                 self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(L_norm[c])
 
-        # ── Winner-Take-All Hard-Attention Routing ───────────────────
-        # Find the index of the highest scale-normalized loss
-        winner_idx = int(torch.tensor(self._loss_ema).argmax().item())
+        # ── Soft-Attention Proportional Gradient Routing ────────────
+        # Power-law soft-attention (alpha=2.0) focuses on worst-performing channel
+        # while preventing starve-gating of other targets.
+        loss_ema_tensor = per_channel_loss.new_tensor(self._loss_ema)
+        scores = loss_ema_tensor ** 2.0
+        scores_sum = scores.sum().clamp(min=1e-8)
+        w_soft = C * (scores / scores_sum)
 
-        # Scale the winner's weight by C to keep the average weight at exactly 1.0,
-        # which preserves overall gradient magnitudes/loss scales.
-        weights_list = [0.0] * C
-        weights_list[winner_idx] = float(C)
-
-        w_final = per_channel_loss.new_tensor(weights_list)
-        self._last_weights = weights_list
+        w_final = w_soft
+        self._last_weights = w_soft.tolist()
 
         # Telemetry storage
         self._last_cal_ratio = L_norm.tolist()
         self._last_cal_score = list(self._loss_ema)
-        self._last_gates = weights_list
+        self._last_gates = w_soft.tolist()
+
+        return (w_final * per_channel_loss).sum()
 
         return (w_final * per_channel_loss).sum()
 

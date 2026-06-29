@@ -1309,7 +1309,7 @@ class LossComponentCallback(Callback):
             self._buf[f"loss_components/ch_{c}/cal_ratio"].append(cal_ratio[c])
             self._buf[f"loss_components/ch_{c}/cal_score"].append(cal_score[c])
             self._buf[f"loss_components/ch_{c}/gate_weight"].append(gates[c])
-            self._buf[f"loss_components/ch_{c}/budget_won"].append(1.0 if gates[c] > 0.0 else 0.0)
+            self._buf[f"loss_components/ch_{c}/budget_won"].append(gates[c] / C)
             if not math.isnan(ema[c]):
                 self._buf[f"loss_components/ch_{c}/ema"].append(ema[c])
             if contribution is not None:

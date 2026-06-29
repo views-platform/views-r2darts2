@@ -119,7 +119,10 @@ class SchedulerCatalog:
                     kwargs[k] = v
 
         # Inject static kwargs last — these are mandatory for Darts/PL integration
-        # and must not be overridden by config values.
-        kwargs.update(self._STATIC_KWARGS.get(self.sched_name, {}))
+        # and must not be overridden by config values unless explicitly specified.
+        static_kwargs = self._STATIC_KWARGS.get(self.sched_name, {}).copy()
+        if "monitor" in static_kwargs:
+            static_kwargs["monitor"] = self.config.get("lr_scheduler_monitor", static_kwargs["monitor"])
+        kwargs.update(static_kwargs)
 
         return kwargs

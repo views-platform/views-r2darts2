@@ -144,10 +144,11 @@ class ModelCatalog:
         # Wire EarlyStopping if patience is set in config
         early_stopping_patience = self.config.get("early_stopping_patience", None)
         early_stopping_min_delta = self.config.get("early_stopping_min_delta", 0.0)
+        early_stopping_monitor = self.config.get("early_stopping_monitor", "val_loss")
         if early_stopping_patience is not None:
             callbacks.append(
                 EarlyStopping(
-                    monitor="val_loss",
+                    monitor=early_stopping_monitor,
                     patience=early_stopping_patience,
                     min_delta=early_stopping_min_delta,
                     mode="min",

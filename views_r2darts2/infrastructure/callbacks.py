@@ -1159,6 +1159,10 @@ class ValMetricsCallback(Callback):
             "val_metrics/MSE": mse,
         }
 
+        # Log to PyTorch Lightning callback_metrics so EarlyStopping/checkpointing can monitor them
+        for k, v in metrics.items():
+            pl_module.log(k, v, on_epoch=True, prog_bar=True, logger=False)
+
         if trainer.logger is not None:
             trainer.logger.log_metrics(metrics, step=trainer.global_step)
 

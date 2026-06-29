@@ -1292,6 +1292,9 @@ class LossComponentCallback(Callback):
         weight = comp.get("weight", [1.0] * C)
         ema = comp.get("ema", [float("nan")] * C)
         contribution = comp.get("contribution")
+        cal_ratio = comp.get("cal_ratio", [1.0] * C)
+        cal_score = comp.get("cal_score", [1.0] * C)
+        gates = comp.get("gates", [1.0] * C)
 
         for c in range(C):
             tot_c = shape[c] + level[c] + spec[c]
@@ -1303,6 +1306,10 @@ class LossComponentCallback(Callback):
             self._buf[f"loss_components/ch_{c}/frac_level"].append(level[c] / denom)
             self._buf[f"loss_components/ch_{c}/frac_spec"].append(spec[c] / denom)
             self._buf[f"loss_components/ch_{c}/weight"].append(weight[c])
+            self._buf[f"loss_components/ch_{c}/cal_ratio"].append(cal_ratio[c])
+            self._buf[f"loss_components/ch_{c}/cal_score"].append(cal_score[c])
+            self._buf[f"loss_components/ch_{c}/gate_weight"].append(gates[c])
+            self._buf[f"loss_components/ch_{c}/budget_won"].append(1.0 if gates[c] > 0.0 else 0.0)
             if not math.isnan(ema[c]):
                 self._buf[f"loss_components/ch_{c}/ema"].append(ema[c])
             if contribution is not None:
@@ -1334,8 +1341,11 @@ class LossComponentCallback(Callback):
             lv = metrics.get(f"loss_components/ch_{c}/level", float("nan"))
             sp = metrics.get(f"loss_components/ch_{c}/spec", float("nan"))
             wt = metrics.get(f"loss_components/ch_{c}/weight", float("nan"))
+            norm = metrics.get(f"loss_components/ch_{c}/cal_ratio", float("nan"))
+            smooth = metrics.get(f"loss_components/ch_{c}/cal_score", float("nan"))
+            won = metrics.get(f"loss_components/ch_{c}/budget_won", float("nan"))
             parts.append(
-                f"ch{c}[sh={sh:.2f} lv={lv:.2f} sp={sp:.2f} w={wt:.2f}]"
+                f"ch{c}[sh={sh:.2f} lv={lv:.2f} sp={sp:.2f} w_act={wt:.2f} L_norm={norm:.2f} L_smooth={smooth:.2f} won_frac={won:.2%}]"
             )
         spread = metrics.get("loss_components/contribution_spread")
         spread_str = f" | spread={spread:.2f}" if spread is not None else ""

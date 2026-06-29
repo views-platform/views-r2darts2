@@ -59,9 +59,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # State for cross-channel balancing (inverse-EMA of target RMS scale)
         self._target_ema: list[float] | None = None
 
-        # State for raw-space running calibration EMAs
-        self._cal_pred_ema: list[float] | None = None
-        self._cal_true_ema: list[float] | None = None
+        # State for tracking running EMA of scale-normalized losses
+        self._loss_ema: list[float] | None = None
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -102,22 +101,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combines per-channel losses with inverse-EMA target RMS scale normalisation,
+        """Combines per-channel losses with a Dynamic Max-Loss Gradient Routing system.
 
-        augmented with an automated/curriculum gradient budget routing system.
+        Whichever target has the highest scale-normalized loss in that moment gets 
+        100% of the active gradient budget, meaning all other targets' loss weights
+        are set to 0.
 
-        It monitors the raw-space calibration of each target by de-transforming the 
-        predictions (torch.sinh in asinh space) and computing a running EMA of raw
-        prediction over raw truth.
+        We first balance physical scales dynamically using the target RMS scale (AGC):
+            L_norm_c = per_channel_loss_c / (EMA(target_rms_c) + eps)
+        Then we track a running EMA of L_norm_c to smooth routing decisions, and route 
+        the full budget strictly to the channel representing the highest unlearned relative error.
 
-        It implements a curriculum sequential priority:
-            Ch0 (sb) -> Ch1 (ns) -> Ch2 (os)
-        Gating factors for lower-priority channels contract or expand dynamically
-        based on the active raw-space calibration quality of higher-priority channels.
-        If optimizing a sparse target (e.g. non-state) creates negative transfer that
-        harms state-based calibration, the Ch0 calibration score plummets, causing
-        the Ch1 and Ch2 curriculum gates to shut instantly. This redirects 100% of
-        the gradient budget back to reconstructing Ch0 until calibration is recovered.
+        This focuses 100% of the model's update power on the worst-performing channel. 
+        Once that channel's loss drops, the next worst channel automatically is selected 
+        to train. If negative transfer degrades a previously solved channel, its loss rises 
+        and it instantly re-claims 100% of the budget.
         """
         C = per_channel_loss.shape[0]
         # Calculate target physical scale: root-mean-square (RMS) of target series
@@ -136,63 +134,36 @@ class SpotlightLossLogcosh(torch.nn.Module):
                     rms_det[c]
                 )
 
-        # ── Raw-Space Calibration & Dynamic Gated Curriculum ──────
-        # De-transform predictions and targets to raw space (asinh -> raw via sinh)
-        raw_pred = torch.sinh(y_pred.detach())
-        raw_true = torch.sinh(y_true)
+        # ── Scale-Normalized Losses ──────────────────────────────────
+        target_ema_tensor = per_channel_loss.new_tensor(self._target_ema)
+        # Normalize losses by physical target scales to make targets comparable
+        batch_loss_det = per_channel_loss.detach()
+        L_norm = batch_loss_det / (target_ema_tensor + self._EMA_EPS)
 
-        # Epoch-level simulation via running batch EMAs
-        batch_pred_mean = torch.mean(raw_pred, dim=(0, 1))
-        batch_true_mean = torch.mean(raw_true, dim=(0, 1))
-
-        if self._cal_pred_ema is None or len(self._cal_pred_ema) != C:
-            self._cal_pred_ema = batch_pred_mean.tolist()
-            self._cal_true_ema = batch_true_mean.tolist()
+        # Track rolling EMA of normalized losses to smooth routing decisions
+        if self._loss_ema is None or len(self._loss_ema) != C:
+            self._loss_ema = L_norm.tolist()
         else:
-            beta_cal = self._EMA_BETA
+            beta = self._EMA_BETA
             for c in range(C):
-                self._cal_pred_ema[c] = beta_cal * self._cal_pred_ema[c] + (1.0 - beta_cal) * float(batch_pred_mean[c])
-                self._cal_true_ema[c] = beta_cal * self._cal_true_ema[c] + (1.0 - beta_cal) * float(batch_true_mean[c])
+                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(L_norm[c])
 
-        # Compute calibration ratio theta = (pred + eps) / (true + eps)
-        # We add 1e-4 raw fatalities to protect the denominator during clean/peace batches
-        theta = []
-        cal = []
-        for c in range(C):
-            p_val = max(0.0, self._cal_pred_ema[c])
-            t_val = max(0.0, self._cal_true_ema[c])
-            theta_c = (p_val + 1e-4) / (t_val + 1e-4)
-            theta.append(theta_c)
-            # Symmetric score cal_c ∈ (0, 1] representing distance from perfect calibration (1.0)
-            log_ratio = math.log(max(1e-6, theta_c))
-            cal_c = math.exp(-abs(log_ratio))
-            cal.append(cal_c)
+        # ── Winner-Take-All Hard-Attention Routing ───────────────────
+        # Find the index of the highest scale-normalized loss
+        winner_idx = int(torch.tensor(self._loss_ema).argmax().item())
 
-        # Sequentially cascade curriculum: current channel only unlocks if all previous channels are calibrated
-        # G_0 = 1.0 (primary sb channel always trained directly)
-        # G_c = product_{k=0..c-1} cal_k^2
-        gates_list = [1.0]
-        curr_prod = 1.0
-        for c in range(1, C):
-            curr_prod = curr_prod * (cal[c - 1] ** 2)
-            gates_list.append(curr_prod)
+        # Scale the winner's weight by C to keep the average weight at exactly 1.0,
+        # which preserves overall gradient magnitudes/loss scales.
+        weights_list = [0.0] * C
+        weights_list[winner_idx] = float(C)
 
-        # Base AGC scale normalizing weights
-        ema = per_channel_loss.new_tensor(self._target_ema)
-        w_agc = 1.0 / (ema + self._EMA_EPS)
-
-        # Combine AGC and Curriculum gates
-        gates_tensor = per_channel_loss.new_tensor(gates_list)
-        w_curr = w_agc * gates_tensor
-
-        # Normalize back so mean(w) == 1.0, preserving loss magnitude/gradients
-        w_final = (w_curr / w_curr.mean().clamp(min=1e-8)).detach()
-        self._last_weights = w_final.tolist()
+        w_final = per_channel_loss.new_tensor(weights_list)
+        self._last_weights = weights_list
 
         # Telemetry storage
-        self._last_cal_ratio = theta
-        self._last_cal_score = cal
-        self._last_gates = gates_list
+        self._last_cal_ratio = L_norm.tolist()
+        self._last_cal_score = list(self._loss_ema)
+        self._last_gates = weights_list
 
         return (w_final * per_channel_loss).sum()
 

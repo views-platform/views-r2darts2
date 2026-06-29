@@ -174,11 +174,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         log_cosh on per-window means, then weights each series by its 
         event magnitude. No DRO, no CMW, just the sigmoid weight.
 
-        We scale by the window size W instead of sequence length T. Because the
-        mean operator on a window of size W reduces gradient magnitude by a
-        factor of 1/W, multiplying by W is the exact mathematical inverse of
-        the operator's gradient attenuation, balancing level and shape losses
-        naturally and stably.
+        We scale by the square root of window size W instead of sequence length T
+        or W. Because the mean operator on a window of size W reduces gradient
+        magnitude by a factor of 1/W, scaling by sqrt(W) strikes the optimal
+        balance: it partially offsets gradient attenuation without letting the
+        level loss dominate the core shape loss gradients.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -210,12 +210,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             series_w = series_w / series_w.mean().clamp(min=1e-8)
 
         # Weight each series' level loss
+        scale_factor = math.sqrt(W)
         if level_losses.dim() == 3:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
-            return T * weighted.mean(dim=(0, 1))  # (C,)
+            return scale_factor * weighted.mean(dim=(0, 1))  # (C,)
         else:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-            return T * weighted.mean()  # scalar
+            return scale_factor * weighted.mean()  # scalar
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

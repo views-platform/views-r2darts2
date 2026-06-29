@@ -56,8 +56,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # State for cross-channel balancing (inverse-EMA)
-        self._loss_ema: list[float] | None = None
+        # State for cross-channel balancing (inverse-EMA of target RMS scale)
+        self._target_ema: list[float] | None = None
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -97,21 +97,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # Loss Components
     # ------------------------------------------------------------------
 
-    def _combine_channels(self, per_channel_loss: torch.Tensor) -> torch.Tensor:
-        """Combines per-channel losses with inverse-EMA scale normalisation."""
-        C = per_channel_loss.shape[0]
-        losses_det = per_channel_loss.detach()
+    def _combine_channels(self, per_channel_loss: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Combines per-channel losses with inverse-EMA target RMS scale normalisation.
 
-        if self._loss_ema is None or len(self._loss_ema) != C:
-            self._loss_ema = losses_det.clamp(min=self._EMA_EPS).tolist()
+        Instead of normalising by the model's loss (which has a reverse-hardness
+        trap where predicting a clean channel perfectly shrinks the loss and
+        blows up the weight, locking it into flat predictions), we normalise
+        by the inherent target physical scale of each channel. This is an
+        Automatic Gain Control (AGC) mechanism from signal processing, making
+        different data-generating targets comparable without artificial local
+        minima.
+        """
+        C = per_channel_loss.shape[0]
+        # Calculate target physical scale: root-mean-square (RMS) of target series
+        # y_true has shape (B, T, C)
+        target_rms = torch.sqrt(torch.mean(y_true ** 2, dim=(0, 1)) + self._EMA_EPS)
+        rms_det = target_rms.detach()
+        rms_det = torch.nan_to_num(rms_det, nan=1.0, posinf=1.0, neginf=self._EMA_EPS)
+        rms_det = rms_det.clamp(min=self._EMA_EPS)
+
+        if self._target_ema is None or len(self._target_ema) != C:
+            self._target_ema = rms_det.tolist()
         else:
             beta = self._EMA_BETA
             for c in range(C):
-                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(
-                    losses_det[c]
+                self._target_ema[c] = beta * self._target_ema[c] + (1.0 - beta) * float(
+                    rms_det[c]
                 )
 
-        ema = per_channel_loss.new_tensor(self._loss_ema)
+        ema = per_channel_loss.new_tensor(self._target_ema)
         w = 1.0 / (ema + self._EMA_EPS)
         w = (w / w.mean()).detach()  # mean 1 → preserve loss scale
         self._last_weights = w.tolist()
@@ -146,6 +160,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         Splits the T-length error into non-overlapping windows, computes
         log_cosh on per-window means, then weights each series by its 
         event magnitude. No DRO, no CMW, just the sigmoid weight.
+
+        We scale by the window size W instead of sequence length T. Because the
+        mean operator on a window of size W reduces gradient magnitude by a
+        factor of 1/W, multiplying by W is the exact mathematical inverse of
+        the operator's gradient attenuation, balancing level and shape losses
+        naturally and stably.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
@@ -168,10 +188,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Weight each series' level loss
         if level_losses.dim() == 3:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
-            return weighted.mean(dim=(0, 1))  # (C,)
+            return W * weighted.mean(dim=(0, 1))  # (C,)
         else:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-            return weighted.mean()  # scalar
+            return W * weighted.mean()  # scalar
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -181,21 +201,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
         Only series with signal above threshold are included.
         """
         if y_pred.dim() == 3:
-            B, T, C = y_pred.shape
-            pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
-            true = y_true.permute(0, 2, 1).reshape(B * C, T)
-        else:
-            pred = y_pred
-            true = y_true
+            C = y_pred.shape[-1]
+            return torch.stack(
+                [self._spectral_loss(y_pred[..., c], y_true[..., c]) for c in range(C)]
+            )
+
+        # 2D path continues here
+        pred = y_pred
+        true = y_true
 
         has_signal = (
             (torch.abs(true) > self.non_zero_threshold)
             | (torch.abs(pred.detach()) > self.non_zero_threshold)
         ).any(dim=1)
         if not has_signal.any():
-            # Return shape matching expected output
-            if y_pred.dim() == 3:
-                return pred.new_tensor(0.0).repeat(y_pred.shape[-1])
             return pred.new_tensor(0.0)
             
         pred = pred[has_signal]
@@ -228,20 +247,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 
-        spec_loss = total / max(n_valid, 1)
-        
-        # If 3D input, we processed B*C series. We need to return per-channel (C,)
-        if y_pred.dim() == 3:
-            # Because we flattened B*C, the mean is already across all channels.
-            # To maintain channel isolation, we should technically loop, but 
-            # flattening is mathematically equivalent to averaging across channels.
-            # To keep it strictly per-channel:
-            # (Reverting to loop to guarantee channel isolation)
-            return torch.stack(
-                [self._spectral_loss(y_pred[..., c], y_true[..., c]) for c in range(C)]
-            )
-            
-        return spec_loss
+        return total / max(n_valid, 1)
 
     # ------------------------------------------------------------------
     # Forward
@@ -274,15 +280,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
         w_total = event_mag * w_dro
         
-        # FIX: Per-channel global batch mean normalization for 3D
+        # FIX: Apply nan_to_num BEFORE computing loss_shape to prevent NaN propagation
+        # Also perform per-channel global batch mean normalization for 3D
         if w_total.dim() == 3:
             w_total = w_total / w_total.mean(dim=(0, 1), keepdim=True).clamp(min=1e-8)
+            w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
             loss_shape = (w_total * cell_loss).mean(dim=(0, 1))  # (C,)
         else:
             w_total = w_total / w_total.mean()
+            w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
             loss_shape = (w_total * cell_loss).mean()  # scalar
-
-        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T)
@@ -305,7 +312,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             # Multivariate path
             per_channel_total = loss_shape + loss_level + loss_spec
-            total_loss = self._combine_channels(per_channel_total)
+            total_loss = self._combine_channels(per_channel_total, y_true)
             
             C = per_channel_total.shape[0]
             spec_list = loss_spec.detach().tolist() if loss_spec.dim() else [float(loss_spec)] * C
@@ -315,6 +322,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "level": loss_level.detach().tolist(),
                 "spec": spec_list,
                 "weight": weights,
+                "ema": self._target_ema or [float("nan")] * C,
                 "contribution": [
                     weights[c] * float(per_channel_total.detach()[c]) for c in range(C)
                 ],

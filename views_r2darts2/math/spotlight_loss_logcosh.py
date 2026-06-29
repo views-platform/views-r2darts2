@@ -174,10 +174,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         return (w_final * per_channel_loss).sum()
 
-        return (w_final * per_channel_loss).sum()
-
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
+        y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Event-magnitude-weighted windowed level anchor.
 
@@ -190,6 +189,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         factor of 1/W, multiplying by W is the exact mathematical inverse of
         the operator's gradient attenuation, balancing level and shape losses
         naturally and stably.
+
+        y_pred_det: detached prediction tensor — when supplied, series weighting
+            uses max(|y_true|, |y_pred_det|) so that predicted false positives
+            on peaceful series also attract level loss gradient. Must be same
+            shape as y_true.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
@@ -197,8 +201,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )  # (B, n_windows) or (B, n_windows, C)
         level_losses = self._log_cosh(window_means)
 
-        # Per-series event magnitude: max |y_true| across time → sigmoid
-        series_mag = y_true.abs().max(dim=1).values  # (B,) or (B, C)
+        # Per-series event magnitude: max(|y_true|, |y_pred|) across time → sigmoid
+        # Using max of both ensures false-positive series attract full level gradient,
+        # symmetric with the shape loss abs_max gating.
+        if y_pred_det is not None:
+            abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
+        else:
+            abs_max_series = y_true.abs()
+        series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
         series_w = 0.01 + 0.99 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
@@ -316,7 +326,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = (w_total * cell_loss).mean()  # scalar
 
         # ── Windowed level anchor ─────────────────────────────────────
-        loss_level = self._windowed_level_loss(e, y_true, T)
+        loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)

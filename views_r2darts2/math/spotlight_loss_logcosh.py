@@ -210,7 +210,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             series_w = series_w / series_w.mean().clamp(min=1e-8)
 
         # Weight each series' level loss (scaled by natural log dampened sequence length)
-        scale_factor = T / math.log(T)
+        scale_factor = T / math.log(T, 10)
         if level_losses.dim() == 3:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
             return scale_factor * weighted.mean(dim=(0, 1))  # (C,)

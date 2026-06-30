@@ -56,20 +56,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # Running EMA of each channel's raw loss scale. Near convergence the
-        # loss equals the task's irreducible noise variance, so this acts as a
-        # parameter-free estimate of Kendall & Gal's sigma_c^2 for homoscedastic
-        # channel balancing (see _combine_channels). No learnable parameters.
-        self._loss_ema: list[float] | None = None
+        # Two-timescale self-referential loss tracking for progress routing.
+        # Both EMAs reuse the single _EMA_BETA constant (slow is the EMA of
+        # fast), so no extra timescale/hyperparameter is introduced.
+        self._loss_ema: list[float] | None = None       # fast EMA (~1/(1-beta))
+        self._loss_ema_slow: list[float] | None = None  # slow EMA (~2/(1-beta))
 
         # Running cross-batch scale of the shape-weight magnitude — keeps the
         # event spotlight composition-invariant across batches (see forward()).
         self._w_norm_ema: list[float] | None = None
-
-        # Running EMA of each objective component's mean scale [shape, level, spec].
-        # Three scalars — inter-channel balance is handled by _combine_channels.
-        # Used by _assemble_objective for loss-ratio normalization.
-        self._obj_ema: list[float] | None = None
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -110,61 +105,61 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses by parameter-free homoscedastic-uncertainty
-        weighting (inverse running-loss scale).
+        """Combine per-channel losses by *relative learning progress*.
 
-        Naive pooling of the per-target losses fails in two opposite ways:
+        Two failure modes of magnitude-based routing are avoided:
 
-        * An unweighted sum (Sum_c L_c) lets whichever channel carries the
-          larger loss scale dominate the shared backbone, starving the minor
-          targets.
-        * A two-timescale "progress" ratio fast_c/slow_c collapses to 1 for
-          every channel once training is steady — two EMAs that share the same
-          smoothing constant beta converge together, so the ratio carries no
-          dynamic range and silently degenerates back to the unweighted sum.
+        * Routing on a channel's absolute (scale-normalised) loss makes the
+          router chase whichever target has the highest *irreducible* noise
+          floor, permanently starving channels that could still improve.
+        * Dividing the loss by the physical target scale (RMS) systematically
+          down-weights the largest-signal channel — the primary target — and
+          mixes units (a W-scaled level term over an asinh-RMS is not a clean
+          relative error).
 
-        Kendall & Gal (2018) show the Bayes-optimal weight for a homoscedastic
-        task is 1/(2 sigma_c^2), where sigma_c^2 is the task's irreducible noise
-        variance. Near convergence the running loss IS that variance, so we
-        estimate sigma_c^2 by an EMA of the raw loss and weight each channel by
-        its inverse — recovering uncertainty weighting WITHOUT the learnable
-        log-variance parameters (which previously broke checkpoint loading) and
-        WITHOUT any temperature / restoring-force constant:
+        Instead each channel is compared only to *its own* history via two
+        cascaded EMAs that share the single existing smoothing constant
+        (so no extra timescale is introduced):
 
-            ema_c = EMA_beta(L_c)                      # estimate of sigma_c^2
-            w_c   = C * (1/ema_c) / Sum_k (1/ema_k)    # mean(w) = 1, dimensionless
+            fast_c  = EMA_beta(loss_c)       # ~1/(1-beta) steps
+            slow_c  = EMA_beta(fast_c)       # ~2/(1-beta) steps
+            score_c = fast_c / slow_c        # dimensionless trend
+            w_c     = C * score_c / Sum_k(score_k)
 
-        Each channel's effective loss w_c * L_c then has comparable scale, so
-        the per-channel gradients reaching the shared trunk are balanced and no
-        target is starved. The +log sigma regulariser of Kendall & Gal is
-        dropped because sigma_c^2 here is *estimated*, not a free parameter that
-        could run to infinity. The EMA is a plain Python list and the weights
-        are detached, so this adds no autograd path and no state_dict keys; its
-        slow timescale (beta=0.99) keeps it DRO-safe — it tracks scale, not the
-        non-monotonic per-step DRO spikes.
+        score_c > 1 when channel c is regressing or lagging the others'
+        progress, ~1 when it has plateaued (incl. at its noise floor), and
+        < 1 when it is the fastest-improving channel.  Being a self-referential
+        ratio, the score stays near 1 for any converged channel, so the weights
+        cannot collapse to a winner-take-all regime (no target is starved)
+        while gradient is still tilted toward the least-improving channel.
         """
         C = per_channel_loss.shape[0]
         batch_loss_det = per_channel_loss.detach()
         beta = self._EMA_BETA
 
-        # ── Running per-channel loss-scale estimate (sigma_c^2) ──────
-        if self._loss_ema is None or len(self._loss_ema) != C:
-            self._loss_ema = batch_loss_det.clamp(min=self._EMA_EPS).tolist()
+        # ── Two-timescale self-referential loss tracking ─────────────
+        if (
+            self._loss_ema is None
+            or self._loss_ema_slow is None
+            or len(self._loss_ema) != C
+        ):
+            self._loss_ema = batch_loss_det.tolist()
+            self._loss_ema_slow = batch_loss_det.tolist()
         else:
             for c in range(C):
                 self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
+                self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
 
-        # ── Inverse-scale (homoscedastic-uncertainty) weighting ──────
-        ema = per_channel_loss.new_tensor(self._loss_ema).clamp(min=self._EMA_EPS)
-        inv = 1.0 / ema
-        w_soft = C * inv / inv.sum().clamp(min=self._EMA_EPS)
+        # ── Relative-progress routing ────────────────────────────────
+        fast = per_channel_loss.new_tensor(self._loss_ema)
+        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
+        scores = fast / slow.clamp(min=self._EMA_EPS)
+        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
 
         self._last_weights = w_soft.tolist()
         # Telemetry (keys preserved for the callback contract):
-        #   cal_ratio = scale-normalised relative loss L_c/EMA(L_c) (~1 at steady state),
-        #   cal_score = running loss-scale EMA, gates = applied channel weights.
-        self._last_cal_ratio = (batch_loss_det / ema).tolist()
-        self._last_cal_score = list(self._loss_ema)
+        self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
+        self._last_cal_score = list(self._loss_ema)  # fast EMA
         self._last_gates = w_soft.tolist()
 
         return (w_soft * per_channel_loss).sum()
@@ -176,12 +171,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """Event-magnitude-weighted windowed level anchor.
 
         Splits the T-length error into non-overlapping windows, computes
-        log_cosh on per-window means, then weights each series by its
+        log_cosh on per-window means, then weights each series by its 
         event magnitude. No DRO, no CMW, just the sigmoid weight.
 
-        No manual scale factor is applied — the natural scale difference
-        between this component and shape/spectral is resolved by
-        _assemble_objective's loss-ratio normalisation.
+        We scale by the window size W instead of sequence length T. Because the
+        mean operator on a window of size W reduces gradient magnitude by a
+        factor of 1/W, multiplying by W is the exact mathematical inverse of
+        the operator's gradient attenuation, balancing level and shape losses
+        naturally and stably.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -212,65 +209,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             series_w = series_w / series_w.mean().clamp(min=1e-8)
 
-        # Weight each series' level loss (no manual scale — handled by _assemble_objective)
-        scale_factor = 1.0
+        # Weight each series' level loss
         if level_losses.dim() == 3:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
-            return scale_factor * weighted.mean(dim=(0, 1))  # (C,)
+            return T * weighted.mean(dim=(0, 1))  # (C,)
         else:
             weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-            return scale_factor * weighted.mean()  # scalar
-
-    def _assemble_objective(
-        self,
-        loss_shape: torch.Tensor,
-        loss_level: torch.Tensor,
-        loss_spec: torch.Tensor,
-    ) -> torch.Tensor:
-        """Combine Shape + Level + Spectral via loss-ratio normalization.
-
-        Each component is divided by a detached running EMA of its own magnitude
-        so that each contributes ≈ 1.0 normalised units at steady state — no
-        matter what their natural scale difference is (level is typically ~W×
-        smaller than shape due to the windowed averaging operator):
-
-            L_total = L_shape / EMA(L_shape) + L_level / EMA(L_level) + L_spec / EMA(L_spec)
-
-        Contrast with inverse-EMA weighting (w = 1/EMA, as in Kendall & Gal):
-        that multi-task heuristic down-weights a component when its loss is
-        *large* — the opposite of what is wanted here. For sub-objectives of the
-        same prediction target you want more gradient on whichever aspect the
-        model is currently failing at, not less. Loss-ratio normalisation
-        achieves this: L/EMA > 1 when the model regresses, > 1 gradient; ≈ 1
-        when converged, equal contribution; < 1 if the component is over-fitted.
-
-        Three scalar EMAs (not 3×C) — inter-channel balance is left to
-        _combine_channels (Kendall & Gal). The denominators are plain Python
-        floats (detached), so this adds no autograd path and no state_dict keys.
-        """
-        beta = self._EMA_BETA
-        eps  = self._EMA_EPS
-
-        # Scalar representative values per component (mean across channels)
-        sh_val = float(loss_shape.detach().mean() if loss_shape.dim() > 0 else loss_shape.detach())
-        lv_val = float(loss_level.detach().mean() if loss_level.dim() > 0 else loss_level.detach())
-        sp_val = float(loss_spec.detach().mean()  if loss_spec.dim()  > 0 else loss_spec.detach())
-
-        if self._obj_ema is None:
-            self._obj_ema = [max(sh_val, eps), max(lv_val, eps), max(sp_val, eps)]
-        else:
-            self._obj_ema[0] = beta * self._obj_ema[0] + (1.0 - beta) * max(sh_val, eps)
-            self._obj_ema[1] = beta * self._obj_ema[1] + (1.0 - beta) * max(lv_val, eps)
-            self._obj_ema[2] = beta * self._obj_ema[2] + (1.0 - beta) * max(sp_val, eps)
-
-        sh_denom = max(self._obj_ema[0], eps)
-        lv_denom = max(self._obj_ema[1], eps)
-        sp_denom = max(self._obj_ema[2], eps)
-
-        # Ratios stored for telemetry (≈1 at steady state, >1 when regressing)
-        self._last_obj_ratios = [sh_val / sh_denom, lv_val / lv_denom, sp_val / sp_denom]
-
-        return loss_shape / sh_denom + loss_level / lv_denom + loss_spec / sp_denom
+            return T * weighted.mean()  # scalar
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -396,40 +341,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_spec = self._spectral_loss(y_pred, y_true)
 
         # ── Core objective assembly & telemetry ────────────────────
-        # Loss-ratio normalisation: each component ≈ 1.0 normalised units
-        # at steady state; large errors attract proportionally more gradient.
         if loss_shape.dim() == 0:
             # Univariate path
-            total_loss = self._assemble_objective(loss_shape, loss_level, loss_spec)
-            ratios = getattr(self, "_last_obj_ratios", [1.0, 1.0, 1.0])
+            total_loss = loss_shape + loss_level + loss_spec
             self._last_components = {
                 "shape": [float(loss_shape.detach())],
                 "level": [float(loss_level.detach())],
                 "spec": [float(loss_spec.detach()) if loss_spec.dim()==0 else float(loss_spec)],
                 "weight": [1.0],
-                "obj_ema": list(self._obj_ema) if self._obj_ema else [float("nan")] * 3,
-                "obj_ratio": ratios,
             }
         else:
-            # Multivariate path: normalise within component types, then balance channels
-            per_channel_total = self._assemble_objective(loss_shape, loss_level, loss_spec)
+            # Multivariate path
+            per_channel_total = loss_shape + loss_level + loss_spec
             total_loss = self._combine_channels(per_channel_total, y_pred, y_true)
-
+            
             C = per_channel_total.shape[0]
             spec_list = loss_spec.detach().tolist() if loss_spec.dim() else [float(loss_spec)] * C
             weights = self._last_weights or [1.0] * C
-            ratios = getattr(self, "_last_obj_ratios", [1.0, 1.0, 1.0])
             self._last_components = {
                 "shape": loss_shape.detach().tolist(),
                 "level": loss_level.detach().tolist(),
                 "spec": spec_list,
                 "weight": weights,
-                "ema": self._loss_ema or [float("nan")] * C,
+                "ema": self._loss_ema_slow or [float("nan")] * C,
                 "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
                 "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
                 "gates": getattr(self, "_last_gates", [1.0] * C),
-                "obj_ema": list(self._obj_ema) if self._obj_ema else [float("nan")] * 3,
-                "obj_ratio": ratios,
                 "contribution": [
                     weights[c] * float(per_channel_total.detach()[c]) for c in range(C)
                 ],

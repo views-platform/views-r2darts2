@@ -59,11 +59,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # Single loss EMA for progress routing. It is zero-initialized and
-        # Adam-style bias-corrected so the router starts from an unbiased
-        # estimate instead of a low-biased early average.
-        self._loss_ema: list[float] | None = None
-        self._loss_ema_step: int = 0
+        # Two-timescale self-referential loss tracking for progress routing.
+        # Both EMAs reuse the single _EMA_BETA constant (slow is the EMA of
+        # fast), so no extra timescale/hyperparameter is introduced.
+        self._loss_ema: list[float] | None = None       # fast EMA (~1/(1-beta))
+        self._loss_ema_slow: list[float] | None = None  # slow EMA (~2/(1-beta))
 
         # Shape and level terms are composition-robust WITHOUT cross-batch state:
         # each is a self-normalized (Hájek) ratio estimator loss = Σ(w·ℓ)/Σ(w)
@@ -109,7 +109,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses using a bias-corrected EMA baseline.
+        """Combine per-channel losses by *relative learning progress*.
 
         Two failure modes of magnitude-based routing are avoided:
 
@@ -121,45 +121,49 @@ class SpotlightLossLogcosh(torch.nn.Module):
           mixes units (a W-scaled level term over an asinh-RMS is not a clean
           relative error).
 
-        Instead each channel is compared only to its own bias-corrected EMA
-        baseline (Adam-style zero-init correction, no extra timescale):
+        Instead each channel is compared only to *its own* history via two
+        cascaded EMAs that share the single existing smoothing constant
+        (so no extra timescale is introduced):
 
-            ema_c   = EMA_beta(loss_c)
-            ema_hat = ema_c / (1 - beta^t)
-            score_c = loss_c / ema_hat      # dimensionless relative surprise
+            fast_c  = EMA_beta(loss_c)       # ~1/(1-beta) steps
+            slow_c  = EMA_beta(fast_c)       # ~2/(1-beta) steps
+            score_c = fast_c / slow_c        # dimensionless trend
             w_c     = C * score_c / Sum_k(score_k)
 
-        score_c > 1 when channel c is currently harder than its own smoothed
-        baseline, ~1 when it is tracking that baseline, and < 1 when it is
-        currently easier. The bias correction removes the startup underestimation
-        that makes raw EMAs sluggish and gives the router a cleaner early signal.
+        score_c > 1 when channel c is regressing or lagging the others'
+        progress, ~1 when it has plateaued (incl. at its noise floor), and
+        < 1 when it is the fastest-improving channel.  Being a self-referential
+        ratio, the score stays near 1 for any converged channel, so the weights
+        cannot collapse to a winner-take-all regime (no target is starved)
+        while gradient is still tilted toward the least-improving channel.
         """
         C = per_channel_loss.shape[0]
         batch_loss_det = per_channel_loss.detach()
         beta = self._EMA_BETA
 
-        # ── Bias-corrected EMA tracking ──────────────────────────────
-        if self._loss_ema is None or len(self._loss_ema) != C:
-            self._loss_ema = [0.0] * C
-            self._loss_ema_step = 0
-
-        self._loss_ema_step += 1
-        bias_correction = 1.0 - beta ** self._loss_ema_step
-
-        for c in range(C):
-            loss_c = float(batch_loss_det[c])
-            self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * loss_c
+        # ── Two-timescale self-referential loss tracking ─────────────
+        if (
+            self._loss_ema is None
+            or self._loss_ema_slow is None
+            or len(self._loss_ema) != C
+        ):
+            self._loss_ema = batch_loss_det.tolist()
+            self._loss_ema_slow = batch_loss_det.tolist()
+        else:
+            for c in range(C):
+                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
+                self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
 
         # ── Relative-progress routing ────────────────────────────────
-        ema = per_channel_loss.new_tensor(self._loss_ema)
-        ema_hat = ema / bias_correction
-        scores = batch_loss_det / ema_hat.clamp(min=self._EMA_EPS)
+        fast = per_channel_loss.new_tensor(self._loss_ema)
+        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
+        scores = fast / slow.clamp(min=self._EMA_EPS)
         w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
 
         self._last_weights = w_soft.tolist()
         # Telemetry (keys preserved for the callback contract):
-        self._last_cal_ratio = scores.tolist()        # current loss / bias-corrected EMA
-        self._last_cal_score = ema_hat.tolist()       # bias-corrected EMA baseline
+        self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
+        self._last_cal_score = list(self._loss_ema)  # fast EMA
         self._last_gates = w_soft.tolist()
 
         return (w_soft * per_channel_loss).sum()
@@ -386,7 +390,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "level": loss_level.detach().tolist(),
                 "spec": spec_list,
                 "weight": weights,
-                "ema": getattr(self, "_last_cal_score", [float("nan")] * C),
+                "ema": self._loss_ema_slow or [float("nan")] * C,
                 "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
                 "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
                 "gates": getattr(self, "_last_gates", [1.0] * C),

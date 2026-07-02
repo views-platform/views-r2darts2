@@ -33,8 +33,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     4. **Windowed level anchor** — T-scaled log_cosh on per-window means.
 
-    5. **Multi-resolution STFT loss** — always on, ungated.
+    5. **Multi-resolution STFT loss** — disabled by default (_STFT = False).
        log_cosh on magnitude-spectrum differences.  DC bin masked.
+
+    Channels (sb/ns/os) are combined by a uniform mean. Each channel's shape
+    and level terms are self-normalized (Hájek) ratio estimators, so the loss
+    is fully stateless — no cross-batch EMA anywhere.
 
     ── Base cell loss: log_cosh × (1 + log(1+|x|³))  (proportional) ───
 
@@ -59,16 +63,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # Two-timescale self-referential loss tracking for progress routing.
-        # Both EMAs reuse the single _EMA_BETA constant (slow is the EMA of
-        # fast), so no extra timescale/hyperparameter is introduced.
-        self._loss_ema: list[float] | None = None       # fast EMA (~1/(1-beta))
-        self._loss_ema_slow: list[float] | None = None  # slow EMA (~2/(1-beta))
-
         # Shape and level terms are composition-robust WITHOUT cross-batch state:
         # each is a self-normalized (Hájek) ratio estimator loss = Σ(w·ℓ)/Σ(w)
         # over the current batch, so numerator and denominator scale together
         # with event composition and no running weight-scale EMA is needed.
+        # Channels are combined by a uniform mean (see _combine_channels), so no
+        # cross-batch loss-tracking EMA is kept here either — the loss is fully
+        # stateless.
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -109,64 +110,34 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses by *relative learning progress*.
+        """Combine per-channel losses by a uniform (equal-weight) mean.
 
-        Two failure modes of magnitude-based routing are avoided:
-
-        * Routing on a channel's absolute (scale-normalised) loss makes the
-          router chase whichever target has the highest *irreducible* noise
-          floor, permanently starving channels that could still improve.
-        * Dividing the loss by the physical target scale (RMS) systematically
-          down-weights the largest-signal channel — the primary target — and
-          mixes units (a W-scaled level term over an asinh-RMS is not a clean
-          relative error).
-
-        Instead each channel is compared only to *its own* history via two
-        cascaded EMAs that share the single existing smoothing constant
-        (so no extra timescale is introduced):
-
-            fast_c  = EMA_beta(loss_c)       # ~1/(1-beta) steps
-            slow_c  = EMA_beta(fast_c)       # ~2/(1-beta) steps
-            score_c = fast_c / slow_c        # dimensionless trend
-            w_c     = C * score_c / Sum_k(score_k)
-
-        score_c > 1 when channel c is regressing or lagging the others'
-        progress, ~1 when it has plateaued (incl. at its noise floor), and
-        < 1 when it is the fastest-improving channel.  Being a self-referential
-        ratio, the score stays near 1 for any converged channel, so the weights
-        cannot collapse to a winner-take-all regime (no target is starved)
-        while gradient is still tilted toward the least-improving channel.
+        Each channel's total is already a self-normalized (Hájek) ratio
+        estimator loss = Σ(w·ℓ)/Σ(w), so the three channels are on a common,
+        composition-invariant per-cell scale. Equal weights are therefore
+        meaningful and unbiased: no channel can monopolise the gradient, none
+        can be starved, and — crucially — the combine carries NO cross-batch
+        state. The previous fast/slow-EMA progress router was a lagged control
+        loop whose weight for THIS batch depended on past batches; on an ~88%-
+        sparse, 4-OOM signal its fast/slow ratio mostly amplified sampling noise
+        (which channel drew events this batch) and reintroduced the very
+        composition dependence the Hájek normalization removes. A uniform mean
+        is the neutral, stateless default; any future tilt should come from a
+        stable exposure-free calibration gap, not a noisy training-loss EMA and
+        not event mass (which drives an sb monopoly).
         """
         C = per_channel_loss.shape[0]
-        batch_loss_det = per_channel_loss.detach()
-        beta = self._EMA_BETA
+        w_uniform = per_channel_loss.new_ones(C)
 
-        # ── Two-timescale self-referential loss tracking ─────────────
-        if (
-            self._loss_ema is None
-            or self._loss_ema_slow is None
-            or len(self._loss_ema) != C
-        ):
-            self._loss_ema = batch_loss_det.tolist()
-            self._loss_ema_slow = batch_loss_det.tolist()
-        else:
-            for c in range(C):
-                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
-                self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
+        self._last_weights = w_uniform.tolist()
+        # Telemetry (keys preserved for the callback contract). With a stateless
+        # uniform combine there is no progress ratio / EMA to report, so these
+        # expose the batch-local per-channel loss instead of running state.
+        self._last_cal_ratio = w_uniform.tolist()                      # all ones
+        self._last_cal_score = per_channel_loss.detach().tolist()      # batch loss
+        self._last_gates = w_uniform.tolist()
 
-        # ── Relative-progress routing ────────────────────────────────
-        fast = per_channel_loss.new_tensor(self._loss_ema)
-        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
-        scores = fast / slow.clamp(min=self._EMA_EPS)
-        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
-
-        self._last_weights = w_soft.tolist()
-        # Telemetry (keys preserved for the callback contract):
-        self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
-        self._last_cal_score = list(self._loss_ema)  # fast EMA
-        self._last_gates = w_soft.tolist()
-
-        return (w_soft * per_channel_loss).sum()
+        return per_channel_loss.mean()
 
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
@@ -390,7 +361,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "level": loss_level.detach().tolist(),
                 "spec": spec_list,
                 "weight": weights,
-                "ema": self._loss_ema_slow or [float("nan")] * C,
+                "ema": [float("nan")] * C,
                 "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
                 "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
                 "gates": getattr(self, "_last_gates", [1.0] * C),

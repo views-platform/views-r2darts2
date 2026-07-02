@@ -65,15 +65,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._loss_ema: list[float] | None = None       # fast EMA (~1/(1-beta))
         self._loss_ema_slow: list[float] | None = None  # slow EMA (~2/(1-beta))
 
-        # Running cross-batch scale of the shape-weight magnitude — keeps the
-        # event spotlight composition-invariant across batches (see forward()).
-        self._w_norm_ema: list[float] | None = None
-
-        # Running cross-batch scale of the level-anchor series weight — same
-        # role as _w_norm_ema but for _windowed_level_loss. Removes the level
-        # term's per-batch-mean composition dependence (an all-peace batch
-        # previously snapped every peaceful series back to weight ~1).
-        self._series_w_norm_ema: list[float] | None = None
+        # Shape and level terms are composition-robust WITHOUT cross-batch state:
+        # each is a self-normalized (Hájek) ratio estimator loss = Σ(w·ℓ)/Σ(w)
+        # over the current batch, so numerator and denominator scale together
+        # with event composition and no running weight-scale EMA is needed.
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -221,49 +216,31 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )  # (B,) or (B, C)
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        # Normalize by a running CROSS-BATCH EMA of the weight's own mean rather
-        # than the current batch mean. The old per-batch-mean normalization was
-        # composition-dependent: an all-peace batch (mean ~= 0.005) was divided
-        # by ~0.005 and snapped every peaceful series back to weight ~1, erasing
-        # the peace/conflict contrast and handing peaceful series full level
-        # gradient. Dividing by the running mean keeps the peace-vs-conflict (and
-        # now magnitude) contrast intact in every batch while holding the long-run
-        # level scale stable. Detached denominator — rescale only. Mirrors the
-        # shape term's _w_norm_ema. The magnitude factor is applied BEFORE this
-        # normalization so the mean-1 renorm preserves (not cancels) the tilt.
-        beta = self._EMA_BETA
-        if series_w.dim() == 2:  # (B, C) — 3D input, per-channel
-            batch_mean = series_w.detach().mean(dim=0)  # (C,)
-            n = batch_mean.numel()
-            if self._series_w_norm_ema is None or len(self._series_w_norm_ema) != n:
-                self._series_w_norm_ema = batch_mean.clamp(min=self._EMA_EPS).tolist()
-            else:
-                for c in range(n):
-                    self._series_w_norm_ema[c] = (
-                        beta * self._series_w_norm_ema[c]
-                        + (1.0 - beta) * float(batch_mean[c])
-                    )
-            denom = series_w.new_tensor(self._series_w_norm_ema).clamp(min=self._EMA_EPS)
-            series_w = series_w / denom
-        else:  # (B,) — 2D input, global
-            batch_mean = float(series_w.detach().mean())
-            if self._series_w_norm_ema is None or len(self._series_w_norm_ema) != 1:
-                self._series_w_norm_ema = [max(batch_mean, self._EMA_EPS)]
-            else:
-                self._series_w_norm_ema[0] = (
-                    beta * self._series_w_norm_ema[0] + (1.0 - beta) * batch_mean
-                )
-            denom = max(self._series_w_norm_ema[0], self._EMA_EPS)
-            series_w = series_w / denom
-
-        # Weight each series' level loss (scaled by natural log dampened sequence length)
-        scale_factor = T # / math.log(T)
+        # ── Hájek self-normalized level anchor (composition-robust) ───
+        # Weight-mass-weighted mean of the per-window level log_cosh — the
+        # self-normalized (Hájek) ratio estimator L = Σ(series_w·level) /
+        # Σ(series_w). Numerator and denominator scale TOGETHER with the batch's
+        # event composition, so a peace-heavy or event-heavy batch leaves the
+        # level scale unchanged. This replaces the cross-batch EMA rescale (whose
+        # lag was the source of the flat-collapse oscillation): no running state,
+        # no delayed feedback, no composition memory.
+        #
+        # scale_factor = T restores the level term's STRENGTH relative to shape:
+        # the mean-over-window operator attenuates the DC gradient by 1/W, and T
+        # is a fixed, composition-INVARIANT multiplier (identical every batch),
+        # so it does not reintroduce composition dependence. When series_w
+        # averages ~1 this matches the previous (working) level magnitude, but
+        # now without the lagging denominator.
+        scale_factor = T
+        n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
-            weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
-            return scale_factor * weighted.mean(dim=(0, 1))  # (C,)
+            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)
+            den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)  # (C,)
+            return scale_factor * num / den                                  # (C,)
         else:
-            weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-            return scale_factor * weighted.mean()  # scalar
+            num = (series_w.unsqueeze(1) * level_losses).sum()
+            den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
+            return scale_factor * num / den                                  # scalar
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -365,33 +342,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
-        # Normalize the spotlight weights by a running (cross-batch) average of
-        # their own magnitude rather than by the *current* batch mean. The
-        # per-batch mean was composition-dependent: an all-peace batch (mean
-        # weight ~= 0.01) was divided by ~0.01 and snapped back to ~1, erasing
-        # the peace/conflict contrast and handing peaceful cells full gradient.
-        # Dividing by the running mean keeps the absolute peace-vs-conflict
-        # contrast intact in every batch while holding the long-run loss_shape
-        # scale stable. The denominator is detached, so it only rescales.
-        beta = self._EMA_BETA
+        # ── Hájek self-normalized shape (composition-robust) ──────────
+        # Weight-mass-weighted mean of the per-cell log_cosh — the
+        # self-normalized (Hájek) ratio estimator loss = Σ(w·ℓ)/Σ(w). Numerator
+        # and denominator move together with the batch's event composition, so
+        # the shape scale is invariant to how many event cells the batch happens
+        # to contain. This replaces the cross-batch EMA rescale: no running
+        # state, no lag, no composition memory (the EMA lag was implicated in the
+        # flat-collapse oscillation).
         if w_total.dim() == 3:
-            batch_w_mean = w_total.detach().mean(dim=(0, 1))  # (C,)
-            n = batch_w_mean.numel()
-            if self._w_norm_ema is None or len(self._w_norm_ema) != n:
-                self._w_norm_ema = batch_w_mean.clamp(min=self._EMA_EPS).tolist()
-            else:
-                for c in range(n):
-                    self._w_norm_ema[c] = beta * self._w_norm_ema[c] + (1.0 - beta) * float(batch_w_mean[c])
-            denom = w_total.new_tensor(self._w_norm_ema).clamp(min=self._EMA_EPS)
-            loss_shape = (w_total / denom * cell_loss).mean(dim=(0, 1))  # (C,)
+            num = (w_total * cell_loss).sum(dim=(0, 1))              # (C,)
+            den = w_total.sum(dim=(0, 1)).clamp(min=self._EMA_EPS)   # (C,)
+            loss_shape = num / den                                  # (C,)
         else:
-            batch_w_mean = float(w_total.detach().mean())
-            if self._w_norm_ema is None or len(self._w_norm_ema) != 1:
-                self._w_norm_ema = [max(batch_w_mean, self._EMA_EPS)]
-            else:
-                self._w_norm_ema[0] = beta * self._w_norm_ema[0] + (1.0 - beta) * batch_w_mean
-            denom = max(self._w_norm_ema[0], self._EMA_EPS)
-            loss_shape = (w_total / denom * cell_loss).mean()  # scalar
+            num = (w_total * cell_loss).sum()
+            den = w_total.sum().clamp(min=self._EMA_EPS)
+            loss_shape = num / den                                  # scalar
 
         # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())

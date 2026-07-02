@@ -8,11 +8,12 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v46 — asinh + RevIN compatible, per-series DRO.
+    SpotlightLoss v47 — asinh + RevIN compatible, empty-batch invariant.
 
     Operates in asinh space (AsinhTransform target scaler). Designed for
-    UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
-    four orders of magnitude in raw deaths.
+    UCDP GED conflict fatality forecasting: ~90% zeros at country-month and
+    >99% zeros at pg-month, with the nonzero tail spanning four orders of
+    magnitude in raw deaths.
 
     ── Components ───────────────────────────────────────────────────────
 
@@ -27,26 +28,34 @@ class SpotlightLossLogcosh(torch.nn.Module):
        sensitivity across the 4-OOM tail so large wars outweigh small skirmishes
        instead of saturating flat. No model-state dependency (abs_max detached).
 
-    3. **Per-series temporal DRO** — within-series shock therapy.
-       Z-scores log(cell_loss) along time axis per series.  Upweights
-       proportionally harder timesteps *relative to that series*.
+    3. **Per-series temporal DRO (event cells only)** — within-series shock
+       therapy restricted to cells that clear τ in y_true OR y_pred, so it
+       cannot amplify label noise on peaceful cells. Neutral (weight 1)
+       elsewhere; renormalized to mean 1 among a series' event cells.
 
     4. **Windowed level anchor** — T-scaled log_cosh on per-window means,
-       peace/conflict *gated* (NOT magnitude-graded — gating only, so the DC
-       anchor does not over-weight the rare highest-magnitude primary-channel
-       series). Cross-batch EMA normalized for composition invariance.
+       peace/conflict *gated* (gating only, not magnitude-graded). T sets the
+       term's strength; the (short) window W sets its resolution for tracking
+       non-stationary conflict on/off transitions.
 
-    5. **Multi-resolution STFT loss** — always on, ungated.
-       log_cosh on magnitude-spectrum differences.  DC bin masked.
+    5. **Multi-resolution STFT loss** — DISABLED by default (_STFT=False).
+       log_cosh on magnitude-spectrum differences, DC bin masked, gated to
+       series with signal above τ.
 
-    ── Base cell loss: log_cosh × (1 + log(1+|x|³))  (proportional) ───
+    ── Normalization: every weighted term is a weight-MASS-weighted mean,
+       loss = Σ(w·cell) / Σ(w).  This is stateless and composition-invariant:
+       a near-empty batch has tiny weight mass and cannot dilute the event
+       signal, removing the need for any cross-batch EMA on the term weights.
+
+    ── Base cell loss: log_cosh (numerically stable). ───
 
     Args:
-        non_zero_threshold: Sigmoid center (AsinhTransform: 0.88 ≈ asinh(1))
+        non_zero_threshold: Event gate center τ (AsinhTransform: 0.88 ≈ asinh(1),
+            i.e. 1 fatality).
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _STFT = True
+    _STFT = False
     _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
 
@@ -62,21 +71,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # Two-timescale self-referential loss tracking for progress routing.
-        # Both EMAs reuse the single _EMA_BETA constant (slow is the EMA of
-        # fast), so no extra timescale/hyperparameter is introduced.
-        self._loss_ema: list[float] | None = None       # fast EMA (~1/(1-beta))
-        self._loss_ema_slow: list[float] | None = None  # slow EMA (~2/(1-beta))
-
-        # Running cross-batch scale of the shape-weight magnitude — keeps the
-        # event spotlight composition-invariant across batches (see forward()).
-        self._w_norm_ema: list[float] | None = None
-
-        # Running cross-batch scale of the level-anchor series weight — same
-        # role as _w_norm_ema but for _windowed_level_loss. Removes the level
-        # term's per-batch-mean composition dependence (an all-peace batch
-        # previously snapped every peaceful series back to weight ~1).
-        self._series_w_norm_ema: list[float] | None = None
+        # Per-channel EMA of the loss scale, used only to equalize the C targets
+        # so the largest-error channel (sb) cannot monopolize the gradient
+        # budget. Persists across batches so a sparse/empty batch for a channel
+        # does not disturb its scale. Plain list → state_dict stays empty.
+        self._loss_ema: list[float] | None = None
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -95,86 +94,82 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     @staticmethod
-    def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Per-series sqrt self-reweighting
+    def _dro_weights_2d(losses: torch.Tensor, event_mask: torch.Tensor) -> torch.Tensor:
+        """Per-series sqrt self-reweighting, restricted to event cells.
 
-        w_it = sqrt(loss_it / mean_i(loss))
+        w_it = sqrt(loss_it / mean_event(loss))   on event cells, else 1.
 
-        Sublinear concentration: a cell 16× harder than average gets 4×
-        the gradient (not 16×).  Redistributes enough signal to fix
-        systematic bias while still focusing on spikes.
+        Sublinear concentration: a cell 16× harder than the series' event
+        average gets 4× the gradient (not 16×). Restricting to event cells
+        (τ cleared in y_true OR y_pred) keeps DRO from amplifying label noise
+        on the ~99% peaceful cells. Weights are renormalized to mean ≈ 1 among
+        a series' event cells, so DRO only *redistributes* the event budget and
+        does not change its total. Series with no event cells → all 1 (neutral).
 
-        Returns weights with mean ≈ 1 per series, shape (B, T) or (B, T, C).
+        Returns weights shaped like losses: (B, T) or (B, T, C).
         """
         l = losses.detach()                                  # (B, T) or (B, T, C)
-        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1) or (B, 1, C)
-        w = torch.sqrt(l / mu)                               # (B, T) or (B, T, C)
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
-        return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
+        m = event_mask.to(l.dtype)                           # 1 on event cells
+        n_event = m.sum(dim=1, keepdim=True)                 # (B, 1) or (B, 1, C)
+        mu = ((l * m).sum(dim=1, keepdim=True)
+              / n_event.clamp(min=1.0)).clamp(min=1e-6)      # event-cell mean
+        w = torch.sqrt(l / mu)                               # sublinear focus
+        w_mean = ((w * m).sum(dim=1, keepdim=True)
+                  / n_event.clamp(min=1.0)).clamp(min=1e-8)  # mean over events
+        w = w / w_mean                                       # event weights → mean 1
+        w = torch.where(event_mask & (n_event > 0), w, torch.ones_like(w))
+        return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=1.0)
 
     # ------------------------------------------------------------------
     # Loss Components
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses by *relative learning progress*.
+        """Combine per-channel losses with inverse-scale equalization.
 
-        Two failure modes of magnitude-based routing are avoided:
+        The three targets have very different error scales: sb (state-based) is
+        denser and carries much larger asinh errors than ns/os, so an unweighted
+        Σ_c loss_c lets sb monopolize the gradient. We instead divide each
+        channel by its own running loss scale so every channel's *contribution*
+        is comparable:
 
-        * Routing on a channel's absolute (scale-normalised) loss makes the
-          router chase whichever target has the highest *irreducible* noise
-          floor, permanently starving channels that could still improve.
-        * Dividing the loss by the physical target scale (RMS) systematically
-          down-weights the largest-signal channel — the primary target — and
-          mixes units (a W-scaled level term over an asinh-RMS is not a clean
-          relative error).
+            ema_c = EMA_beta(loss_c)                 # per-channel scale
+            total = Σ_c loss_c / ema_c               # each term ≈ 1 at steady state
 
-        Instead each channel is compared only to *its own* history via two
-        cascaded EMAs that share the single existing smoothing constant
-        (so no extra timescale is introduced):
-
-            fast_c  = EMA_beta(loss_c)       # ~1/(1-beta) steps
-            slow_c  = EMA_beta(fast_c)       # ~2/(1-beta) steps
-            score_c = fast_c / slow_c        # dimensionless trend
-            w_c     = C * score_c / Sum_k(score_k)
-
-        score_c > 1 when channel c is regressing or lagging the others'
-        progress, ~1 when it has plateaued (incl. at its noise floor), and
-        < 1 when it is the fastest-improving channel.  Being a self-referential
-        ratio, the score stays near 1 for any converged channel, so the weights
-        cannot collapse to a winner-take-all regime (no target is starved)
-        while gradient is still tilted toward the least-improving channel.
+        A channel above its own scale (loss_c > ema_c) temporarily contributes
+        >1 (gets attention); below it, <1. Because we divide (rather than
+        renormalize weights to sum C) a channel with genuinely tiny loss simply
+        contributes ~0 — it cannot vacuum up the budget and starve an active
+        channel (the failure mode of straight 1/ema weighting). To stop a
+        long-dormant channel's scale from collapsing to the ε floor (which would
+        make a later event explode), each ema_c is floored at a small fraction
+        of the cross-channel mean. Weights (1/ema) are detached — rescale only.
+        The EMA persists across batches, so a batch that is all-peace for ns/os
+        does not swing the budget (their loss ~0 barely moves the EMA).
         """
         C = per_channel_loss.shape[0]
-        batch_loss_det = per_channel_loss.detach()
+        batch = per_channel_loss.detach()
         beta = self._EMA_BETA
 
-        # ── Two-timescale self-referential loss tracking ─────────────
-        if (
-            self._loss_ema is None
-            or self._loss_ema_slow is None
-            or len(self._loss_ema) != C
-        ):
-            self._loss_ema = batch_loss_det.tolist()
-            self._loss_ema_slow = batch_loss_det.tolist()
+        if self._loss_ema is None or len(self._loss_ema) != C:
+            self._loss_ema = batch.clamp(min=self._EMA_EPS).tolist()
         else:
             for c in range(C):
-                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
-                self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
+                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch[c])
 
-        # ── Relative-progress routing ────────────────────────────────
-        fast = per_channel_loss.new_tensor(self._loss_ema)
-        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
-        scores = fast / slow.clamp(min=self._EMA_EPS)
-        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
+        ema = per_channel_loss.new_tensor(self._loss_ema)
+        # Floor each scale at 1% of the cross-channel mean so a dormant channel
+        # cannot sit at the ε floor and blow up when it finally sees an event.
+        ema = ema.clamp(min=ema.mean() * 1e-2).clamp(min=self._EMA_EPS)
+        w = (1.0 / ema).detach()
 
-        self._last_weights = w_soft.tolist()
-        # Telemetry (keys preserved for the callback contract):
-        self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
-        self._last_cal_score = list(self._loss_ema)  # fast EMA
-        self._last_gates = w_soft.tolist()
+        # Telemetry (keys preserved for the callback contract)
+        self._last_weights = w.tolist()
+        self._last_cal_ratio = (batch / ema).tolist()   # loss / its own scale
+        self._last_cal_score = list(self._loss_ema)      # per-channel EMA scale
+        self._last_gates = w.tolist()
 
-        return (w_soft * per_channel_loss).sum()
+        return (w * per_channel_loss).sum()
 
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
@@ -197,7 +192,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             on peaceful series also attract level loss gradient. Must be same
             shape as y_true.
         """
-        W = max(6, T // 3)
+        W = max(4, T // 9)
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )  # (B, n_windows) or (B, n_windows, C)
@@ -230,49 +225,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
             10.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C) — gate only
 
-        # Normalize by a running CROSS-BATCH EMA of the weight's own mean rather
-        # than the current batch mean. The old per-batch-mean normalization was
-        # composition-dependent: an all-peace batch (mean ~= 0.005) was divided
-        # by ~0.005 and snapped every peaceful series back to weight ~1, erasing
-        # the peace/conflict contrast and handing peaceful series full level
-        # gradient. Dividing by the running mean keeps the peace-vs-conflict (and
-        # now magnitude) contrast intact in every batch while holding the long-run
-        # level scale stable. Detached denominator — rescale only. Mirrors the
-        # shape term's _w_norm_ema. The magnitude factor is applied BEFORE this
-        # normalization so the mean-1 renorm preserves (not cancels) the tilt.
-        beta = self._EMA_BETA
-        if series_w.dim() == 2:  # (B, C) — 3D input, per-channel
-            batch_mean = series_w.detach().mean(dim=0)  # (C,)
-            n = batch_mean.numel()
-            if self._series_w_norm_ema is None or len(self._series_w_norm_ema) != n:
-                self._series_w_norm_ema = batch_mean.clamp(min=self._EMA_EPS).tolist()
-            else:
-                for c in range(n):
-                    self._series_w_norm_ema[c] = (
-                        beta * self._series_w_norm_ema[c]
-                        + (1.0 - beta) * float(batch_mean[c])
-                    )
-            denom = series_w.new_tensor(self._series_w_norm_ema).clamp(min=self._EMA_EPS)
-            series_w = series_w / denom
-        else:  # (B,) — 2D input, global
-            batch_mean = float(series_w.detach().mean())
-            if self._series_w_norm_ema is None or len(self._series_w_norm_ema) != 1:
-                self._series_w_norm_ema = [max(batch_mean, self._EMA_EPS)]
-            else:
-                self._series_w_norm_ema[0] = (
-                    beta * self._series_w_norm_ema[0] + (1.0 - beta) * batch_mean
-                )
-            denom = max(self._series_w_norm_ema[0], self._EMA_EPS)
-            series_w = series_w / denom
-
-        # Weight each series' level loss (scaled by natural log dampened sequence length)
-        scale_factor = T # / math.log(T)
+        # ── Weighted-mean normalization (empty-batch invariant) ────────
+        # Normalize the level loss by the series-weight MASS,
+        # loss = Σ(series_w·level) / Σ(series_w), instead of the old cross-batch
+        # EMA. An all-peace batch has tiny weight mass in both numerator and
+        # denominator, so it neither snaps peaceful series back to weight ~1 nor
+        # dilutes the level signal — stateless and composition-invariant.
+        n_windows = level_losses.shape[1]
+        scale_factor = T  # T sets level-term STRENGTH (kept); W sets resolution
         if level_losses.dim() == 3:
-            weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows, C)
-            return scale_factor * weighted.mean(dim=(0, 1))  # (C,)
+            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))   # (C,)
+            den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)
+            return scale_factor * num / den                               # (C,)
         else:
-            weighted = series_w.unsqueeze(1) * level_losses  # (B, n_windows)
-            return scale_factor * weighted.mean()  # scalar
+            num = (series_w.unsqueeze(1) * level_losses).sum()
+            den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
+            return scale_factor * num / den                               # scalar
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -344,7 +312,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Per-window DC/AC decomposition ────────────────────────────
         # Demean within each non-overlapping window (same W as level anchor).
-        W = max(6, T // 3)
+        W = max(4, T // 9)
         windows = list(e.split(W, dim=1))  # list of (B, W_i) or (B, W_i, C)
         e_shape = torch.cat(
             [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
@@ -366,41 +334,36 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
         event_gate = 0.005 + 0.995 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
-        # ── Per-series temporal DRO ────────────────────────────────────
-        w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
-        w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+        # ── Per-series temporal DRO (event cells only) ─────────────────
+        # DRO re-focuses gradient onto the hardest timesteps within a series,
+        # but on ~99%-zero data it would otherwise amplify label noise on
+        # peaceful cells. Restrict it to cells that clear τ in y_true OR y_pred,
+        # so peace cells stay neutral (weight 1).
+        event_mask = (torch.abs(y_true) > self.non_zero_threshold) | (
+            torch.abs(y_pred.detach()) > self.non_zero_threshold
+        )
+        w_dro = self._dro_weights_2d(cell_loss, event_mask)  # (B, T) or (B, T, C)
+        w_total = torch.nan_to_num(event_mag * w_dro, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Normalize the spotlight weights by a running (cross-batch) average of
-        # their own magnitude rather than by the *current* batch mean. The
-        # per-batch mean was composition-dependent: an all-peace batch (mean
-        # weight ~= 0.01) was divided by ~0.01 and snapped back to ~1, erasing
-        # the peace/conflict contrast and handing peaceful cells full gradient.
-        # Dividing by the running mean keeps the absolute peace-vs-conflict
-        # contrast intact in every batch while holding the long-run loss_shape
-        # scale stable. The denominator is detached, so it only rescales.
-        beta = self._EMA_BETA
+        # ── Weighted-mass normalization (empty-batch invariant) ────────
+        # Normalize the shape loss by its own weight MASS rather than by cell
+        # count or a cross-batch EMA: loss = Σ(w·cell) / Σ(w). Peace cells carry
+        # weight ~0.005, so a near-empty batch contributes almost nothing to
+        # both numerator and denominator and cannot dilute the accumulated event
+        # signal, while within any batch the event cells dominate the average.
+        # Stateless, composition-invariant, and the single most important
+        # property for keeping the model sensitive to conflict on/off states.
         if w_total.dim() == 3:
-            batch_w_mean = w_total.detach().mean(dim=(0, 1))  # (C,)
-            n = batch_w_mean.numel()
-            if self._w_norm_ema is None or len(self._w_norm_ema) != n:
-                self._w_norm_ema = batch_w_mean.clamp(min=self._EMA_EPS).tolist()
-            else:
-                for c in range(n):
-                    self._w_norm_ema[c] = beta * self._w_norm_ema[c] + (1.0 - beta) * float(batch_w_mean[c])
-            denom = w_total.new_tensor(self._w_norm_ema).clamp(min=self._EMA_EPS)
-            loss_shape = (w_total / denom * cell_loss).mean(dim=(0, 1))  # (C,)
+            num = (w_total * cell_loss).sum(dim=(0, 1))          # (C,)
+            den = w_total.sum(dim=(0, 1)).clamp(min=self._EMA_EPS)
+            loss_shape = num / den                              # (C,)
         else:
-            batch_w_mean = float(w_total.detach().mean())
-            if self._w_norm_ema is None or len(self._w_norm_ema) != 1:
-                self._w_norm_ema = [max(batch_w_mean, self._EMA_EPS)]
-            else:
-                self._w_norm_ema[0] = beta * self._w_norm_ema[0] + (1.0 - beta) * batch_w_mean
-            denom = max(self._w_norm_ema[0], self._EMA_EPS)
-            loss_shape = (w_total / denom * cell_loss).mean()  # scalar
+            num = (w_total * cell_loss).sum()
+            den = w_total.sum().clamp(min=self._EMA_EPS)
+            loss_shape = num / den                              # scalar
 
         # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
@@ -433,7 +396,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 "level": loss_level.detach().tolist(),
                 "spec": spec_list,
                 "weight": weights,
-                "ema": self._loss_ema_slow or [float("nan")] * C,
+                "ema": self._loss_ema or [float("nan")] * C,
                 "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
                 "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
                 "gates": getattr(self, "_last_gates", [1.0] * C),

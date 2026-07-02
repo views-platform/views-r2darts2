@@ -199,8 +199,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        series_w = 0.01 + 0.99 * torch.sigmoid(
-            5.0 * (series_mag - self.non_zero_threshold)
+        # series_w = 0.01 + 0.99 * torch.sigmoid(
+        #     5.0 * (series_mag - self.non_zero_threshold)
+        # )  # (B,) or (B, C)
+        series_w = 0.005 + 0.995 * torch.sigmoid(
+            10.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
         
         # FIX: Normalize per channel if 3D, else global
@@ -299,7 +302,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Sigmoid event-magnitude weighting ─────────────────────────
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
+        # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
+        event_mag = 0.005 + 0.995 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)

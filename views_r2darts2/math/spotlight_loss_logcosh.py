@@ -20,9 +20,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
        e_shape = e − window_mean(e).  Shape and level are orthogonal:
        shape handles within-window patterns, level handles per-window DC.
 
-    2. **Sigmoid event-magnitude weighting** — ~50:1 contrast ratio.
-       event_mag = 0.01 + 0.99 × σ(5 × (abs_max − τ)).  Peace → ~0.02,
-       conflict → ~1.0.  No model-state dependency.
+    2. **Gated + magnitude-graded event weighting.**
+       event_mag = gate × (1 + abs_max), gate = 0.005 + 0.995 × σ(10 × (abs_max − τ)).
+       The gate suppresses peace (→ ~0.005) vs conflict (→ ~1); the (1 + abs_max)
+       factor — bounded because abs_max is in asinh space — restores magnitude
+       sensitivity across the 4-OOM tail so large wars outweigh small skirmishes
+       instead of saturating flat. No model-state dependency (abs_max detached).
 
     3. **Per-series temporal DRO** — within-series shock therapy.
        Z-scores log(cell_loss) along time axis per series.  Upweights
@@ -65,6 +68,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Running cross-batch scale of the shape-weight magnitude — keeps the
         # event spotlight composition-invariant across batches (see forward()).
         self._w_norm_ema: list[float] | None = None
+
+        # Running cross-batch scale of the level-anchor series weight — same
+        # role as _w_norm_ema but for _windowed_level_loss. Removes the level
+        # term's per-batch-mean composition dependence (an all-peace batch
+        # previously snapped every peaceful series back to weight ~1).
+        self._series_w_norm_ema: list[float] | None = None
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -199,18 +208,53 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
+        # Gate (peace suppression) x magnitude factor (1 + series_mag), mirroring
+        # the shape-term event_mag: the bare sigmoid saturates above ~2 deaths and
+        # is magnitude-blind across the tail; (1 + series_mag) restores bounded
+        # asinh-space magnitude sensitivity so large wars pull more DC gradient
+        # than small skirmishes. No new constant (asinh IS the scale).
         # series_w = 0.01 + 0.99 * torch.sigmoid(
         #     5.0 * (series_mag - self.non_zero_threshold)
         # )  # (B,) or (B, C)
-        series_w = 0.005 + 0.995 * torch.sigmoid(
+        series_gate = 0.005 + 0.995 * torch.sigmoid(
             10.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
-        
-        # FIX: Normalize per channel if 3D, else global
-        if series_w.dim() == 2:
-            series_w = series_w / series_w.mean(dim=0, keepdim=True).clamp(min=1e-8)
-        else:
-            series_w = series_w / series_w.mean().clamp(min=1e-8)
+        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
+
+        # Normalize by a running CROSS-BATCH EMA of the weight's own mean rather
+        # than the current batch mean. The old per-batch-mean normalization was
+        # composition-dependent: an all-peace batch (mean ~= 0.005) was divided
+        # by ~0.005 and snapped every peaceful series back to weight ~1, erasing
+        # the peace/conflict contrast and handing peaceful series full level
+        # gradient. Dividing by the running mean keeps the peace-vs-conflict (and
+        # now magnitude) contrast intact in every batch while holding the long-run
+        # level scale stable. Detached denominator — rescale only. Mirrors the
+        # shape term's _w_norm_ema. The magnitude factor is applied BEFORE this
+        # normalization so the mean-1 renorm preserves (not cancels) the tilt.
+        beta = self._EMA_BETA
+        if series_w.dim() == 2:  # (B, C) — 3D input, per-channel
+            batch_mean = series_w.detach().mean(dim=0)  # (C,)
+            n = batch_mean.numel()
+            if self._series_w_norm_ema is None or len(self._series_w_norm_ema) != n:
+                self._series_w_norm_ema = batch_mean.clamp(min=self._EMA_EPS).tolist()
+            else:
+                for c in range(n):
+                    self._series_w_norm_ema[c] = (
+                        beta * self._series_w_norm_ema[c]
+                        + (1.0 - beta) * float(batch_mean[c])
+                    )
+            denom = series_w.new_tensor(self._series_w_norm_ema).clamp(min=self._EMA_EPS)
+            series_w = series_w / denom
+        else:  # (B,) — 2D input, global
+            batch_mean = float(series_w.detach().mean())
+            if self._series_w_norm_ema is None or len(self._series_w_norm_ema) != 1:
+                self._series_w_norm_ema = [max(batch_mean, self._EMA_EPS)]
+            else:
+                self._series_w_norm_ema[0] = (
+                    beta * self._series_w_norm_ema[0] + (1.0 - beta) * batch_mean
+                )
+            denom = max(self._series_w_norm_ema[0], self._EMA_EPS)
+            series_w = series_w / denom
 
         # Weight each series' level loss (scaled by natural log dampened sequence length)
         scale_factor = T # / math.log(T)
@@ -300,10 +344,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Base cell loss ─────────────────────────────────────────────
         cell_loss = self._log_cosh(e_shape)
 
-        # ── Sigmoid event-magnitude weighting ─────────────────────────
+        # ── Gated + magnitude-graded event weighting ──────────────────
+        # The sigmoid is a *peace-suppression gate* only: peace → ~0, conflict
+        # → ~1. Above ~2 deaths it saturates, so on its own it weighted a
+        # 2-death skirmish identically to a 10,000-death war and left the
+        # entire 4-OOM tail flat (the source of peak under-prediction /
+        # flattening). We restore magnitude sensitivity by multiplying the gate
+        # by (1 + abs_max): abs_max is already in asinh space, which compresses
+        # 4 OOM into ~[0,10], so the factor is bounded (Ukraine ~10x a 1-death
+        # cell) and requires NO new constant — the asinh transform already in
+        # the pipeline IS the data-driven scale. abs_max = max(|y_true|,
+        # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
+        # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
-        event_mag = 0.005 + 0.995 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
+        event_gate = 0.005 + 0.995 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
+        event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)

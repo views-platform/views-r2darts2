@@ -1257,13 +1257,12 @@ class LossComponentCallback(Callback):
     Per-channel composite-loss component auditor (SpotlightLossLogcosh).
 
     Intent Contract:
-        - Purpose: Make the internal structure of the multi-task loss visible —
-          for each target channel, how big its shape / level / spectral terms
-          are, what fraction of that channel each term contributes (the lever
-          for the level anchor's ``×T`` scaling), the inverse-EMA cross-channel
-          weight + running scale, and each channel's weighted contribution to
-          the total loss.  This surfaces both the within-channel term mix and
-          whether the cross-channel balance is actually equalising sb/ns/os.
+                - Purpose: Make the internal structure of the multi-task loss visible —
+                    for each target channel, how big its shape / level / spectral terms
+                    are, what fraction of that channel each term contributes, the
+                    per-channel active weight(s), and each channel's weighted
+                    contribution to the total loss. This surfaces both the within-channel
+                    term mix and whether cross-channel budgeting is behaving as intended.
         - Guarantees: Reads only detached, parameter-free telemetry stashed on
           ``pl_module.train_criterion._last_components`` (never touches the
           graph), accumulates per batch, and pushes per-epoch means to wandb.
@@ -1271,10 +1270,22 @@ class LossComponentCallback(Callback):
         - Non-Goals: Does not modify the loss or training.
 
     wandb keys (per channel c, 0-indexed = sb/ns/os):
-        loss_components/ch_{c}/{shape,level,spec}        raw term magnitudes
-        loss_components/ch_{c}/frac_{shape,level,spec}   within-channel share
-        loss_components/ch_{c}/{weight,ema,contribution} cross-channel balance
-        loss_components/contribution_spread              max/min contribution
+        loss_components/ch_{c}/{shape,level,spec}            raw term magnitudes
+        loss_components/ch_{c}/frac_{shape,level,spec}       within-channel share
+        loss_components/ch_{c}/weight                         primary active weight
+        loss_components/ch_{c}/cal_score                      secondary active weight
+        loss_components/ch_{c}/cal_ratio                      calibration ratio (loss-defined)
+        loss_components/ch_{c}/contribution                   weighted channel contribution
+        loss_components/ch_{c}/budget_won                     contribution share in [0,1]
+        loss_components/contribution_spread                   max/min contribution
+
+    Notes:
+        - Field names are intentionally generic to stay backward-compatible
+          across loss revisions.
+        - For uncertainty-weighted SpotlightLossLogcosh:
+            * ``weight`` = shape precision term (0.5 * exp(-s_shape))
+            * ``cal_score`` = level precision term (0.5 * exp(-s_level))
+            * ``cal_ratio`` = event calibration ratio (sum |y_hat| / sum |y|)
     """
 
     def __init__(self):
@@ -1300,6 +1311,10 @@ class LossComponentCallback(Callback):
         cal_score = comp.get("cal_score", [1.0] * C)
         gates = comp.get("gates", [1.0] * C)
 
+        contrib_sum = None
+        if contribution is not None and len(contribution) == C:
+            contrib_sum = sum(abs(x) for x in contribution) + 1e-12
+
         for c in range(C):
             tot_c = shape[c] + level[c] + spec[c]
             denom = tot_c if abs(tot_c) > 1e-12 else 1e-12
@@ -1313,15 +1328,20 @@ class LossComponentCallback(Callback):
             self._buf[f"loss_components/ch_{c}/cal_ratio"].append(cal_ratio[c])
             self._buf[f"loss_components/ch_{c}/cal_score"].append(cal_score[c])
             self._buf[f"loss_components/ch_{c}/gate_weight"].append(gates[c])
-            self._buf[f"loss_components/ch_{c}/budget_won"].append(gates[c] / C)
+            if contrib_sum is not None:
+                self._buf[f"loss_components/ch_{c}/budget_won"].append(
+                    abs(contribution[c]) / contrib_sum
+                )
+            else:
+                # Backward-compatible fallback when only gate-like telemetry exists.
+                self._buf[f"loss_components/ch_{c}/budget_won"].append(gates[c] / C)
             if not math.isnan(ema[c]):
                 self._buf[f"loss_components/ch_{c}/ema"].append(ema[c])
             if contribution is not None:
                 self._buf[f"loss_components/ch_{c}/contribution"].append(contribution[c])
 
-        # How equal are the channel contributions after balancing?  ~1.0 means
-        # the inverse-EMA combine is doing its job; ≫1 means one channel still
-        # dominates the joint gradient.
+        # How equal are the channel contributions after balancing? ~1.0 means
+        # balanced; ≫1 means one channel dominates the joint objective.
         if contribution is not None and len(contribution) > 1:
             cmax = max(contribution)
             cmin = min(contribution)
@@ -1344,12 +1364,12 @@ class LossComponentCallback(Callback):
             sh = metrics.get(f"loss_components/ch_{c}/shape", float("nan"))
             lv = metrics.get(f"loss_components/ch_{c}/level", float("nan"))
             sp = metrics.get(f"loss_components/ch_{c}/spec", float("nan"))
-            wt = metrics.get(f"loss_components/ch_{c}/weight", float("nan"))
-            norm = metrics.get(f"loss_components/ch_{c}/cal_ratio", float("nan"))
-            smooth = metrics.get(f"loss_components/ch_{c}/cal_score", float("nan"))
+            w_shape = metrics.get(f"loss_components/ch_{c}/weight", float("nan"))
+            w_level = metrics.get(f"loss_components/ch_{c}/cal_score", float("nan"))
+            cal = metrics.get(f"loss_components/ch_{c}/cal_ratio", float("nan"))
             won = metrics.get(f"loss_components/ch_{c}/budget_won", float("nan"))
             parts.append(
-                f"ch{c}[sh={sh:.2f} lv={lv:.2f} sp={sp:.2f} w_act={wt:.2f} L_norm={norm:.2f} L_smooth={smooth:.2f} won_frac={won:.2%}]"
+                f"ch{c}[sh={sh:.2f} lv={lv:.2f} sp={sp:.2f} w_sh={w_shape:.2f} w_lv={w_level:.2f} cal={cal:.2f} won_frac={won:.2%}]"
             )
         spread = metrics.get("loss_components/contribution_spread")
         spread_str = f" | spread={spread:.2f}" if spread is not None else ""

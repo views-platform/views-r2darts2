@@ -33,14 +33,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
        cannot amplify label noise on peaceful cells. Neutral (weight 1)
        elsewhere; renormalized to mean 1 among a series' event cells.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window means,
-       peace/conflict *gated* (gating only, not magnitude-graded). T sets the
-       term's strength; the (short) window W sets its resolution for tracking
-       non-stationary conflict on/off transitions.
+    4. **Windowed level anchor** — log_cosh on per-window means, peace/conflict
+       *gated* (gating only, not magnitude-graded). The (short) window W sets
+       its resolution for tracking non-stationary conflict on/off transitions.
+       Its strength relative to the shape term is now *learned* (see 6), not a
+       fixed T-scale.
 
     5. **Multi-resolution STFT loss** — DISABLED by default (_STFT=False).
        log_cosh on magnitude-spectrum differences, DC bin masked, gated to
        series with signal above τ.
+
+    6. **Homoscedastic uncertainty weighting** (Kendall & Gal 2018; positive
+       Liebel-Körner 2018 regularizer). The shape (magnitude-carrying) and
+       level (DC) terms — per channel — are combined with learned log-variances
+       instead of a hand-tuned T-scale and an inverse-EMA channel equalizer:
+
+           total = Σ_{c}  ½ e^{−s_shape,c}·L_shape,c  +  ½ e^{−s_level,c}·L_level,c
+                       +  softplus(s_shape,c) + softplus(s_level,c)
+
+       s = log σ². The precision ½e^{−s} auto-balances shape↔level (the old
+       T-scale starved the shape term to ~5% of the budget → systematic peak
+       under-prediction) and, by summing the per-channel weighted terms, budgets
+       gradient across the C channels in the same principled step. softplus(s)
+       (≥0, = ln(1+σ²)) keeps the objective non-negative and stops any σ→0
+       collapse. The log-variances are real nn.Parameters (trained by the
+       optimizer) but are excluded from state_dict, so Darts checkpoint load
+       does not crash on unexpected keys.
 
     ── Normalization: every weighted term is a weight-MASS-weighted mean,
        loss = Σ(w·cell) / Σ(w).  This is stateless and composition-invariant:
@@ -56,8 +74,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
     _STFT = False
-    _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
+    # Over-allocation for the per-channel learned log-variances. The loss is
+    # constructed (via LossCatalog) with only non_zero_threshold — the channel
+    # count C is unknown at __init__, yet the params must already exist before
+    # configure_optimizers() reads self.parameters() (Darts builds the optimizer
+    # before the first forward, so lazy creation would miss it). We allocate a
+    # generous C_max and slice [:C] at forward; unused rows never receive
+    # gradient. 8 ≫ the 3 UCDP targets.
+    _MAX_CHANNELS = 8
+    _SAFE_S = 10.0  # numerical guard on |log σ²| (non-binding: precision ∈ ~[2e-5, 1e4])
 
     def __init__(
         self,
@@ -71,17 +97,45 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.non_zero_threshold = non_zero_threshold
 
-        # Per-channel EMA of the loss scale, used only to equalize the C targets
-        # so the largest-error channel (sb) cannot monopolize the gradient
-        # budget. Persists across batches so a sparse/empty batch for a channel
-        # does not disturb its scale. Plain list → state_dict stays empty.
-        self._loss_ema: list[float] | None = None
+        # Homoscedastic uncertainty weighting (Kendall & Gal 2018 / positive
+        # Liebel-Körner 2018 variant). One log-variance per (channel, term) with
+        # term ∈ {shape, level}. Real nn.Parameter so Darts' optimizer trains it
+        # (configure_optimizers reads self.parameters()); EXCLUDED from
+        # state_dict via the _save/_load overrides below so checkpoint load does
+        # not crash on unexpected keys. Init 0 → σ²=1 → equal ½ weighting, so
+        # shape and level start co-equal (vs the old ~5/95 split).
+        self._log_var = torch.nn.Parameter(torch.zeros(self._MAX_CHANNELS, 2))
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
 
-        logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
+        logger.info(
+            "SpotlightLossLogcosh | threshold=%.4f | uncertainty-weighted "
+            "(shape/level, per-channel)",
+            non_zero_threshold,
+        )
+
+    # ------------------------------------------------------------------
+    # Checkpoint safety: keep the learned log-variances OUT of state_dict.
+    # They live in self.parameters() (so the optimizer trains them), but Darts
+    # both pickles the whole criterion object into the checkpoint separately AND
+    # calls load_state_dict(strict=...); emitting the params here would make the
+    # freshly-built loss report unexpected/missing keys and crash model load.
+    # The params only shape the training-time gradient balance and are
+    # irrelevant at predict time, so skipping them is safe.
+    # ------------------------------------------------------------------
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # Intentionally emit nothing → state_dict() stays empty.
+        return
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        # Intentionally a no-op: never claim missing keys, never consume any.
+        return
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -124,52 +178,71 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # Loss Components
     # ------------------------------------------------------------------
 
-    def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses with inverse-scale equalization.
+    def _uncertainty_combine(
+        self,
+        loss_shape: torch.Tensor,
+        loss_level: torch.Tensor,
+        loss_spec: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[float], list[float], list[float]]:
+        """Homoscedastic uncertainty weighting of the shape & level terms.
 
-        The three targets have very different error scales: sb (state-based) is
-        denser and carries much larger asinh errors than ns/os, so an unweighted
-        Σ_c loss_c lets sb monopolize the gradient. We instead divide each
-        channel by its own running loss scale so every channel's *contribution*
-        is comparable:
+        Kendall & Gal (2018) with the positive Liebel-Körner (2018) regularizer:
 
-            ema_c = EMA_beta(loss_c)                 # per-channel scale
-            total = Σ_c loss_c / ema_c               # each term ≈ 1 at steady state
+            total = Σ_c  ½ e^{−s_shape,c}·L_shape,c
+                       +  ½ e^{−s_level,c}·L_level,c
+                       +  softplus(s_shape,c) + softplus(s_level,c)
+                       +  Σ_c L_spec,c
 
-        A channel above its own scale (loss_c > ema_c) temporarily contributes
-        >1 (gets attention); below it, <1. Because we divide (rather than
-        renormalize weights to sum C) a channel with genuinely tiny loss simply
-        contributes ~0 — it cannot vacuum up the budget and starve an active
-        channel (the failure mode of straight 1/ema weighting). To stop a
-        long-dormant channel's scale from collapsing to the ε floor (which would
-        make a later event explode), each ema_c is floored at a small fraction
-        of the cross-channel mean. Weights (1/ema) are detached — rescale only.
-        The EMA persists across batches, so a batch that is all-peace for ns/os
-        does not swing the budget (their loss ~0 barely moves the EMA).
+        s = log σ² is learned per (channel, term). The precision ½e^{−s}
+        replaces BOTH the old fixed T-scale on the level term (which starved the
+        magnitude-carrying shape term to ~5% of the budget → peak
+        under-prediction) AND the inverse-EMA channel equalizer: summing the
+        per-channel weighted terms budgets gradient across channels in the same
+        step. softplus(s) ≥ 0 keeps the objective non-negative and penalizes
+        σ→0, so no component can zero out its own weight.
+
+        Returns (total, w_shape, w_level, contribution); the last three are
+        per-channel Python lists for telemetry.
         """
-        C = per_channel_loss.shape[0]
-        batch = per_channel_loss.detach()
-        beta = self._EMA_BETA
+        univariate = loss_shape.dim() == 0
+        L_shape = loss_shape.reshape(1) if univariate else loss_shape
+        L_level = loss_level.reshape(1) if univariate else loss_level
+        C = L_shape.shape[0]
 
-        if self._loss_ema is None or len(self._loss_ema) != C:
-            self._loss_ema = batch.clamp(min=self._EMA_EPS).tolist()
-        else:
-            for c in range(C):
-                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch[c])
+        s = self._log_var[:C].clamp(-self._SAFE_S, self._SAFE_S)  # (C, 2)
+        s_shape, s_level = s[:, 0], s[:, 1]                       # (C,), (C,)
 
-        ema = per_channel_loss.new_tensor(self._loss_ema)
-        # Floor each scale at 1% of the cross-channel mean so a dormant channel
-        # cannot sit at the ε floor and blow up when it finally sees an event.
-        ema = ema.clamp(min=ema.mean() * 1e-2).clamp(min=self._EMA_EPS)
-        w = (1.0 / ema).detach()
+        w_shape = 0.5 * torch.exp(-s_shape)                       # precision ½/σ²
+        w_level = 0.5 * torch.exp(-s_level)
+        reg = F.softplus(s_shape) + F.softplus(s_level)          # ≥0, = ln(1+σ²)
 
-        # Telemetry (keys preserved for the callback contract)
-        self._last_weights = w.tolist()
-        self._last_cal_ratio = (batch / ema).tolist()   # loss / its own scale
-        self._last_cal_score = list(self._loss_ema)      # per-channel EMA scale
-        self._last_gates = w.tolist()
+        weighted = w_shape * L_shape + w_level * L_level + reg   # (C,)
+        # Spectral term (disabled by default) is carried UNWEIGHTED: it is 0 when
+        # off and must not enter the uncertainty weighting (a zero L would drive
+        # its s → −∞). loss_spec is a scalar 0 when off, or (C,) when enabled.
+        spec = loss_spec.reshape(-1) if loss_spec.dim() else loss_spec.reshape(1).expand(C)
+        total = weighted.sum() + spec.sum()
 
-        return (w * per_channel_loss).sum()
+        contribution = (w_shape * L_shape + w_level * L_level).detach().tolist()
+        return total, w_shape.detach().tolist(), w_level.detach().tolist(), contribution
+
+    def _event_calibration_ratio(
+        self, y_pred_det: torch.Tensor, y_true: torch.Tensor
+    ) -> list[float]:
+        """Σ|y_pred| / Σ|y_true| over true-event cells, per channel.
+
+        <1 → the model under-predicts event magnitude (the failure this
+        rebalance targets); >1 → over-prediction. Detached diagnostic only.
+        """
+        with torch.no_grad():
+            ev = (y_true.abs() > self.non_zero_threshold).to(y_true.dtype)
+            if y_true.dim() == 3:
+                num = (y_pred_det.abs() * ev).sum(dim=(0, 1))
+                den = (y_true.abs() * ev).sum(dim=(0, 1)).clamp(min=self._EMA_EPS)
+                return (num / den).tolist()
+            num = (y_pred_det.abs() * ev).sum()
+            den = (y_true.abs() * ev).sum().clamp(min=self._EMA_EPS)
+            return [float(num / den)]
 
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
@@ -178,14 +251,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """Event-magnitude-weighted windowed level anchor.
 
         Splits the T-length error into non-overlapping windows, computes
-        log_cosh on per-window means, then weights each series by its 
-        event magnitude. No DRO, no CMW, just the sigmoid weight.
-
-        We scale by the window size W instead of sequence length T. Because the
-        mean operator on a window of size W reduces gradient magnitude by a
-        factor of 1/W, multiplying by W is the exact mathematical inverse of
-        the operator's gradient attenuation, balancing level and shape losses
-        naturally and stably.
+        log_cosh on per-window means, then weights each series by its
+        event magnitude. No DRO, no CMW, just the sigmoid weight. Returns the
+        raw weight-mass-normalized level loss; its weight relative to the shape
+        term is learned downstream (see _uncertainty_combine).
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -231,16 +300,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # EMA. An all-peace batch has tiny weight mass in both numerator and
         # denominator, so it neither snaps peaceful series back to weight ~1 nor
         # dilutes the level signal — stateless and composition-invariant.
+        # No fixed scale on the level term: its strength relative to the shape
+        # term is now learned via homoscedastic uncertainty weighting
+        # (_uncertainty_combine). This returns the raw weight-mass-normalized
+        # level loss; the old T-scale that dominated the budget (~95%) and drove
+        # peak under-prediction is gone.
         n_windows = level_losses.shape[1]
-        scale_factor = T  # T sets level-term STRENGTH (kept); W sets resolution
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))   # (C,)
             den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)
-            return scale_factor * num / den                               # (C,)
+            return num / den                                              # (C,)
         else:
             num = (series_w.unsqueeze(1) * level_losses).sum()
             den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
-            return scale_factor * num / den                               # scalar
+            return num / den                                              # scalar
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -373,36 +446,44 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if self._STFT and T >= 6:
             loss_spec = self._spectral_loss(y_pred, y_true)
 
-        # ── Core objective assembly & telemetry ────────────────────
+        # ── Homoscedastic uncertainty weighting & telemetry ────────────
+        total_loss, w_shape, w_level, contribution = self._uncertainty_combine(
+            loss_shape, loss_level, loss_spec
+        )
+
+        # Real event calibration ratio Σ|y_pred|/Σ|y_true| over true-event cells,
+        # per channel — <1 means under-prediction (the failure this rebalance
+        # targets). Surfaced as cal_ratio for the LossComponents callback.
+        cal_ratio = self._event_calibration_ratio(y_pred.detach(), y_true)
+
         if loss_shape.dim() == 0:
             # Univariate path
-            total_loss = loss_shape + loss_level + loss_spec
+            self._last_weights = w_shape
             self._last_components = {
                 "shape": [float(loss_shape.detach())],
                 "level": [float(loss_level.detach())],
-                "spec": [float(loss_spec.detach()) if loss_spec.dim()==0 else float(loss_spec)],
-                "weight": [1.0],
+                "spec": [float(loss_spec.detach()) if loss_spec.dim() == 0 else float(loss_spec)],
+                "weight": w_shape,          # learned shape precision ½e^{−s}
+                "cal_score": w_level,       # learned level precision ½e^{−s}
+                "cal_ratio": cal_ratio,     # <1 → under-prediction
+                "gates": contribution,
+                "contribution": contribution,
             }
         else:
             # Multivariate path
-            per_channel_total = loss_shape + loss_level + loss_spec
-            total_loss = self._combine_channels(per_channel_total, y_pred, y_true)
-            
-            C = per_channel_total.shape[0]
+            C = loss_shape.shape[0]
             spec_list = loss_spec.detach().tolist() if loss_spec.dim() else [float(loss_spec)] * C
-            weights = self._last_weights or [1.0] * C
+            self._last_weights = w_shape
             self._last_components = {
                 "shape": loss_shape.detach().tolist(),
                 "level": loss_level.detach().tolist(),
                 "spec": spec_list,
-                "weight": weights,
-                "ema": self._loss_ema or [float("nan")] * C,
-                "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
-                "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
-                "gates": getattr(self, "_last_gates", [1.0] * C),
-                "contribution": [
-                    weights[c] * float(per_channel_total.detach()[c]) for c in range(C)
-                ],
+                "weight": w_shape,          # learned shape precision ½e^{−s}
+                "cal_score": w_level,       # learned level precision ½e^{−s}
+                "cal_ratio": cal_ratio,     # <1 → under-prediction
+                "ema": w_shape,
+                "gates": contribution,      # per-channel weighted total
+                "contribution": contribution,
             }
 
         if torch.isnan(total_loss):

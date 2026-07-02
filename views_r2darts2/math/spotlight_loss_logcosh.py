@@ -44,20 +44,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
        series with signal above τ.
 
     6. **Homoscedastic uncertainty weighting** (Kendall & Gal 2018; positive
-       Liebel-Körner 2018 regularizer). The shape (magnitude-carrying) and
-       level (DC) terms — per channel — are combined with learned log-variances
-       instead of a hand-tuned T-scale and an inverse-EMA channel equalizer:
+       Liebel-Körner 2018 regularizer). ONE learned log-variance PER CHANNEL
+       (not per term) balances the C channels, replacing a hand-tuned T-scale
+       and an inverse-EMA channel equalizer:
 
-           total = Σ_{c}  ½ e^{−s_shape,c}·L_shape,c  +  ½ e^{−s_level,c}·L_level,c
-                       +  softplus(s_shape,c) + softplus(s_level,c)
+           total = Σ_{c}  ½ e^{−s_c}·(L_shape,c + L_level,c)  +  softplus(s_c)
 
-       s = log σ². The precision ½e^{−s} auto-balances shape↔level (the old
-       T-scale starved the shape term to ~5% of the budget → systematic peak
-       under-prediction) and, by summing the per-channel weighted terms, budgets
-       gradient across the C channels in the same principled step. softplus(s)
-       (≥0, = ln(1+σ²)) keeps the objective non-negative and stops any σ→0
-       collapse. The log-variances are real nn.Parameters (trained by the
-       optimizer) but are excluded from state_dict, so Darts checkpoint load
+       s = log σ². The shape (magnitude-carrying) and level (DC) terms are two
+       orthogonal projections of the SAME residual e (e_shape = e −
+       window_mean(e); level = window_mean(e)), so they share one observation
+       noise σ_c and combine 1:1 under a single per-channel precision. Giving
+       them SEPARATE learned precisions was pathological: the level term (whose
+       optimum is a flat within-window smear) is the easier to drive down, so it
+       accrued weight and STARVED the shape term — the only anti-flat force —
+       pushing w_sh/w_lv monotonically down and the forecasts toward a flat,
+       under-predicting line. Coupling them removes that failure while keeping
+       the per-channel budget (genuine sb/ns/os noise) fully data-driven.
+       softplus(s) (≥0, = ln(1+σ²)) keeps the objective non-negative and stops
+       any σ→0 collapse. The log-variances are real nn.Parameters (trained by
+       the optimizer) but are excluded from state_dict, so Darts checkpoint load
        does not crash on unexpected keys.
 
     ── Normalization: every weighted term is a weight-MASS-weighted mean,
@@ -98,13 +103,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.non_zero_threshold = non_zero_threshold
 
         # Homoscedastic uncertainty weighting (Kendall & Gal 2018 / positive
-        # Liebel-Körner 2018 variant). One log-variance per (channel, term) with
-        # term ∈ {shape, level}. Real nn.Parameter so Darts' optimizer trains it
-        # (configure_optimizers reads self.parameters()); EXCLUDED from
-        # state_dict via the _save/_load overrides below so checkpoint load does
-        # not crash on unexpected keys. Init 0 → σ²=1 → equal ½ weighting, so
-        # shape and level start co-equal (vs the old ~5/95 split).
-        self._log_var = torch.nn.Parameter(torch.zeros(self._MAX_CHANNELS, 2))
+        # Liebel-Körner 2018 variant). ONE log-variance per CHANNEL (not per
+        # term): the shape and level terms are two orthogonal projections of the
+        # SAME residual e (e_shape = e − window_mean(e); level = window_mean(e)),
+        # so they share one observation noise σ_c and combine 1:1 under a single
+        # per-channel precision. Giving them SEPARATE learned precisions let the
+        # easy-to-minimize level term (whose optimum is a flat within-window
+        # smear) accrue weight and STARVE the shape term — the only anti-flat
+        # force — driving w_sh/w_lv monotonically down and the forecasts toward
+        # a flat, under-predicting line. Coupling them fixes that while keeping
+        # the per-channel budget (genuine sb/ns/os noise) fully data-driven.
+        # Real nn.Parameter so Darts' optimizer trains it (configure_optimizers
+        # reads self.parameters()); EXCLUDED from state_dict via the _save/_load
+        # overrides below so checkpoint load does not crash on unexpected keys.
+        # Init 0 → σ²=1 → ½ precision.
+        self._log_var = torch.nn.Parameter(torch.zeros(self._MAX_CHANNELS, 1))
 
         # Telemetry for callbacks
         self._last_components: dict | None = None
@@ -186,45 +199,53 @@ class SpotlightLossLogcosh(torch.nn.Module):
     ) -> tuple[torch.Tensor, list[float], list[float], list[float]]:
         """Homoscedastic uncertainty weighting of the shape & level terms.
 
-        Kendall & Gal (2018) with the positive Liebel-Körner (2018) regularizer:
+        Kendall & Gal (2018) with the positive Liebel-Körner (2018) regularizer,
+        coupled per channel:
 
-            total = Σ_c  ½ e^{−s_shape,c}·L_shape,c
-                       +  ½ e^{−s_level,c}·L_level,c
-                       +  softplus(s_shape,c) + softplus(s_level,c)
+            total = Σ_c  ½ e^{−s_c}·(L_shape,c + L_level,c)
+                       +  softplus(s_c)
                        +  Σ_c L_spec,c
 
-        s = log σ² is learned per (channel, term). The precision ½e^{−s}
-        replaces BOTH the old fixed T-scale on the level term (which starved the
-        magnitude-carrying shape term to ~5% of the budget → peak
-        under-prediction) AND the inverse-EMA channel equalizer: summing the
-        per-channel weighted terms budgets gradient across channels in the same
-        step. softplus(s) ≥ 0 keeps the objective non-negative and penalizes
-        σ→0, so no component can zero out its own weight.
+        s = log σ² is learned per CHANNEL (one precision shared by both the
+        shape and level terms, which are orthogonal projections of the same
+        residual). A single shared precision keeps shape:level at a fixed 1:1
+        balance so the easy flat-smear level term can no longer accrue weight
+        and starve the anti-flat shape term (the failure that drove w_sh/w_lv
+        monotonically down and the forecasts flat), while still budgeting
+        gradient across channels data-drivenly. softplus(s) ≥ 0 keeps the
+        objective non-negative and penalizes σ→0, so no channel can zero out
+        its own weight.
 
         Returns (total, w_shape, w_level, contribution); the last three are
-        per-channel Python lists for telemetry.
+        per-channel Python lists for telemetry. w_shape == w_level now (the
+        precision is shared) — the ratio is pinned at 1.0 by design.
         """
         univariate = loss_shape.dim() == 0
         L_shape = loss_shape.reshape(1) if univariate else loss_shape
         L_level = loss_level.reshape(1) if univariate else loss_level
         C = L_shape.shape[0]
 
-        s = self._log_var[:C].clamp(-self._SAFE_S, self._SAFE_S)  # (C, 2)
-        s_shape, s_level = s[:, 0], s[:, 1]                       # (C,), (C,)
+        s = self._log_var[:C].clamp(-self._SAFE_S, self._SAFE_S)  # (C, 1)
+        s_ch = s[:, 0]                                            # (C,)
 
-        w_shape = 0.5 * torch.exp(-s_shape)                       # precision ½/σ²
-        w_level = 0.5 * torch.exp(-s_level)
-        reg = F.softplus(s_shape) + F.softplus(s_level)          # ≥0, = ln(1+σ²)
+        # ONE precision per channel, SHARED by the shape & level terms. They are
+        # orthogonal projections of the same residual, so they take the same
+        # observation noise and a fixed 1:1 balance. This removes the pathology
+        # of independent (shape, level) precisions, under which the easy flat-
+        # smear level term accrued weight and starved the anti-flat shape term.
+        w_ch = 0.5 * torch.exp(-s_ch)                            # precision ½/σ²
+        reg = F.softplus(s_ch)                                   # ≥0, = ln(1+σ²)
 
-        weighted = w_shape * L_shape + w_level * L_level + reg   # (C,)
+        weighted = w_ch * (L_shape + L_level) + reg             # (C,)
         # Spectral term (disabled by default) is carried UNWEIGHTED: it is 0 when
         # off and must not enter the uncertainty weighting (a zero L would drive
         # its s → −∞). loss_spec is a scalar 0 when off, or (C,) when enabled.
         spec = loss_spec.reshape(-1) if loss_spec.dim() else loss_spec.reshape(1).expand(C)
         total = weighted.sum() + spec.sum()
 
-        contribution = (w_shape * L_shape + w_level * L_level).detach().tolist()
-        return total, w_shape.detach().tolist(), w_level.detach().tolist(), contribution
+        contribution = (w_ch * (L_shape + L_level)).detach().tolist()
+        w_list = w_ch.detach().tolist()
+        return total, w_list, w_list, contribution
 
     def _event_calibration_ratio(
         self, y_pred_det: torch.Tensor, y_true: torch.Tensor

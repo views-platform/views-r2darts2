@@ -252,7 +252,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         Splits the T-length error into non-overlapping windows, computes
         log_cosh on per-window means, then weights each series by its
-        event magnitude. No DRO, no CMW, just the sigmoid weight. Returns the
+        event magnitude (gate × (1 + series_mag)). No DRO, no CMW. Returns the
         raw weight-mass-normalized level loss; its weight relative to the shape
         term is learned downstream (see _uncertainty_combine).
 
@@ -275,24 +275,31 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        # GATE ONLY on the level anchor (deliberately NOT magnitude-graded).
-        # The shape term gets gate x (1 + abs_max) to restore tail-peak
-        # sensitivity, but the level anchor is DC/mean correction, x T-scaled.
-        # Multiplying it by (1 + series_mag) too concentrated ~10x-amplified,
-        # T-scaled DC gradient on the rare highest-magnitude series — which live
-        # in the primary channel (sb/ch0) — and empirically drove ch0 to
-        # 2.3-2.5x over-prediction while low-magnitude ch2 stayed under (0.75x),
-        # plus fed the grad-norm shocks (max 2k-20k). The gate alone still
-        # preserves per-country peace/conflict contrast (so no templating), it
-        # just stops the level anchor from chasing magnitude on the primary
-        # channel. It also lowers the per-batch variance of series_w, keeping the
-        # cross-batch EMA denominator below cleaner.
-        # series_w = 0.01 + 0.99 * torch.sigmoid(
-        #     5.0 * (series_mag - self.non_zero_threshold)
-        # )  # (B,) or (B, C)
-        series_w = 0.005 + 0.995 * torch.sigmoid(
+        # GATE × MAGNITUDE on the level anchor. The gate suppresses peace
+        # (→ ~0.005) vs conflict (→ ~1); the (1 + series_mag) factor makes the
+        # level anchor prioritize HIGH-magnitude event series so the model is
+        # pushed to raise its predicted LEVEL where it matters most — the direct
+        # remedy for the systematic under-prediction on the biggest events
+        # (e.g. ch2/os sitting at ~0.15x). series_mag is in asinh space, so the
+        # factor is bounded (a 10k-death war ≈ 11x a 1-death cell) and adds NO
+        # new constant. Level is the ONLY magnitude-carrying term — shape is
+        # window-demeaned, hence DC/magnitude-blind — so this is where magnitude
+        # grading BELONGS; putting it on shape (as (1+abs_max)) cannot lift the
+        # predicted level at all.
+        #
+        # This was previously gate-only because the old FIXED ×T=36 level scale
+        # turned the magnitude factor into a ~10x-amplified, T-scaled DC gradient
+        # that drove ch0/sb to 2.3-2.5x over-prediction with grad-norm shocks.
+        # That ×T is GONE: homoscedastic uncertainty weighting now sets the level
+        # strength adaptively and PER CHANNEL, so (a) there is no T amplification
+        # and (b) w_level self-lowers on any channel that begins to over-predict.
+        # That makes the magnitude grading safe to restore, and it increases
+        # per-country differentiation (big series get more level attention) —
+        # which fights templating rather than causing it.
+        series_gate = 0.005 + 0.995 * torch.sigmoid(
             10.0 * (series_mag - self.non_zero_threshold)
-        )  # (B,) or (B, C) — gate only
+        )  # (B,) or (B, C) — peace-suppression gate
+        series_w = series_gate * (1.0 + series_mag)  # gate × magnitude grading
 
         # ── Weighted-mean normalization (empty-batch invariant) ────────
         # Normalize the level loss by the series-weight MASS,

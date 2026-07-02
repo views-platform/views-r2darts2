@@ -31,7 +31,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
        Z-scores log(cell_loss) along time axis per series.  Upweights
        proportionally harder timesteps *relative to that series*.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window means.
+    4. **Windowed level anchor** — T-scaled log_cosh on per-window means,
+       peace/conflict *gated* (NOT magnitude-graded — gating only, so the DC
+       anchor does not over-weight the rare highest-magnitude primary-channel
+       series). Cross-batch EMA normalized for composition invariance.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -208,18 +211,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        # Gate (peace suppression) x magnitude factor (1 + series_mag), mirroring
-        # the shape-term event_mag: the bare sigmoid saturates above ~2 deaths and
-        # is magnitude-blind across the tail; (1 + series_mag) restores bounded
-        # asinh-space magnitude sensitivity so large wars pull more DC gradient
-        # than small skirmishes. No new constant (asinh IS the scale).
+        # GATE ONLY on the level anchor (deliberately NOT magnitude-graded).
+        # The shape term gets gate x (1 + abs_max) to restore tail-peak
+        # sensitivity, but the level anchor is DC/mean correction, x T-scaled.
+        # Multiplying it by (1 + series_mag) too concentrated ~10x-amplified,
+        # T-scaled DC gradient on the rare highest-magnitude series — which live
+        # in the primary channel (sb/ch0) — and empirically drove ch0 to
+        # 2.3-2.5x over-prediction while low-magnitude ch2 stayed under (0.75x),
+        # plus fed the grad-norm shocks (max 2k-20k). The gate alone still
+        # preserves per-country peace/conflict contrast (so no templating), it
+        # just stops the level anchor from chasing magnitude on the primary
+        # channel. It also lowers the per-batch variance of series_w, keeping the
+        # cross-batch EMA denominator below cleaner.
         # series_w = 0.01 + 0.99 * torch.sigmoid(
         #     5.0 * (series_mag - self.non_zero_threshold)
         # )  # (B,) or (B, C)
-        series_gate = 0.005 + 0.995 * torch.sigmoid(
+        series_w = 0.005 + 0.995 * torch.sigmoid(
             10.0 * (series_mag - self.non_zero_threshold)
-        )  # (B,) or (B, C)
-        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
+        )  # (B,) or (B, C) — gate only
 
         # Normalize by a running CROSS-BATCH EMA of the weight's own mean rather
         # than the current batch mean. The old per-batch-mean normalization was

@@ -43,7 +43,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _STFT = True
+    _STFT = False
     _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
 

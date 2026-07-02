@@ -261,7 +261,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             on peaceful series also attract level loss gradient. Must be same
             shape as y_true.
         """
-        W = max(4, T // 9)
+        W = max(6, T // 3)
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )  # (B, n_windows) or (B, n_windows, C)
@@ -385,7 +385,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Per-window DC/AC decomposition ────────────────────────────
         # Demean within each non-overlapping window (same W as level anchor).
-        W = max(4, T // 9)
+        W = max(6, T // 3)
         windows = list(e.split(W, dim=1))  # list of (B, W_i) or (B, W_i, C)
         e_shape = torch.cat(
             [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1

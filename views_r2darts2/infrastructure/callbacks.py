@@ -1354,11 +1354,26 @@ class LossComponentCallback(Callback):
             return
 
         metrics = {k: float(np.mean(v)) for k, v in self._buf.items() if v}
+
+        # Mean shape-vs-level active weight ratio across channels. This is a
+        # compact monitor for uncertainty-weight drift: >1 means shape gets
+        # more budget than level; <1 means level dominates.
+        n_ch = sum(1 for k in metrics if k.endswith("/shape"))
+        if n_ch > 0:
+            ratios = []
+            for c in range(n_ch):
+                w_shape = metrics.get(f"loss_components/ch_{c}/weight")
+                w_level = metrics.get(f"loss_components/ch_{c}/cal_score")
+                if w_shape is None or w_level is None:
+                    continue
+                ratios.append(w_shape / (abs(w_level) + 1e-12))
+            if ratios:
+                metrics["loss_components/shape_level_weight_ratio"] = float(np.mean(ratios))
+
         if trainer.logger is not None:
             trainer.logger.log_metrics(metrics, step=trainer.global_step)
 
         # Concise per-channel summary line for the console.
-        n_ch = sum(1 for k in metrics if k.endswith("/shape"))
         parts = []
         for c in range(n_ch):
             sh = metrics.get(f"loss_components/ch_{c}/shape", float("nan"))
@@ -1373,10 +1388,13 @@ class LossComponentCallback(Callback):
             )
         spread = metrics.get("loss_components/contribution_spread")
         spread_str = f" | spread={spread:.2f}" if spread is not None else ""
+        ratio = metrics.get("loss_components/shape_level_weight_ratio")
+        ratio_str = f" | w_sh/w_lv={ratio:.2f}" if ratio is not None else ""
         logger.info(
             f"[Epoch {trainer.current_epoch}] LossComponents | "
             + " ".join(parts)
             + spread_str
+            + ratio_str
         )
 
         self._buf.clear()

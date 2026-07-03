@@ -172,50 +172,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-magnitude-weighted multi-scale convolutional level anchor.
+        """Event-magnitude-weighted windowed level anchor.
 
-        Replaces block-mean windows with fixed normalized 1D smoothing filters
-        at dyadic scales {T, T//3, T//6}. Each scale contributes:
-        (1) magnitude mismatch on smoothed signals, and
-        (2) trend mismatch on first differences of smoothed signals.
+        Splits the T-length error into non-overlapping windows, computes
+        log_cosh on per-window means, then weights each series by its 
+        event magnitude. No DRO, no CMW, just the sigmoid weight.
 
-        This preserves the original per-series sigmoid magnitude weighting and
-        Hájek self-normalized reduction while adding persistence sensitivity
-        within windows.
+        We scale by the window size W instead of sequence length T. Because the
+        mean operator on a window of size W reduces gradient magnitude by a
+        factor of 1/W, multiplying by W is the exact mathematical inverse of
+        the operator's gradient attenuation, balancing level and shape losses
+        naturally and stably.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
             on peaceful series also attract level loss gradient. Must be same
             shape as y_true.
         """
-        W = max(6, T // 3)
-        # Dyadic ladder {T, T//3, T//6}.
-        W_mid = max(6, T // 3)
+        W = max(6, T // 6)
+        # ── Multi-scale temporal pyramid of window sizes ───────────────
+        # Dyadic ladder {T, T//6, T//12}: finer resolution (6-month windows)
+        # enforces persistence at tighter granularity. A spike-then-zero pattern
+        # can hide in a 12-month window but not in 6-month sub-windows.
+        W_mid = max(6, T // 6)
         scales = sorted({T, W_mid, max(2, W_mid // 2)})  # e.g. {36, 12, 6}
-
-        y_pred = y_true + e
-
-        def _conv_same(x: torch.Tensor, kernel_1d: torch.Tensor) -> torch.Tensor:
-            """Depthwise-like 1D conv over time with exact same-length output."""
-            k = kernel_1d.numel()
-            left = (k - 1) // 2
-            right = k - 1 - left
-
-            if x.dim() == 3:
-                B, Tn, C = x.shape
-                x_bc_t = x.permute(0, 2, 1).reshape(B * C, 1, Tn)
-                x_pad = F.pad(x_bc_t, (left, right), mode="replicate")
-                y_bc_t = F.conv1d(x_pad, kernel_1d)
-                return y_bc_t.reshape(B, C, Tn).permute(0, 2, 1)
-
-            x_b_t = x.unsqueeze(1)
-            x_pad = F.pad(x_b_t, (left, right), mode="replicate")
-            return F.conv1d(x_pad, kernel_1d).squeeze(1)
-
-        def _diff_time(x: torch.Tensor) -> torch.Tensor:
-            if x.dim() == 3:
-                return x[:, 1:, :] - x[:, :-1, :]
-            return x[:, 1:] - x[:, :-1]
 
         # Per-series event magnitude: max(|y_true|, |y_pred|) across time → gate.
         if y_pred_det is not None:
@@ -228,33 +208,91 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        # Keep W scaling for DC anchoring strength.
+        # No scale_factor: level sits at its natural Hájek-normalized scale
+        # (~0.5–0.7) while shape sits at ~1.0–1.5 (event_mag × (1+abs_max)
+        # weighted). This gives frac_level ≈ 35–40%, enough for magnitude
+        # anchoring without the ×T / ×W DC-minimizer dominance (which drove
+        # frac_level to 0.88–0.96 and starved the magnitude-graded shape term).
+        # Shape is NOT DC-invariant here — it carries per-country differentiation
+        # via event_mag grading, so reducing level budget does not cause templating
+        # (unlike Option B which equalized all three terms including spec).
         scale_factor = T
         is_3d = e.dim() == 3
         rung_losses = []
         for W in scales:
-            kernel = e.new_ones(1, 1, W) / float(W)
-
-            y_pred_smooth = _conv_same(y_pred, kernel)
-            y_true_smooth = _conv_same(y_true, kernel)
-
-            mag_losses = self._log_cosh(y_pred_smooth - y_true_smooth)
-
-            d_pred = _diff_time(y_pred_smooth)
-            d_true = _diff_time(y_true_smooth)
-            trend_losses = self._log_cosh(d_pred - d_true)
-
-            # Concatenate magnitude + trend channels along time axis so both
-            # contribute without introducing extra mixing constants.
-            level_losses = torch.cat([mag_losses, trend_losses], dim=1)
-            n_positions = level_losses.shape[1]
-
+            window_means = torch.stack(
+                [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
+            )  # (B, n_w) or (B, n_w, C)
+            level_losses = self._log_cosh(window_means)
+            n_windows = level_losses.shape[1]
             if is_3d:
                 num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))       # (C,)
-                den = (series_w.sum(dim=0) * n_positions).clamp(min=self._EMA_EPS)  # (C,)
+                den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)   # (C,)
             else:
                 num = (series_w.unsqueeze(1) * level_losses).sum()
-                den = (series_w.sum() * n_positions).clamp(min=self._EMA_EPS)
+                den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
+            rung_losses.append(num / den)
+
+        level = torch.stack(rung_losses, dim=0).mean(dim=0)  # (C,) or scalar
+        return scale_factor * level                          # scalar
+
+    def _cascaded_level_loss(
+        self, e: torch.Tensor, e_shape: torch.Tensor, y_true: torch.Tensor, T: int,
+        y_pred_det: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Cascaded level loss: apply level anchor to shape residual.
+
+        Instead of applying level independently to raw error (e), this couples
+        level with shape: level loss is computed on the window-demeaned error
+        (e_shape), i.e., the residual *after* shape correction.
+
+        This forces the model to satisfy both constraints simultaneously:
+        - Level anchors the DC (global offset).
+        - But only *after* shape has minimized within-window patterns.
+        - If model gets DC wrong, the shape residual becomes larger and harder.
+
+        Uses same magnitude-graded weighting as independent level.
+
+        Args:
+            e: raw error (B, T) or (B, T, C)
+            e_shape: window-demeaned error (B, T) or (B, T, C)
+            y_true: true targets
+            T: sequence length
+            y_pred_det: detached predictions for weighting
+        """
+        W = max(6, T // 6)  # Same 6-month window resolution
+        W_mid = max(6, T // 6)
+        scales = sorted({T, W_mid, max(2, W_mid // 2)})  # e.g. {36, 6, 3}
+
+        # Per-series event magnitude: max(|y_true|, |y_pred|) across time → gate.
+        if y_pred_det is not None:
+            abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
+        else:
+            abs_max_series = y_true.abs()
+        series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
+        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
+            10.0 * (series_mag - self.non_zero_threshold)
+        )
+        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
+
+        # Apply level anchor to e_shape (window-demeaned residual, not raw error).
+        # This cascades: level loss = f(shape_residual), so it encourages the model
+        # to find a DC offset that, when subtracted, also minimizes remaining patterns.
+        scale_factor = T
+        is_3d = e_shape.dim() == 3
+        rung_losses = []
+        for W in scales:
+            window_means = torch.stack(
+                [ew.mean(dim=1) for ew in e_shape.split(W, dim=1)], dim=1
+            )  # (B, n_w) or (B, n_w, C) — window means of shape residual
+            level_losses = self._log_cosh(window_means)
+            n_windows = level_losses.shape[1]
+            if is_3d:
+                num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))       # (C,)
+                den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)   # (C,)
+            else:
+                num = (series_w.unsqueeze(1) * level_losses).sum()
+                den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
             rung_losses.append(num / den)
 
         level = torch.stack(rung_losses, dim=0).mean(dim=0)  # (C,) or scalar
@@ -306,6 +344,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
             # Safe magnitude — bounded gradient at |z|→0
             mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
             mag_true = S_true.abs()
+            # Mask DC bin — level is handled by the level anchor
+            mag_pred = mag_pred.clone()
+            mag_true = mag_true.clone()
+            mag_pred[:, 0, :] = 0.0
+            mag_true[:, 0, :] = 0.0
             total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 
@@ -324,8 +367,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e = y_pred - y_true
 
         # ── Per-window DC/AC decomposition ────────────────────────────
-        # Demean within each non-overlapping window (same W as level anchor).
-        W = max(6, T // 3)
+        # Demean within each non-overlapping window (6-month resolution).
+        W = max(6, T // 6)
         windows = list(e.split(W, dim=1))  # list of (B, W_i) or (B, W_i, C)
         e_shape = torch.cat(
             [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
@@ -373,7 +416,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = num / den                                  # scalar
 
         # ── Windowed level anchor ─────────────────────────────────────
-        loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
+        # OLD (independent): loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
+        # NEW (cascaded): apply level to shape residual to force coupled constraint satisfaction
+        loss_level = self._cascaded_level_loss(e, e_shape, y_true, T, y_pred_det=y_pred.detach())
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)

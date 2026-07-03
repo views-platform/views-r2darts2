@@ -216,7 +216,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # is Hájek self-normalized (Σ series_w·level / Σ series_w) so batch event
         # composition cancels; averaging the rungs keeps level's load-bearing
         # magnitude ≈ the prior single-scale value (L_T ≤ L_mid ≤ L_fine).
-        scale_factor = T
+        scale_factor = W
         is_3d = e.dim() == 3
         rung_losses = []
         for W in scales:

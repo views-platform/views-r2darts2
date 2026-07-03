@@ -27,11 +27,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
        sensitivity across the 4-OOM tail so large wars outweigh small skirmishes
        instead of saturating flat. No model-state dependency (abs_max detached).
 
-    3. **Per-series temporal DRO** — within-series shock therapy.
-       Z-scores log(cell_loss) along time axis per series.  Upweights
-       proportionally harder timesteps *relative to that series*.
+     3. **Per-series temporal DRO** — within-series shock therapy.
+         Sqrt self-reweighting along time axis per series. Upweights
+         proportionally harder timesteps *relative to that series*.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window means.
+    4. **Windowed level anchor** — W-scaled log_cosh on per-window means.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -87,7 +87,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     @staticmethod
-    def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def _dro_weights_2d(losses: torch.Tensor) -> torch.Tensor:
         """Per-series sqrt self-reweighting
 
         w_it = sqrt(loss_it / mean_i(loss))
@@ -109,64 +109,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Combine per-channel losses by *relative learning progress*.
+        """Combine per-channel losses with a deterministic uniform mean.
 
-        Two failure modes of magnitude-based routing are avoided:
-
-        * Routing on a channel's absolute (scale-normalised) loss makes the
-          router chase whichever target has the highest *irreducible* noise
-          floor, permanently starving channels that could still improve.
-        * Dividing the loss by the physical target scale (RMS) systematically
-          down-weights the largest-signal channel — the primary target — and
-          mixes units (a W-scaled level term over an asinh-RMS is not a clean
-          relative error).
-
-        Instead each channel is compared only to *its own* history via two
-        cascaded EMAs that share the single existing smoothing constant
-        (so no extra timescale is introduced):
-
-            fast_c  = EMA_beta(loss_c)       # ~1/(1-beta) steps
-            slow_c  = EMA_beta(fast_c)       # ~2/(1-beta) steps
-            score_c = fast_c / slow_c        # dimensionless trend
-            w_c     = C * score_c / Sum_k(score_k)
-
-        score_c > 1 when channel c is regressing or lagging the others'
-        progress, ~1 when it has plateaued (incl. at its noise floor), and
-        < 1 when it is the fastest-improving channel.  Being a self-referential
-        ratio, the score stays near 1 for any converged channel, so the weights
-        cannot collapse to a winner-take-all regime (no target is starved)
-        while gradient is still tilted toward the least-improving channel.
+        Channel totals are already composition-robust (Hájek-normalized shape
+        and level). A stateless uniform mean avoids injecting cross-batch router
+        dynamics into the objective while keeping every channel active.
         """
         C = per_channel_loss.shape[0]
-        batch_loss_det = per_channel_loss.detach()
-        beta = self._EMA_BETA
+        w_uniform = per_channel_loss.new_full((C,), 1.0 / max(C, 1))
 
-        # ── Two-timescale self-referential loss tracking ─────────────
-        if (
-            self._loss_ema is None
-            or self._loss_ema_slow is None
-            or len(self._loss_ema) != C
-        ):
-            self._loss_ema = batch_loss_det.tolist()
-            self._loss_ema_slow = batch_loss_det.tolist()
-        else:
-            for c in range(C):
-                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
-                self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
+        self._last_weights = w_uniform.tolist()
+        # Keep callback telemetry contract stable for downstream logging.
+        self._last_cal_ratio = [1.0] * C
+        self._last_cal_score = [1.0] * C
+        self._last_gates = w_uniform.tolist()
 
-        # ── Relative-progress routing ────────────────────────────────
-        fast = per_channel_loss.new_tensor(self._loss_ema)
-        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
-        scores = fast / slow.clamp(min=self._EMA_EPS)
-        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
-
-        self._last_weights = w_soft.tolist()
-        # Telemetry (keys preserved for the callback contract):
-        self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
-        self._last_cal_score = list(self._loss_ema)  # fast EMA
-        self._last_gates = w_soft.tolist()
-
-        return (w_soft * per_channel_loss).sum()
+        return per_channel_loss.mean()
 
     def _windowed_level_loss(
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
@@ -225,13 +183,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # lag was the source of the flat-collapse oscillation): no running state,
         # no delayed feedback, no composition memory.
         #
-        # scale_factor = T restores the level term's STRENGTH relative to shape:
-        # the mean-over-window operator attenuates the DC gradient by 1/W, and T
-        # is a fixed, composition-INVARIANT multiplier (identical every batch),
-        # so it does not reintroduce composition dependence. When series_w
-        # averages ~1 this matches the previous (working) level magnitude, but
-        # now without the lagging denominator.
-        scale_factor = T
+        # scale_factor = W is the exact inverse of the window-mean operator's
+        # 1/W gradient attenuation, preserving a natural shape-vs-level balance
+        # without sequence-length inflation.
+        scale_factor = W
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)
@@ -339,7 +294,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO ────────────────────────────────────
-        w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
+        w_dro = self._dro_weights_2d(cell_loss)  # (B, T) or (B, T, C)
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Hájek self-normalized shape (composition-robust) ──────────

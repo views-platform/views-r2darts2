@@ -190,57 +190,51 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape as y_true.
         """
         W = max(6, T // 3)
-        window_means = torch.stack(
-            [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
-        )  # (B, n_windows) or (B, n_windows, C)
-        level_losses = self._log_cosh(window_means)
+        # ── Multi-scale temporal pyramid of window sizes ───────────────
+        # Dyadic ladder {T, T//3, T//6}: the coarse rung (W=T) enforces total
+        # volume, the mid rung (W=T//3) is the original DC anchor (orthogonal
+        # complement of the window-demeaned shape term), and the fine rung
+        # (W=T//6) enforces persistence — a spike-then-zero forecast can fake
+        # the 12-month mean but not every 6-month sub-block mean, so it can no
+        # longer leave empty months between spikes.
+        W_mid = max(6, T // 3)
+        scales = sorted({T, W_mid, max(2, W_mid // 2)})  # e.g. {36, 12, 6}
 
-        # Per-series event magnitude: max(|y_true|, |y_pred|) across time → sigmoid
-        # Using max of both ensures false-positive series attract full level gradient,
-        # symmetric with the shape loss abs_max gating.
+        # Per-series event magnitude: max(|y_true|, |y_pred|) across time → gate.
         if y_pred_det is not None:
             abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        # Gate (peace suppression) x magnitude factor (1 + series_mag), mirroring
-        # the shape-term event_mag: the bare sigmoid saturates above ~2 deaths and
-        # is magnitude-blind across the tail; (1 + series_mag) restores bounded
-        # asinh-space magnitude sensitivity so large wars pull more DC gradient
-        # than small skirmishes. No new constant (asinh IS the scale).
-        # series_w = 0.01 + 0.99 * torch.sigmoid(
-        #     5.0 * (series_mag - self.non_zero_threshold)
-        # )  # (B,) or (B, C)
         series_gate = 0.0125 + 0.9875 * torch.sigmoid(
             10.0 * (series_mag - self.non_zero_threshold)
-        )  # (B,) or (B, C)
+        )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        # ── Hájek self-normalized level anchor (composition-robust) ───
-        # Weight-mass-weighted mean of the per-window level log_cosh — the
-        # self-normalized (Hájek) ratio estimator L = Σ(series_w·level) /
-        # Σ(series_w). Numerator and denominator scale TOGETHER with the batch's
-        # event composition, so a peace-heavy or event-heavy batch leaves the
-        # level scale unchanged. This replaces the cross-batch EMA rescale (whose
-        # lag was the source of the flat-collapse oscillation): no running state,
-        # no delayed feedback, no composition memory.
-        #
-        # scale_factor = T restores the level term's STRENGTH relative to shape:
-        # the mean-over-window operator attenuates the DC gradient by 1/W, and T
-        # is a fixed, composition-INVARIANT multiplier (identical every batch),
-        # so it does not reintroduce composition dependence. When series_w
-        # averages ~1 this matches the previous (working) level magnitude, but
-        # now without the lagging denominator.
+        # scale_factor = T restores DC strength vs shape (1/W gradient attenuation
+        # is inverted by the fixed, composition-invariant multiplier T). Each rung
+        # is Hájek self-normalized (Σ series_w·level / Σ series_w) so batch event
+        # composition cancels; averaging the rungs keeps level's load-bearing
+        # magnitude ≈ the prior single-scale value (L_T ≤ L_mid ≤ L_fine).
         scale_factor = T
-        n_windows = level_losses.shape[1]
-        if level_losses.dim() == 3:
-            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)
-            den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)  # (C,)
-            return scale_factor * num / den                                  # (C,)
-        else:
-            num = (series_w.unsqueeze(1) * level_losses).sum()
-            den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
-            return scale_factor * num / den                                  # scalar
+        is_3d = e.dim() == 3
+        rung_losses = []
+        for W in scales:
+            window_means = torch.stack(
+                [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
+            )  # (B, n_w) or (B, n_w, C)
+            level_losses = self._log_cosh(window_means)
+            n_windows = level_losses.shape[1]
+            if is_3d:
+                num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))       # (C,)
+                den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)   # (C,)
+            else:
+                num = (series_w.unsqueeze(1) * level_losses).sum()
+                den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
+            rung_losses.append(num / den)
+
+        level = torch.stack(rung_losses, dim=0).mean(dim=0)  # (C,) or scalar
+        return scale_factor * level                          # scalar
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

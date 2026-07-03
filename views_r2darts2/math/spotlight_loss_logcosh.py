@@ -43,7 +43,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _STFT = False
+    _STFT = True
     _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
 
@@ -211,15 +211,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        # No scale_factor: level sits at its natural Hájek-normalized scale
-        # (~0.5–0.7) while shape sits at ~1.0–1.5 (event_mag × (1+abs_max)
-        # weighted). This gives frac_level ≈ 35–40%, enough for magnitude
-        # anchoring without the ×T / ×W DC-minimizer dominance (which drove
-        # frac_level to 0.88–0.96 and starved the magnitude-graded shape term).
-        # Shape is NOT DC-invariant here — it carries per-country differentiation
-        # via event_mag grading, so reducing level budget does not cause templating
-        # (unlike Option B which equalized all three terms including spec).
-        scale_factor = 1
+        # Level is scaled by the window size W to restore the original DC
+        # anchoring strength relative to the window mean operator.
+        scale_factor = W
         is_3d = e.dim() == 3
         rung_losses = []
         for W in scales:
@@ -285,11 +279,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             # Safe magnitude — bounded gradient at |z|→0
             mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
             mag_true = S_true.abs()
-            # Mask DC bin — level is handled by the level anchor
-            mag_pred = mag_pred.clone()
-            mag_true = mag_true.clone()
-            mag_pred[:, 0, :] = 0.0
-            mag_true[:, 0, :] = 0.0
             total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 

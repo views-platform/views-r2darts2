@@ -216,7 +216,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Shape is NOT DC-invariant here — it carries per-country differentiation
         # via event_mag grading, so reducing level budget does not cause templating
         # (unlike Option B which equalized all three terms including spec).
-        scale_factor = T
+        scale_factor = W
         is_3d = e.dim() == 3
         rung_losses = []
         for W in scales:

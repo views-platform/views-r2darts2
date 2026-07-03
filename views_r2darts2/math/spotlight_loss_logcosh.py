@@ -211,12 +211,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        # scale_factor = T restores DC strength vs shape (1/W gradient attenuation
-        # is inverted by the fixed, composition-invariant multiplier T). Each rung
-        # is Hájek self-normalized (Σ series_w·level / Σ series_w) so batch event
-        # composition cancels; averaging the rungs keeps level's load-bearing
-        # magnitude ≈ the prior single-scale value (L_T ≤ L_mid ≤ L_fine).
-        scale_factor = W
+        # No scale_factor: level sits at its natural Hájek-normalized scale
+        # (~0.5–0.7) while shape sits at ~1.0–1.5 (event_mag × (1+abs_max)
+        # weighted). This gives frac_level ≈ 35–40%, enough for magnitude
+        # anchoring without the ×T / ×W DC-minimizer dominance (which drove
+        # frac_level to 0.88–0.96 and starved the magnitude-graded shape term).
+        # Shape is NOT DC-invariant here — it carries per-country differentiation
+        # via event_mag grading, so reducing level budget does not cause templating
+        # (unlike Option B which equalized all three terms including spec).
+        scale_factor = 1
         is_3d = e.dim() == 3
         rung_losses = []
         for W in scales:

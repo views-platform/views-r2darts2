@@ -43,7 +43,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _STFT = True
+    _STFT = False
     _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
 
@@ -172,17 +172,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-magnitude-weighted windowed level anchor.
+        """Event-magnitude-weighted multi-scale convolutional level anchor.
 
-        Splits the T-length error into non-overlapping windows, computes
-        log_cosh on per-window means, then weights each series by its 
-        event magnitude. No DRO, no CMW, just the sigmoid weight.
+        Replaces block-mean windows with fixed normalized 1D smoothing filters
+        at dyadic scales {T, T//3, T//6}. Each scale contributes:
+        (1) magnitude mismatch on smoothed signals, and
+        (2) trend mismatch on first differences of smoothed signals.
 
-        We scale by the window size W instead of sequence length T. Because the
-        mean operator on a window of size W reduces gradient magnitude by a
-        factor of 1/W, multiplying by W is the exact mathematical inverse of
-        the operator's gradient attenuation, balancing level and shape losses
-        naturally and stably.
+        This preserves the original per-series sigmoid magnitude weighting and
+        Hájek self-normalized reduction while adding persistence sensitivity
+        within windows.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -190,15 +189,33 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape as y_true.
         """
         W = max(6, T // 3)
-        # ── Multi-scale temporal pyramid of window sizes ───────────────
-        # Dyadic ladder {T, T//3, T//6}: the coarse rung (W=T) enforces total
-        # volume, the mid rung (W=T//3) is the original DC anchor (orthogonal
-        # complement of the window-demeaned shape term), and the fine rung
-        # (W=T//6) enforces persistence — a spike-then-zero forecast can fake
-        # the 12-month mean but not every 6-month sub-block mean, so it can no
-        # longer leave empty months between spikes.
+        # Dyadic ladder {T, T//3, T//6}.
         W_mid = max(6, T // 3)
         scales = sorted({T, W_mid, max(2, W_mid // 2)})  # e.g. {36, 12, 6}
+
+        y_pred = y_true + e
+
+        def _conv_same(x: torch.Tensor, kernel_1d: torch.Tensor) -> torch.Tensor:
+            """Depthwise-like 1D conv over time with exact same-length output."""
+            k = kernel_1d.numel()
+            left = (k - 1) // 2
+            right = k - 1 - left
+
+            if x.dim() == 3:
+                B, Tn, C = x.shape
+                x_bc_t = x.permute(0, 2, 1).reshape(B * C, 1, Tn)
+                x_pad = F.pad(x_bc_t, (left, right), mode="replicate")
+                y_bc_t = F.conv1d(x_pad, kernel_1d)
+                return y_bc_t.reshape(B, C, Tn).permute(0, 2, 1)
+
+            x_b_t = x.unsqueeze(1)
+            x_pad = F.pad(x_b_t, (left, right), mode="replicate")
+            return F.conv1d(x_pad, kernel_1d).squeeze(1)
+
+        def _diff_time(x: torch.Tensor) -> torch.Tensor:
+            if x.dim() == 3:
+                return x[:, 1:, :] - x[:, :-1, :]
+            return x[:, 1:] - x[:, :-1]
 
         # Per-series event magnitude: max(|y_true|, |y_pred|) across time → gate.
         if y_pred_det is not None:
@@ -211,23 +228,33 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        # Level is scaled by the window size W to restore the original DC
-        # anchoring strength relative to the window mean operator.
-        scale_factor = W
+        # Keep W scaling for DC anchoring strength.
+        scale_factor = T
         is_3d = e.dim() == 3
         rung_losses = []
         for W in scales:
-            window_means = torch.stack(
-                [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
-            )  # (B, n_w) or (B, n_w, C)
-            level_losses = self._log_cosh(window_means)
-            n_windows = level_losses.shape[1]
+            kernel = e.new_ones(1, 1, W) / float(W)
+
+            y_pred_smooth = _conv_same(y_pred, kernel)
+            y_true_smooth = _conv_same(y_true, kernel)
+
+            mag_losses = self._log_cosh(y_pred_smooth - y_true_smooth)
+
+            d_pred = _diff_time(y_pred_smooth)
+            d_true = _diff_time(y_true_smooth)
+            trend_losses = self._log_cosh(d_pred - d_true)
+
+            # Concatenate magnitude + trend channels along time axis so both
+            # contribute without introducing extra mixing constants.
+            level_losses = torch.cat([mag_losses, trend_losses], dim=1)
+            n_positions = level_losses.shape[1]
+
             if is_3d:
                 num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))       # (C,)
-                den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)   # (C,)
+                den = (series_w.sum(dim=0) * n_positions).clamp(min=self._EMA_EPS)  # (C,)
             else:
                 num = (series_w.unsqueeze(1) * level_losses).sum()
-                den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
+                den = (series_w.sum() * n_positions).clamp(min=self._EMA_EPS)
             rung_losses.append(num / den)
 
         level = torch.stack(rung_losses, dim=0).mean(dim=0)  # (C,) or scalar

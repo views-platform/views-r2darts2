@@ -195,16 +195,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )  # (B, n_windows) or (B, n_windows, C)
         level_losses = self._log_cosh(window_means)
 
-        # Per-series event magnitude: RMS(|y_true|, |y_pred|) across time.
-        # RMS keeps strong event emphasis but avoids single-month spikes setting
-        # the level weight for an entire series.
+        # Per-series event magnitude: max(|y_true|, |y_pred|) across time → sigmoid
+        # Using max of both ensures false-positive series attract full level gradient,
+        # symmetric with the shape loss abs_max gating.
         if y_pred_det is not None:
             abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
         else:
             abs_max_series = y_true.abs()
-        series_mag = torch.sqrt(
-            (abs_max_series ** 2).mean(dim=1).clamp(min=self._EMA_EPS)
-        )  # (B,) or (B, C)
+        series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
         # Gate (peace suppression) x magnitude factor (1 + series_mag), mirroring
         # the shape-term event_mag: the bare sigmoid saturates above ~2 deaths and
         # is magnitude-blind across the tail; (1 + series_mag) restores bounded
@@ -227,9 +225,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # lag was the source of the flat-collapse oscillation): no running state,
         # no delayed feedback, no composition memory.
         #
-        # scale_factor = W inverts the 1/W gradient attenuation from window means
-        # without inflating the level path by full sequence length.
-        scale_factor = W
+        # scale_factor = T restores the level term's STRENGTH relative to shape:
+        # the mean-over-window operator attenuates the DC gradient by 1/W, and T
+        # is a fixed, composition-INVARIANT multiplier (identical every batch),
+        # so it does not reintroduce composition dependence. When series_w
+        # averages ~1 this matches the previous (working) level magnitude, but
+        # now without the lagging denominator.
+        scale_factor = T
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)
@@ -325,18 +327,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # 2-death skirmish identically to a 10,000-death war and left the
         # entire 4-OOM tail flat (the source of peak under-prediction /
         # flattening). We restore magnitude sensitivity by multiplying the gate
-        # by sqrt(1 + abs_max): abs_max is already in asinh space, which compresses
-        # 4 OOM into ~[0,10], and sqrt further prevents single extreme months from
-        # dominating gradient budget while preserving rank ordering.
-        # This keeps magnitude sensitivity with less spike dominance.
-        # The asinh transform already in
+        # by (1 + abs_max): abs_max is already in asinh space, which compresses
+        # 4 OOM into ~[0,10], so the factor is bounded (Ukraine ~10x a 1-death
+        # cell) and requires NO new constant — the asinh transform already in
         # the pipeline IS the data-driven scale. abs_max = max(|y_true|,
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
         event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
-        event_mag = event_gate * torch.sqrt(1.0 + abs_max)
+        event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)

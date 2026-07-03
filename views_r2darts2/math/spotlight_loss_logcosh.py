@@ -417,8 +417,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Windowed level anchor ─────────────────────────────────────
         # OLD (independent): loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
+        loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
         # NEW (cascaded): apply level to shape residual to force coupled constraint satisfaction
-        loss_level = self._cascaded_level_loss(e, e_shape, y_true, T, y_pred_det=y_pred.detach())
+        # loss_level = self._cascaded_level_loss(e, e_shape, y_true, T, y_pred_det=y_pred.detach())
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)

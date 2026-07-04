@@ -189,12 +189,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
             on peaceful series also attract level loss gradient. Must be same
             shape as y_true.
         """
-        W = max(6, T // 6)
+        W = max(12, T // 3)
         # ── Multi-scale temporal pyramid of window sizes ───────────────
-        # Dyadic ladder {T, T//6, T//12}: the coarse rung (W=T) enforces total
-        # volume, the mid rung (W=T//6) anchors 6-month DC, and the fine rung
-        # (W=T//12) adds tighter persistence pressure.
-        W_mid = max(6, T // 6)
+        # Dyadic ladder {T, T//3, T//6}: the coarse rung (W=T) enforces total
+        # volume, the mid rung (W=T//3) anchors 12-month DC (for T=36), and
+        # the fine rung (W=T//6) adds tighter persistence pressure.
+        W_mid = max(12, T // 3)
         scales = sorted({T, W_mid, max(2, W_mid // 2)})  # e.g. {36, 12, 6}
 
         # Per-series event magnitude: max(|y_true|, |y_pred|) across time → gate.
@@ -305,8 +305,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e = y_pred - y_true
 
         # ── Per-window DC/AC decomposition ────────────────────────────
-        # Demean within each non-overlapping 6-month window.
-        W = max(6, T // 6)
+        # Demean within each non-overlapping 12-month window.
+        W = max(12, T // 3)
         windows = list(e.split(W, dim=1))  # list of (B, W_i) or (B, W_i, C)
         e_shape = torch.cat(
             [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1

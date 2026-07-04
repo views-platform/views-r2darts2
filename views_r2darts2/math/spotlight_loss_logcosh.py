@@ -43,7 +43,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _STFT = False
+    _STFT = True
     _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
 
@@ -189,12 +189,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
             on peaceful series also attract level loss gradient. Must be same
             shape as y_true.
         """
-        W = max(12, T // 3)
+        W = max(6, T // 3)
         # ── Multi-scale temporal pyramid of window sizes ───────────────
         # Dyadic ladder {T, T//3, T//6}: the coarse rung (W=T) enforces total
-        # volume, the mid rung (W=T//3) anchors 12-month DC (for T=36), and
-        # the fine rung (W=T//6) adds tighter persistence pressure.
-        W_mid = max(12, T // 3)
+        # volume, the mid rung (W=T//3) is the original DC anchor (orthogonal
+        # complement of the window-demeaned shape term), and the fine rung
+        # (W=T//6) enforces persistence — a spike-then-zero forecast can fake
+        # the 12-month mean but not every 6-month sub-block mean, so it can no
+        # longer leave empty months between spikes.
+        W_mid = max(6, T // 3)
         scales = sorted({T, W_mid, max(2, W_mid // 2)})  # e.g. {36, 12, 6}
 
         # Per-series event magnitude: max(|y_true|, |y_pred|) across time → gate.
@@ -263,6 +266,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         pred = pred[has_signal]
         true = true[has_signal]
 
+        # Hájek series weights — same gate/magnitude formula as shape/level.
+        # Prevents high-energy war series being drowned by peaceful majority.
+        abs_max_spec = torch.max(true.abs(), pred.detach().abs())
+        series_mag_spec = abs_max_spec.max(dim=1).values
+        series_gate_spec = 0.0125 + 0.9875 * torch.sigmoid(
+            10.0 * (series_mag_spec - self.non_zero_threshold)
+        )
+        series_w_spec = series_gate_spec * (1.0 + series_mag_spec)  # (B_signal,)
+
         T = pred.size(1)
         total = pred.new_tensor(0.0)
         n_valid = 0
@@ -287,7 +299,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            total = total + self._log_cosh(mag_pred - mag_true).mean()
+            # Hájek aggregation: Σ(w·ℓ)/Σ(w) over signal series
+            spec_cell = self._log_cosh(mag_pred - mag_true)   # (B_signal, F, N)
+            spec_per_series = spec_cell.mean(dim=(1, 2))      # (B_signal,)
+            num = (series_w_spec * spec_per_series).sum()
+            den = series_w_spec.sum().clamp(min=self._EMA_EPS)
+            total = total + (num / den)
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -305,8 +322,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e = y_pred - y_true
 
         # ── Per-window DC/AC decomposition ────────────────────────────
-        # Demean within each non-overlapping 12-month window.
-        W = max(12, T // 3)
+        # Demean within each non-overlapping window (same W as level anchor).
+        W = max(6, T // 3)
         windows = list(e.split(W, dim=1))  # list of (B, W_i) or (B, W_i, C)
         e_shape = torch.cat(
             [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
@@ -327,14 +344,36 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # the pipeline IS the data-driven scale. abs_max = max(|y_true|,
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
-        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        # Series-level abs_max: broadcast series peak across all timesteps so every
+        # month in a high-magnitude event gets equal weight. Without this, the peak
+        # timestep attracts ~5x more gradient than the sustained plateau, causing
+        # spike-then-drop patterns to satisfy magnitude weighting cheaply.
+        abs_max_t = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        abs_max = abs_max_t.max(dim=1, keepdim=True).values.expand_as(abs_max_t)
         # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
         event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
-        w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+
+        # ── Cross-series DRO ──────────────────────────────────────────
+        # Upweights entire series whose mean loss is high relative to batch mean.
+        # Complements temporal DRO: temporal DRO localises within a series but
+        # collapses to uniform weights when errors are sustained and flat (zero
+        # variance). Cross-series DRO handles exactly that case — a series with
+        # uniformly high error gets w_cross > 1 even when w_temporal ≈ 1 everywhere.
+        # Combined: w_total = event_mag × w_temporal × w_cross, so a sustained-error
+        # series gets the whole series upweighted; a spikey-error series gets the
+        # spike timestep extra-upweighted AND the series slightly upweighted.
+        series_mean_loss = cell_loss.detach().mean(dim=1)   # (B,) or (B, C)
+        batch_mean_loss = series_mean_loss.mean(dim=0, keepdim=True).clamp(min=1e-6)
+        w_cross = torch.sqrt(series_mean_loss / batch_mean_loss)
+        w_cross = w_cross / w_cross.mean(dim=0, keepdim=True).clamp(min=1e-8)
+        w_cross = torch.nan_to_num(w_cross, nan=1.0, posinf=1.0, neginf=0.0)
+        w_cross_t = w_cross.unsqueeze(1).expand_as(w_dro)  # broadcast over time
+
+        w_total = torch.nan_to_num(event_mag * w_dro * w_cross_t, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Hájek self-normalized shape (composition-robust) ──────────
         # Weight-mass-weighted mean of the per-cell log_cosh — the

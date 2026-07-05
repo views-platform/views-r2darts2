@@ -31,7 +31,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
        Z-scores log(cell_loss) along time axis per series.  Upweights
        proportionally harder timesteps *relative to that series*.
 
-    4. **Distribution level anchor** — sorted-value log_cosh matching.
+    4. **Windowed distribution level anchor** — sorted-value log_cosh matching.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -174,10 +174,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
     ) -> torch.Tensor:
         """Event-magnitude-weighted sorted-distribution level anchor.
 
-        Option 1 replacement: compare sorted prediction and target values along
-        time, which is order-agnostic and enforces the forecast value histogram.
-        This penalizes spike-and-drop substitutions for sustained conflict while
-        leaving timing supervision to the shape term.
+        Option 1 replacement with locality: split by the same non-overlapping
+        windows used by shape, sort prediction and target values inside each
+        window, then compare with log_cosh. This stays order-agnostic within
+        each window but enforces local occupancy/persistence instead of a
+        single global histogram over the full horizon.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -195,21 +196,33 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        # Sort values along time in descending order and compare distributions.
-        # This is time-agnostic (orthogonal to timing/shape) but persistence-aware
-        # because upper-tail occupancy must match between forecast and target.
-        y_pred_sorted = torch.sort((e + y_true), dim=1, descending=True).values
-        y_true_sorted = torch.sort(y_true, dim=1, descending=True).values
-        level_losses = self._log_cosh(y_pred_sorted - y_true_sorted)  # (B, T) or (B, T, C)
+        y_pred = e + y_true
+        W = max(6, T // 3)
+        pred_windows = list(y_pred.split(W, dim=1))
+        true_windows = list(y_true.split(W, dim=1))
 
-        if level_losses.dim() == 3:
-            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
-            den = (series_w.sum(dim=0) * T).clamp(min=self._EMA_EPS)
-            return num / den  # (C,)
+        # Sum windowwise sorted-distribution losses, normalized by total cells
+        # (Hájek style) and then T-scaled per request.
+        num = None
+        den = None
+        for pw, tw in zip(pred_windows, true_windows):
+            pw_sorted = torch.sort(pw, dim=1, descending=True).values
+            tw_sorted = torch.sort(tw, dim=1, descending=True).values
+            w_loss = self._log_cosh(pw_sorted - tw_sorted)  # (B, W_i) or (B, W_i, C)
+            w_len = w_loss.shape[1]
 
-        num = (series_w.unsqueeze(1) * level_losses).sum()
-        den = (series_w.sum() * T).clamp(min=self._EMA_EPS)
-        return num / den
+            if w_loss.dim() == 3:
+                w_num = (series_w.unsqueeze(1) * w_loss).sum(dim=(0, 1))
+                w_den = (series_w.sum(dim=0) * w_len).clamp(min=self._EMA_EPS)
+            else:
+                w_num = (series_w.unsqueeze(1) * w_loss).sum()
+                w_den = (series_w.sum() * w_len).clamp(min=self._EMA_EPS)
+
+            num = w_num if num is None else (num + w_num)
+            den = w_den if den is None else (den + w_den)
+
+        level = num / den.clamp(min=self._EMA_EPS)
+        return T * level
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

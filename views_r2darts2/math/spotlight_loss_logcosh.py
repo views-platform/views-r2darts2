@@ -31,7 +31,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
        Z-scores log(cell_loss) along time axis per series.  Upweights
        proportionally harder timesteps *relative to that series*.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window means.
+    4. **Distribution level anchor** — sorted-value log_cosh matching.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -43,7 +43,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-    _STFT = True
+    _STFT = False
     _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
 
@@ -172,35 +172,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-magnitude-weighted windowed level anchor.
+        """Event-magnitude-weighted sorted-distribution level anchor.
 
-        Splits the T-length error into non-overlapping windows, computes
-        log_cosh on per-window means, then weights each series by its 
-        event magnitude. No DRO, no CMW, just the sigmoid weight.
-
-        We scale by the window size W instead of sequence length T. Because the
-        mean operator on a window of size W reduces gradient magnitude by a
-        factor of 1/W, multiplying by W is the exact mathematical inverse of
-        the operator's gradient attenuation, balancing level and shape losses
-        naturally and stably.
+        Option 1 replacement: compare sorted prediction and target values along
+        time, which is order-agnostic and enforces the forecast value histogram.
+        This penalizes spike-and-drop substitutions for sustained conflict while
+        leaving timing supervision to the shape term.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
             on peaceful series also attract level loss gradient. Must be same
             shape as y_true.
         """
-        W = max(6, T // 3)
-        # ── Multi-scale temporal pyramid of window sizes ───────────────
-        # Dyadic ladder {T, T//3, T//6}: the coarse rung (W=T) enforces total
-        # volume, the mid rung (W=T//3) is the original DC anchor (orthogonal
-        # complement of the window-demeaned shape term), and the fine rung
-        # (W=T//6) enforces persistence — a spike-then-zero forecast can fake
-        # the 12-month mean but not every 6-month sub-block mean, so it can no
-        # longer leave empty months between spikes.
-        W_mid = max(6, T // 3)
-        scales = sorted({T, W_mid, max(2, W_mid // 2)})  # e.g. {36, 12, 6}
-
-        # Per-series event magnitude: max(|y_true|, |y_pred|) across time → gate.
+        # Per-series event magnitude: max(|y_true|, |y_pred|) across time -> gate.
         if y_pred_det is not None:
             abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
         else:
@@ -211,33 +195,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        # No scale_factor: level sits at its natural Hájek-normalized scale
-        # (~0.5–0.7) while shape sits at ~1.0–1.5 (event_mag × (1+abs_max)
-        # weighted). This gives frac_level ≈ 35–40%, enough for magnitude
-        # anchoring without the ×T / ×W DC-minimizer dominance (which drove
-        # frac_level to 0.88–0.96 and starved the magnitude-graded shape term).
-        # Shape is NOT DC-invariant here — it carries per-country differentiation
-        # via event_mag grading, so reducing level budget does not cause templating
-        # (unlike Option B which equalized all three terms including spec).
-        scale_factor = T
-        is_3d = e.dim() == 3
-        rung_losses = []
-        for W in scales:
-            window_means = torch.stack(
-                [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
-            )  # (B, n_w) or (B, n_w, C)
-            level_losses = self._log_cosh(window_means)
-            n_windows = level_losses.shape[1]
-            if is_3d:
-                num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))       # (C,)
-                den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)   # (C,)
-            else:
-                num = (series_w.unsqueeze(1) * level_losses).sum()
-                den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
-            rung_losses.append(num / den)
+        # Sort values along time in descending order and compare distributions.
+        # This is time-agnostic (orthogonal to timing/shape) but persistence-aware
+        # because upper-tail occupancy must match between forecast and target.
+        y_pred_sorted = torch.sort((e + y_true), dim=1, descending=True).values
+        y_true_sorted = torch.sort(y_true, dim=1, descending=True).values
+        level_losses = self._log_cosh(y_pred_sorted - y_true_sorted)  # (B, T) or (B, T, C)
 
-        level = torch.stack(rung_losses, dim=0).mean(dim=0)  # (C,) or scalar
-        return scale_factor * level                          # scalar
+        if level_losses.dim() == 3:
+            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
+            den = (series_w.sum(dim=0) * T).clamp(min=self._EMA_EPS)
+            return num / den  # (C,)
+
+        num = (series_w.unsqueeze(1) * level_losses).sum()
+        den = (series_w.sum() * T).clamp(min=self._EMA_EPS)
+        return num / den
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -266,15 +238,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         pred = pred[has_signal]
         true = true[has_signal]
 
-        # Hájek series weights — same gate/magnitude formula as shape/level.
-        # Prevents high-energy war series being drowned by peaceful majority.
-        abs_max_spec = torch.max(true.abs(), pred.detach().abs())
-        series_mag_spec = abs_max_spec.max(dim=1).values
-        series_gate_spec = 0.0125 + 0.9875 * torch.sigmoid(
-            10.0 * (series_mag_spec - self.non_zero_threshold)
-        )
-        series_w_spec = series_gate_spec * (1.0 + series_mag_spec)  # (B_signal,)
-
         T = pred.size(1)
         total = pred.new_tensor(0.0)
         n_valid = 0
@@ -299,12 +262,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-            # Hájek aggregation: Σ(w·ℓ)/Σ(w) over signal series
-            spec_cell = self._log_cosh(mag_pred - mag_true)   # (B_signal, F, N)
-            spec_per_series = spec_cell.mean(dim=(1, 2))      # (B_signal,)
-            num = (series_w_spec * spec_per_series).sum()
-            den = series_w_spec.sum().clamp(min=self._EMA_EPS)
-            total = total + (num / den)
+            total = total + self._log_cosh(mag_pred - mag_true).mean()
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -344,36 +302,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # the pipeline IS the data-driven scale. abs_max = max(|y_true|,
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
-        # Series-level abs_max: broadcast series peak across all timesteps so every
-        # month in a high-magnitude event gets equal weight. Without this, the peak
-        # timestep attracts ~5x more gradient than the sustained plateau, causing
-        # spike-then-drop patterns to satisfy magnitude weighting cheaply.
-        abs_max_t = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        abs_max = abs_max_t.max(dim=1, keepdim=True).values.expand_as(abs_max_t)
+        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
         event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
-
-        # ── Cross-series DRO ──────────────────────────────────────────
-        # Upweights entire series whose mean loss is high relative to batch mean.
-        # Complements temporal DRO: temporal DRO localises within a series but
-        # collapses to uniform weights when errors are sustained and flat (zero
-        # variance). Cross-series DRO handles exactly that case — a series with
-        # uniformly high error gets w_cross > 1 even when w_temporal ≈ 1 everywhere.
-        # Combined: w_total = event_mag × w_temporal × w_cross, so a sustained-error
-        # series gets the whole series upweighted; a spikey-error series gets the
-        # spike timestep extra-upweighted AND the series slightly upweighted.
-        series_mean_loss = cell_loss.detach().mean(dim=1)   # (B,) or (B, C)
-        batch_mean_loss = series_mean_loss.mean(dim=0, keepdim=True).clamp(min=1e-6)
-        w_cross = torch.sqrt(series_mean_loss / batch_mean_loss)
-        w_cross = w_cross / w_cross.mean(dim=0, keepdim=True).clamp(min=1e-8)
-        w_cross = torch.nan_to_num(w_cross, nan=1.0, posinf=1.0, neginf=0.0)
-        w_cross_t = w_cross.unsqueeze(1).expand_as(w_dro)  # broadcast over time
-
-        w_total = torch.nan_to_num(event_mag * w_dro * w_cross_t, nan=1.0, posinf=1.0, neginf=0.0)
+        w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Hájek self-normalized shape (composition-robust) ──────────
         # Weight-mass-weighted mean of the per-cell log_cosh — the
@@ -392,7 +328,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             den = w_total.sum().clamp(min=self._EMA_EPS)
             loss_shape = num / den                                  # scalar
 
-        # ── Windowed level anchor ─────────────────────────────────────
+        # ── Sorted-distribution level anchor ──────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 
         # ── Multi-resolution spectral loss (always on) ──────────────

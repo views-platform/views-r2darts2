@@ -16,12 +16,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Components ───────────────────────────────────────────────────────
 
-    1. **DC/AC decomposition** — per-window demeaning (same windows as level).
-       e_shape = e − window_mean(e).  Shape and level are orthogonal:
-       shape handles within-window patterns, level handles per-window DC.
+     1. **DC/AC decomposition** — full-horizon demeaning.
+         e_shape = e − mean_t(e). Shape and level are orthogonal:
+         shape handles temporal patterns, level handles global DC.
 
     2. **Gated + magnitude-graded event weighting.**
-    event_mag = gate × (1 + abs_max), gate = 0.0125 + 0.9875 × σ(10 × (abs_max − τ)).
+    event_mag = gate × (1 + abs_max), gate = 0.0125 + 0.9875 × σ(12 × (abs_max − τ)).
     The gate suppresses peace (→ ~0.0125) vs conflict (→ ~1); the (1 + abs_max)
        factor — bounded because abs_max is in asinh space — restores magnitude
        sensitivity across the 4-OOM tail so large wars outweigh small skirmishes
@@ -31,7 +31,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
        Z-scores log(cell_loss) along time axis per series.  Upweights
        proportionally harder timesteps *relative to that series*.
 
-    4. **Windowed distribution level anchor** — sorted-value log_cosh matching.
+    4. **Cumulative level anchor** — full-horizon cumsum log_cosh matching.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -118,7 +118,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
           floor, permanently starving channels that could still improve.
         * Dividing the loss by the physical target scale (RMS) systematically
           down-weights the largest-signal channel — the primary target — and
-          mixes units (a W-scaled level term over an asinh-RMS is not a clean
+          mixes units (a scaled level term over an asinh-RMS is not a clean
           relative error).
 
         Instead each channel is compared only to *its own* history via two
@@ -172,13 +172,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-magnitude-weighted sorted-distribution level anchor.
+        """Event-magnitude-weighted cumulative level anchor.
 
-        Option 1 replacement with locality: split by the same non-overlapping
-        windows used by shape, sort prediction and target values inside each
-        window, then compare with log_cosh. This stays order-agnostic within
-        each window but enforces local occupancy/persistence instead of a
-        single global histogram over the full horizon.
+        Compare full-horizon cumulative sums with log_cosh.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -192,37 +188,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
         series_gate = 0.0125 + 0.9875 * torch.sigmoid(
-            10.0 * (series_mag - self.non_zero_threshold)
+            9.0 * (series_mag - self.non_zero_threshold)
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
         y_pred = e + y_true
-        W = max(6, T // 3)
-        pred_windows = list(y_pred.split(W, dim=1))
-        true_windows = list(y_true.split(W, dim=1))
+        cum_pred = torch.cumsum(y_pred, dim=1)
+        cum_true = torch.cumsum(y_true, dim=1)
+        l_cum = self._log_cosh(cum_pred - cum_true)
 
-        # Sum windowwise sorted-distribution losses, normalized by total cells
-        # (Hájek style) and then T-scaled per request.
-        num = None
-        den = None
-        for pw, tw in zip(pred_windows, true_windows):
-            pw_sorted = torch.sort(pw, dim=1, descending=True).values
-            tw_sorted = torch.sort(tw, dim=1, descending=True).values
-            w_loss = self._log_cosh(pw_sorted - tw_sorted)  # (B, W_i) or (B, W_i, C)
-            w_len = w_loss.shape[1]
+        if l_cum.dim() == 3:
+            num = (series_w.unsqueeze(1) * l_cum).sum(dim=(0, 1))
+            den = (series_w.sum(dim=0) * l_cum.shape[1]).clamp(min=self._EMA_EPS)
+        else:
+            num = (series_w.unsqueeze(1) * l_cum).sum()
+            den = (series_w.sum() * l_cum.shape[1]).clamp(min=self._EMA_EPS)
 
-            if w_loss.dim() == 3:
-                w_num = (series_w.unsqueeze(1) * w_loss).sum(dim=(0, 1))
-                w_den = (series_w.sum(dim=0) * w_len).clamp(min=self._EMA_EPS)
-            else:
-                w_num = (series_w.unsqueeze(1) * w_loss).sum()
-                w_den = (series_w.sum() * w_len).clamp(min=self._EMA_EPS)
-
-            num = w_num if num is None else (num + w_num)
-            den = w_den if den is None else (den + w_den)
-
-        level = num / den.clamp(min=self._EMA_EPS)
-        return T * level
+        level = num / den
+        return level
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -292,13 +275,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── Per-window DC/AC decomposition ────────────────────────────
-        # Demean within each non-overlapping window (same W as level anchor).
-        W = max(6, T // 3)
-        windows = list(e.split(W, dim=1))  # list of (B, W_i) or (B, W_i, C)
-        e_shape = torch.cat(
-            [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
-        )  # (B, T) or (B, T, C) — zero-mean within each window
+        # ── Full-horizon DC/AC decomposition ──────────────────────────
+        # Demean across time to isolate AC (shape) from global DC (level).
+        e_shape = e - e.mean(dim=1, keepdim=True)
 
         # ── Base cell loss ─────────────────────────────────────────────
         cell_loss = self._log_cosh(e_shape)
@@ -317,7 +296,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
-        event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
+        event_gate = 0.0125 + 0.9875 * torch.sigmoid(12.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO ────────────────────────────────────
@@ -341,7 +320,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             den = w_total.sum().clamp(min=self._EMA_EPS)
             loss_shape = num / den                                  # scalar
 
-        # ── Sorted-distribution level anchor ──────────────────────────
+        # ── Windowed cumulative level anchor ──────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 
         # ── Multi-resolution spectral loss (always on) ──────────────

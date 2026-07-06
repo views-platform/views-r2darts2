@@ -294,10 +294,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         if l_level.dim() == 3:
             num = (series_w.unsqueeze(1) * l_level).sum(dim=(0, 1))
-            den = (series_w.sum(dim=0) * l_level.shape[1]).clamp(min=self._EMA_EPS)
+            den = series_w.sum(dim=0).clamp(min=self._EMA_EPS)
         else:
             num = (series_w.unsqueeze(1) * l_level).sum()
-            den = (series_w.sum() * l_level.shape[1]).clamp(min=self._EMA_EPS)
+            den = series_w.sum().clamp(min=self._EMA_EPS)
 
         level = num / den
         return level

@@ -205,7 +205,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             den = (series_w.sum() * l_cum.shape[1]).clamp(min=self._EMA_EPS)
 
         level = num / den
-        return level
+        return T * level
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).

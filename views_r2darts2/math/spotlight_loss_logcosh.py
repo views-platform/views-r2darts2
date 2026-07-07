@@ -16,22 +16,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Components ───────────────────────────────────────────────────────
 
-     1. **DC/AC decomposition** — full-horizon demeaning.
-         e_shape = e − mean_t(e). Shape and level are orthogonal:
-         shape handles temporal patterns, level handles global DC.
+    1. **DC/AC decomposition** — per-window demeaning (same windows as level).
+       e_shape = e − window_mean(e).  Shape and level are orthogonal:
+       shape handles within-window patterns, level handles per-window DC.
 
     2. **Gated + magnitude-graded event weighting.**
-    event_mag = gate × (1 + abs_max), gate = 0.0125 + 0.9875 × σ(10 × (abs_max − τ)).
-    The gate suppresses peace (→ ~0.0125) vs conflict (→ ~1); the (1 + abs_max)
-       factor — bounded because abs_max is in asinh space — restores magnitude
-       sensitivity across the 4-OOM tail so large wars outweigh small skirmishes
-       instead of saturating flat. No model-state dependency (abs_max detached).
+    event_mag = gate × (1 + abs_max)^gamma,
+    gate = floor + (1-floor) × σ(slope × (abs_max − (τ + shift))).
+    The gate suppresses peace while preserving smooth transition around τ;
+    the magnitude term restores sensitivity across the compressed asinh tail.
 
     3. **Per-series temporal DRO** — within-series shock therapy.
-       Z-scores log(cell_loss) along time axis per series.  Upweights
-       proportionally harder timesteps *relative to that series*.
+       Power-law reweighting (alpha in (0,1)) upweights harder timesteps
+       *relative to that series* while remaining sublinear.
 
-    4. **Cumulative level anchor** — full-horizon cumsum log_cosh matching.
+    4. **Windowed level anchor** — log_cosh on per-window means.
+       Uses the exact same window partition as shape for strict orthogonality.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -46,6 +46,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
     _STFT = False
     _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
+
+    # Imbalance and weighting controls.
+    _EVENT_GATE_FLOOR = 0.005
+    _EVENT_GATE_SLOPE = 12.0
+    _EVENT_TAU_SHIFT = 0.02
+    _EVENT_MAG_GAMMA = 1.15
+    _DRO_ALPHA = 0.65
+
+    # Shared windowing for strict shape-level orthogonality.
+    _WINDOW_DIVISOR = 3
+    _MIN_WINDOW = 6
+    _LEVEL_SCALE = 1.0  # Fine-tuning multiplier applied on top of the base T scaling.
 
     def __init__(
         self,
@@ -86,23 +98,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
-    @staticmethod
-    def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Per-series sqrt self-reweighting
+    def _dro_weights_2d(self, losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Per-series power-law self-reweighting.
 
-        w_it = sqrt(loss_it / mean_i(loss))
+        w_it = (loss_it / mean_i(loss))^alpha, alpha in (0, 1)
 
-        Sublinear concentration: a cell 16× harder than average gets 4×
-        the gradient (not 16×).  Redistributes enough signal to fix
-        systematic bias while still focusing on spikes.
+        Sublinear concentration remains: harder cells get more gradient without
+        allowing extreme spikes to dominate.
 
         Returns weights with mean ≈ 1 per series, shape (B, T) or (B, T, C).
         """
+        del y_true  # Kept for signature compatibility.
         l = losses.detach()                                  # (B, T) or (B, T, C)
         mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1) or (B, 1, C)
-        w = torch.sqrt(l / mu)                               # (B, T) or (B, T, C)
+        w = torch.pow(l / mu, self._DRO_ALPHA)               # (B, T) or (B, T, C)
         w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
+
+    def _window_size(self, T: int) -> int:
+        """Shared non-overlapping window size for shape and level terms."""
+        return max(self._MIN_WINDOW, T // self._WINDOW_DIVISOR)
+
+    def _event_weight_from_mag(self, magnitude: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (event_weight, gate) from a magnitude tensor in asinh space."""
+        tau_eff = self.non_zero_threshold + self._EVENT_TAU_SHIFT
+        gate = self._EVENT_GATE_FLOOR + (1.0 - self._EVENT_GATE_FLOOR) * torch.sigmoid(
+            self._EVENT_GATE_SLOPE * (magnitude - tau_eff)
+        )
+        weight = gate * torch.pow(1.0 + magnitude, self._EVENT_MAG_GAMMA)
+        return weight, gate
 
     # ------------------------------------------------------------------
     # Loss Components
@@ -118,7 +142,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
           floor, permanently starving channels that could still improve.
         * Dividing the loss by the physical target scale (RMS) systematically
           down-weights the largest-signal channel — the primary target — and
-          mixes units (a scaled level term over an asinh-RMS is not a clean
+          mixes units (a W-scaled level term over an asinh-RMS is not a clean
           relative error).
 
         Instead each channel is compared only to *its own* history via two
@@ -172,40 +196,36 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-magnitude-weighted cumulative level anchor.
+        """Event-magnitude-weighted level anchor on shared shape windows.
 
-        Compare full-horizon cumulative sums with log_cosh.
-
-        y_pred_det: detached prediction tensor — when supplied, series weighting
-            uses max(|y_true|, |y_pred_det|) so that predicted false positives
-            on peaceful series also attract level loss gradient. Must be same
-            shape as y_true.
+        Strict orthogonality: shape is demeaned within exactly the same
+        non-overlapping windows used by this level term.
         """
-        # Per-series event magnitude: max(|y_true|, |y_pred|) across time -> gate.
+        W = self._window_size(T)
+
+        # Per-series event magnitude: max(|y_true|, |y_pred|) across time.
         if y_pred_det is not None:
             abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
-            10.0 * (series_mag - self.non_zero_threshold)
-        )
-        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
+        series_w, _ = self._event_weight_from_mag(series_mag)
 
-        y_pred = e + y_true
-        cum_pred = torch.cumsum(y_pred, dim=1)
-        cum_true = torch.cumsum(y_true, dim=1)
-        l_cum = self._log_cosh(cum_pred - cum_true)
+        window_means = torch.stack(
+            [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
+        )  # (B, n_w) or (B, n_w, C)
+        level_losses = self._log_cosh(window_means)
+        n_windows = level_losses.shape[1]
 
-        if l_cum.dim() == 3:
-            num = (series_w.unsqueeze(1) * l_cum).sum(dim=(0, 1))
-            den = (series_w.sum(dim=0) * l_cum.shape[1]).clamp(min=self._EMA_EPS)
+        if level_losses.dim() == 3:
+            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
+            den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)
         else:
-            num = (series_w.unsqueeze(1) * l_cum).sum()
-            den = (series_w.sum() * l_cum.shape[1]).clamp(min=self._EMA_EPS)
+            num = (series_w.unsqueeze(1) * level_losses).sum()
+            den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
 
         level = num / den
-        return level
+        return T * self._LEVEL_SCALE * level
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only).
@@ -275,9 +295,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── Full-horizon DC/AC decomposition ──────────────────────────
-        # Demean across time to isolate AC (shape) from global DC (level).
-        e_shape = e - e.mean(dim=1, keepdim=True)
+        # ── Per-window DC/AC decomposition ────────────────────────────
+        # Strict orthogonality: use the exact same non-overlapping windows as
+        # the level anchor.
+        W = self._window_size(T)
+        windows = list(e.split(W, dim=1))  # list of (B, W_i) or (B, W_i, C)
+        e_shape = torch.cat(
+            [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
+        )  # (B, T) or (B, T, C)
 
         # ── Base cell loss ─────────────────────────────────────────────
         cell_loss = self._log_cosh(e_shape)
@@ -295,9 +320,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
-        event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
-        event_mag = event_gate * (1.0 + abs_max)
+        event_mag, _ = self._event_weight_from_mag(abs_max)
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
@@ -320,7 +343,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             den = w_total.sum().clamp(min=self._EMA_EPS)
             loss_shape = num / den                                  # scalar
 
-        # ── Windowed cumulative level anchor ──────────────────────────
+        # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 
         # ── Multi-resolution spectral loss (always on) ──────────────

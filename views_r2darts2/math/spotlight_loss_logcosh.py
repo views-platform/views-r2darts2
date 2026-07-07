@@ -16,13 +16,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Components ───────────────────────────────────────────────────────
 
-     1. **DC/AC decomposition** — Haar local pairwise demeaning.
-         Within each adjacent time pair (t, t+1), subtract the pair mean:
-         the deviation is the Haar detail (local AC/shape), the pair mean is
-         the Haar approximation (local DC/level). Strictly LOCAL — a spike at
-         t only perturbs its own pair, so shape is not smeared across the
-         horizon the way global demeaning smears it. Orthogonal to the pair
-         mean by construction, preserving the AC/DC split.
+     1. **DC/AC decomposition** — full-horizon demeaning.
+         e_shape = e − mean_t(e). Shape and level are orthogonal:
+         shape handles temporal patterns, level handles global DC.
 
     2. **Gated + magnitude-graded event weighting.**
     event_mag = gate × (1 + abs_max), gate = 0.0125 + 0.9875 × σ(10 × (abs_max − τ)).
@@ -35,9 +31,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
        Z-scores log(cell_loss) along time axis per series.  Upweights
        proportionally harder timesteps *relative to that series*.
 
-    4. **Multi-scale level anchor** — dyadic average-pool (Haar approximation)
-       log_cosh matching. Strictly local, O(log T) gradient, DC-carrying;
-       the orthogonal complement of the Haar shape detail (component 1).
+    4. **Cumulative level anchor** — full-horizon cumsum log_cosh matching.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -110,97 +104,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
-    @staticmethod
-    def _haar_shape(e: torch.Tensor) -> torch.Tensor:
-        """Haar detail (local AC) via adjacent-pair demeaning.
-
-        Splits the time axis into non-overlapping pairs (t, t+1) and subtracts
-        each pair's mean. The residual is the Haar detail coefficient carried
-        in the original (B, T[, C]) layout (both members hold ±deviation), so
-        every downstream per-cell op (event weighting, DRO, Hájek) is unchanged.
-
-        Strictly local: a spike at t only affects its own pair, unlike global
-        demeaning which contaminates every timestep's shape. Odd final timestep
-        (T odd) carries zero deviation — its signal lives only in the level term.
-        """
-        T = e.shape[1]
-        if T < 2:
-            return e - e.mean(dim=1, keepdim=True)
-        n_pairs = T // 2
-        core = e[:, : 2 * n_pairs, ...]
-        if e.dim() == 3:
-            C = e.shape[2]
-            pairs = core.reshape(e.shape[0], n_pairs, 2, C)
-            detail = (pairs - pairs.mean(dim=2, keepdim=True)).reshape(
-                e.shape[0], 2 * n_pairs, C
-            )
-        else:
-            pairs = core.reshape(e.shape[0], n_pairs, 2)
-            detail = (pairs - pairs.mean(dim=2, keepdim=True)).reshape(
-                e.shape[0], 2 * n_pairs
-            )
-        if T - 2 * n_pairs:
-            detail = torch.cat([detail, torch.zeros_like(e[:, 2 * n_pairs :, ...])], dim=1)
-        return detail
-
-    @staticmethod
-    def _block_mean_broadcast(e: torch.Tensor, k: int) -> torch.Tensor:
-        """Replace each timestep with the mean of its length-k dyadic block.
-
-        Handles arbitrary T (a trailing partial block is averaged over its own
-        length). The gradient of a block mean w.r.t. its members is 1/k and
-        zero elsewhere, so the operation is strictly local.
-        """
-        B, T = e.shape[0], e.shape[1]
-        n_full = T // k
-        parts = []
-        if n_full:
-            core = e[:, : n_full * k, ...]
-            if e.dim() == 3:
-                C = e.shape[2]
-                m = core.reshape(B, n_full, k, C).mean(dim=2, keepdim=True)
-                parts.append(m.expand(B, n_full, k, C).reshape(B, n_full * k, C))
-            else:
-                m = core.reshape(B, n_full, k).mean(dim=2, keepdim=True)
-                parts.append(m.expand(B, n_full, k).reshape(B, n_full * k))
-        if T - n_full * k:
-            tail = e[:, n_full * k :, ...]
-            parts.append(tail.mean(dim=1, keepdim=True).expand_as(tail))
-        return torch.cat(parts, dim=1)
-
-    @classmethod
-    def _haar_level(cls, e: torch.Tensor) -> torch.Tensor:
-        """Multi-scale dyadic average-pool DC/level anchor (Haar approximation).
-
-        For each dyadic block size k = 2, 4, 8, … up to the full horizon,
-        compare the block-mean prediction error (the Haar approximation
-        coefficient) against zero via log_cosh, broadcast that block value back
-        over the timesteps it covers, and average across scales. The result is
-        a strictly local, DC-carrying level signal in the original (B, T[, C])
-        layout: the coarsest scale is the global mean (total-magnitude anchor);
-        finer scales localize where the cumulative mass imbalance sits.
-
-        Unlike cumsum, each e[t] contributes to exactly one block per scale, so
-        the gradient is O(log T), position-symmetric, and non-smearing — it
-        removes cumsum's O(T) early-step amplification while keeping DC
-        sensitivity. Orthogonal complement of the Haar detail used for shape.
-        """
-        T = e.shape[1]
-        if T < 2:
-            return cls._log_cosh(e)
-        scales = []
-        k = 2
-        while True:
-            scales.append(min(k, T))
-            if k >= T:
-                break
-            k *= 2
-        acc = None
-        for k in scales:
-            l = cls._log_cosh(cls._block_mean_broadcast(e, k))
-            acc = l if acc is None else acc + l
-        return acc / len(scales)
-
     # ------------------------------------------------------------------
     # Loss Components
     # ------------------------------------------------------------------
@@ -269,10 +172,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-magnitude-weighted multi-scale DC/level anchor.
+        """Event-magnitude-weighted cumulative level anchor.
 
-        Compare dyadic block-mean prediction errors (Haar approximation)
-        against zero with log_cosh, averaged across scales.
+        Compare full-horizon cumulative sums with log_cosh.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -290,14 +192,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
-        l_level = self._haar_level(e)
+        y_pred = e + y_true
+        cum_pred = torch.cumsum(y_pred, dim=1)
+        cum_true = torch.cumsum(y_true, dim=1)
+        l_cum = self._log_cosh(cum_pred - cum_true)
 
-        if l_level.dim() == 3:
-            num = (series_w.unsqueeze(1) * l_level).sum(dim=(0, 1))
-            den = series_w.sum(dim=0).clamp(min=self._EMA_EPS)
+        if l_cum.dim() == 3:
+            num = (series_w.unsqueeze(1) * l_cum).sum(dim=(0, 1))
+            den = (series_w.sum(dim=0) * l_cum.shape[1]).clamp(min=self._EMA_EPS)
         else:
-            num = (series_w.unsqueeze(1) * l_level).sum()
-            den = series_w.sum().clamp(min=self._EMA_EPS)
+            num = (series_w.unsqueeze(1) * l_cum).sum()
+            den = (series_w.sum() * l_cum.shape[1]).clamp(min=self._EMA_EPS)
 
         level = num / den
         return level
@@ -370,11 +275,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── Haar local DC/AC decomposition ────────────────────────────
-        # Adjacent-pair demeaning: the deviation is the Haar detail (local AC/
-        # shape), the pair mean is the Haar approximation (local DC/level).
-        # Strictly local, so a spike only perturbs its own pair.
-        e_shape = self._haar_shape(e)
+        # ── Full-horizon DC/AC decomposition ──────────────────────────
+        # Demean across time to isolate AC (shape) from global DC (level).
+        e_shape = e - e.mean(dim=1, keepdim=True)
 
         # ── Base cell loss ─────────────────────────────────────────────
         cell_loss = self._log_cosh(e_shape)
@@ -417,7 +320,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             den = w_total.sum().clamp(min=self._EMA_EPS)
             loss_shape = num / den                                  # scalar
 
-        # ── Multi-scale (Haar approximation) DC/level anchor ─────────────
+        # ── Windowed cumulative level anchor ──────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 
         # ── Multi-resolution spectral loss (always on) ──────────────

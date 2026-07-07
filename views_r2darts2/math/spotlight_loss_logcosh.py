@@ -52,7 +52,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
     _EVENT_GATE_SLOPE = 12.0
     _EVENT_TAU_SHIFT = 0.02
     _EVENT_MAG_GAMMA = 1.15
-    _DRO_ALPHA = 0.65
+    # Adaptive DRO alpha bounds.
+    # alpha is computed each forward pass as:
+    #   alpha = _DRO_ALPHA_MIN + (_DRO_ALPHA_MAX - _DRO_ALPHA_MIN) * (1 - f_event)
+    # where f_event = fraction of cells with abs_max > tau_eff.
+    # At 97% zeros (f_event ≈ 0.03): alpha ≈ _DRO_ALPHA_MAX (aggressive concentration).
+    # At 50% events (f_event ≈ 0.50): alpha ≈ midpoint (relaxed).
+    _DRO_ALPHA_MIN = 0.30
+    _DRO_ALPHA_MAX = 0.80
 
     # Shared windowing for strict shape-level orthogonality.
     _WINDOW_DIVISOR = 3
@@ -98,20 +105,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
-    def _dro_weights_2d(self, losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def _dro_weights_2d(
+        self, losses: torch.Tensor, y_true: torch.Tensor, alpha: float
+    ) -> torch.Tensor:
         """Per-series power-law self-reweighting.
 
         w_it = (loss_it / mean_i(loss))^alpha, alpha in (0, 1)
 
-        Sublinear concentration remains: harder cells get more gradient without
-        allowing extreme spikes to dominate.
+        alpha is computed adaptively per-batch in forward() based on the
+        fraction of active (conflict) cells in the batch.
 
         Returns weights with mean ≈ 1 per series, shape (B, T) or (B, T, C).
         """
         del y_true  # Kept for signature compatibility.
         l = losses.detach()                                  # (B, T) or (B, T, C)
         mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1) or (B, 1, C)
-        w = torch.pow(l / mu, self._DRO_ALPHA)               # (B, T) or (B, T, C)
+        w = torch.pow(l / mu, alpha)                         # (B, T) or (B, T, C)
         w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
@@ -322,8 +331,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_mag, _ = self._event_weight_from_mag(abs_max)
 
+        # ── Adaptive DRO alpha ─────────────────────────────────────────
+        # f_event: fraction of cells with abs_max above the effective threshold.
+        # Low f_event (sparse batch, ~0.03 at pg-month) → alpha near _DRO_ALPHA_MAX
+        # (concentrate harder on the few event cells).
+        # High f_event → alpha near _DRO_ALPHA_MIN (relax; event weighting carries
+        # the differentiation).
+        tau_eff = self.non_zero_threshold + self._EVENT_TAU_SHIFT
+        f_event = (abs_max.detach() > tau_eff).float().mean().item()
+        dro_alpha = self._DRO_ALPHA_MIN + (self._DRO_ALPHA_MAX - self._DRO_ALPHA_MIN) * (1.0 - f_event)
+
         # ── Per-series temporal DRO ────────────────────────────────────
-        w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
+        w_dro = self._dro_weights_2d(cell_loss, y_true, dro_alpha)  # (B, T) or (B, T, C)
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Hájek self-normalized shape (composition-robust) ──────────

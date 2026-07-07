@@ -26,14 +26,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
     The gate suppresses peace while preserving smooth transition around τ;
     the magnitude term restores sensitivity across the compressed asinh tail.
 
-    3. **Per-series temporal DRO** — within-series shock therapy.
-       Power-law reweighting (alpha in (0,1)) upweights harder timesteps
-       *relative to that series* while remaining sublinear.
+     3. **Pseudo-hurdle occurrence term** — zero vs non-zero supervision
+         from the same scalar output. The model's asinh prediction is converted
+         into an occurrence logit relative to ``non_zero_threshold`` and trained
+         with positive-class-reweighted BCE. This gives explicit event-detection
+         signal without adding a second head.
 
-    4. **Windowed level anchor** — log_cosh on per-window means.
-       Uses the exact same window partition as shape for strict orthogonality.
+     4. **Per-series temporal DRO** — within-series shock therapy.
+         Power-law reweighting (alpha in (0,1)) upweights harder timesteps
+         *relative to that series* while remaining sublinear.
 
-    5. **Multi-resolution STFT loss** — always on, ungated.
+     5. **Windowed level anchor** — log_cosh on per-window means.
+         Uses the exact same window partition as shape for strict orthogonality.
+
+     6. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
 
     ── Base cell loss: log_cosh × (1 + log(1+|x|³))  (proportional) ───
@@ -137,6 +143,58 @@ class SpotlightLossLogcosh(torch.nn.Module):
         weight = gate * torch.pow(1.0 + magnitude, self._EVENT_MAG_GAMMA)
         return weight, gate
 
+    def _occurrence_hurdle_terms(
+        self, y_pred: torch.Tensor, y_true: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return occurrence loss and a soft magnitude mask.
+
+        This is a no-new-head pseudo-hurdle mechanism:
+
+        * ``z_event`` is the true zero-vs-event indicator from
+          ``non_zero_threshold`` in asinh space.
+        * ``occ_logit`` reuses the existing scalar prediction as an occurrence
+          score relative to that threshold.
+        * ``mag_mask = max(z_event, p_event.detach())`` makes the regression
+          path behave like a hurdle: true events train magnitude directly,
+          easy zeros are largely ignored by the magnitude loss, and predicted
+          false positives still receive gradient.
+
+        Returns:
+            loss_occ: scalar for 2D inputs or (C,) for 3D inputs.
+            mag_mask: same shape as ``y_true``.
+        """
+        tau_eff = self.non_zero_threshold + self._EVENT_TAU_SHIFT
+        z_event = (y_true > tau_eff).to(dtype=y_pred.dtype)
+        occ_logit = self._EVENT_GATE_SLOPE * (y_pred - tau_eff)
+        p_event = torch.sigmoid(occ_logit)
+
+        # Positive-class reweighting is derived from the current batch event
+        # rate, so the occurrence loss stays informative even when ~97% of
+        # cells are zero.
+        if z_event.dim() == 3:
+            event_rate = z_event.mean(dim=(0, 1)).detach().clamp(
+                min=self._EMA_EPS, max=1.0 - self._EMA_EPS
+            )
+            pos_weight = ((1.0 - event_rate) / event_rate).view(1, 1, -1)
+            loss_occ_raw = F.binary_cross_entropy_with_logits(
+                occ_logit, z_event, reduction="none"
+            )
+            loss_occ_weighted = torch.where(z_event > 0.0, pos_weight * loss_occ_raw, loss_occ_raw)
+            loss_occ = loss_occ_weighted.mean(dim=(0, 1))
+        else:
+            event_rate = z_event.mean().detach().clamp(
+                min=self._EMA_EPS, max=1.0 - self._EMA_EPS
+            )
+            pos_weight = (1.0 - event_rate) / event_rate
+            loss_occ_raw = F.binary_cross_entropy_with_logits(
+                occ_logit, z_event, reduction="none"
+            )
+            loss_occ_weighted = torch.where(z_event > 0.0, pos_weight * loss_occ_raw, loss_occ_raw)
+            loss_occ = loss_occ_weighted.mean()
+
+        mag_mask = torch.maximum(z_event, p_event.detach())
+        return loss_occ, mag_mask
+
     # ------------------------------------------------------------------
     # Loss Components
     # ------------------------------------------------------------------
@@ -219,6 +277,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
         series_w, _ = self._event_weight_from_mag(series_mag)
+
+        # Pseudo-hurdle series mask: empty series are down-weighted in the
+        # level term unless the model is actively trying to predict an event.
+        tau_eff = self.non_zero_threshold + self._EVENT_TAU_SHIFT
+        true_series_event = (y_true > tau_eff).any(dim=1).to(dtype=y_true.dtype)
+        if y_pred_det is not None:
+            pred_series_event = torch.sigmoid(
+                self._EVENT_GATE_SLOPE * (y_pred_det.max(dim=1).values - tau_eff)
+            )
+        else:
+            pred_series_event = true_series_event
+        series_mask = torch.maximum(true_series_event, pred_series_event.detach())
+        series_w = series_w * series_mask
 
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
@@ -330,6 +401,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_mag, _ = self._event_weight_from_mag(abs_max)
+        loss_occ, mag_mask = self._occurrence_hurdle_terms(y_pred, y_true)
 
         # ── Adaptive DRO alpha ─────────────────────────────────────────
         # f_event: fraction of cells with abs_max above the effective threshold.
@@ -343,7 +415,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true, dro_alpha)  # (B, T) or (B, T, C)
-        w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+        w_total = torch.nan_to_num(
+            mag_mask * event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0
+        )
 
         # ── Hájek self-normalized shape (composition-robust) ──────────
         # Weight-mass-weighted mean of the per-cell log_cosh — the
@@ -365,6 +439,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 
+        # Occurrence BCE is automatically scale-matched to the existing shape
+        # loss, avoiding a new tuning constant while still giving explicit
+        # zero-vs-event supervision.
+        occ_scale = loss_shape.detach() / loss_occ.detach().clamp(min=self._EMA_EPS)
+        loss_occ_scaled = occ_scale * loss_occ
+
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)
         if self._STFT and T >= 6:
@@ -373,16 +453,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Core objective assembly & telemetry ────────────────────
         if loss_shape.dim() == 0:
             # Univariate path
-            total_loss = loss_shape + loss_level + loss_spec
+            total_loss = loss_shape + loss_level + loss_spec + loss_occ_scaled
             self._last_components = {
                 "shape": [float(loss_shape.detach())],
                 "level": [float(loss_level.detach())],
+                "occ": [float(loss_occ_scaled.detach())],
                 "spec": [float(loss_spec.detach()) if loss_spec.dim()==0 else float(loss_spec)],
                 "weight": [1.0],
             }
         else:
             # Multivariate path
-            per_channel_total = loss_shape + loss_level + loss_spec
+            per_channel_total = loss_shape + loss_level + loss_spec + loss_occ_scaled
             total_loss = self._combine_channels(per_channel_total, y_pred, y_true)
             
             C = per_channel_total.shape[0]
@@ -391,6 +472,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             self._last_components = {
                 "shape": loss_shape.detach().tolist(),
                 "level": loss_level.detach().tolist(),
+                "occ": loss_occ_scaled.detach().tolist(),
                 "spec": spec_list,
                 "weight": weights,
                 "ema": self._loss_ema_slow or [float("nan")] * C,

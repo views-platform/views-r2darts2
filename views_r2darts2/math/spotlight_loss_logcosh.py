@@ -124,7 +124,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             event_rate = z_event.mean(dim=(0, 1)).detach().clamp(
                 min=self._EMA_EPS, max=1.0 - self._EMA_EPS
             )
-            pos_weight = ((1.0 - event_rate) / event_rate).view(1, 1, -1)
+            pos_weight = torch.sqrt((1.0 - event_rate) / event_rate).view(1, 1, -1)
             loss_occ_raw = F.binary_cross_entropy_with_logits(
                 occ_logit, z_event, reduction="none"
             )
@@ -134,7 +134,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             event_rate = z_event.mean().detach().clamp(
                 min=self._EMA_EPS, max=1.0 - self._EMA_EPS
             )
-            pos_weight = (1.0 - event_rate) / event_rate
+            pos_weight = torch.sqrt((1.0 - event_rate) / event_rate)
             loss_occ_raw = F.binary_cross_entropy_with_logits(
                 occ_logit, z_event, reduction="none"
             )

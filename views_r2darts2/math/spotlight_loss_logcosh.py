@@ -447,7 +447,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Data-driven balance: keep level informative without letting it dominate
         # shape. Uses only current-batch losses, with no new constants.
         level_match = loss_shape.detach() / loss_level_raw.detach().clamp(min=self._EMA_EPS)
-        loss_level = level_match * loss_level_raw
+        loss_level = T * level_match * loss_level_raw
 
         # Occurrence BCE is automatically scale-matched to the existing shape
         # loss, avoiding a new tuning constant while still giving explicit

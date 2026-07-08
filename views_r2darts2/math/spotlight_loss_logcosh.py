@@ -138,7 +138,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _event_weight(
         self, z_event: torch.Tensor, p_event: torch.Tensor
     ) -> torch.Tensor:
-        """Data-driven event weight from occurrence probability.
+        """Base event gate from occurrence probability.
 
         For true event cells (z_event=1): weight = 1.0 — full regression signal.
         For peace cells (z_event=0):      weight = p_event (detached) — the
@@ -403,9 +403,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         loss_occ, z_event, p_event = self._occurrence_hurdle_terms(y_pred, y_true)
-        # Event weight: true events=1.0, peace cells=predicted event probability.
+        # Event gate: true events=1.0, peace cells=predicted event probability.
         # Self-correcting and zero hyperparameters — see _event_weight().
         event_weight = self._event_weight(z_event, p_event)
+        # Restore magnitude sensitivity using the already-available asinh scale.
+        # This prioritizes larger conflicts without introducing any new knobs.
+        event_weight = event_weight * (1.0 + abs_max.detach())
 
         # ── Adaptive DRO alpha ─────────────────────────────────────────
         # f_event: fraction of cells with abs_max above non_zero_threshold.
@@ -440,7 +443,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = num / den                                  # scalar
 
         # ── Windowed level anchor ─────────────────────────────────────
-        loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
+        loss_level_raw = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
+        # Data-driven balance: keep level informative without letting it dominate
+        # shape. Uses only current-batch losses, with no new constants.
+        level_match = loss_shape.detach() / loss_level_raw.detach().clamp(min=self._EMA_EPS)
+        loss_level = level_match * loss_level_raw
 
         # Occurrence BCE is automatically scale-matched to the existing shape
         # loss, avoiding a new tuning constant while still giving explicit

@@ -20,11 +20,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
        e_shape = e − window_mean(e).  Shape and level are orthogonal:
        shape handles within-window patterns, level handles per-window DC.
 
-    2. **Gated + magnitude-graded event weighting.**
-    event_mag = gate × (1 + abs_max)^gamma,
-    gate = floor + (1-floor) × σ(slope × (abs_max − (τ + shift))).
-    The gate suppresses peace while preserving smooth transition around τ;
-    the magnitude term restores sensitivity across the compressed asinh tail.
+    2. **Occurrence-probability event weighting.**
+    event_weight = z_event + (1 − z_event) × p_event,
+    where z_event = 1{y_true > τ} and p_event = σ(y_pred − τ).
+    True events get weight 1.0. Peace cells get the model's own predicted
+    event probability — fully data-driven, zero hyperparameters. Self-
+    correcting: hallucinated events raise p_event, increasing regression
+    weight and pushing the prediction back down.
 
      3. **Pseudo-hurdle occurrence term** — zero vs non-zero supervision
          from the same scalar output. The model's asinh prediction is converted
@@ -53,12 +55,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
     _EMA_BETA = 0.99
     _EMA_EPS = 1e-6
 
-    # Imbalance and weighting controls.
-    _EVENT_GATE_FLOOR = 0.005
-    _EVENT_GATE_SLOPE = 12.0
-    _EVENT_TAU_SHIFT = 0.02
-    _EVENT_MAG_GAMMA = 1.15
     # Adaptive DRO alpha bounds.
+    # Event weighting uses no separate constants: event_weight is derived
+    # entirely from the pseudo-hurdle occurrence probability p_event and the
+    # already-present non_zero_threshold. See _event_weight() and
+    # _occurrence_hurdle_terms().
     # alpha is computed each forward pass as:
     #   alpha = _DRO_ALPHA_MIN + (_DRO_ALPHA_MAX - _DRO_ALPHA_MIN) * (1 - f_event)
     # where f_event = fraction of cells with abs_max > tau_eff.
@@ -134,43 +135,52 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """Shared non-overlapping window size for shape and level terms."""
         return max(self._MIN_WINDOW, T // self._WINDOW_DIVISOR)
 
-    def _event_weight_from_mag(self, magnitude: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (event_weight, gate) from a magnitude tensor in asinh space."""
-        tau_eff = self.non_zero_threshold + self._EVENT_TAU_SHIFT
-        gate = self._EVENT_GATE_FLOOR + (1.0 - self._EVENT_GATE_FLOOR) * torch.sigmoid(
-            self._EVENT_GATE_SLOPE * (magnitude - tau_eff)
-        )
-        weight = gate * torch.pow(1.0 + magnitude, self._EVENT_MAG_GAMMA)
-        return weight, gate
+    def _event_weight(
+        self, z_event: torch.Tensor, p_event: torch.Tensor
+    ) -> torch.Tensor:
+        """Data-driven event weight from occurrence probability.
+
+        For true event cells (z_event=1): weight = 1.0 — full regression signal.
+        For peace cells (z_event=0):      weight = p_event (detached) — the
+          model's own predicted probability.
+
+        Self-correcting property: if the model hallucinates an event on a
+        peace cell, p_event is high, the regression loss gets high weight, and
+        the gradient pushes the prediction back below the threshold. Once the
+        model correctly predicts peace, p_event ≈ 0 and the regression weight
+        vanishes — no pressure to overfit to exact zero values.
+
+        Zero hyperparameters: uses only non_zero_threshold (via
+        _occurrence_hurdle_terms) and no additional constants.
+        """
+        return z_event + (1.0 - z_event) * p_event.detach()
 
     def _occurrence_hurdle_terms(
         self, y_pred: torch.Tensor, y_true: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return occurrence loss and a soft magnitude mask.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return occurrence loss, true event indicator, and predicted event probability.
 
-        This is a no-new-head pseudo-hurdle mechanism:
-
-        * ``z_event`` is the true zero-vs-event indicator from
-          ``non_zero_threshold`` in asinh space.
-        * ``occ_logit`` reuses the existing scalar prediction as an occurrence
-          score relative to that threshold.
-        * ``mag_mask = max(z_event, p_event.detach())`` makes the regression
-          path behave like a hurdle: true events train magnitude directly,
-          easy zeros are largely ignored by the magnitude loss, and predicted
-          false positives still receive gradient.
+        Uses a unit-slope sigmoid centered at ``non_zero_threshold``.
+        No slope multiplier or threshold shift constants are needed: the
+        positive-class reweighting already calibrates the gradient magnitude,
+        and the threshold is the semantically meaningful boundary (asinh(1) ≈
+        one battle death).
 
         Returns:
-            loss_occ: scalar for 2D inputs or (C,) for 3D inputs.
-            mag_mask: same shape as ``y_true``.
+            loss_occ: class-reweighted BCE, scalar (2D) or (C,) (3D).
+            z_event:  true event indicator, same shape as ``y_true``.
+            p_event:  predicted event probability, same shape as ``y_true``.
         """
-        tau_eff = self.non_zero_threshold + self._EVENT_TAU_SHIFT
-        z_event = (y_true > tau_eff).to(dtype=y_pred.dtype)
-        occ_logit = self._EVENT_GATE_SLOPE * (y_pred - tau_eff)
+        tau = self.non_zero_threshold
+        z_event = (y_true > tau).to(dtype=y_pred.dtype)
+        # Unit-slope logit: positive when y_pred > tau, negative otherwise.
+        # The BCE gradient is already calibrated by the class-reweighted loss;
+        # no additional slope multiplier is required.
+        occ_logit = y_pred - tau
         p_event = torch.sigmoid(occ_logit)
 
-        # Positive-class reweighting is derived from the current batch event
-        # rate, so the occurrence loss stays informative even when ~97% of
-        # cells are zero.
+        # Positive-class reweighting from the current batch event rate keeps
+        # the occurrence loss informative even at 97% sparsity.
         if z_event.dim() == 3:
             event_rate = z_event.mean(dim=(0, 1)).detach().clamp(
                 min=self._EMA_EPS, max=1.0 - self._EMA_EPS
@@ -192,8 +202,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_occ_weighted = torch.where(z_event > 0.0, pos_weight * loss_occ_raw, loss_occ_raw)
             loss_occ = loss_occ_weighted.mean()
 
-        mag_mask = torch.maximum(z_event, p_event.detach())
-        return loss_occ, mag_mask
+        return loss_occ, z_event, p_event
 
     # ------------------------------------------------------------------
     # Loss Components
@@ -270,26 +279,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """
         W = self._window_size(T)
 
-        # Per-series event magnitude: max(|y_true|, |y_pred|) across time.
+        # Series-level occurrence-probability weight — zero hyperparameters.
+        # Series with any true event above threshold get weight 1.0.
+        # Peaceful series get the model's predicted event probability for its
+        # highest-valued timestep: self-correcting and no floor constant needed.
+        tau = self.non_zero_threshold
+        true_series_event = (y_true > tau).any(dim=1).to(dtype=y_true.dtype)
         if y_pred_det is not None:
-            abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
-        else:
-            abs_max_series = y_true.abs()
-        series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        series_w, _ = self._event_weight_from_mag(series_mag)
-
-        # Pseudo-hurdle series mask: empty series are down-weighted in the
-        # level term unless the model is actively trying to predict an event.
-        tau_eff = self.non_zero_threshold + self._EVENT_TAU_SHIFT
-        true_series_event = (y_true > tau_eff).any(dim=1).to(dtype=y_true.dtype)
-        if y_pred_det is not None:
-            pred_series_event = torch.sigmoid(
-                self._EVENT_GATE_SLOPE * (y_pred_det.max(dim=1).values - tau_eff)
+            p_series = torch.sigmoid(y_pred_det.max(dim=1).values - tau)
+            series_w = (
+                true_series_event + (1.0 - true_series_event) * p_series.detach()
             )
         else:
-            pred_series_event = true_series_event
-        series_mask = torch.maximum(true_series_event, pred_series_event.detach())
-        series_w = series_w * series_mask
+            series_w = true_series_event
 
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
@@ -400,23 +402,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_mag, _ = self._event_weight_from_mag(abs_max)
-        loss_occ, mag_mask = self._occurrence_hurdle_terms(y_pred, y_true)
+        loss_occ, z_event, p_event = self._occurrence_hurdle_terms(y_pred, y_true)
+        # Event weight: true events=1.0, peace cells=predicted event probability.
+        # Self-correcting and zero hyperparameters — see _event_weight().
+        event_weight = self._event_weight(z_event, p_event)
 
         # ── Adaptive DRO alpha ─────────────────────────────────────────
-        # f_event: fraction of cells with abs_max above the effective threshold.
+        # f_event: fraction of cells with abs_max above non_zero_threshold.
         # Low f_event (sparse batch, ~0.03 at pg-month) → alpha near _DRO_ALPHA_MAX
         # (concentrate harder on the few event cells).
-        # High f_event → alpha near _DRO_ALPHA_MIN (relax; event weighting carries
+        # High f_event → alpha near _DRO_ALPHA_MIN (relax; event weight carries
         # the differentiation).
-        tau_eff = self.non_zero_threshold + self._EVENT_TAU_SHIFT
-        f_event = (abs_max.detach() > tau_eff).float().mean().item()
+        f_event = (abs_max.detach() > self.non_zero_threshold).float().mean().item()
         dro_alpha = self._DRO_ALPHA_MIN + (self._DRO_ALPHA_MAX - self._DRO_ALPHA_MIN) * (1.0 - f_event)
 
         # ── Per-series temporal DRO ────────────────────────────────────
         w_dro = self._dro_weights_2d(cell_loss, y_true, dro_alpha)  # (B, T) or (B, T, C)
         w_total = torch.nan_to_num(
-            mag_mask * event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0
+            event_weight * w_dro, nan=1.0, posinf=1.0, neginf=0.0
         )
 
         # ── Hájek self-normalized shape (composition-robust) ──────────

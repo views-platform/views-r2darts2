@@ -183,10 +183,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
     ) -> torch.Tensor:
         """Event-mask-weighted level anchor on shared shape windows.
 
-        Using a Hájek self-normalized window level loss weighted by raw-scale
-        cosh magnitude (max of true or predicted). This ensures the level loss 
-        provides intense, mathematically aligned corrective pressure on 
-        high-magnitude level errors while remaining composition-robust.
+        Using a Hájek self-normalized window level loss with a robust, balanced
+        linear magnitude scaling (1.0 + window_mag). This provides healthy 
+        corrective pressure on large errors without the exponential weight 
+        explosion of cosh, which suppresses/dilutes the gradient of quiet areas 
+        and leads to overprediction drift.
         """
         W = self._window_size(T)
 
@@ -216,11 +217,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         level_losses = self._log_cosh(window_means)
 
-        # Scale corrective pressure using first-order raw scale approximation.
-        # This converts symmetric target-space error into raw-space aligned pressure.
+        # Scale corrective pressure using a linear magnitude multiplier.
+        # This prevents exponential (cosh) weight ratios that drown out silent series/timesteps.
         window_mag = torch.max(torch.abs(window_true), torch.abs(window_pred))
-        window_cosh = torch.cosh(window_mag.clamp(max=5.0))
-        window_w = series_w.unsqueeze(1) * window_cosh
+        window_w = series_w.unsqueeze(1) * (1.0 + window_mag)
 
         if level_losses.dim() == 3:
             num = (window_w * level_losses).sum(dim=(0, 1))
@@ -230,7 +230,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             den = window_w.sum().clamp(min=self._EMA_EPS)
 
         level = num / den
-        return level
+        return T * level
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only)."""

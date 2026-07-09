@@ -60,7 +60,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # Shared windowing for strict shape-level orthogonality.
     _WINDOW_DIVISOR = 3
     _MIN_WINDOW = 6
-    _LEVEL_SCALE = 1.0
 
     def __init__(
         self,
@@ -182,7 +181,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-mask-weighted level anchor on shared shape windows."""
+        """Event-mask-weighted level anchor on shared shape windows.
+
+        Using a Hájek self-normalized window level loss weighted by raw-scale
+        cosh magnitude (max of true or predicted). This ensures the level loss 
+        provides intense, mathematically aligned corrective pressure on 
+        high-magnitude level errors while remaining composition-robust.
+        """
         W = self._window_size(T)
 
         true_series_event = (y_true > self.non_zero_threshold).any(dim=1).to(dtype=y_true.dtype)
@@ -195,21 +200,37 @@ class SpotlightLossLogcosh(torch.nn.Module):
         series_mask = torch.maximum(true_series_event, pred_series_event.detach())
         series_w = series_mask
 
+        # Window level means of targets and predictions
+        window_true = torch.stack(
+            [yt.mean(dim=1) for yt in y_true.split(W, dim=1)], dim=1
+        )
+        if y_pred_det is not None:
+            window_pred = torch.stack(
+                [yp.mean(dim=1) for yp in y_pred_det.split(W, dim=1)], dim=1
+            )
+        else:
+            window_pred = window_true
+
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
         level_losses = self._log_cosh(window_means)
-        n_windows = level_losses.shape[1]
+
+        # Scale corrective pressure using first-order raw scale approximation.
+        # This converts symmetric target-space error into raw-space aligned pressure.
+        window_mag = torch.max(torch.abs(window_true), torch.abs(window_pred))
+        window_cosh = torch.cosh(window_mag.clamp(max=5.0))
+        window_w = series_w.unsqueeze(1) * window_cosh
 
         if level_losses.dim() == 3:
-            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
-            den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)
+            num = (window_w * level_losses).sum(dim=(0, 1))
+            den = window_w.sum(dim=(0, 1)).clamp(min=self._EMA_EPS)
         else:
-            num = (series_w.unsqueeze(1) * level_losses).sum()
-            den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
+            num = (window_w * level_losses).sum()
+            den = window_w.sum().clamp(min=self._EMA_EPS)
 
         level = num / den
-        return T * self._LEVEL_SCALE * level
+        return T * level
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only)."""

@@ -318,6 +318,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
             den = w_total.sum().clamp(min=self._EMA_EPS)
             loss_shape = num / den
 
+        # Scale shape by T to align with sequence-length temporal integration (Option A)
+        loss_shape = T * loss_shape
+
         # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 

@@ -184,10 +184,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """Event-mask-weighted level anchor on shared shape windows.
 
         Using a Hájek self-normalized window level loss with a robust, balanced
-        linear magnitude scaling (1.0 + window_mag). This provides healthy 
-        corrective pressure on large errors without the exponential weight 
-        explosion of cosh, which suppresses/dilutes the gradient of quiet areas 
-        and leads to overprediction drift.
+        linear target-magnitude weighting (1.0 + window_true.abs()). This eliminates
+        prediction-dependent weights in the self-normalization denominator, which 
+        previously caused runaway gradient dilution for quiet sequences and 
+        allowed massive overpredictions / drift to go unpunished.
         """
         W = self._window_size(T)
 
@@ -201,25 +201,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
         series_mask = torch.maximum(true_series_event, pred_series_event.detach())
         series_w = series_mask
 
-        # Window level means of targets and predictions
+        # Window level means of targets
         window_true = torch.stack(
             [yt.mean(dim=1) for yt in y_true.split(W, dim=1)], dim=1
         )
-        if y_pred_det is not None:
-            window_pred = torch.stack(
-                [yp.mean(dim=1) for yp in y_pred_det.split(W, dim=1)], dim=1
-            )
-        else:
-            window_pred = window_true
 
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
         level_losses = self._log_cosh(window_means)
 
-        # Scale corrective pressure using a linear magnitude multiplier.
-        # This prevents exponential (cosh) weight ratios that drown out silent series/timesteps.
-        window_mag = torch.max(torch.abs(window_true), torch.abs(window_pred))
+        # Scale corrective pressure using targets only.
+        # This keeps the self-normalization denominator independent of model predictions,
+        # ensuring silent areas always receive strong gradient pressure to stay at 0.
+        window_mag = torch.abs(window_true)
         window_w = series_w.unsqueeze(1) * (1.0 + window_mag)
 
         if level_losses.dim() == 3:

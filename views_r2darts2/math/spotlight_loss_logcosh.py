@@ -231,13 +231,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # lag was the source of the flat-collapse oscillation): no running state,
         # no delayed feedback, no composition memory.
         #
-        # scale_factor = T restores the level term's STRENGTH relative to shape:
-        # the mean-over-window operator attenuates the DC gradient by 1/W, and T
-        # is a fixed, composition-INVARIANT multiplier (identical every batch),
-        # so it does not reintroduce composition dependence. When series_w
-        # averages ~1 this matches the previous (working) level magnitude, but
-        # now without the lagging denominator.
-        scale_factor = T
+        scale_factor = W
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)

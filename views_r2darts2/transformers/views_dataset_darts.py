@@ -514,6 +514,15 @@ class _ViewsDatasetDarts:
             use_cyclic_encoders=use_cyclic_encoders,
         )
 
+        if use_cyclic_encoders:
+            resolution = self._time_id.split("_")[0][0]
+            cyclic_encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
+            if cyclic_encoders:
+                for fn in cyclic_encoders:
+                    col_name = fn.__name__
+                    if col_name not in self.features:
+                        self.features.append(col_name)
+
         t_time = target_sel.index.time.astype(np.int64, copy=False)
         t_unit = target_sel.index.unit.astype(np.int64, copy=False)
         t_values = target_sel.values[:, :, 0].astype(np.float32, copy=False)

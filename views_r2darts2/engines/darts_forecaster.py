@@ -951,35 +951,51 @@ class DartsForecaster:
             end=self._test_start - 1 + sequence_number,  # origin = test_start - 1 + seq (base_origin convention)
         )
 
-        # VALIDATION: Extract actual predicted entity IDs from target_series static_covariates
-        # instead of using stale _last_entity_order (which was collected before filtering).
-        # This prevents entity count mismatches when some entities get filtered during
-        # preprocessing (e.g., too short for input_chunk_length).
+        # Resolve entity IDs for reconstruction.
+        # Prefer static_covariates when present, but fall back to dataset.last_entity_order
+        # because static covariate injection is optional in this pipeline.
         predicted_entity_ids = []
+        missing_static_cov = 0
         for ts in target_series:
+            entity_id = None
             if ts.static_covariates is not None:
                 sc = ts.static_covariates
                 if hasattr(sc, "iat"):
-                    entity_id = int(sc.iat[0, 0])
+                    try:
+                        entity_id = int(sc.iat[0, 0])
+                    except Exception:
+                        entity_id = None
                 else:
                     sc_arr = np.asarray(sc)
                     if sc_arr.size > 0:
-                        entity_id = int(sc_arr.reshape(-1)[0])
-                    else:
-                        entity_id = None
-            else:
-                entity_id = None
-            
+                        try:
+                            entity_id = int(sc_arr.reshape(-1)[0])
+                        except Exception:
+                            entity_id = None
+
             if entity_id is None:
-                raise ValueError(
-                    "Target TimeSeries is missing entity metadata in static_covariates. "
-                    "This indicates data integrity issue at preprocessing stage."
-                )
+                missing_static_cov += 1
             predicted_entity_ids.append(entity_id)
 
-        logger.info(
-            f"Extracted {len(predicted_entity_ids)} entity IDs from preprocessed target series."
-        )
+        if missing_static_cov > 0:
+            fallback_entity_ids = getattr(self.dataset, "last_entity_order", None) or []
+            if len(fallback_entity_ids) != len(target_series):
+                raise ValueError(
+                    "Could not recover entity IDs for prediction reconstruction. "
+                    f"Missing static_covariates for {missing_static_cov}/{len(target_series)} series "
+                    "and fallback entity order length does not match preprocessed targets: "
+                    f"fallback={len(fallback_entity_ids)} targets={len(target_series)}."
+                )
+            predicted_entity_ids = [int(eid) for eid in fallback_entity_ids]
+            logger.info(
+                "Entity reconstruction using dataset.last_entity_order fallback "
+                f"({len(predicted_entity_ids)} entities; static_covariates missing for {missing_static_cov})."
+            )
+        else:
+            predicted_entity_ids = [int(eid) for eid in predicted_entity_ids]
+            logger.info(
+                f"Entity reconstruction using static_covariates ({len(predicted_entity_ids)} entities)."
+            )
 
         # Resilient Device Management: Ensure model is on the correct device
         # Darts models often shift to CPU in teardown(); we restore them if needed.

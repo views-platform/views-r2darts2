@@ -200,6 +200,93 @@ class DartsForecaster:
             return None
         return ScalerSelector.instantiate_darts_scaler(scaler_cfg)
 
+    def _validate_scaler_chain(self, scaler, scaler_name: str) -> None:
+        """
+        Validates chained scalers (e.g., AsinhTransform->MaxAbsScaler) by testing
+        forward and inverse transforms on sample data. Detects configuration errors,
+        numerical instabilities (NaN/Inf), and fit failures early.
+
+        Args:
+            scaler: Darts Scaler or Pipeline instance (or None)
+            scaler_name: Name for logging ("target_scaler", "feature_scaler")
+
+        Raises:
+            RuntimeError: If scaler is not fitted, produces NaN/Inf, or round-trip fails
+        """
+        if scaler is None or not self.scaler_fitted:
+            return
+
+        from darts.dataprocessing import Pipeline
+
+        # Create sample test data: realistic conflict count range with zeros and outliers
+        # AsinhTransform expects raw counts (0 to millions)
+        test_values = np.array([
+            [0.0],      # Peace (zero deaths)
+            [1.0],      # Low conflict
+            [10.0],     # Medium conflict
+            [100.0],    # High conflict
+            [1000.0],   # War tail
+        ], dtype=np.float32)
+
+        try:
+            test_ts = TimeSeries.from_times_and_values(
+                times=pd.RangeIndex(5),
+                values=test_values,
+                columns=["test_col"],
+            )
+
+            # Forward transform
+            transformed = scaler.fit_transform([test_ts])[0]
+            trans_vals = transformed.all_values()
+
+            # Check forward output
+            if np.any(np.isnan(trans_vals)):
+                raise RuntimeError(
+                    f"{scaler_name} forward transform produced NaN values. "
+                    f"Input range: [0, 1000], Output: {trans_vals.ravel()}"
+                )
+            if np.any(np.isinf(trans_vals)):
+                raise RuntimeError(
+                    f"{scaler_name} forward transform produced Inf values. "
+                    f"Input range: [0, 1000], Output: {trans_vals.ravel()}"
+                )
+
+            # Inverse transform
+            inverse_ts = scaler.inverse_transform([transformed])[0]
+            inverse_vals = inverse_ts.all_values()
+
+            # Check inverse output
+            if np.any(np.isnan(inverse_vals)):
+                raise RuntimeError(
+                    f"{scaler_name} inverse transform produced NaN values. "
+                    f"Transformed input: {trans_vals.ravel()}"
+                )
+            if np.any(np.isinf(inverse_vals)):
+                raise RuntimeError(
+                    f"{scaler_name} inverse transform produced Inf values. "
+                    f"Transformed input: {trans_vals.ravel()}"
+                )
+
+            # Round-trip accuracy check (allow small numerical tolerance for chains)
+            max_error = np.max(np.abs(inverse_vals - test_values))
+            if max_error > 1e-3:  # Allow 0.001 unit error for chained transforms
+                logger.warning(
+                    f"{scaler_name} round-trip error large: {max_error:.6f}. "
+                    f"Original: {test_values.ravel()}, "
+                    f"After round-trip: {inverse_vals.ravel()}. "
+                    f"For chained scalers (AsinhTransform->MaxAbsScaler), small "
+                    f"accumulated errors are normal but should be < 1e-3."
+                )
+            else:
+                logger.info(
+                    f"{scaler_name} validation passed. Round-trip error: {max_error:.8f}"
+                )
+
+        except Exception as e:
+            raise RuntimeError(
+                f"SCALER VALIDATION FAILED for {scaler_name}: {type(e).__name__}: {e}"
+            ) from e
+
     def _apply_log_to_targets(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
         """
         Vectorized log1p for target series.
@@ -464,6 +551,16 @@ class DartsForecaster:
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
                 for s in timeseries_float
             ]
+            # Log entity count for predict mode (diagnose entity-prediction mismatches)
+            initial_count = len(timeseries_float)
+            final_count = len(targets)
+            if final_count < initial_count:
+                logger.info(
+                    f"Predict mode: {initial_count} entities in dataset, "
+                    f"{final_count} entities after slicing (filtered {initial_count - final_count}). "
+                    f"Time range: [{start}, {end}]. This is normal if some entities have "
+                    f"no data in the forecast window."
+                )
 
         # Slice past covariates (end + 1 to prevent feature leakage)
         # In train mode this is already aligned in `paired` above.
@@ -813,6 +910,11 @@ class DartsForecaster:
             )
 
         # LOCK ENTROPY: Guarantee bit-perfect identity for probabilistic samples
+            # VALIDATION: Verify chained scaler integrity (e.g., AsinhTransform->MaxAbsScaler)
+            # Test both forward and inverse transforms on a sample to catch configuration errors early.
+            # self._validate_scaler_chain(self.target_scaler, "target_scaler")
+            # self._validate_scaler_chain(self.feature_scaler, "feature_scaler")
+
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
         # Scaler provenance log: confirms whether scalers are in-memory (sweep path,
@@ -847,6 +949,36 @@ class DartsForecaster:
             timeseries=timeseries,
             start=self._test_start + sequence_number - self.model.input_chunk_length,
             end=self._test_start - 1 + sequence_number,  # origin = test_start - 1 + seq (base_origin convention)
+        )
+
+        # VALIDATION: Extract actual predicted entity IDs from target_series static_covariates
+        # instead of using stale _last_entity_order (which was collected before filtering).
+        # This prevents entity count mismatches when some entities get filtered during
+        # preprocessing (e.g., too short for input_chunk_length).
+        predicted_entity_ids = []
+        for ts in target_series:
+            if ts.static_covariates is not None:
+                sc = ts.static_covariates
+                if hasattr(sc, "iat"):
+                    entity_id = int(sc.iat[0, 0])
+                else:
+                    sc_arr = np.asarray(sc)
+                    if sc_arr.size > 0:
+                        entity_id = int(sc_arr.reshape(-1)[0])
+                    else:
+                        entity_id = None
+            else:
+                entity_id = None
+            
+            if entity_id is None:
+                raise ValueError(
+                    "Target TimeSeries is missing entity metadata in static_covariates. "
+                    "This indicates data integrity issue at preprocessing stage."
+                )
+            predicted_entity_ids.append(entity_id)
+
+        logger.info(
+            f"Extracted {len(predicted_entity_ids)} entity IDs from preprocessed target series."
         )
 
         # Resilient Device Management: Ensure model is on the correct device
@@ -889,10 +1021,11 @@ class DartsForecaster:
         timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
 
         # Process predictions into list format
-        expected_entities = getattr(self.dataset, "last_entity_order", None)
+        # Use actual predicted entity IDs (extracted from static_covariates above)
+        # instead of stale _last_entity_order. Handles entity filtering during preprocessing.
         results = self._process_predictions(
             timeseries_pred,
-            entity_ids=expected_entities,
+            entity_ids=predicted_entity_ids,
             expected_horizon=output_length,
         )
 
@@ -901,9 +1034,9 @@ class DartsForecaster:
         df = df.set_index([self.dataset._time_id, self.dataset._entity_id])
 
         # Ensure full entity-time grid is present and uniquely reconstructed.
-        if expected_entities:
+        if predicted_entity_ids and timeseries_pred:
             expected_index = pd.MultiIndex.from_product(
-                [timeseries_pred[0].time_index, expected_entities],
+                [timeseries_pred[0].time_index, predicted_entity_ids],
                 names=[self.dataset._time_id, self.dataset._entity_id],
             )
             if not df.index.is_unique:

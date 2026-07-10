@@ -33,10 +33,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
        where an event is present in y_true or y_pred (|·| > τ) so it cannot
        amplify pure numerical noise in the 97%-peace regime.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window means,
-       weighted by gate × (1 + sqrt(series_mag)).  sqrt grading is sublinear
-       (same philosophy as DRO): a top-war series gets ×4.7 not ×15 (linear)
-       nor ×1 (gate-only), preventing both overshoot and channel starvation.
+    4. **Windowed level anchor** — T-scaled log_cosh on per-window means.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -91,9 +88,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
-    @staticmethod
-    def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Per-series sqrt self-reweighting
+    def _dro_weights_2d(
+        self,
+        losses: torch.Tensor,
+        soft_event_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Event-aware per-series DRO with robust denominator.
 
         w_it = sqrt(loss_it / mean_i(loss))
 
@@ -101,12 +101,42 @@ class SpotlightLossLogcosh(torch.nn.Module):
         the gradient (not 16×).  Redistributes enough signal to fix
         systematic bias while still focusing on spikes.
 
+        - DRO statistics are computed on event-active cells (soft mask weights).
+        - Peace cells are kept near-neutral (weight ~1).
+        - Denominator uses per-series median-of-means (robust center).
+        - Final DRO weights are self-normalized to mean 1 on active region.
+
         Returns weights with mean ≈ 1 per series, shape (B, T) or (B, T, C).
         """
-        l = losses.detach()                                  # (B, T) or (B, T, C)
-        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1) or (B, 1, C)
-        w = torch.sqrt(l / mu)                               # (B, T) or (B, T, C)
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
+        l = losses.detach()  # (B, T) or (B, T, C)
+        m = soft_event_mask.detach().to(dtype=l.dtype).clamp(min=0.0, max=1.0)
+
+        def _wmean(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            den = w.sum(dim=1, keepdim=True).clamp(min=self._EMA_EPS)
+            return (x * w).sum(dim=1, keepdim=True) / den
+
+        # Robust denominator: median-of-means with block count derived from
+        # existing window logic (no new hyperparameter).
+        T = int(l.shape[1])
+        W = max(6, T // 3)
+        n_blocks = max(1, (T + W - 1) // W)
+
+        means = []
+        for lb, mb in zip(torch.tensor_split(l, n_blocks, dim=1), torch.tensor_split(m, n_blocks, dim=1)):
+            means.append(_wmean(lb, mb))
+        mom = torch.cat(means, dim=1)
+        mu = mom.median(dim=1, keepdim=True).values.clamp(min=self._EMA_EPS)
+
+        # Base DRO
+        w = torch.sqrt(l / mu)
+
+        # Keep peace cells near-neutral (~1), preserving soft onsets/offsets.
+        w = 1.0 + m * (w - 1.0)
+
+        # Self-normalize to mean 1 on active region per series.
+        w_active_mean = _wmean(w, m).clamp(min=self._EMA_EPS)
+        w = torch.where(m > 0.0, w / w_active_mean, torch.ones_like(w))
+
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     # ------------------------------------------------------------------
@@ -208,19 +238,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        # Gate × sqrt-magnitude grading.
-        # Pure gate (no grading) starved lower-scale channels (ch_1 ×0.71,
-        # ch_2 ×0.31): without scale-aware weighting, combine_channels routed
-        # ~40% budget to ch_0 (largest absolute level loss) and the smaller
-        # channels' DC never received enough corrective signal.
-        # Linear (1+series_mag) overcorrected the opposite way: a single
-        # Ukraine-type series carried ×15 weight → ch_0 ×1.52 overshoot.
-        # sqrt is the principled middle: same sublinear DRO philosophy applied
-        # to level weights — a ×14 asinh series gets only ×4.7 not ×15, while
-        # still giving ch_2 proportional scale-aware pressure. No new constant.
-        series_w = (0.0125 + 0.9875 * torch.sigmoid(
+        # Gate-only series weighting keeps the level anchor focused on
+        # peace-vs-event composition without amplifying DC pull from the
+        # highest-magnitude series.
+        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
-        )) * (1.0 + torch.sqrt(series_mag))  # (B,) or (B, C)
+        )  # (B,) or (B, C)
+        series_w = series_gate
 
         # ── Hájek self-normalized level anchor (composition-robust) ───
         # Weight-mass-weighted mean of the per-window level log_cosh — the
@@ -231,12 +255,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # lag was the source of the flat-collapse oscillation): no running state,
         # no delayed feedback, no composition memory.
         #
-        # scale_factor = T restores the level term's STRENGTH relative to shape:
-        # the mean-over-window operator attenuates the DC gradient by 1/W, and T
-        # is a fixed, composition-INVARIANT multiplier (identical every batch),
-        # so it does not reintroduce composition dependence. When series_w
-        # averages ~1 this matches the previous (working) level magnitude, but
-        # now without the lagging denominator.
+        # Balance between the two known regimes:
+        # - W-only underweights level (observed underprediction drift),
+        # - T-only can over-amplify level early in training.
+        # Use the geometric midpoint to keep T-coupled strength while avoiding
+        # the full aggressiveness of pure T scaling.
         scale_factor = T
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
@@ -343,17 +366,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         event_gate = 0.0125 + 0.9875 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
-        # ── Per-series temporal DRO (event-gated) ─────────────────────
-        # DRO's sqrt(l/mean) amplifies within-series relative hardness, but on
-        # an all-peace series l is a vector of near-equal near-zero values, so
-        # the ratio amplifies pure numerical NOISE into spurious per-timestep
-        # weights on 97%-peace cells. Restrict DRO to cells where an event is
-        # present in either y_true or y_pred (|·| > τ); everywhere else the
-        # weight is neutral (1.0). Reuses the existing threshold — no new
-        # constant.
-        w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
-        event_present = abs_max > self.non_zero_threshold
-        w_dro = torch.where(event_present, w_dro, torch.ones_like(w_dro))
+        # ── Per-series temporal DRO (soft event-aware) ───────────────
+        # Soft mask preserves onset/offset gradients while keeping peace cells
+        # near-neutral. Uses requested form:
+        # m = m_floor + (1 - m_floor) * sigmoid(k * (|y| - tau)).
+        soft_event_mask = 0.0125 + (1.0 - 0.0125) * torch.sigmoid(
+            5.0 * (abs_max - self.non_zero_threshold)
+        )
+        w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)  # (B, T) or (B, T, C)
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Hájek self-normalized shape (composition-robust) ──────────

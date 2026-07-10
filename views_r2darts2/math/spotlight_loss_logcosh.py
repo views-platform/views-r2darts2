@@ -215,9 +215,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # sqrt is the principled middle: same sublinear DRO philosophy applied
         # to level weights — a ×14 asinh series gets only ×4.7 not ×15, while
         # still giving ch_2 proportional scale-aware pressure. No new constant.
-        series_w = (0.0125 + 0.9875 * torch.sigmoid(
+        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
-        )) * torch.sqrt(1.0 + series_mag)  # (B,) or (B, C)
+        )  # (B,) or (B, C)
+        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded, (B,) or (B, C)
 
         # ── Hájek self-normalized level anchor (composition-robust) ───
         # Weight-mass-weighted mean of the per-window level log_cosh — the
@@ -332,7 +333,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_gate = 0.0125 + 0.9875 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
-        event_mag = event_gate * torch.sqrt(1.0 + abs_max)
+        event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO (event-gated) ─────────────────────
         # DRO's sqrt(l/mean) amplifies within-series relative hardness, but on

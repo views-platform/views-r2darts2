@@ -478,6 +478,11 @@ class DartsForecaster:
         elif not self.dataset.features:
             past_cov = None
 
+        # Keep train/eval preprocessing parity: when log_features is enabled,
+        # apply it before feature-scaler fit/transform in both modes.
+        if train_mode and self.dataset.features and past_cov is not None:
+            past_cov = self._apply_log_to_features(past_cov)
+
         targets = self._apply_log_to_targets(targets)
 
         if train_mode:

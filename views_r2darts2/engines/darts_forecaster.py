@@ -466,7 +466,8 @@ class DartsForecaster:
             ]
 
         # Slice past covariates (end + 1 to prevent feature leakage)
-        if self.dataset.features:
+        # In train mode this is already aligned in `paired` above.
+        if self.dataset.features and not train_mode:
             past_cov = [
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(
                     np.float32
@@ -474,7 +475,7 @@ class DartsForecaster:
                 for s in timeseries_float
             ]
             past_cov = self._apply_log_to_features(past_cov)
-        else:
+        elif not self.dataset.features:
             past_cov = None
 
         targets = self._apply_log_to_targets(targets)
@@ -515,6 +516,7 @@ class DartsForecaster:
         self,
         timeseries_pred: List[TimeSeries],
         entity_ids: Optional[List[int]] = None,
+        expected_horizon: Optional[int] = None,
     ) -> list:
         """
         Processes a list of TimeSeries prediction objects into a structured list of dictionaries.
@@ -540,10 +542,20 @@ class DartsForecaster:
         )
 
         # Process predictions into list format
+        if entity_ids is not None and len(entity_ids) < len(timeseries_pred):
+            raise ValueError(
+                "Entity mapping is shorter than prediction list: "
+                f"entity_ids={len(entity_ids)} predictions={len(timeseries_pred)}"
+            )
+
         results = []
         for idx, pred in enumerate(timeseries_pred):
             entity_id = None
-            if pred.static_covariates is not None:
+            # Prefer explicit entity fallback order from dataset creation.
+            # Static covariates are not guaranteed to contain an entity id.
+            if entity_ids is not None and idx < len(entity_ids):
+                entity_id = int(entity_ids[idx])
+            elif pred.static_covariates is not None:
                 sc = pred.static_covariates
                 if hasattr(sc, "iat"):
                     entity_id = int(sc.iat[0, 0])
@@ -553,15 +565,19 @@ class DartsForecaster:
                         entity_id = int(sc_arr.reshape(-1)[0])
 
             if entity_id is None:
-                if entity_ids is None or idx >= len(entity_ids):
-                    raise ValueError(
-                        "Prediction TimeSeries is missing recoverable entity metadata. "
-                        "Provide entity_ids fallback from dataset ordering."
-                    )
-                entity_id = int(entity_ids[idx])
+                raise ValueError(
+                    "Prediction TimeSeries is missing recoverable entity metadata."
+                )
+
             pred_values = pred.all_values(copy=False)
             if pred_values.ndim == 2:
                 pred_values = pred_values[..., np.newaxis]
+
+            if expected_horizon is not None and pred_values.shape[0] != expected_horizon:
+                raise ValueError(
+                    f"Prediction horizon mismatch for entity {entity_id}: "
+                    f"got={pred_values.shape[0]} expected={expected_horizon}"
+                )
 
             # Clamp: raw count predictions cannot be negative (deaths have a physical floor of 0).
             # Sub-unit fractional counts (0 < pred < 1) are kept as-is; zeroing them
@@ -569,7 +585,7 @@ class DartsForecaster:
             # for low-conflict countries (1–5 deaths/month).
             pred_values = np.maximum(pred_values, 0.0).astype(np.float32)
             for time_idx in range(pred_values.shape[0]):
-                time_stamp = pred.start_time() + time_idx * pred.freq
+                time_stamp = pred.time_index[time_idx]
                 row_data = {
                     self.dataset._time_id: time_stamp,
                     self.dataset._entity_id: entity_id,
@@ -868,14 +884,39 @@ class DartsForecaster:
         timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
 
         # Process predictions into list format
+        expected_entities = getattr(self.dataset, "last_entity_order", None)
         results = self._process_predictions(
             timeseries_pred,
-            entity_ids=getattr(self.dataset, "last_entity_order", None),
+            entity_ids=expected_entities,
+            expected_horizon=output_length,
         )
 
         # Create final DataFrame
         df = pd.DataFrame(results)
         df = df.set_index([self.dataset._time_id, self.dataset._entity_id])
+
+        # Ensure full entity-time grid is present and uniquely reconstructed.
+        if expected_entities:
+            expected_index = pd.MultiIndex.from_product(
+                [timeseries_pred[0].time_index, expected_entities],
+                names=[self.dataset._time_id, self.dataset._entity_id],
+            )
+            if not df.index.is_unique:
+                dup_count = int(df.index.duplicated(keep=False).sum())
+                raise RuntimeError(
+                    f"Prediction reconstruction produced duplicate index rows: {dup_count}"
+                )
+            missing_count = len(expected_index.difference(df.index))
+            if missing_count > 0:
+                raise RuntimeError(
+                    "Prediction reconstruction is missing entity/time rows: "
+                    f"{missing_count} missing out of {len(expected_index)} expected"
+                )
+            extra_count = len(df.index.difference(expected_index))
+            if extra_count > 0:
+                raise RuntimeError(
+                    f"Prediction reconstruction produced {extra_count} unexpected rows"
+                )
 
         # Numerical Sanity Check: Ensure no NaNs leaked through the inverse pipeline
         # (df.fillna(0) is forbidden by ADR-010 and ADR-008)

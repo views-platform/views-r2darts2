@@ -78,6 +78,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Telemetry for callbacks
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
+        self._last_cal_gate: list[float] | None = None
 
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
@@ -112,6 +113,38 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
     # Loss Components
     # ------------------------------------------------------------------
+
+    def _channel_event_calibration_gate(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-channel under/over calibration gate from event-mass ratio.
+
+        gate_c = sqrt(sum|y_true|_event / sum|y_pred|_event)
+
+        - Under-predicting channels (pred mass < true mass) get gate > 1.
+        - Over-predicting channels (pred mass > true mass) get gate < 1.
+
+        The square root keeps this correction sublinear, mirroring the DRO
+        philosophy used elsewhere in the loss.
+        """
+        if y_pred.dim() != 3:
+            return y_pred.new_tensor([1.0])
+
+        C = y_pred.shape[-1]
+        abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
+        event_mask = abs_max > self.non_zero_threshold
+
+        true_mass = (y_true.abs() * event_mask).sum(dim=(0, 1)).detach()  # (C,)
+        pred_mass = (y_pred.detach().abs() * event_mask).sum(dim=(0, 1)).detach()  # (C,)
+
+        valid = true_mass > 0
+        ratio = torch.ones_like(true_mass)
+        ratio = torch.where(valid, true_mass / pred_mass.clamp(min=self._EMA_EPS), ratio)
+        gate = torch.sqrt(ratio).clamp(min=0.5, max=2.0)
+        gate = C * gate / gate.sum().clamp(min=self._EMA_EPS)
+        return gate
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Combine per-channel losses by *relative learning progress*.
@@ -163,13 +196,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         fast = per_channel_loss.new_tensor(self._loss_ema)
         slow = per_channel_loss.new_tensor(self._loss_ema_slow)
         scores = fast / slow.clamp(min=self._EMA_EPS)
-        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
+        cal_gate = self._channel_event_calibration_gate(y_pred=y_pred, y_true=y_true)
+        fused_scores = scores * cal_gate
+        w_soft = C * fused_scores / fused_scores.sum().clamp(min=self._EMA_EPS)
 
         self._last_weights = w_soft.tolist()
+        self._last_cal_gate = cal_gate.tolist()
         # Telemetry (keys preserved for the callback contract):
         self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
         self._last_cal_score = list(self._loss_ema)  # fast EMA
-        self._last_gates = w_soft.tolist()
+        self._last_gates = cal_gate.tolist()
 
         return (w_soft * per_channel_loss).sum()
 
@@ -183,11 +219,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         log_cosh on per-window means, then weights each series by its 
         event magnitude. No DRO, no CMW, just the sigmoid weight.
 
-        We scale by the window size W instead of sequence length T. Because the
-        mean operator on a window of size W reduces gradient magnitude by a
-        factor of 1/W, multiplying by W is the exact mathematical inverse of
-        the operator's gradient attenuation, balancing level and shape losses
-        naturally and stably.
+        We scale by sequence length T to keep level pressure stable across
+        window partitions and preserve the historical calibration behavior.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -231,7 +264,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # lag was the source of the flat-collapse oscillation): no running state,
         # no delayed feedback, no composition memory.
         #
-        scale_factor = W
+        scale_factor = T
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)

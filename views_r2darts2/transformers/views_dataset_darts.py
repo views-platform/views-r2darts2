@@ -141,6 +141,20 @@ class _ViewsDatasetDarts:
             excluded = {time_col, unit_col, *targets}
             features = [c for c in df_reset.columns if c not in excluded]
 
+        # Legacy viewser dataframes can include aggregate/malformed rows with
+        # NaN in index columns. If converted directly to int64, NaN becomes an
+        # implementation-defined integer and creates phantom entities in output.
+        nan_mask = df_reset[time_col].isna() | df_reset[unit_col].isna()
+        if nan_mask.any():
+            n_dropped = int(nan_mask.sum())
+            logger.warning(
+                "from_dataframe: dropping %d rows with NaN in '%s' or '%s'",
+                n_dropped,
+                time_col,
+                unit_col,
+            )
+            df_reset = df_reset.loc[~nan_mask].copy()
+
         df_reset = df_reset.sort_values([time_col, unit_col], kind="stable")
 
         if unit_col == "priogrid_id":

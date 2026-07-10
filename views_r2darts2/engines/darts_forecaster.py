@@ -4,6 +4,7 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 import torch
 from darts import TimeSeries
+from darts.utils.data.torch_datasets.training_dataset import SequentialTorchTrainingDataset
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
 from views_r2darts2.transformers.scaler_selector import ScalerSelector
 from views_r2darts2.transformers.feature_scaler_manager import FeatureScalerManager
@@ -48,6 +49,7 @@ class DartsForecaster:
         static_covariate_stats: Optional[Dict[str, Any]] = None,
         checkpoint_mode: str = "best",
         use_cyclic_encoders: bool = False,
+        use_torch_training_dataset: bool = True,
     ):
         """
         Initializes the forecaster with dataset, model, partition information, and optional scalers.
@@ -131,6 +133,10 @@ class DartsForecaster:
 
         self._use_cyclic_encoders = use_cyclic_encoders
         logger.info(f"use_cyclic_encoders: {self._use_cyclic_encoders!r}")
+        self._use_torch_training_dataset = bool(use_torch_training_dataset)
+        logger.info(
+            f"use_torch_training_dataset: {self._use_torch_training_dataset!r}"
+        )
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler
@@ -505,7 +511,11 @@ class DartsForecaster:
 
         return targets, past_cov
 
-    def _process_predictions(self, timeseries_pred: List[TimeSeries]) -> list:
+    def _process_predictions(
+        self,
+        timeseries_pred: List[TimeSeries],
+        entity_ids: Optional[List[int]] = None,
+    ) -> list:
         """
         Processes a list of TimeSeries prediction objects into a structured list of dictionaries.
 
@@ -531,13 +541,24 @@ class DartsForecaster:
 
         # Process predictions into list format
         results = []
-        for pred in timeseries_pred:
-            if pred.static_covariates is None:
-                raise ValueError(
-                    "Prediction TimeSeries is missing static_covariates. "
-                    "Ensure data was grouped by entity via TimeSeries.from_group_dataframe()."
-                )
-            entity_id = int(pred.static_covariates.iat[0, 0])
+        for idx, pred in enumerate(timeseries_pred):
+            entity_id = None
+            if pred.static_covariates is not None:
+                sc = pred.static_covariates
+                if hasattr(sc, "iat"):
+                    entity_id = int(sc.iat[0, 0])
+                else:
+                    sc_arr = np.asarray(sc)
+                    if sc_arr.size > 0:
+                        entity_id = int(sc_arr.reshape(-1)[0])
+
+            if entity_id is None:
+                if entity_ids is None or idx >= len(entity_ids):
+                    raise ValueError(
+                        "Prediction TimeSeries is missing recoverable entity metadata. "
+                        "Provide entity_ids fallback from dataset ordering."
+                    )
+                entity_id = int(entity_ids[idx])
             pred_values = pred.all_values(copy=False)
             if pred_values.ndim == 2:
                 pred_values = pred_values[..., np.newaxis]
@@ -686,14 +707,47 @@ class DartsForecaster:
             if num_workers > 0
             else {}
         )
-        self.model.fit(
-            series=target_series,
-            past_covariates=past_covariates,
-            val_series=val_targets,
-            val_past_covariates=val_past_cov,
-            dataloader_kwargs=dataloader_kwargs,
-            verbose=True,
-        )
+
+        if self._use_torch_training_dataset:
+            output_chunk_shift = int(getattr(self.model, "output_chunk_shift", 0) or 0)
+            train_dataset = SequentialTorchTrainingDataset(
+                series=target_series,
+                past_covariates=past_covariates,
+                input_chunk_length=self.model.input_chunk_length,
+                output_chunk_length=self.model.output_chunk_length,
+                output_chunk_shift=output_chunk_shift,
+                stride=1,
+                use_static_covariates=bool(self._static_cov_inject),
+            )
+            val_dataset = SequentialTorchTrainingDataset(
+                series=val_targets,
+                past_covariates=val_past_cov,
+                input_chunk_length=self.model.input_chunk_length,
+                output_chunk_length=self.model.output_chunk_length,
+                output_chunk_shift=output_chunk_shift,
+                stride=1,
+                use_static_covariates=bool(self._static_cov_inject),
+            )
+
+            logger.info(
+                "Training via fit_from_dataset(TorchTrainingDataset) "
+                f"with {len(train_dataset)} train samples and {len(val_dataset)} val samples."
+            )
+            self.model.fit_from_dataset(
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                dataloader_kwargs=dataloader_kwargs,
+                verbose=True,
+            )
+        else:
+            self.model.fit(
+                series=target_series,
+                past_covariates=past_covariates,
+                val_series=val_targets,
+                val_past_covariates=val_past_cov,
+                dataloader_kwargs=dataloader_kwargs,
+                verbose=True,
+            )
 
         # After fit(), Darts automatically reloads the best val_loss checkpoint.
         # When checkpoint_mode='last', explicitly reload the final epoch weights
@@ -814,7 +868,10 @@ class DartsForecaster:
         timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
 
         # Process predictions into list format
-        results = self._process_predictions(timeseries_pred)
+        results = self._process_predictions(
+            timeseries_pred,
+            entity_ids=getattr(self.dataset, "last_entity_order", None),
+        )
 
         # Create final DataFrame
         df = pd.DataFrame(results)

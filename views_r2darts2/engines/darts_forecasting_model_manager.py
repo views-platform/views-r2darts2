@@ -33,6 +33,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
         model_path: ModelPathManager,
         wandb_notifications: bool = False,
         use_prediction_store: bool = False,
+        dataframe=None,
     ) -> None:
         """
         Initializes the model manager with the specified configuration.
@@ -56,6 +57,8 @@ class DartsForecastingModelManager(ForecastingModelManager):
         logger.info(
             f"Current model architecture: \033[92m{self.configs['algorithm']}\033[0m"
         )
+        # Optional pre-loaded pandas DataFrame — when set, bypasses frames/disk loading.
+        self._source_dataframe = dataframe
 
     def _resolve_active_partition_dict(self, config: dict) -> dict:
         """
@@ -169,10 +172,18 @@ class DartsForecastingModelManager(ForecastingModelManager):
         path_artifacts = self._model_path.artifacts
         run_type = active_config["run_type"]
 
-        dataset = _ViewsDatasetDarts.from_views_path(
-            path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=None,
-        )
+        if self._source_dataframe is not None:
+            logger.info("Loading dataset from in-memory DataFrame (bypassing disk/frames lookup).")
+            dataset = _ViewsDatasetDarts.from_dataframe(
+                dataframe=self._source_dataframe,
+                targets=active_config.get("targets") or [],
+                features=active_config.get("features"),
+            )
+        else:
+            dataset = _ViewsDatasetDarts.from_views_path(
+                path_raw=path_raw, run_type=run_type, config=active_config,
+                cached_path=None,
+            )
 
         model_object = ModelCatalog(config=active_config).get_model(
             model_name=active_config["algorithm"]
@@ -199,6 +210,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
             ),
             checkpoint_mode=active_config.get("checkpoint_mode", "best"),
             use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
+            use_torch_training_dataset=active_config.get("use_torch_training_dataset", True),
         )
         forecaster.train()
 
@@ -267,10 +279,18 @@ class DartsForecastingModelManager(ForecastingModelManager):
         # Refresh snapshot to include the timestamp
         active_config = self.configs
 
-        dataset = _ViewsDatasetDarts.from_views_path(
-            path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=None,
-        )
+        if self._source_dataframe is not None:
+            logger.info("Loading dataset from in-memory DataFrame (bypassing disk/frames lookup).")
+            dataset = _ViewsDatasetDarts.from_dataframe(
+                dataframe=self._source_dataframe,
+                targets=active_config.get("targets") or [],
+                features=active_config.get("features"),
+            )
+        else:
+            dataset = _ViewsDatasetDarts.from_views_path(
+                path_raw=path_raw, run_type=run_type, config=active_config,
+                cached_path=None,
+            )
 
         model_object = ModelCatalog(config=active_config).get_model(
             model_name=active_config["algorithm"]
@@ -291,6 +311,7 @@ class DartsForecastingModelManager(ForecastingModelManager):
                 else None
             ),
             use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
+            use_torch_training_dataset=active_config.get("use_torch_training_dataset", True),
         )
         forecaster.load_model(path=path_artifact)
 
@@ -400,10 +421,18 @@ class DartsForecastingModelManager(ForecastingModelManager):
         # Refresh snapshot
         active_config = self.configs
 
-        dataset = _ViewsDatasetDarts.from_views_path(
-            path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=None,
-        )
+        if self._source_dataframe is not None:
+            logger.info("Loading dataset from in-memory DataFrame (bypassing disk/frames lookup).")
+            dataset = _ViewsDatasetDarts.from_dataframe(
+                dataframe=self._source_dataframe,
+                targets=active_config.get("targets") or [],
+                features=active_config.get("features"),
+            )
+        else:
+            dataset = _ViewsDatasetDarts.from_views_path(
+                path_raw=path_raw, run_type=run_type, config=active_config,
+                cached_path=None,
+            )
 
         model_object = ModelCatalog(config=active_config).get_model(
             model_name=active_config["algorithm"]

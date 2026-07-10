@@ -1,68 +1,391 @@
-from views_pipeline_core.data.handlers import _ViewsDataset
-from views_pipeline_core.files.utils import read_dataframe
-from views_pipeline_core.configs.pipeline import PipelineConfig
-from typing import Optional, List, Union
+from __future__ import annotations
+
 import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import numpy as np
 from darts import TimeSeries
+from views_frames.feature_frame import FeatureFrame
+from views_frames.index import SpatioTemporalIndex
+from views_frames.spatial_level import SpatialLevel
+
 from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
-from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 
 logger = logging.getLogger(__name__)
 
 
-class _ViewsDatasetDarts(_ViewsDataset):
+class _ViewsDatasetDarts:
     """
-    Handles the transformation of multi-index VIEWS dataframes into Darts-compatible TimeSeries collections.
+    Frames-native dataset boundary for Darts.
 
-    Intent Contract:
-        - Purpose: Act as the data boundary between the generic VIEWS pipeline and the Darts ecosystem,
-          ensuring correct mapping of time and entity dimensions.
-        - Non-Goals: Does not perform data cleaning or temporal slicing (slicing is handled by the forecaster).
-        - Guarantees:
-            - Ensures that feature and target columns are correctly grouped by entity.
-            - Guarantees that the resulting TimeSeries collection preserves the multi-index semantic structure.
-        - Failure Behavior: Raises KeyError if specified target or feature columns are missing from the source dataframe.
+    This class intentionally has no dependency on pandas or _ViewsDataset.
+    It consumes views-frames FeatureFrame artifacts and exposes Darts-friendly
+    grouped TimeSeries collections.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # HANDSHAKE: Audit the incoming dataframe schema immediately
-        ReproducibilityGate.Data.audit_dataframe_schema(
-            df=self.get_subset_dataframe(),
-            expected_targets=self.targets,
-            expected_features=self.features,
+    _ALL_STAT_NAMES = ("mu", "sigma", "max", "trend", "sparsity")
+
+    def __init__(
+        self,
+        target_frame: FeatureFrame,
+        feature_frame: Optional[FeatureFrame] = None,
+        targets: Optional[List[str]] = None,
+    ):
+        self._target_frame = target_frame
+        self._feature_frame = feature_frame
+
+        self._time_id = "month_id"
+        if target_frame.index.level == SpatialLevel.PGM:
+            self._entity_id = "priogrid_id"
+        else:
+            self._entity_id = "country_id"
+
+        self.targets = list(targets) if targets else list(target_frame.feature_names)
+        if len(self.targets) != target_frame.n_features:
+            raise ValueError(
+                "Number of targets does not match target frame feature axis: "
+                f"targets={len(self.targets)} frame_features={target_frame.n_features}"
+            )
+
+        self.features = (
+            list(feature_frame.feature_names)
+            if feature_frame is not None
+            else []
+        )
+
+        self._t_time = target_frame.index.time.astype(np.int64, copy=False)
+        self._t_unit = target_frame.index.unit.astype(np.int64, copy=False)
+        self._t_values = target_frame.values[:, :, 0].astype(np.float32, copy=False)
+
+        if feature_frame is not None:
+            if feature_frame.n_rows != target_frame.n_rows:
+                raise ValueError(
+                    "FeatureFrame and TargetFrame must share identical row count."
+                )
+            if not np.array_equal(feature_frame.index.time, target_frame.index.time):
+                raise ValueError("FeatureFrame and TargetFrame time indices are not aligned.")
+            if not np.array_equal(feature_frame.index.unit, target_frame.index.unit):
+                raise ValueError("FeatureFrame and TargetFrame unit indices are not aligned.")
+
+            self._f_values = feature_frame.values[:, :, 0].astype(np.float32, copy=False)
+        else:
+            self._f_values = None
+
+        self._unique_time = np.unique(self._t_time)
+        self._unique_unit = np.unique(self._t_unit)
+        self._last_entity_order: List[int] = []
+
+    @property
+    def last_entity_order(self) -> List[int]:
+        return list(self._last_entity_order)
+
+    @staticmethod
+    def _first_existing_path(candidates: List[str]) -> Optional[str]:
+        for p in candidates:
+            if p and os.path.exists(p):
+                return p
+        return None
+
+    @staticmethod
+    def from_dataframe(
+        dataframe,
+        targets: List[str],
+        features: Optional[List[str]] = None,
+    ):
+        """
+        Build a frames-native dataset from a pandas DataFrame.
+
+        Accepted layouts:
+        - MultiIndex: (month_id, country_id|priogrid_id|priogrid_gid)
+        - Flat columns: month_id + country_id/priogrid_id/priogrid_gid
+        """
+        import pandas as pd
+
+        if not isinstance(dataframe, pd.DataFrame) or dataframe.empty:
+            raise ValueError("dataframe must be a non-empty pandas DataFrame")
+
+        df = dataframe.copy()
+
+        if isinstance(df.index, pd.MultiIndex):
+            if len(df.index.names) < 2:
+                raise ValueError("MultiIndex dataframe must have at least two levels")
+            time_col, unit_col = df.index.names[0], df.index.names[1]
+            if unit_col == "priogrid_gid":
+                unit_col = "priogrid_id"
+                df.index = df.index.rename([time_col, unit_col])
+            df_reset = df.reset_index()
+        else:
+            candidate_units = ["country_id", "priogrid_id", "priogrid_gid"]
+            time_col = "month_id"
+            if time_col not in df.columns:
+                raise ValueError("DataFrame must include month_id column or MultiIndex")
+            unit_col = next((c for c in candidate_units if c in df.columns), None)
+            if unit_col is None:
+                raise ValueError(
+                    "DataFrame must include one of country_id, priogrid_id, priogrid_gid"
+                )
+            if unit_col == "priogrid_gid":
+                df = df.rename(columns={"priogrid_gid": "priogrid_id"})
+                unit_col = "priogrid_id"
+            df_reset = df
+
+        if not targets:
+            raise ValueError("targets must be a non-empty list")
+        missing_targets = [t for t in targets if t not in df_reset.columns]
+        if missing_targets:
+            raise ValueError(f"Missing targets in dataframe: {missing_targets}")
+
+        if features is None:
+            excluded = {time_col, unit_col, *targets}
+            features = [c for c in df_reset.columns if c not in excluded]
+
+        df_reset = df_reset.sort_values([time_col, unit_col], kind="stable")
+
+        if unit_col == "priogrid_id":
+            level = SpatialLevel.PGM
+        else:
+            level = SpatialLevel.CM
+
+        st_index = SpatioTemporalIndex(
+            time=df_reset[time_col].to_numpy(dtype=np.int64),
+            unit=df_reset[unit_col].to_numpy(dtype=np.int64),
+            level=level,
+        )
+
+        target_values = df_reset[targets].to_numpy(dtype=np.float32)
+        target_frame = FeatureFrame.from_2d(
+            y_features_2d=target_values,
+            index=st_index,
+            feature_names=list(targets),
+        )
+
+        feature_frame = None
+        if features:
+            feature_values = df_reset[features].to_numpy(dtype=np.float32)
+            feature_frame = FeatureFrame.from_2d(
+                y_features_2d=feature_values,
+                index=st_index,
+                feature_names=list(features),
+            )
+
+        return _ViewsDatasetDarts(
+            target_frame=target_frame,
+            feature_frame=feature_frame,
+            targets=list(targets),
         )
 
     @staticmethod
     def from_views_path(path_raw: str, run_type: str, config: dict, cached_path=None):
         """
-        Factory method to load a VIEWS dataset from a raw path and configuration.
+        Load a frames-native dataset.
 
-        Args:
-            path_raw (str): Path to the directory containing the raw dataframes.
-            run_type (str): The run type (e.g., 'validation', 'calibration').
-            config (dict): The DNA manifest for the experiment.
-            cached_path: Optional pre-resolved path to the cached data file.
-                If provided, this path is used directly instead of constructing
-                one from path_raw and run_type.
-
-        Returns:
-            _ViewsDatasetDarts: Initialized dataset object.
+        Resolution order:
+        1. config['frames_target_path'] / config['frames_feature_path']
+        2. <path_raw>/<run_type>_target_frame and <path_raw>/<run_type>_feature_frame
+        3. <path_raw>/<run_type>/target_frame and <path_raw>/<run_type>/feature_frame
         """
         if cached_path is not None:
-            file_path = str(cached_path)
+            cached_root = str(cached_path)
         else:
-            file_path = f"{path_raw}/{run_type}_viewser_df{PipelineConfig.dataframe_format}"
-        df_source = read_dataframe(file_path)
+            cached_root = None
 
-        return _ViewsDatasetDarts(
-            source=df_source,
-            targets=config.get("targets"),
-            broadcast_features=True,
+        target_candidates = [
+            config.get("frames_target_path"),
+            f"{path_raw}/{run_type}_target_frame",
+            f"{path_raw}/{run_type}/target_frame",
+            f"{cached_root}/target_frame" if cached_root else None,
+        ]
+        feature_candidates = [
+            config.get("frames_feature_path"),
+            f"{path_raw}/{run_type}_feature_frame",
+            f"{path_raw}/{run_type}/feature_frame",
+            f"{cached_root}/feature_frame" if cached_root else None,
+        ]
+
+        target_path = _ViewsDatasetDarts._first_existing_path([p for p in target_candidates if p])
+
+        feature_path = _ViewsDatasetDarts._first_existing_path([p for p in feature_candidates if p])
+
+        if target_path is not None:
+            logger.info(f"Loading target frame from: {target_path}")
+            target_frame = FeatureFrame.load(target_path, mmap=True)
+
+            feature_frame = None
+            if feature_path is not None:
+                logger.info(f"Loading feature frame from: {feature_path}")
+                feature_frame = FeatureFrame.load(feature_path, mmap=True)
+
+            return _ViewsDatasetDarts(
+                target_frame=target_frame,
+                feature_frame=feature_frame,
+                targets=config.get("targets"),
+            )
+
+        # Fall back to the legacy multi-index parquet/feather file at path_raw.
+        # path_raw may be:
+        #   a) a directory containing {run_type}_viewser_df.{ext} files, or
+        #   b) a direct path to a parquet/feather file (path_raw itself is the file).
+        from views_pipeline_core.configs.pipeline import PipelineConfig
+        from views_pipeline_core.files.utils import read_dataframe
+
+        legacy_candidates = [
+            f"{path_raw}/{run_type}_viewser_df{PipelineConfig.dataframe_format}",
+            f"{path_raw}/{run_type}_viewser_df.parquet",
+            # path_raw may itself be a direct file path
+            str(path_raw) if os.path.isfile(str(path_raw)) else None,
+        ]
+        legacy_path = _ViewsDatasetDarts._first_existing_path(
+            [p for p in legacy_candidates if p]
+        )
+        if legacy_path is None:
+            raise FileNotFoundError(
+                "Could not locate frame artifacts or a legacy dataframe file.\n"
+                f"  Frame paths searched: {[p for p in target_candidates if p]}\n"
+                f"  Legacy paths searched: {[p for p in legacy_candidates if p]}"
+            )
+
+        logger.info(
+            "Frame artifacts not found — loading legacy dataframe and converting to "
+            f"views-frames in-memory: {legacy_path}"
+        )
+        df_source = read_dataframe(legacy_path)
+        return _ViewsDatasetDarts.from_dataframe(
+            dataframe=df_source,
+            targets=config.get("targets") or [],
+            features=config.get("features"),
         )
 
-    _ALL_STAT_NAMES = ("mu", "sigma", "max", "trend", "sparsity")
+    def _resolve_time_ids(self, time_ids: Optional[Union[int, List[int]]]) -> np.ndarray:
+        if time_ids is None:
+            return self._unique_time
+        if isinstance(time_ids, int):
+            return np.asarray([time_ids], dtype=np.int64)
+        return np.asarray(sorted(set(time_ids)), dtype=np.int64)
+
+    def _resolve_entity_ids(
+        self,
+        entity_ids: Optional[Union[int, List[int]]],
+        selected_times: np.ndarray,
+    ) -> np.ndarray:
+        if entity_ids is None:
+            mask = np.isin(self._t_time, selected_times)
+            return np.asarray(sorted(set(self._t_unit[mask].tolist())), dtype=np.int64)
+        if isinstance(entity_ids, int):
+            return np.asarray([entity_ids], dtype=np.int64)
+        return np.asarray(sorted(set(entity_ids)), dtype=np.int64)
+
+    @staticmethod
+    def _build_stat_transform(static_cov_transform: Optional[str]):
+        if static_cov_transform is None:
+            return None
+
+        elementwise = {
+            "AsinhTransform": np.arcsinh,
+            "LogTransform": np.log1p,
+            "SqrtTransform": lambda x: np.sqrt(np.maximum(x, 0)),
+            "FourthRootTransform": lambda x: np.power(1.0 + np.maximum(x, 0.0), 0.25) - 1.0,
+        }
+
+        fn = None
+        for step in [s.strip() for s in static_cov_transform.split("->")]:
+            if step in elementwise:
+                fn = elementwise[step]
+                continue
+            if step in {"MaxAbsScaler", "StandardScaler"}:
+                # Cross-entity normalizations are intentionally skipped here; they are
+                # better applied in the explicit scaler path to avoid hidden leakage.
+                continue
+            raise ValueError(f"Unknown static_cov_transform step: {step}")
+        return fn
+
+    def _compute_static_covariates(
+        self,
+        entity_id: int,
+        stat_time_range: Optional[tuple],
+        static_cov_transform: Optional[str],
+        static_cov_stats: Optional[List[str]],
+    ) -> Optional[np.ndarray]:
+        requested = tuple(static_cov_stats) if static_cov_stats else self._ALL_STAT_NAMES
+        unknown = set(requested) - set(self._ALL_STAT_NAMES)
+        if unknown:
+            raise ValueError(f"Unknown static_cov_stats: {unknown}")
+
+        mask = self._t_unit == entity_id
+        if stat_time_range is not None:
+            stat_start, stat_end = stat_time_range
+            mask = mask & (self._t_time >= stat_start) & (self._t_time <= stat_end)
+
+        if not np.any(mask):
+            return None
+
+        vals = self._t_values[mask]
+        times = self._t_time[mask]
+        order = np.argsort(times, kind="stable")
+        vals = vals[order]
+
+        transform_fn = self._build_stat_transform(static_cov_transform)
+        pieces: List[np.ndarray] = []
+        for target_idx in range(vals.shape[1]):
+            series = vals[:, target_idx].astype(np.float64)
+            stat_map: Dict[str, float] = {}
+            if "mu" in requested:
+                stat_map["mu"] = float(np.mean(series))
+            if "sigma" in requested:
+                stat_map["sigma"] = float(np.std(series))
+            if "max" in requested:
+                stat_map["max"] = float(np.max(series))
+            if "trend" in requested:
+                t = np.arange(len(series), dtype=np.float64)
+                tc = t - t.mean()
+                yc = series - series.mean()
+                denom = float(np.sum(tc * tc))
+                stat_map["trend"] = 0.0 if denom == 0.0 else float(np.sum(tc * yc) / denom)
+            if "sparsity" in requested:
+                stat_map["sparsity"] = float(np.mean(series == 0.0))
+
+            for stat in requested:
+                x = stat_map[stat]
+                if transform_fn is not None and stat != "sparsity":
+                    x = float(transform_fn(np.asarray([x], dtype=np.float64))[0])
+                pieces.append(np.asarray([x], dtype=np.float32))
+
+        if not pieces:
+            return None
+        return np.concatenate(pieces, axis=0)
+
+    def as_views_frames(
+        self,
+        time_ids: Optional[Union[int, List[int]]] = None,
+        entity_ids: Optional[Union[int, List[int]]] = None,
+        use_cyclic_encoders: bool = False,
+    ) -> Tuple[FeatureFrame, Optional[FeatureFrame]]:
+        selected_times = self._resolve_time_ids(time_ids)
+        selected_entities = self._resolve_entity_ids(entity_ids, selected_times)
+
+        row_mask = np.isin(self._t_time, selected_times) & np.isin(self._t_unit, selected_entities)
+        row_idx = np.where(row_mask)[0]
+
+        target_sel = self._target_frame.select(row_idx)
+        feature_sel = self._feature_frame.select(row_idx) if self._feature_frame is not None else None
+
+        if use_cyclic_encoders:
+            resolution = self._time_id.split("_")[0][0]
+            cyclic_encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
+            if cyclic_encoders:
+                tvals = target_sel.index.time.astype(np.float32)
+                enc = [fn(tvals).astype(np.float32) for fn in cyclic_encoders]
+                enc_matrix = np.stack(enc, axis=1)[:, :, np.newaxis]
+                enc_names = [fn.__name__ for fn in cyclic_encoders]
+
+                if feature_sel is None:
+                    feature_sel = FeatureFrame(enc_matrix, target_sel.index, enc_names)
+                else:
+                    merged_vals = np.concatenate([feature_sel.values, enc_matrix], axis=1)
+                    merged_names = feature_sel.feature_names + enc_names
+                    feature_sel = FeatureFrame(merged_vals, feature_sel.index, merged_names)
+
+        return target_sel, feature_sel
 
     def as_darts_timeseries(
         self,
@@ -75,237 +398,79 @@ class _ViewsDatasetDarts(_ViewsDataset):
         use_cyclic_encoders: bool = False,
     ):
         """
-        Converts the internal data subset into a Darts TimeSeries object.
-
-        Parameters:
-            time_ids (Optional[Union[int, List[int]]]): Specific time indices or list of time indices to filter the data. If None, all time indices are included.
-            entity_ids (Optional[Union[int, List[int]]]): Specific entity indices or list of entity indices to filter the data. If None, all entity indices are included.
-            stat_time_range (Optional[tuple]): A (start, end) tuple of time_id boundaries
-                (inclusive) for computing static covariate statistics. If None, statistics
-                are computed from the entire df_subset — which may leak test-period data
-                if df_subset is unfiltered. Callers should always pass the training
-                partition boundaries here to prevent leakage.
-            static_cov_transform (Optional[str]): Name of a transform to apply to the
-                computed static covariate statistics (mu, sigma, max, trend) before
-                injection. Supported: 'AsinhTransform', 'LogTransform', 'SqrtTransform',
-                'FourthRootTransform'. When None, stats are injected in raw space.
-                Sparsity (already in [0, 1]) is never transformed.
-            static_cov_stats (Optional[List[str]]): Subset of stat names to inject.
-                Must be a subset of ('mu', 'sigma', 'max', 'trend', 'sparsity').
-                When None, all five stats are injected (backward compatible).
-
-        Returns:
-            TimeSeries: A Darts TimeSeries object constructed from the filtered dataframe, grouped by entity and containing the specified features and targets.
+        Convert frames-native arrays into per-entity Darts TimeSeries.
         """
-        df_subset = self.get_subset_dataframe(time_ids=time_ids, entity_ids=entity_ids)
+        selected_times = self._resolve_time_ids(time_ids)
+        selected_entities = self._resolve_entity_ids(entity_ids, selected_times)
+        selected_times = np.sort(selected_times)
+        selected_entities = np.sort(selected_entities)
+        self._last_entity_order = selected_entities.astype(int).tolist()
 
-        # Enforce float32 precision at the Data Airlock boundary (ADR-010).
-        # Only cast columns already present in the raw dataframe — cyclic
-        # encoder columns (month_sin, month_cos, etc.) are appended to
-        # self.features by prior calls but don't exist in df_subset yet;
-        # they are injected below on df_reset and cast there.
-        cols_to_cast = [c for c in self.features + self.targets if c in df_subset.columns]
-        df_subset[cols_to_cast] = df_subset[cols_to_cast].astype(np.float32)
+        target_sel, feature_sel = self.as_views_frames(
+            time_ids=selected_times.tolist(),
+            entity_ids=selected_entities.tolist(),
+            use_cyclic_encoders=use_cyclic_encoders,
+        )
 
-        df_reset = df_subset.reset_index(level=[1])
+        t_time = target_sel.index.time.astype(np.int64, copy=False)
+        t_unit = target_sel.index.unit.astype(np.int64, copy=False)
+        t_values = target_sel.values[:, :, 0].astype(np.float32, copy=False)
 
-        # --- Cyclic time encoders (past covariates) ---
-        # Infer temporal resolution from the index name (month_id → "m",
-        # week_id → "w", day_id → "d", year_id → "y") and inject the
-        # corresponding sin/cos encoders from encoders.py.
-        # Zero leakage — purely calendar-derived, known for all time steps.
-        # Values already in [-1, 1]; no scaling needed.
-        resolution = self._time_id.split("_")[0][0]  # "month_id" → "m", "week_id" → "w", etc.
-        cyclic_encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
-        if use_cyclic_encoders and cyclic_encoders is not None:
-            for enc_fn in cyclic_encoders:
-                col_name = enc_fn.__name__
-                df_reset[col_name] = enc_fn(df_reset.index).astype(np.float32)
-                if col_name not in self.features:
-                    self.features.append(col_name)
-            logger.info(
-                f"Cyclic encoders: injected {[fn.__name__ for fn in cyclic_encoders]} "
-                f"for resolution '{resolution}' ({self._time_id})."
-            )
+        f_values = None
+        feature_names: List[str] = []
+        if feature_sel is not None:
+            f_values = feature_sel.values[:, :, 0].astype(np.float32, copy=False)
+            feature_names = list(feature_sel.feature_names)
 
-        if not inject_static_covariates:
-            logger.info("inject_static_covariates=False — skipping static covariate stat injection.")
-            return TimeSeries.from_group_dataframe(
-                df=df_reset,
-                group_cols=self._entity_id,
-                value_cols=self.features + self.targets,
-                n_jobs=-1,
-                verbose=True,
-            )
+        min_t = int(selected_times.min())
+        max_t = int(selected_times.max())
+        full_times = np.arange(min_t, max_t + 1, dtype=np.int64)
+        time_to_pos = {t: i for i, t in enumerate(full_times.tolist())}
 
-        # --- Per-entity static covariates (entity fingerprint) ---
-        #
-        # Statistics are computed from df_stat — a time-
-        # filtered slice of df_reset restricted to stat_time_range (the
-        # training partition). This guarantees that no test/forecast-period
-        # target values contaminate the static covariates. The full df_reset
-        # (including test rows) still gets the stats joined and is returned
-        # as TimeSeries — but the stats themselves only reflect training data.
-        #
-        # When static_cov_transform is provided (e.g. 'AsinhTransform'), mu,
-        # sigma, max, and trend are transformed before injection so that their
-        # scale matches the model's internal representation space. Sparsity
-        # (fraction in [0, 1]) is never transformed.
-        #
-        # Features injected (all per-entity, all from stat_time_range only):
-        #   target_mu      — mean target level
-        #   target_sigma   — std of target (spread / volatility)
-        #   target_max     — peak observed value (captures spike extremity)
-        #   target_trend   — OLS slope of target over time (regime change detector)
-        #   target_sparsity— fraction of zero-valued months (structural break signal)
-        if stat_time_range is not None:
-            stat_start, stat_end = stat_time_range
-            df_stat = df_reset.loc[
-                (df_reset.index >= stat_start) & (df_reset.index <= stat_end)
-            ]
-            logger.info(
-                f"Static covariate stats restricted to time range [{stat_start}, {stat_end}] "
-                f"({df_stat.index.nunique()} time steps, {len(df_stat)} rows). "
-                f"Full dataframe has {df_reset.index.nunique()} time steps."
-            )
-        else:
-            df_stat = df_reset
-            logger.warning(
-                "stat_time_range not provided — static covariate stats computed from "
-                "the FULL dataframe. This may cause leakage if test-period data is present."
-            )
-
-        # OLS slope: Σ(t - t̄)(y - ȳ) / Σ(t - t̄)² per entity
-        # Uses integer time index position (0,1,2,...) to avoid scale issues
-        def _ols_slope(s):
-            t = np.arange(len(s), dtype=np.float64)
-            t_centered = t - t.mean()
-            y_centered = s.values - s.values.mean()
-            denom = (t_centered ** 2).sum()
-            if denom == 0:
-                return 0.0
-            return float((t_centered * y_centered).sum() / denom)
-
-        # Resolve the transform chain for static cov stats.
-        # Supports single transforms ("AsinhTransform") or chains
-        # ("AsinhTransform->MaxAbsScaler"). Element-wise transforms are
-        # numpy-level (not Darts Scaler) because static covariates are
-        # scalars per entity, not time series. Cross-entity scalers
-        # (MaxAbsScaler, StandardScaler) normalize across countries.
-        _STATIC_COV_ELEMENTWISE = {
-            "AsinhTransform": np.arcsinh,
-            "LogTransform": np.log1p,
-            "SqrtTransform": lambda x: np.sqrt(np.maximum(x, 0)),
-            "FourthRootTransform": lambda x: np.power(1.0 + np.maximum(x, 0.0), 0.25) - 1.0,
+        row_map: Dict[Tuple[int, int], int] = {
+            (int(tt), int(uu)): idx for idx, (tt, uu) in enumerate(zip(t_time.tolist(), t_unit.tolist()))
         }
-        _STATIC_COV_CROSS_ENTITY = {"MaxAbsScaler", "StandardScaler"}
 
-        transform_fn = None
-        cross_entity_scaler = None
-        if static_cov_transform is not None:
-            steps = [s.strip() for s in static_cov_transform.split("->")]
-            for step in steps:
-                if step in _STATIC_COV_ELEMENTWISE:
-                    transform_fn = _STATIC_COV_ELEMENTWISE[step]
-                elif step in _STATIC_COV_CROSS_ENTITY:
-                    cross_entity_scaler = step
-                else:
-                    raise ValueError(
-                        f"Unknown static_cov_transform step '{step}'. "
-                        f"Available elementwise: {list(_STATIC_COV_ELEMENTWISE.keys())}. "
-                        f"Available cross-entity: {sorted(_STATIC_COV_CROSS_ENTITY)}."
-                    )
-
-        # Resolve which stats to compute. Default: all five.
-        requested_stats = tuple(static_cov_stats) if static_cov_stats else self._ALL_STAT_NAMES
-        unknown = set(requested_stats) - set(self._ALL_STAT_NAMES)
-        if unknown:
-            raise ValueError(
-                f"Unknown static_cov_stats: {unknown}. "
-                f"Allowed: {self._ALL_STAT_NAMES}"
+        out = []
+        for ent in selected_entities.tolist():
+            target_dense = np.zeros((len(full_times), len(self.targets)), dtype=np.float32)
+            feature_dense = (
+                np.zeros((len(full_times), len(feature_names)), dtype=np.float32)
+                if f_values is not None
+                else None
             )
 
-        # Compute fingerprint stats for every target and name them {target_col}_{stat}.
-        # This supports both single-target models (e.g. "lr_ged_sb_mu") and
-        # multi-target models (e.g. "lr_ged_sb_mu", "lr_ged_ns_mu", ...) without
-        # ambiguity. TFT's VSN treats these as plain feature names — the exact
-        # strings are irrelevant to the model, only their values matter.
-        stat_frames = []
-        for target_col in self.targets:
-            grouped = df_stat.groupby(self._entity_id)[target_col]
+            for t in full_times.tolist():
+                ridx = row_map.get((int(t), int(ent)))
+                if ridx is None:
+                    continue
+                pos = time_to_pos[int(t)]
+                target_dense[pos, :] = t_values[ridx, :]
+                if feature_dense is not None:
+                    feature_dense[pos, :] = f_values[ridx, :]
 
-            # Only compute requested agg stats (mu/sigma/max are pandas agg-able)
-            _agg_map = {"mu": "mean", "sigma": "std", "max": "max"}
-            agg_kwargs = {
-                f"{target_col}_{stat}": _agg_map[stat]
-                for stat in requested_stats if stat in _agg_map
-            }
-            if agg_kwargs:
-                col_stats = grouped.agg(**agg_kwargs).fillna(0.0)
+            if feature_dense is not None:
+                values = np.concatenate([feature_dense, target_dense], axis=1)
+                cols = feature_names + self.targets
             else:
-                # No agg stats requested (only trend/sparsity) — seed with entity-indexed frame
-                import pandas as _pd
-                col_stats = _pd.DataFrame(index=grouped.first().index)
+                values = target_dense
+                cols = list(self.targets)
 
-            if "trend" in requested_stats:
-                col_stats[f"{target_col}_trend"] = grouped.apply(_ols_slope)
-            if "sparsity" in requested_stats:
-                col_stats[f"{target_col}_sparsity"] = grouped.apply(lambda s: (s == 0).mean())
+            static_cov = None
+            if inject_static_covariates:
+                static_cov = self._compute_static_covariates(
+                    entity_id=int(ent),
+                    stat_time_range=stat_time_range,
+                    static_cov_transform=static_cov_transform,
+                    static_cov_stats=static_cov_stats,
+                )
 
-            # Apply element-wise transform to scale-sensitive stats.
-            # Sparsity is already in [0, 1] — never transformed.
-            _transformable = [s for s in ("mu", "sigma", "max", "trend") if s in requested_stats]
-            if transform_fn is not None:
-                for stat in _transformable:
-                    col_name = f"{target_col}_{stat}"
-                    col_stats[col_name] = transform_fn(col_stats[col_name].values).astype(np.float32)
+            ts = TimeSeries.from_times_and_values(
+                times=full_times,
+                values=values.astype(np.float32),
+                columns=cols,
+                static_covariates=static_cov,
+            )
+            out.append(ts)
 
-            # Apply cross-entity scaler if specified in the chain.
-            if cross_entity_scaler == "MaxAbsScaler":
-                for stat in _transformable:
-                    col_name = f"{target_col}_{stat}"
-                    abs_max = col_stats[col_name].abs().max()
-                    if abs_max > 0:
-                        col_stats[col_name] = (col_stats[col_name] / abs_max).astype(np.float32)
-            elif cross_entity_scaler == "StandardScaler":
-                for stat in _transformable:
-                    col_name = f"{target_col}_{stat}"
-                    mean = col_stats[col_name].mean()
-                    std = col_stats[col_name].std()
-                    if std > 0:
-                        col_stats[col_name] = ((col_stats[col_name] - mean) / std).astype(np.float32)
-
-            stat_frames.append(col_stats)
-
-        # Merge per-target stat DataFrames on the shared entity_id index
-        stats = stat_frames[0]
-        for frame in stat_frames[1:]:
-            stats = stats.join(frame)
-        stats = stats.astype(np.float32).reset_index()
-
-        static_cov_names = [
-            f"{col}_{stat}"
-            for col in self.targets
-            for stat in requested_stats
-        ]
-
-        n_entities = len(stats)
-        n_stat_rows = len(df_stat)
-        n_stat_time_steps = df_stat.index.nunique()
-        transform_label = static_cov_transform or "raw"
-        logger.info(
-            f"Static covariates: injecting {static_cov_names} "
-            f"({len(self.targets)} target(s) × 5 stats = {len(static_cov_names)} cols) "
-            f"for {n_entities} entities computed from {n_stat_rows} rows "
-            f"({n_stat_time_steps} time steps, {transform_label} space)."
-        )
-        df_reset = df_reset.join(stats.set_index(self._entity_id), on=self._entity_id)
-
-        return TimeSeries.from_group_dataframe(
-            df=df_reset,
-            group_cols=self._entity_id,
-            value_cols=self.features + self.targets,
-            static_cols=static_cov_names,
-            n_jobs=-1,
-            verbose=True,
-        )
+        return out

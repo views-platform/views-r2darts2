@@ -33,7 +33,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
        where an event is present in y_true or y_pred (|·| > τ) so it cannot
        amplify pure numerical noise in the 97%-peace regime.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window means.
+    4. **Windowed level anchor** — T-scaled log_cosh on per-window means,
+       gated (peace-suppressed) but NOT magnitude-graded: level anchors DC only,
+       magnitude capture is left to the shape term.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -205,15 +207,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        # Gate (peace suppression) x magnitude factor (1 + series_mag), mirroring
-        # the shape-term event_mag: the bare sigmoid saturates above ~2 deaths and
-        # is magnitude-blind across the tail; (1 + series_mag) restores bounded
-        # asinh-space magnitude sensitivity so large wars pull more DC gradient
-        # than small skirmishes. No new constant (asinh IS the scale).
-        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
+        # Peace-suppression GATE only — NO (1 + series_mag) magnitude grading.
+        # The level anchor sets the DC/mean of the forecast; grading it by
+        # magnitude made the largest series carry an up-to-~15× multiplier that,
+        # stacked on the T-scale, dominated the (90%-of-loss) level term and made
+        # the model overshoot big-event DC (ch_0 ×1.5) with periodic gradient
+        # explosions. Magnitude capture is the SHAPE term's job (it keeps the
+        # (1 + abs_max) grading); level just anchors every event series' DC
+        # equally through the gate (peace still suppressed to 0.0125, so no
+        # flattening). Removing a multiplier — no new constant.
+        series_w = 0.0125 + 0.9875 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
-        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
         # ── Hájek self-normalized level anchor (composition-robust) ───
         # Weight-mass-weighted mean of the per-window level log_cosh — the

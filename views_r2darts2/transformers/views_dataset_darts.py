@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from darts import TimeSeries
 from views_frames.feature_frame import FeatureFrame
+import pandas as pd
 from views_frames.index import SpatioTemporalIndex
 from views_frames.spatial_level import SpatialLevel
 
@@ -424,8 +425,9 @@ class _ViewsDatasetDarts:
 
         min_t = int(selected_times.min())
         max_t = int(selected_times.max())
-        full_times = np.arange(min_t, max_t + 1, dtype=np.int64)
-        time_to_pos = {t: i for i, t in enumerate(full_times.tolist())}
+        full_times_np = np.arange(min_t, max_t + 1, dtype=np.int64)
+        full_times = pd.Index(full_times_np)  # Darts requires a pandas Index
+        time_to_pos = {t: i for i, t in enumerate(full_times_np.tolist())}
 
         row_map: Dict[Tuple[int, int], int] = {
             (int(tt), int(uu)): idx for idx, (tt, uu) in enumerate(zip(t_time.tolist(), t_unit.tolist()))
@@ -433,14 +435,14 @@ class _ViewsDatasetDarts:
 
         out = []
         for ent in selected_entities.tolist():
-            target_dense = np.zeros((len(full_times), len(self.targets)), dtype=np.float32)
+            target_dense = np.zeros((len(full_times_np), len(self.targets)), dtype=np.float32)
             feature_dense = (
-                np.zeros((len(full_times), len(feature_names)), dtype=np.float32)
+                np.zeros((len(full_times_np), len(feature_names)), dtype=np.float32)
                 if f_values is not None
                 else None
             )
 
-            for t in full_times.tolist():
+            for t in full_times_np.tolist():
                 ridx = row_map.get((int(t), int(ent)))
                 if ridx is None:
                     continue

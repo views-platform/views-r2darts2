@@ -21,8 +21,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
          shape handles temporal patterns, level handles global DC.
 
     2. **Gated + magnitude-graded event weighting.**
-    event_mag = gate × (1 + abs_max), gate = 0.0125 + 0.9875 × σ(10 × (abs_max − τ)).
-    The gate suppresses peace (→ ~0.0125) vs conflict (→ ~1); the (1 + abs_max)
+    event_mag = gate × (1 + abs_max), gate = 0.0025 + 0.9875 × σ(10 × (abs_max − τ)).
+    The gate suppresses peace (→ ~0.0025) vs conflict (→ ~1); the (1 + abs_max)
        factor — bounded because abs_max is in asinh space — restores magnitude
        sensitivity across the 4-OOM tail so large wars outweigh small skirmishes
        instead of saturating flat. No model-state dependency (abs_max detached).
@@ -87,7 +87,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     @staticmethod
-    def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def _dro_weights_2d(
+        losses: torch.Tensor,
+        y_true: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Per-series sqrt self-reweighting
 
         w_it = sqrt(loss_it / mean_i(loss))
@@ -97,11 +101,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
         systematic bias while still focusing on spikes.
 
         Returns weights with mean ≈ 1 per series, shape (B, T) or (B, T, C).
+        When mask is provided, DRO statistics are computed on masked cells only.
         """
         l = losses.detach()                                  # (B, T) or (B, T, C)
-        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1) or (B, 1, C)
-        w = torch.sqrt(l / mu)                               # (B, T) or (B, T, C)
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
+
+        if mask is None:
+            mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)     # (B, 1) or (B, 1, C)
+            w = torch.sqrt(l / mu)                               # (B, T) or (B, T, C)
+            w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)  # renormalize mean=1
+            return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
+
+        m = mask.detach().to(dtype=l.dtype)
+        active_count = m.sum(dim=1, keepdim=True).clamp(min=1.0)
+        mu = (l * m).sum(dim=1, keepdim=True) / active_count
+        mu = mu.clamp(min=1e-6)
+        w = torch.sqrt(l / mu)
+        # Keep inactive cells neutral for DRO (event gate/mask handles their final weight).
+        w = torch.where(m > 0, w, torch.ones_like(w))
+        w_mean = ((w * m).sum(dim=1, keepdim=True) / active_count).clamp(min=1e-8)
+        w = torch.where(m > 0, w / w_mean, torch.ones_like(w))
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     # ------------------------------------------------------------------
@@ -187,10 +205,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
+        series_gate = 0.0025 + 0.9875 * torch.sigmoid(
             10.0 * (series_mag - self.non_zero_threshold)
         )
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
+        series_mask = (series_mag > self.non_zero_threshold).to(series_w.dtype)
+        # Apply threshold masking for level anchoring, but keep all-peace batches stable.
+        if torch.any(series_mask):
+            series_w = series_w * series_mask
 
         y_pred = e + y_true
         cum_pred = torch.cumsum(y_pred, dim=1)
@@ -295,13 +317,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        non_zero_mask = (abs_max > self.non_zero_threshold).to(y_pred.dtype)
+        # If the whole batch is below threshold, fall back to unmasked routing.
+        if not torch.any(non_zero_mask):
+            non_zero_mask = torch.ones_like(non_zero_mask)
         # event_mag = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
-        event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
+        event_gate = 0.0025 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO ────────────────────────────────────
-        w_dro = self._dro_weights_2d(cell_loss, y_true)  # (B, T) or (B, T, C)
-        w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+        w_dro = self._dro_weights_2d(cell_loss, y_true, mask=non_zero_mask)  # (B, T) or (B, T, C)
+        w_total = torch.nan_to_num(event_mag * w_dro * non_zero_mask, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Hájek self-normalized shape (composition-robust) ──────────
         # Weight-mass-weighted mean of the per-cell log_cosh — the

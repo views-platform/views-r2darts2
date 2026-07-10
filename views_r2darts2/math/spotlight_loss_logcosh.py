@@ -78,7 +78,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Telemetry for callbacks
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
-        self._last_cal_gate: list[float] | None = None
 
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
@@ -113,38 +112,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
     # Loss Components
     # ------------------------------------------------------------------
-
-    def _channel_event_calibration_gate(
-        self,
-        y_pred: torch.Tensor,
-        y_true: torch.Tensor,
-    ) -> torch.Tensor:
-        """Per-channel under/over calibration gate from event-mass ratio.
-
-        gate_c = sqrt(sum|y_true|_event / sum|y_pred|_event)
-
-        - Under-predicting channels (pred mass < true mass) get gate > 1.
-        - Over-predicting channels (pred mass > true mass) get gate < 1.
-
-        The square root keeps this correction sublinear, mirroring the DRO
-        philosophy used elsewhere in the loss.
-        """
-        if y_pred.dim() != 3:
-            return y_pred.new_tensor([1.0])
-
-        C = y_pred.shape[-1]
-        abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        event_mask = abs_max > self.non_zero_threshold
-
-        true_mass = (y_true.abs() * event_mask).sum(dim=(0, 1)).detach()  # (C,)
-        pred_mass = (y_pred.detach().abs() * event_mask).sum(dim=(0, 1)).detach()  # (C,)
-
-        valid = true_mass > 0
-        ratio = torch.ones_like(true_mass)
-        ratio = torch.where(valid, true_mass / pred_mass.clamp(min=self._EMA_EPS), ratio)
-        gate = torch.sqrt(ratio).clamp(min=0.5, max=2.0)
-        gate = C * gate / gate.sum().clamp(min=self._EMA_EPS)
-        return gate
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Combine per-channel losses by *relative learning progress*.
@@ -196,16 +163,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         fast = per_channel_loss.new_tensor(self._loss_ema)
         slow = per_channel_loss.new_tensor(self._loss_ema_slow)
         scores = fast / slow.clamp(min=self._EMA_EPS)
-        cal_gate = self._channel_event_calibration_gate(y_pred=y_pred, y_true=y_true)
-        fused_scores = scores * cal_gate
-        w_soft = C * fused_scores / fused_scores.sum().clamp(min=self._EMA_EPS)
+        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
 
         self._last_weights = w_soft.tolist()
-        self._last_cal_gate = cal_gate.tolist()
         # Telemetry (keys preserved for the callback contract):
         self._last_cal_ratio = scores.tolist()       # progress ratio fast/slow
         self._last_cal_score = list(self._loss_ema)  # fast EMA
-        self._last_gates = cal_gate.tolist()
+        self._last_gates = w_soft.tolist()
 
         return (w_soft * per_channel_loss).sum()
 
@@ -219,8 +183,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         log_cosh on per-window means, then weights each series by its 
         event magnitude. No DRO, no CMW, just the sigmoid weight.
 
-        We scale by sequence length T to keep level pressure stable across
-        window partitions and preserve the historical calibration behavior.
+        We scale by sequence length T to preserve the stronger level anchor
+        needed for calibration in sparse conflict data.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -253,7 +217,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # still giving ch_2 proportional scale-aware pressure. No new constant.
         series_w = (0.0125 + 0.9875 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
-        )) * (1.0 + torch.sqrt(series_mag))  # (B,) or (B, C)
+        )) * torch.sqrt(1.0 + series_mag)  # (B,) or (B, C)
 
         # ── Hájek self-normalized level anchor (composition-robust) ───
         # Weight-mass-weighted mean of the per-window level log_cosh — the
@@ -368,7 +332,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_gate = 0.0125 + 0.9875 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
-        event_mag = event_gate * (1.0 + abs_max)
+        event_mag = event_gate * torch.sqrt(1.0 + abs_max)
 
         # ── Per-series temporal DRO (event-gated) ─────────────────────
         # DRO's sqrt(l/mean) amplifies within-series relative hardness, but on

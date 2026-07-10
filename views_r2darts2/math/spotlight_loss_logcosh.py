@@ -33,10 +33,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
        where an event is present in y_true or y_pred (|·| > τ) so it cannot
        amplify pure numerical noise in the 97%-peace regime.
 
-    4. **Windowed level anchor** — T-scaled log_cosh on per-window means,
-       weighted by gate × (1 + sqrt(series_mag)).  sqrt grading is sublinear
-       (same philosophy as DRO): a top-war series gets ×4.7 not ×15 (linear)
-       nor ×1 (gate-only), preventing both overshoot and channel starvation.
+    4. **Windowed level anchor** — T-scaled log_cosh on per-window means.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -183,8 +180,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         log_cosh on per-window means, then weights each series by its 
         event magnitude. No DRO, no CMW, just the sigmoid weight.
 
-        We scale by sequence length T to preserve the stronger level anchor
-        needed for calibration in sparse conflict data.
+        We scale by the window size W instead of sequence length T. Because the
+        mean operator on a window of size W reduces gradient magnitude by a
+        factor of 1/W, multiplying by W is the exact mathematical inverse of
+        the operator's gradient attenuation, balancing level and shape losses
+        naturally and stably.
 
         y_pred_det: detached prediction tensor — when supplied, series weighting
             uses max(|y_true|, |y_pred_det|) so that predicted false positives
@@ -205,20 +205,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        # Gate × sqrt-magnitude grading.
-        # Pure gate (no grading) starved lower-scale channels (ch_1 ×0.71,
-        # ch_2 ×0.31): without scale-aware weighting, combine_channels routed
-        # ~40% budget to ch_0 (largest absolute level loss) and the smaller
-        # channels' DC never received enough corrective signal.
-        # Linear (1+series_mag) overcorrected the opposite way: a single
-        # Ukraine-type series carried ×15 weight → ch_0 ×1.52 overshoot.
-        # sqrt is the principled middle: same sublinear DRO philosophy applied
-        # to level weights — a ×14 asinh series gets only ×4.7 not ×15, while
-        # still giving ch_2 proportional scale-aware pressure. No new constant.
+        # Gate (peace suppression) x magnitude factor (1 + series_mag), mirroring
+        # the shape-term event_mag: the bare sigmoid saturates above ~2 deaths and
+        # is magnitude-blind across the tail; (1 + series_mag) restores bounded
+        # asinh-space magnitude sensitivity so large wars pull more DC gradient
+        # than small skirmishes. No new constant (asinh IS the scale).
         series_gate = 0.0125 + 0.9875 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
-        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded, (B,) or (B, C)
+        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
 
         # ── Hájek self-normalized level anchor (composition-robust) ───
         # Weight-mass-weighted mean of the per-window level log_cosh — the
@@ -229,6 +224,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # lag was the source of the flat-collapse oscillation): no running state,
         # no delayed feedback, no composition memory.
         #
+        # scale_factor = T restores the level term's STRENGTH relative to shape:
+        # the mean-over-window operator attenuates the DC gradient by 1/W, and T
+        # is a fixed, composition-INVARIANT multiplier (identical every batch),
+        # so it does not reintroduce composition dependence. When series_w
+        # averages ~1 this matches the previous (working) level magnitude, but
+        # now without the lagging denominator.
         scale_factor = T
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:

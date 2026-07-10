@@ -227,7 +227,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # - T-only can over-amplify level early in training.
         # Use the geometric midpoint to keep T-coupled strength while avoiding
         # the full aggressiveness of pure T scaling.
-        scale_factor = math.sqrt(float(T * W))
+        scale_factor = T
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)

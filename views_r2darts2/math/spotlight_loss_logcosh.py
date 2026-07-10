@@ -130,12 +130,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Base DRO
         w = torch.sqrt(l / mu)
 
-        # Keep peace cells near-neutral (~1), preserving soft onsets/offsets.
-        w = 1.0 + m * (w - 1.0)
-
         # Self-normalize to mean 1 on active region per series.
         w_active_mean = _wmean(w, m).clamp(min=self._EMA_EPS)
-        w = torch.where(m > 0.0, w / w_active_mean, torch.ones_like(w))
+        w_normalized_active = w / w_active_mean
+
+        # Keep peace cells near-neutral (~1), preserving soft onsets/offsets.
+        # This interpolation guarantees that peace cells remain neutral (weight ~1.0)
+        # regardless of how much active region scaling fluctuates.
+        w = 1.0 + m * (w_normalized_active - 1.0)
 
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
@@ -185,9 +187,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             self._loss_ema = batch_loss_det.tolist()
             self._loss_ema_slow = batch_loss_det.tolist()
         else:
-            for c in range(C):
-                self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
-                self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
+            if self.training:
+                for c in range(C):
+                    self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
+                    self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
 
         # ── Relative-progress routing ────────────────────────────────
         fast = per_channel_loss.new_tensor(self._loss_ema)
@@ -242,7 +245,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # peace-vs-event composition without amplifying DC pull from the
         # highest-magnitude series.
         series_gate = 0.0125 + 0.9875 * torch.sigmoid(
-            5.0 * (series_mag - self.non_zero_threshold)
+            10.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
         series_w = series_gate
 
@@ -363,7 +366,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_gate = 0.0125 + 0.9875 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
+        event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO (soft event-aware) ───────────────
@@ -371,7 +374,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # near-neutral. Uses requested form:
         # m = m_floor + (1 - m_floor) * sigmoid(k * (|y| - tau)).
         soft_event_mask = 0.0125 + (1.0 - 0.0125) * torch.sigmoid(
-            5.0 * (abs_max - self.non_zero_threshold)
+            10.0 * (abs_max - self.non_zero_threshold)
         )
         w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)  # (B, T) or (B, T, C)
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)

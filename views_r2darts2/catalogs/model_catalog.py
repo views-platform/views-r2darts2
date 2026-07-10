@@ -136,8 +136,11 @@ class ModelCatalog:
             PredictionSanityCallback(),
             LossStabilityCallback(),
             EpochTimingCallback(),
-            YHatBarCallback(),
-            ValMetricsCallback(),
+            YHatBarCallback(
+                target_scaler=self.config.get("target_scaler", None),
+                non_zero_threshold=self.config.get("non_zero_threshold", 0.88),
+            ),
+            ValMetricsCallback(target_scaler=self.config.get("target_scaler", None)),
             InputBatchMonitorCallback(),
             LossComponentCallback(),
         ]

@@ -205,15 +205,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        # Gate (peace suppression) x magnitude factor (1 + series_mag), mirroring
-        # the shape-term event_mag: the bare sigmoid saturates above ~2 deaths and
-        # is magnitude-blind across the tail; (1 + series_mag) restores bounded
-        # asinh-space magnitude sensitivity so large wars pull more DC gradient
-        # than small skirmishes. No new constant (asinh IS the scale).
+        # Gate-only series weighting keeps the level anchor focused on
+        # peace-vs-event composition without amplifying DC pull from the
+        # highest-magnitude series.
         series_gate = 0.0125 + 0.9875 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
-        series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
+        series_w = series_gate
 
         # ── Hájek self-normalized level anchor (composition-robust) ───
         # Weight-mass-weighted mean of the per-window level log_cosh — the

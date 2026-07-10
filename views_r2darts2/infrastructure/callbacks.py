@@ -1127,6 +1127,11 @@ class ValMetricsCallback(Callback):
             )
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            self._preds.clear()
+            self._truths.clear()
+            return
+
         preds_buf = self._preds[:]
         truths_buf = self._truths[:]
         self._preds.clear()

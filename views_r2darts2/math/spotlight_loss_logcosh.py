@@ -130,12 +130,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Base DRO
         w = torch.sqrt(l / mu)
 
-        # Keep peace cells near-neutral (~1), preserving soft onsets/offsets.
-        w = 1.0 + m * (w - 1.0)
-
         # Self-normalize to mean 1 on active region per series.
         w_active_mean = _wmean(w, m).clamp(min=self._EMA_EPS)
-        w = torch.where(m > 0.0, w / w_active_mean, torch.ones_like(w))
+        w_normalized_active = w / w_active_mean
+
+        # Keep peace cells near-neutral (~1), preserving soft onsets/offsets.
+        # This interpolation guarantees that peace cells remain neutral (weight ~1.0)
+        # regardless of how much active region scaling fluctuates.
+        w = 1.0 + m * (w_normalized_active - 1.0)
 
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
@@ -260,7 +262,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # - T-only can over-amplify level early in training.
         # Use the geometric midpoint to keep T-coupled strength while avoiding
         # the full aggressiveness of pure T scaling.
-        scale_factor = T
+        scale_factor = math.sqrt(W * T)
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)

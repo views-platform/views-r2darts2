@@ -132,7 +132,7 @@ class _ViewsDatasetDarts:
         existing = np.unique(unit[time == last_month])
 
         keep = np.isin(unit, existing)
-        unique_times = np.unique(time[keep])
+        unique_times = np.unique(time)
         n_t = int(unique_times.shape[0])
         n_e = int(existing.shape[0])
 

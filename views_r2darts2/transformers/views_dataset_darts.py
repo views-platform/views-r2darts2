@@ -33,6 +33,13 @@ class _ViewsDatasetDarts:
         feature_frame: Optional[FeatureFrame] = None,
         targets: Optional[List[str]] = None,
     ):
+        # Panel densification runs here — the single choke point both the
+        # frames-native mmap load (from_views_path) and the legacy in-memory
+        # conversion (from_dataframe) funnel through — so both tracks get
+        # identical missingness correction, done in pure numpy on the frames
+        # (never a pandas from_product/reindex over the full dataframe).
+        target_frame, feature_frame = self._densify_frames(target_frame, feature_frame)
+
         self._target_frame = target_frame
         self._feature_frame = feature_frame
 
@@ -80,6 +87,80 @@ class _ViewsDatasetDarts:
     @property
     def last_entity_order(self) -> List[int]:
         return list(self._last_entity_order)
+
+    @staticmethod
+    def _densify_frames(
+        target_frame: FeatureFrame,
+        feature_frame: Optional[FeatureFrame],
+    ) -> Tuple[FeatureFrame, Optional[FeatureFrame]]:
+        """Balance the panel in pure numpy (legacy _preprocess_dataframe parity).
+
+        Replicates, on the frames rather than a pandas dataframe:
+          1. Take the entities present in the LAST month.
+          2. Drop every entity not present in that last month (no fabricated
+             fake-peace tails for exited entities).
+          3. Reindex survivors across all observed months, zero-filling every
+             missing (month, entity) cell for BOTH targets and features.
+
+        Pure numpy scatter — no pandas from_product/reindex, no full-dataframe
+        materialization. Idempotent on an already-dense, last-month-complete
+        panel (it only reorders to canonical (time, unit) order). The feature
+        frame is aligned by the target index (the class invariant), so the same
+        row map is applied to both.
+        """
+        idx = target_frame.index
+        time = np.asarray(idx.time, dtype=np.int64)
+        unit = np.asarray(idx.unit, dtype=np.int64)
+        level = idx.level
+
+        if time.shape[0] == 0:
+            return target_frame, feature_frame
+
+        # Guard the alignment invariant before we reuse one row map for both.
+        if feature_frame is not None:
+            f_idx = feature_frame.index
+            if feature_frame.n_rows != target_frame.n_rows or not (
+                np.array_equal(f_idx.time, idx.time)
+                and np.array_equal(f_idx.unit, idx.unit)
+            ):
+                raise ValueError(
+                    "FeatureFrame and TargetFrame indices must be aligned before "
+                    "densification."
+                )
+
+        last_month = int(time.max())
+        existing = np.unique(unit[time == last_month])
+
+        keep = np.isin(unit, existing)
+        unique_times = np.unique(time[keep])
+        n_t = int(unique_times.shape[0])
+        n_e = int(existing.shape[0])
+
+        # Canonical dense (time, unit) grid, time-major to match sort order.
+        t_pos = np.searchsorted(unique_times, time[keep])
+        e_pos = np.searchsorted(existing, unit[keep])
+        flat_pos = t_pos * n_e + e_pos
+
+        dense_time = np.repeat(unique_times, n_e)
+        dense_unit = np.tile(existing, n_t)
+        dense_index = SpatioTemporalIndex(time=dense_time, unit=dense_unit, level=level)
+
+        def _densify(frame: FeatureFrame) -> FeatureFrame:
+            vals = np.asarray(frame.values)  # (N, F, S); memmap stays lazy until sliced
+            n_features = int(vals.shape[1])
+            n_samples = int(vals.shape[2])
+            dense = np.zeros((n_t * n_e, n_features, n_samples), dtype=np.float32)
+            dense[flat_pos] = vals[keep].astype(np.float32, copy=False)
+            return FeatureFrame(
+                dense,
+                dense_index,
+                frame.feature_names,
+                frame.metadata,
+            )
+
+        dense_target = _densify(target_frame)
+        dense_feature = _densify(feature_frame) if feature_frame is not None else None
+        return dense_target, dense_feature
 
     @staticmethod
     def _first_existing_path(candidates: List[str]) -> Optional[str]:
@@ -157,6 +238,12 @@ class _ViewsDatasetDarts:
 
         df_reset = df_reset.sort_values([time_col, unit_col], kind="stable")
 
+        # NOTE: panel densification (last-month entity filter + dense zero-fill)
+        # is NOT done here in pandas. It is performed in numpy on the frames in
+        # _ViewsDatasetDarts.__init__ (via _densify_frames), so this legacy path
+        # converts to frames ASAP with only the minimal pandas needed to build
+        # the raw index, then hands off. Both load tracks share that one numpy
+        # correction — no from_product/reindex over the full dataframe.
         if unit_col == "priogrid_id":
             level = SpatialLevel.PGM
         else:

@@ -34,8 +34,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
        amplify pure numerical noise in the 97%-peace regime.
 
     4. **Windowed level anchor** — T-scaled log_cosh on per-window means,
-       gated (peace-suppressed) but NOT magnitude-graded: level anchors DC only,
-       magnitude capture is left to the shape term.
+       weighted by gate × (1 + sqrt(series_mag)).  sqrt grading is sublinear
+       (same philosophy as DRO): a top-war series gets ×4.7 not ×15 (linear)
+       nor ×1 (gate-only), preventing both overshoot and channel starvation.
 
     5. **Multi-resolution STFT loss** — always on, ungated.
        log_cosh on magnitude-spectrum differences.  DC bin masked.
@@ -207,18 +208,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values  # (B,) or (B, C)
-        # Peace-suppression GATE only — NO (1 + series_mag) magnitude grading.
-        # The level anchor sets the DC/mean of the forecast; grading it by
-        # magnitude made the largest series carry an up-to-~15× multiplier that,
-        # stacked on the T-scale, dominated the (90%-of-loss) level term and made
-        # the model overshoot big-event DC (ch_0 ×1.5) with periodic gradient
-        # explosions. Magnitude capture is the SHAPE term's job (it keeps the
-        # (1 + abs_max) grading); level just anchors every event series' DC
-        # equally through the gate (peace still suppressed to 0.0125, so no
-        # flattening). Removing a multiplier — no new constant.
-        series_w = 0.0125 + 0.9875 * torch.sigmoid(
+        # Gate × sqrt-magnitude grading.
+        # Pure gate (no grading) starved lower-scale channels (ch_1 ×0.71,
+        # ch_2 ×0.31): without scale-aware weighting, combine_channels routed
+        # ~40% budget to ch_0 (largest absolute level loss) and the smaller
+        # channels' DC never received enough corrective signal.
+        # Linear (1+series_mag) overcorrected the opposite way: a single
+        # Ukraine-type series carried ×15 weight → ch_0 ×1.52 overshoot.
+        # sqrt is the principled middle: same sublinear DRO philosophy applied
+        # to level weights — a ×14 asinh series gets only ×4.7 not ×15, while
+        # still giving ch_2 proportional scale-aware pressure. No new constant.
+        series_w = (0.0125 + 0.9875 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
-        )  # (B,) or (B, C)
+        )) * (1.0 + torch.sqrt(series_mag))  # (B,) or (B, C)
 
         # ── Hájek self-normalized level anchor (composition-robust) ───
         # Weight-mass-weighted mean of the per-window level log_cosh — the

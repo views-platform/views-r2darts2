@@ -6,43 +6,40 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """Minimal scale-normalized loss for zero-inflated conflict forecasting.
+    """Adaptive loss for zero‑inflated conflict fatality forecasting.
 
-    Operates in asinh space on ``(B, T, C)`` tensors for UCDP GED fatality
-    forecasting (sb/ns/os), where 86–98% of cells are zero and non‑zero
-    values span ~4 orders of magnitude.
+    Operates in asinh space on ``(B, T, C)`` tensors (sb/ns/os).
+    The loss is designed for ~86‑98% zeros and heavy‑tailed non‑zero values.
 
     ── Design ─────────────────────────────────────────────────────────
 
-    The error is split into two dedicated terms:
+    The error is split into two complementary terms:
 
-      * **Shape (temporal pattern).** Per‑series demeaned residual
-        ``(pred - mean_t pred) - (true - mean_t true)``, penalised
-        quadratically and standardised by each channel's own temporal‑
-        deviation scale (data‑driven, floored at the threshold).  This
-        scores within‑series dynamics only; a constant‑wrong prediction is
-        **not** free because the level term catches its magnitude.
+    * **Shape (temporal pattern).** Demeaned per‑series residual,
+      penalised quadratically and standardised by the channel‑wise
+      temporal standard deviation of the true AC component.
+      This ensures each series is forced to learn its own dynamics
+      and flat forecasts are actively penalised.
 
-      * **Level (total event mass).** Total sum over the forecast window,
-        penalised via an **adaptive scaled logcosh**.  The scale is set
-        per channel and batch as the standard deviation of the true totals
-        – no constant, no tuning.  This gives a gradient proportional to
-        the miss when the miss is comparable to the natural spread of the
-        data, and gently saturates when the miss far exceeds that spread,
-        preventing gradient explosions and wild over‑prediction while still
-        correcting large under‑prediction 10× faster than ordinary logcosh.
+    * **Level (magnitude).** Per‑cell Huber loss on raw error,
+      with an adaptive threshold ``δ`` set per channel as
+      ``δ = 2 * std(event‑cell true values)``, floored at the
+      non‑zero threshold.  The gradient grows proportionally with
+      moderate errors (up to ``δ``) and saturates gracefully for
+      extreme outliers, providing far more lifting force than
+      saturating losses while preventing gradient explosions.
 
-    A **sharp event gate** ``sigmoid(10*(|·| - τ))`` (τ = non_zero_threshold,
-    default 0.88) keeps gradient focused on conflict cells.  The **shape
-    term uses Hájek (self‑normalised) weighting**; the **level term uses a
-    weighted mean** (not Hájek) to avoid gradient starvation at 90‑97 %
-    peace series.  Both terms are parameter‑free once τ is chosen; the
-    level–shape balance is emergent and naturally stays around 0.5–0.7.
+    Both terms are gated by a sharp event mask
+    ``sigmoid(10·(|·| − τ))`` (τ = ``non_zero_threshold``) and
+    normalised with Hájek (self‑normalised weighted means).
+    The shape term is given an explicit relative weight of 5.0
+    to maintain its influence alongside the stronger level signal.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
-    ``non_zero_threshold`` — the ONLY tunable, ≈ 0.88 (asinh(1)).
-    Everything else is data‑driven.
+    ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
+    All other quantities (shapes, scales, Huber threshold) are
+    data‑driven.
     """
 
     _EPS = 1e-6
@@ -59,13 +56,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
-    # Stable logcosh helper
+    # Helper: stable logcosh (used only if needed; kept for reference)
     # ------------------------------------------------------------------
     @staticmethod
     def _Logcosh(z: torch.Tensor) -> torch.Tensor:
         """log(cosh(z)) without the additive constant log(2)."""
         a = z.abs()
         return a + F.softplus(-2.0 * a)
+
+    # ------------------------------------------------------------------
+    # Helper: per‑channel std of event cells (for adaptive Huber delta)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _event_std(y_true: torch.Tensor, tau: float) -> torch.Tensor:
+        """Per‑channel standard deviation of y_true for |y_true| > tau."""
+        mask = (y_true.abs() > tau).float()                     # (B, T, C)
+        y_event = y_true * mask
+        s1 = y_event.sum(dim=(0, 1))                            # (C,)
+        s2 = (y_event ** 2).sum(dim=(0, 1))
+        n = mask.sum(dim=(0, 1)).clamp_min(1e-6)                # (C,)
+        mean = s1 / n
+        var = (s2 / n) - (mean ** 2)
+        return var.clamp_min(0.0).sqrt()
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -82,31 +94,41 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Shape term (unchanged quadratic, standardised) ───────────
+        # ── Shape term: demeaned quadratic, standardised ─────────────
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
-        # ── Level term: scaled logcosh with FIXED scale c=3.0 ──────
-        c = 3.0                     # gradient cap = 3, strong but bounded
-        sum_true = y_true.sum(dim=1)   # (B, C)
-        sum_pred = y_pred.sum(dim=1)
-        delta = sum_pred - sum_true
-        level_cell = c * self._Logcosh(delta / c)
-
-        # Per‑series weight (peace series get ~0)
-        w = gate.amax(dim=1)        # (B, C)
-
-        # ── Normalisation ────────────────────────────────────────────
+        # ── Level term: per‑cell Huber loss, adaptive delta ──────────
+        # Adaptive δ = 2 × channel‑wise std of true event cells, floored at τ
+        event_std = self._event_std(y_true, tau)                 # (C,) or scalar
+        delta_huber = event_std.clamp_min(tau) * 2.0             # (C,) or scalar
         if multivariate:
-            # Shape: Hájek self‑normalised gated mean
-            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            # Level: weighted mean (no dilution) over batch
-            level = (w * level_cell).sum(dim=0) / w.sum(dim=0).clamp_min(self._EPS)
+            delta_huber = delta_huber.unsqueeze(0).unsqueeze(0)  # (1,1,C)
+        else:
+            # univariate: delta_huber is scalar or 1‑element tensor
+            delta_huber = delta_huber.unsqueeze(0)               # make broadcastable
 
-            # Boost shape influence to balance level dominance
-            w_shape = 2.0
+        raw_error = y_pred - y_true
+        abs_error = raw_error.abs()
+        quadratic = 0.5 * raw_error ** 2
+        linear = delta_huber * (abs_error - 0.5 * delta_huber)
+        level_cell_raw = torch.where(abs_error <= delta_huber, quadratic, linear)
+
+        # Weight level cells by event magnitude (gate × (1 + abs_max))
+        mag_weight = gate * (1.0 + abs_max)                      # (B, T, C)
+        level_cell = mag_weight * level_cell_raw
+
+        # ── Normalisation (Hájek weighted means) ─────────────────────
+        if multivariate:
+            # Shape: gated mean
+            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
+            # Level: weighted by mag_weight
+            level = level_cell.sum(dim=(0, 1)) / mag_weight.sum(dim=(0, 1)).clamp_min(self._EPS)
+
+            # Boost shape influence to balance the level term
+            w_shape = 5.0
             per_channel = w_shape * shape + level
             total_loss = per_channel.mean()
             shape_c = shape.detach().tolist()
@@ -114,8 +136,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = (w * level_cell).sum() / w.sum().clamp_min(self._EPS)
-            w_shape = 2.0
+            level = level_cell.sum() / mag_weight.sum().clamp_min(self._EPS)
+            w_shape = 5.0
             total_loss = w_shape * shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]

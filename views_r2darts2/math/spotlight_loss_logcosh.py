@@ -12,30 +12,31 @@ class SpotlightLossLogcosh(torch.nn.Module):
     UCDP GED conflict fatality forecasting at country-month level:
     ~92% zeros for sb, ~97% for ns, ~98% for os.
 
-    ── v49 changes (minimal, from v47) ────────────────────────────────
+    ── v49c: evidence-based fixes from training dynamics ──────────────
 
-    1. **Level scale_factor = (W+T)//2** (was W in v47, T in v49a).
-       W=12 gave level=3.6% (templating). T=36 gave level=93% (underprediction).
-       (W+T)//2=24 gives level~50% — balanced with shape. Derived from
-       existing W and T, no new constant.
+    1. **Level scale_factor = W** (reverted from T and (W+T)//2).
+       EVIDENCE: Any scale > W causes level to dominate (85-93% of loss).
+       At 90% sparsity, window means are near-zero in training but non-zero
+       in eval → model memorizes training window means → sb drops from
+       103% (train) to 46% (eval). W keeps level at ~4% — the squared
+       event_mag gate (fix #2) handles dilution instead.
 
-    2. **Event mag gate: (1+abs_max) → (1+abs_max)²**. At 90%+ sparsity,
-       the few event cells need to dominate the Hájek ratio. Linear
-       magnitude gave 5:1 large/small ratio; squared gives 25:1. This
-       counters zero-dilution by making large events pull the gradient
-       proportionally harder.
+    2. **Event mag gate: (1+abs_max) → (1+abs_max)²** (kept from v49a).
+       EVIDENCE: With linear mag, large events got 5:1 weight vs small.
+       Squared gives 25:1 — large events dominate the Hájek numerator,
+       countering zero-dilution without inflating the level loss.
 
-    3. **Calibration std floor: clamp(min=non_zero_threshold)**. Prevents
-       z² explosion on sparse channels (ns) where few events per batch
-       give tiny std → enormous z² → channel router destabilizes.
-       Uses existing constructor parameter, no new constant.
+    3. **Calibration std floor: clamp(min=non_zero_threshold)** (kept).
+       EVIDENCE: Without the floor, ns channel EMA exploded to 51,767
+       (vs 17 for sb, 12 for os) because sparse channels have tiny std
+       → z² explodes → channel router destabilizes.
 
     ── Components (unchanged from v47) ─────────────────────────────────
 
     1. DC/AC decomposition — per-window demeaning.
     2. Gated + magnitude-graded event weighting (now squared).
     3. Per-series temporal DRO (event-gated).
-    4. Windowed level anchor — (W+T)//2-scaled log_cosh on per-window means.
+    4. Windowed level anchor — W-scaled log_cosh on per-window means.
     5. Relative z-score calibration — per-channel mean-matching (z², std-floored).
     6. Multi-resolution STFT loss (disabled by default).
     """
@@ -168,7 +169,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate
 
-        scale_factor = (W + T) // 2  # CHANGED: was T, now midpoint of W and T
+        scale_factor = W  # REVERTED to W: >W causes level to memorize training window means (near-zero at 90% sparsity), causing eval collapse. The squared event_mag gate already counters dilution.
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))

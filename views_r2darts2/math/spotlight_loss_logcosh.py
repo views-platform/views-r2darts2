@@ -96,7 +96,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # The gradient is UNIFORM (same for all cells) → pure DC bias
         # shift, no conflict with shape, no oscillation/collapse.
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
-        level_cell = (2.0 * (T ** 0.5)) * self._Logcosh(gap)
+        level_cell = self._Logcosh(gap)
 
         # ── Per-series event weight for level ────────────────────────
         w = gate.amax(dim=1)  # (B,) or (B, C)

@@ -127,9 +127,12 @@ def _make_mock_model(
     m.input_chunk_length = input_chunk_length
     m.output_chunk_length = output_chunk_length
     # The forecaster accesses ``self.model.model.parameters()`` during
-    # predict to check the device. Configure the iterator explicitly.
+    # predict to check the device (potentially twice — once to detect CPU
+    # drift, once to verify restoration). Use ``side_effect`` so each call
+    # returns a FRESH iterator (``return_value`` would share one exhausted
+    # iterator across calls, causing StopIteration on the second ``next()``).
     m.model = Mock()
-    m.model.parameters.return_value = iter(
+    m.model.parameters.side_effect = lambda: iter(
         [Mock(device=torch.device("cpu"))]
     )
     return m
@@ -180,14 +183,17 @@ class TestDartsForecasterInit:
 
     def test_init_basic(self, dataset: ViewsDatasetDarts) -> None:
         """A mock model + real dataset unpacks partition, sets scaler_fitted
-        False, and reports device='cpu'."""
-        fc = DartsForecaster(
-            dataset=dataset,
-            model=_make_mock_model(),
-            partition_dict=PARTITION,
-            target_scaler="MinMaxScaler",
-            random_state=42,
-        )
+        False, and reports the mocked device."""
+        # Mock get_device so the test is deterministic (MPS/CUDA machines
+        # would otherwise report 'mps'/'cuda' instead of 'cpu').
+        with patch("views_r2darts2.engines.darts_forecaster._get_device", return_value="cpu"):
+            fc = DartsForecaster(
+                dataset=dataset,
+                model=_make_mock_model(),
+                partition_dict=PARTITION,
+                target_scaler="MinMaxScaler",
+                random_state=42,
+            )
         assert fc._train_start == 121
         assert fc._train_end == 200
         assert fc._test_start == 201

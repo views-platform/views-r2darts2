@@ -35,6 +35,7 @@ from views_r2darts2.data.views_dataset import ViewsDatasetDarts
 from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.infrastructure.patches import apply_all_patches
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.transformers.darts_bridge import prediction_frames_to_dataframe
 
 # Lazy import: the parent class lives in views_pipeline_core, which is not
 # importable in every environment (e.g. the unit-test sandbox). The lazy
@@ -222,13 +223,6 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         model_object: Any,
         checkpoint_mode: str | None = None,
     ) -> DartsForecaster:
-        """Single factory for :class:`DartsForecaster` construction.
-
-        Replaces the 3× duplicated 17-kwarg construction blocks in the legacy
-        code. The ``checkpoint_mode`` arg is ``None`` for the eval/forecast
-        paths (which use the saved artifact's mode) and set explicitly for
-        the train path.
-        """
         kwargs: dict[str, Any] = dict(
             dataset=dataset,
             model=model_object,
@@ -251,6 +245,25 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         return DartsForecaster(**kwargs)
 
     # ------------------------------------------------------------------ train
+
+    def _predictions_to_dataframe(self, predictions: dict) -> Any:
+        """Convert ``dict[str, PredictionFrame]`` → pandas DataFrame.
+
+        ``DartsForecaster.predict`` returns ``dict[str, PredictionFrame]``
+        (pandas-free), but the parent ``views_pipeline_core`` manager expects
+        a list of pandas DataFrames with a ``(time_id, entity_id)`` MultiIndex.
+        This helper bridges the gap using
+        :func:`prediction_frames_to_dataframe` (the only pandas touchpoint,
+        confined to ``transformers/darts_bridge.py``).
+        """
+        active_config = self.configs
+        time_id = active_config.get("time_id", "month_id")
+        entity_id = active_config.get("entity_id", "country_id")
+        return prediction_frames_to_dataframe(
+            predictions=predictions,
+            time_id=time_id,
+            entity_id=entity_id,
+        )
 
     def _train_model_artifact(self) -> DartsForecaster:
         """Train a forecasting model and (optionally) save the artifact.
@@ -433,7 +446,9 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         logger.info(
             "All %d predictions completed successfully", total_sequence_number
         )
-        return df_predictions  # type: ignore[return-value]
+        # Convert each dict[str, PredictionFrame] → pd.DataFrame for the parent
+        # manager (which expects a list of MultiIndex DataFrames).
+        return [self._predictions_to_dataframe(preds) for preds in df_predictions]  # type: ignore[list-item]
 
     # ------------------------------------------------------------------ forecast
 
@@ -489,7 +504,8 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         forecaster.load_model(path=path_artifact)
 
         predict_kwargs = self._get_predict_kwargs(active_config)
-        return forecaster.predict(0, max(active_config["steps"]), **predict_kwargs)
+        predictions = forecaster.predict(0, max(active_config["steps"]), **predict_kwargs)
+        return self._predictions_to_dataframe(predictions)
 
     # ------------------------------------------------------------------ sweep
 
@@ -596,10 +612,12 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
             partition, time_steps
         )
         predict_kwargs = self._get_predict_kwargs(active_config)
-        return [
+        raw_preds = [
             model.predict(seq, time_steps, **predict_kwargs)
             for seq in range(total_sequence_number)
         ]
+        # Convert each dict[str, PredictionFrame] → pd.DataFrame for the parent.
+        return [self._predictions_to_dataframe(preds) for preds in raw_preds]
 
     # ------------------------------------------------------------------ predict kwargs
 

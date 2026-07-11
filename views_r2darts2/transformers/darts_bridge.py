@@ -279,3 +279,54 @@ def prediction_frames_from_darts(
             np.maximum(values, 0.0, out=values)
         frames[tgt] = PredictionFrame(values, index=index, metadata=metadata)
     return frames
+
+
+def prediction_frames_to_dataframe(
+    *,
+    predictions: Mapping[str, PredictionFrame],
+    time_id: str,
+    entity_id: str,
+) -> pd.DataFrame:
+    """Convert a ``{target: PredictionFrame}`` dict to a pandas MultiIndex DataFrame.
+
+    This is the inverse-direction boundary helper: ``DartsForecaster.predict``
+    returns ``dict[str, PredictionFrame]`` (pandas-free), but the parent
+    ``views_pipeline_core`` manager expects a list of pandas DataFrames with a
+    ``(time_id, entity_id)`` MultiIndex. This helper builds that DataFrame from
+    a PredictionFrame dict, with one column per target (``pred_<target>``)
+    carrying the sample values as Python lists (the legacy cell format).
+
+    Args:
+        predictions: ``{target_name: PredictionFrame}`` mapping (from
+            :meth:`DartsForecaster.predict`).
+        time_id: Time index column name (e.g. ``"month_id"``).
+        entity_id: Entity index column name (e.g. ``"country_id"``).
+
+    Returns:
+        A pandas DataFrame indexed by ``(time_id, entity_id)`` with one column
+        per target (``pred_<target>``). Each cell holds a list of sample values
+        (length 1 for deterministic, length ``S`` for probabilistic).
+    """
+    if not predictions:
+        return pd.DataFrame()
+
+    # All targets share the same SpatioTemporalIndex (built from the same
+    # prediction TimeSeries list). Use the first target's frame for the index.
+    first_frame = next(iter(predictions.values()))
+    time_arr = first_frame.index.time
+    entity_arr = first_frame.index.unit
+
+    data: dict[str, list] = {}
+    for target, frame in predictions.items():
+        # Each cell is a list of S sample values (legacy format).
+        col_data: list[list] = []
+        for row_idx in range(frame.n_rows):
+            samples = frame.values[row_idx, :].tolist()
+            col_data.append(samples)
+        data[f"pred_{target}"] = col_data
+
+    df = pd.DataFrame(data)
+    df[time_id] = time_arr
+    df[entity_id] = entity_arr
+    df = df.set_index([time_id, entity_id])
+    return df.sort_index()

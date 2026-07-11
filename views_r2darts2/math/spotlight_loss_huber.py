@@ -14,42 +14,51 @@ class SpotlightLossHuber(torch.nn.Module):
 
     ── Design ─────────────────────────────────────────────────────────
 
-    The loss scores the **raw error** ``e = y_pred - y_true`` — level and
-    shape are penalized jointly, so a constant-correct prediction is
-    correctly rewarded and bursty predictions are not "free" (no per-window
-    demeaning). Channel magnitude imbalance (sb/ns/os differ in sparsity and
-    scale) is removed by **per-channel standardization**: the error is
-    divided by the channel's own asinh-space standard deviation (computed
-    across series and time), floored at ``non_zero_threshold``. This is a
-    *shared* per-channel scale, deliberately NOT per-series — a per-series
-    scale divides each window by its own spread, shrinking the gradient on
-    the high-intensity windows that raw-space MSLE (≈ MSE-in-asinh) most
-    cares about, which causes chronic under-prediction of large events. The
-    shared scale instead:
+    A single joint error term lets the model trade *level* for *shape* — it
+    can hide a magnitude error inside a plausible pattern (or vice versa) —
+    and a symmetric penalty on a right-skewed target then settles into a
+    flat, under-predicting compromise: the event peaks are never lifted. The
+    loss therefore splits the error into two dedicated terms, each with its
+    own bounded gradient, so neither objective can be sacrificed for the
+    other and gradient reaches both:
 
-      * keeps the three channels contributing comparable gradient magnitude
-        (no per-channel hyperparameters); while
-      * preserving each series' true error magnitude, so large events are
-        pushed up rather than equalized away.
+      * **Shape (temporal pattern).** Per-series demeaned residual
+        ``(pred - mean_t pred) - (true - mean_t true)`` under ``logcosh``.
+        This scores the within-series dynamics only; a constant-wrong
+        prediction is NOT free because the level term below catches its
+        magnitude.
 
-    A robust **Huber** penalty on the standardized error keeps large events
-    influential without letting any single series dominate the batch
-    gradient (its bounded gradient is what prevents templating). A single
-    soft **event gate** (keyed to ``non_zero_threshold``) concentrates
-    emphasis on conflict cells, and a **Hájek** (self-normalized) gated mean
-    keeps peace-heavy and event-heavy batches comparable. Channels are
-    combined by a plain mean.
+      * **Level (soft-peak magnitude).** ``logcosh`` of
+        ``logsumexp_t(pred) - logsumexp_t(true)`` per series. Because asinh
+        values are already log-scale, ``logsumexp`` over time is a smooth
+        maximum dominated by the event peak — matching it forces the model
+        to reproduce raw peak magnitude, which is exactly what a symmetric
+        cell loss leaves under-predicted.
+
+    The anti-under-prediction pressure is **dynamic and data-driven, not an
+    imposed constant**: the gradient of ``logsumexp`` is a softmax over
+    timesteps, so the level term's correction concentrates automatically on
+    the current peak month and, since the model sits below the true peak,
+    pushes it upward. That asymmetry emerges from the data and fades to zero
+    as the peak is matched — there is no asymmetry coefficient to set.
+
+    A soft **event gate** ``sigmoid((|·| - tau) / tau)`` (its only input is
+    ``non_zero_threshold``) focuses both terms on conflict cells, and
+    **Hájek** (self-normalized) gated means keep peace-heavy and event-heavy
+    batches comparable. Both terms live in the same asinh units and are
+    ``logcosh``-bounded, so they are naturally comparable and need no
+    weighting hyperparameter. Channels are combined by a plain mean.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` is the ONLY tunable — the asinh-space boundary
-    that separates peace from conflict (default use ≈ 0.88 ≈ asinh(1)). The
-    Huber transition (delta=1.0) and the gate sharpness are fixed structural
-    conventions, not tuning knobs.
+    that separates peace from conflict (default use ≈ 0.88 ≈ asinh(1)).
+    Everything else is parameter-free: ``logcosh`` and ``logsumexp`` have no
+    knobs, and the level/shape balance and the under-prediction asymmetry
+    are both emergent from the data rather than set by constants.
     """
 
-    _EMA_EPS = 1e-6
-    _HUBER_DELTA = 1.0
+    _EPS = 1e-6
 
     def __init__(self, non_zero_threshold: float):
         if non_zero_threshold <= 0.0:

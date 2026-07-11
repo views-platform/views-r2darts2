@@ -280,47 +280,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── Per-window DC/AC decomposition ────────────────────────────
-        W = max(6, T // 3)
-        windows = list(e.split(W, dim=1))
-        e_shape = torch.cat(
-            [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
-        )
-
-        # ── Base cell loss ─────────────────────────────────────────────
-        cell_loss = self._log_cosh(e_shape)
-
-        # ── Gated + magnitude-graded event weighting ──────────────────
-        # REVERTED to linear (1+abs_max). The squared version (v49a-c) caused
-        # level to dominate (72-83%) because it shrank the shape Hájek
-        # denominator faster than the numerator. Linear mag keeps the
-        # original v47 shape/level balance. The std floor on calibration
-        # handles the ns explosion that the squared gate was trying to fix.
-        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_gate = torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
-        event_mag = event_gate * (1.0 + abs_max)  # REVERTED: was squared
-
-        soft_event_mask = torch.sigmoid(
-            10.0 * (abs_max - self.non_zero_threshold)
-        )
-        w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)
-        w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
-
-        # ── Hájek self-normalized shape ───────────────────────────────
-        if w_total.dim() == 3:
-            num = (w_total * cell_loss).sum(dim=(0, 1))
-            den = w_total.sum(dim=(0, 1)).clamp(min=self._EMA_EPS)
-            loss_shape = num / den
+        # Prototype baseline: plain pointwise log-cosh residual loss.
+        cell_loss = self._log_cosh(e)
+        if cell_loss.dim() == 3:
+            loss_shape = cell_loss.mean(dim=(0, 1))
+            loss_level = torch.zeros_like(loss_shape)
         else:
-            num = (w_total * cell_loss).sum()
-            den = w_total.sum().clamp(min=self._EMA_EPS)
-            loss_shape = num / den
-
-        # ── Windowed level anchor (T-scaled) ──────────────────────────
-        loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
-
-        # ── Calibration loss (relative z-score, z²) ───────────────────
-        loss_cal = self._calibration_loss(y_pred, y_true)
+            loss_shape = cell_loss.mean()
+            loss_level = cell_loss.new_tensor(0.0)
 
         # ── Spectral loss ──────────────────────────────────────────────
         loss_spec = y_pred.new_tensor(0.0)
@@ -329,37 +296,34 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Assemble total ────────────────────────────────────────────
         if loss_shape.dim() == 0:
-            total_loss = loss_shape + loss_level + loss_cal + loss_spec
+            total_loss = loss_shape + loss_spec
             self._last_components = {
                 "shape": [float(loss_shape.detach())],
                 "level": [float(loss_level.detach())],
-                "cal": [float(loss_cal.detach())],
                 "spec": [float(loss_spec.detach()) if loss_spec.dim() == 0 else float(loss_spec)],
                 "weight": [1.0],
             }
         else:
-            per_channel_total = loss_shape + loss_level + loss_cal
+            per_channel_total = loss_shape
             if loss_spec.dim() == 0:
                 per_channel_total = per_channel_total + float(loss_spec)
             else:
                 per_channel_total = per_channel_total + loss_spec
 
-            total_loss = self._combine_channels(per_channel_total, y_pred, y_true)
+            total_loss = per_channel_total.mean()
 
             C = per_channel_total.shape[0]
             spec_list = loss_spec.detach().tolist() if loss_spec.dim() else [float(loss_spec)] * C
-            cal_list = loss_cal.detach().tolist() if loss_cal.dim() else [float(loss_cal)] * C
-            weights = self._last_weights or [1.0] * C
+            weights = [1.0] * C
             self._last_components = {
                 "shape": loss_shape.detach().tolist(),
                 "level": loss_level.detach().tolist(),
-                "cal": cal_list,
                 "spec": spec_list,
                 "weight": weights,
-                "ema": self._loss_ema_slow or [float("nan")] * C,
-                "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
-                "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
-                "gates": getattr(self, "_last_gates", [1.0] * C),
+                "ema": [float("nan")] * C,
+                "cal_ratio": [1.0] * C,
+                "cal_score": [1.0] * C,
+                "gates": [1.0] * C,
                 "contribution": [
                     weights[c] * float(per_channel_total.detach()[c]) for c in range(C)
                 ],
@@ -368,18 +332,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if torch.isnan(total_loss):
             _s = float(loss_shape.sum()) if loss_shape.dim() else float(loss_shape)
             _l = float(loss_level.sum()) if loss_level.dim() else float(loss_level)
-            _c = float(loss_cal.sum()) if loss_cal.dim() else float(loss_cal)
             _sp = float(loss_spec.sum()) if loss_spec.dim() else float(loss_spec)
             raise RuntimeError(
                 f"NaN in SpotlightLossLogcosh: shape={_s:.6f} level={_l:.6f} "
-                f"cal={_c:.6f} spec={_sp:.6f}"
+                f"spec={_sp:.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh v49 | shape=%.6f level=%.6f cal=%.6f spec=%.6f total=%.6f",
+            "SpotlightLossLogcosh v49 | shape=%.6f level=%.6f spec=%.6f total=%.6f",
             loss_shape.item() if loss_shape.dim() == 0 else loss_shape.sum().item(),
             loss_level.item() if loss_level.dim() == 0 else loss_level.sum().item(),
-            loss_cal.item() if loss_cal.dim() == 0 else loss_cal.sum().item(),
             loss_spec.item() if loss_spec.dim() == 0 else loss_spec.sum().item(),
             total_loss.item(),
         )

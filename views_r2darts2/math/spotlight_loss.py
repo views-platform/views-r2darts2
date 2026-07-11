@@ -6,45 +6,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class SpotlightLossLogcosh(torch.nn.Module):
+class SpotlightLoss(torch.nn.Module):
     """
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting at country-month level:
     ~92% zeros for sb, ~97% for ns, ~98% for os.
-
-    ── v49e: level needs T-scale (evidence-based) ─────────────────────
-
-    1. **Level scale_factor = T** (reverted from W).
-       EVIDENCE: With scale=W, level=77-85% but eval UNDERPREDICTS.
-       Root cause: level is intrinsically harder than shape:
-       - Shape loss operates on demeaned errors → gradient to ALL W cells
-       - Level loss operates on window means → 1/W gradient attenuation
-       - At 90% sparsity, only 10% of windows have non-zero level
-       - Shape gets gradient from ALL windows (demeaned ≠ 0)
-       Level needs T-scale to compensate for BOTH the 1/W attenuation
-       AND the 90% zero-dilution of window means.
-
-       Previous T runs failed because of the SQUARED MAG GATE (v49a-c),
-       not because of T itself. With linear mag + std floor, T is stable.
-
-    2. **Event mag gate: linear (1+abs_max)** (kept from v49d).
-       EVIDENCE: The squared gate caused level to dominate (72-83%) by
-       shrinking the shape Hájek denominator. Linear keeps shape/level
-       balance correct.
-
-    3. **Calibration std floor: clamp(min=non_zero_threshold)** (kept).
-       EVIDENCE: Without the floor, ns channel EMA exploded to 51,767
-       because sparse channels have tiny std → z² explodes → router
-       destabilizes.
-
-    ── Components (unchanged from v47) ─────────────────────────────────
-
-    1. DC/AC decomposition — per-window demeaning.
-    2. Gated + magnitude-graded event weighting (linear).
-    3. Per-series temporal DRO (event-gated).
-    4. Windowed level anchor — T-scaled log_cosh on per-window means.
-    5. Relative z-score calibration — per-channel mean-matching (z², std-floored).
-    6. Multi-resolution STFT loss (disabled by default).
     """
 
     _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
@@ -70,7 +36,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
 
-        logger.info("SpotlightLossLogcosh v49b-barron | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLoss v49b-barron | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -381,12 +347,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
             _c = float(loss_cal.sum()) if loss_cal.dim() else float(loss_cal)
             _sp = float(loss_spec.sum()) if loss_spec.dim() else float(loss_spec)
             raise RuntimeError(
-                f"NaN in SpotlightLossLogcosh: shape={_s:.6f} level={_l:.6f} "
+                f"NaN in SpotlightLoss: shape={_s:.6f} level={_l:.6f} "
                 f"cal={_c:.6f} spec={_sp:.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh v49-barron | shape=%.6f level=%.6f cal=%.6f spec=%.6f total=%.6f",
+            "SpotlightLoss v49-barron | shape=%.6f level=%.6f cal=%.6f spec=%.6f total=%.6f",
             loss_shape.item() if loss_shape.dim() == 0 else loss_shape.sum().item(),
             loss_level.item() if loss_level.dim() == 0 else loss_level.sum().item(),
             loss_cal.item() if loss_cal.dim() == 0 else loss_cal.sum().item(),
@@ -396,4 +362,4 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossLogcosh(non_zero_threshold={self.non_zero_threshold})"
+        return f"SpotlightLoss(non_zero_threshold={self.non_zero_threshold})"

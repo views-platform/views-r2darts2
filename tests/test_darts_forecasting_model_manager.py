@@ -216,3 +216,161 @@ class TestBuildForecasterFactory:
             model_object=mock_model,
         )
         assert isinstance(forecaster, DartsForecaster)
+
+
+# ----------------------------------------------------------------------
+# Prediction format switching (dataframe vs prediction_frame)
+# ----------------------------------------------------------------------
+
+
+class TestPredictionFormat:
+    """Tests for the ``prediction_format`` config switch.
+
+    The parent ``views_pipeline_core`` manager accepts two return shapes from
+    ``_evaluate_model_artifact``:
+
+        * ``prediction_format == "dataframe"`` (default): ``list[pd.DataFrame]``
+        * ``prediction_format == "prediction_frame"``: ``dict[str, list[PredictionFrame]]``
+
+    The manager's ``_format_eval_predictions`` and ``_format_forecast_predictions``
+    helpers switch between the two based on ``self.configs["prediction_format"]``.
+    """
+
+    @staticmethod
+    def _make_manager(config: dict | None = None) -> "DartsForecastingModelManager":
+        """Build a bare manager instance with a mock ``configs`` property."""
+        mgr = DartsForecastingModelManager.__new__(DartsForecastingModelManager)
+        # Bypass the property — set the underlying attribute directly.
+        cfg = config or {}
+        object.__setattr__(mgr, "_configs_cache", cfg)
+        # Mock the configs property.
+        DartsForecastingModelManager.configs = property(  # type: ignore[method-assign]
+            lambda self: object.__getattribute__(self, "_configs_cache")
+        )
+        return mgr
+
+    def test_get_prediction_format_default(self) -> None:
+        """When ``prediction_format`` is not set, default to ``"dataframe"``."""
+        mgr = self._make_manager({})
+        assert mgr._get_prediction_format() == "dataframe"
+
+    def test_get_prediction_format_dataframe(self) -> None:
+        """Explicit ``"dataframe"`` is returned."""
+        mgr = self._make_manager({"prediction_format": "dataframe"})
+        assert mgr._get_prediction_format() == "dataframe"
+
+    def test_get_prediction_format_prediction_frame(self) -> None:
+        """Explicit ``"prediction_frame"`` is returned."""
+        mgr = self._make_manager({"prediction_format": "prediction_frame"})
+        assert mgr._get_prediction_format() == "prediction_frame"
+
+    def test_transpose_predictions(self) -> None:
+        """``list[dict]`` → ``dict[list]`` transpose."""
+        from views_frames import (
+            FeatureFrame,
+            PredictionFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+        )
+        import numpy as np
+
+        # Build 2 sequences × 2 targets.
+        time = np.array([100, 101], dtype=np.int64)
+        entity = np.array([1, 1], dtype=np.int64)
+        index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
+        f1 = PredictionFrame(np.zeros((2, 1), dtype=np.float32), index=index)
+        f2 = PredictionFrame(np.ones((2, 1), dtype=np.float32), index=index)
+        per_seq = [
+            {"target_a": f1, "target_b": f2},
+            {"target_a": f2, "target_b": f1},
+        ]
+        transposed = DartsForecastingModelManager._transpose_predictions(per_seq)
+        assert set(transposed.keys()) == {"target_a", "target_b"}
+        assert len(transposed["target_a"]) == 2
+        assert len(transposed["target_b"]) == 2
+        # Sequence 0, target_a → f1 (zeros). Sequence 1, target_a → f2 (ones).
+        assert transposed["target_a"][0] is f1
+        assert transposed["target_a"][1] is f2
+
+    def test_transpose_predictions_empty(self) -> None:
+        """Empty list → empty dict."""
+        assert DartsForecastingModelManager._transpose_predictions([]) == {}
+
+    def test_format_eval_predictions_dataframe_mode(self) -> None:
+        """In dataframe mode, returns ``list[pd.DataFrame]``."""
+        import pandas as pd
+        from views_frames import (
+            PredictionFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+        )
+        import numpy as np
+
+        mgr = self._make_manager({"prediction_format": "dataframe"})
+        time = np.array([100, 101], dtype=np.int64)
+        entity = np.array([1, 1], dtype=np.int64)
+        index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
+        frame = PredictionFrame(np.array([[0.5], [1.5]], dtype=np.float32), index=index)
+        per_seq = [{"lr_ged_sb": frame}]
+        result = mgr._format_eval_predictions(per_seq)
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert isinstance(result[0], pd.DataFrame)
+
+    def test_format_eval_predictions_prediction_frame_mode(self) -> None:
+        """In prediction_frame mode, returns ``dict[str, list[PredictionFrame]]``."""
+        from views_frames import (
+            PredictionFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+        )
+        import numpy as np
+
+        mgr = self._make_manager({"prediction_format": "prediction_frame"})
+        time = np.array([100, 101], dtype=np.int64)
+        entity = np.array([1, 1], dtype=np.int64)
+        index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
+        frame = PredictionFrame(np.array([[0.5], [1.5]], dtype=np.float32), index=index)
+        per_seq = [{"lr_ged_sb": frame}]
+        result = mgr._format_eval_predictions(per_seq)
+        assert isinstance(result, dict)
+        assert "lr_ged_sb" in result
+        assert isinstance(result["lr_ged_sb"], list)
+        assert len(result["lr_ged_sb"]) == 1
+        assert result["lr_ged_sb"][0] is frame
+
+    def test_format_forecast_predictions_dataframe_mode(self) -> None:
+        """Single-forecast: dataframe mode returns a DataFrame."""
+        import pandas as pd
+        from views_frames import (
+            PredictionFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+        )
+        import numpy as np
+
+        mgr = self._make_manager({"prediction_format": "dataframe"})
+        time = np.array([100], dtype=np.int64)
+        entity = np.array([1], dtype=np.int64)
+        index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
+        frame = PredictionFrame(np.array([[0.5]], dtype=np.float32), index=index)
+        result = mgr._format_forecast_predictions({"lr_ged_sb": frame})
+        assert isinstance(result, pd.DataFrame)
+
+    def test_format_forecast_predictions_prediction_frame_mode(self) -> None:
+        """Single-forecast: prediction_frame mode returns the dict as-is."""
+        from views_frames import (
+            PredictionFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+        )
+        import numpy as np
+
+        mgr = self._make_manager({"prediction_format": "prediction_frame"})
+        time = np.array([100], dtype=np.int64)
+        entity = np.array([1], dtype=np.int64)
+        index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
+        frame = PredictionFrame(np.array([[0.5]], dtype=np.float32), index=index)
+        preds = {"lr_ged_sb": frame}
+        result = mgr._format_forecast_predictions(preds)
+        assert result is preds  # identity — no conversion

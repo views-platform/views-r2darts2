@@ -246,15 +246,31 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
     # ------------------------------------------------------------------ train
 
+    def _get_prediction_format(self) -> str:
+        """Return the configured prediction output format.
+
+        Reads ``self.configs["prediction_format"]``. Two values are supported:
+
+            * ``"dataframe"`` (default): ``_evaluate_model_artifact`` returns a
+              ``list[pd.DataFrame]`` (one DataFrame per rolling-origin
+              sequence), compatible with the legacy
+              ``views_pipeline_core`` evaluation pipeline.
+            * ``"prediction_frame"``: ``_evaluate_model_artifact`` returns a
+              ``dict[str, list[PredictionFrame]]`` (target → list of frames,
+              one per sequence), compatible with the new streaming evaluation
+              pipeline that consumes ``PredictionFrame`` objects directly.
+        """
+        return self.configs.get("prediction_format", "dataframe")
+
     def _predictions_to_dataframe(self, predictions: dict) -> Any:
         """Convert ``dict[str, PredictionFrame]`` → pandas DataFrame.
 
         ``DartsForecaster.predict`` returns ``dict[str, PredictionFrame]``
         (pandas-free), but the parent ``views_pipeline_core`` manager expects
-        a list of pandas DataFrames with a ``(time_id, entity_id)`` MultiIndex.
-        This helper bridges the gap using
-        :func:`prediction_frames_to_dataframe` (the only pandas touchpoint,
-        confined to ``transformers/darts_bridge.py``).
+        a list of pandas DataFrames with a ``(time_id, entity_id)`` MultiIndex
+        when ``prediction_format == "dataframe"``. This helper bridges the gap
+        using :func:`prediction_frames_to_dataframe` (the only pandas
+        touchpoint, confined to ``transformers/darts_bridge.py``).
         """
         active_config = self.configs
         time_id = active_config.get("time_id", "month_id")
@@ -264,6 +280,65 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
             time_id=time_id,
             entity_id=entity_id,
         )
+
+    @staticmethod
+    def _transpose_predictions(
+        per_sequence_preds: list[dict[str, PredictionFrame]],
+    ) -> dict[str, list[PredictionFrame]]:
+        """Transpose ``list[dict[str, PredictionFrame]]`` → ``dict[str, list[PredictionFrame]]``.
+
+        ``DartsForecaster.predict`` returns one ``dict[str, PredictionFrame]``
+        per rolling-origin sequence. The ``prediction_format="prediction_frame"``
+        contract expects the inverse shape: a dict keyed by target name, where
+        each value is the list of per-sequence frames for that target.
+        """
+        if not per_sequence_preds:
+            return {}
+        target_names = list(per_sequence_preds[0].keys())
+        return {
+            tgt: [seq_preds[tgt] for seq_preds in per_sequence_preds]
+            for tgt in target_names
+        }
+
+    def _format_eval_predictions(
+        self, per_sequence_preds: list[dict[str, PredictionFrame]]
+    ) -> Any:
+        """Format per-sequence predictions for the parent manager.
+
+        Args:
+            per_sequence_preds: A list of ``{target: PredictionFrame}`` dicts,
+                one per rolling-origin sequence (the raw output of
+                ``DartsForecaster.predict``).
+
+        Returns:
+            * ``list[pd.DataFrame]`` when ``prediction_format == "dataframe"``.
+            * ``dict[str, list[PredictionFrame]]`` when
+              ``prediction_format == "prediction_frame"``.
+        """
+        fmt = self._get_prediction_format()
+        if fmt == "prediction_frame":
+            return self._transpose_predictions(per_sequence_preds)
+        # Default: dataframe mode.
+        return [self._predictions_to_dataframe(preds) for preds in per_sequence_preds]
+
+    def _format_forecast_predictions(
+        self, predictions: dict[str, PredictionFrame]
+    ) -> Any:
+        """Format a single forecast's predictions for the parent manager.
+
+        Args:
+            predictions: A ``{target: PredictionFrame}`` dict (the raw output
+                of a single ``DartsForecaster.predict`` call).
+
+        Returns:
+            * ``pd.DataFrame`` when ``prediction_format == "dataframe"``.
+            * ``dict[str, PredictionFrame]`` when
+              ``prediction_format == "prediction_frame"``.
+        """
+        fmt = self._get_prediction_format()
+        if fmt == "prediction_frame":
+            return predictions
+        return self._predictions_to_dataframe(predictions)
 
     def _train_model_artifact(self) -> DartsForecaster:
         """Train a forecasting model and (optionally) save the artifact.
@@ -446,9 +521,10 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         logger.info(
             "All %d predictions completed successfully", total_sequence_number
         )
-        # Convert each dict[str, PredictionFrame] → pd.DataFrame for the parent
-        # manager (which expects a list of MultiIndex DataFrames).
-        return [self._predictions_to_dataframe(preds) for preds in df_predictions]  # type: ignore[list-item]
+        # Format per the configured prediction_format:
+        #   "dataframe"       → list[pd.DataFrame]
+        #   "prediction_frame" → dict[str, list[PredictionFrame]]
+        return self._format_eval_predictions(df_predictions)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------ forecast
 
@@ -505,7 +581,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
         predict_kwargs = self._get_predict_kwargs(active_config)
         predictions = forecaster.predict(0, max(active_config["steps"]), **predict_kwargs)
-        return self._predictions_to_dataframe(predictions)
+        return self._format_forecast_predictions(predictions)
 
     # ------------------------------------------------------------------ sweep
 
@@ -571,6 +647,22 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
                 )
 
                 df_predictions = self._evaluate_sweep(self._eval_type, model)
+                # The sweep path always uses DataFrames — the sniffer and
+                # ``_evaluate_prediction_dataframe`` consume pandas objects,
+                # not PredictionFrames. Force dataframe mode here regardless
+                # of the configured ``prediction_format``.
+                if isinstance(df_predictions, dict):
+                    # prediction_frame mode: transpose back to per-sequence
+                    # dicts, then convert each to a DataFrame.
+                    target_names = list(df_predictions.keys())
+                    n_seqs = len(df_predictions[target_names[0]])
+                    per_seq = [
+                        {tgt: df_predictions[tgt][i] for tgt in target_names}
+                        for i in range(n_seqs)
+                    ]
+                    df_predictions = [
+                        self._predictions_to_dataframe(preds) for preds in per_seq
+                    ]
 
                 sniffer = CorePredictionSniffer(level=active_config["level"])
                 for i, df in enumerate(df_predictions):
@@ -616,8 +708,8 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
             model.predict(seq, time_steps, **predict_kwargs)
             for seq in range(total_sequence_number)
         ]
-        # Convert each dict[str, PredictionFrame] → pd.DataFrame for the parent.
-        return [self._predictions_to_dataframe(preds) for preds in raw_preds]
+        # Format per the configured prediction_format.
+        return self._format_eval_predictions(raw_preds)
 
     # ------------------------------------------------------------------ predict kwargs
 

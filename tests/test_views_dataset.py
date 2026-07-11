@@ -1,9 +1,11 @@
 """Tests for :class:`views_r2darts2.data.views_dataset.ViewsDatasetDarts`.
 
-Exercises the FeatureFrame-backed data boundary against the user-provided
-validation parquet (81,192 rows × 87 cols, 213 entities, month_id range
-121..552; entity 248 has only 1 row — used as a regression for the
-single-row TimeSeries construction bug).
+Exercises the FeatureFrame-backed data boundary against the session-scoped
+synthetic country-month parquet fixture (200 countries × 100 months = 20,000
+rows, ``country_id`` entity column, month_id range 121..220). The synthetic
+fixture mirrors the schema of the real ``validation_viewser_df.parquet`` but
+with dummy data so the suite runs anywhere without the real parquet — see
+``tests/conftest.py`` for the fixture API.
 
 Google Python Style. ``pandas`` is used only at the Darts boundary (for
 ``pd.Index``/``pd.DataFrame`` construction in :class:`TimeSeries`), mirroring
@@ -12,6 +14,7 @@ the production package's confinement rule.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Sequence
 
@@ -21,15 +24,16 @@ import pyarrow.parquet as pq
 import pytest
 from darts import TimeSeries
 
-from views_frames import SpatialLevel
+from views_frames import (
+    FeatureFrame,
+    SpatialLevel,
+    SpatioTemporalIndex,
+)
 from views_r2darts2.data.parquet_loader import load_views_parquet
 from views_r2darts2.data.views_dataset import ViewsDatasetDarts
 
-# Path to the user-provided validation parquet (12 MB, 87 cols, 81192 rows).
-PARQUET_PATH = Path("/home/z/my-project/upload/validation_viewser_df.parquet")
-UPLOAD_DIR = PARQUET_PATH.parent
-
-# Three targets + six features used throughout the suite.
+# Three targets + six features used throughout the suite. These match the
+# synthetic column vocabulary in ``tests/conftest.py``.
 TARGETS: list[str] = ["lr_ged_sb", "lr_ged_ns", "lr_ged_os"]
 FEATURES: list[str] = [
     "lr_ged_sb_delta",
@@ -40,14 +44,12 @@ FEATURES: list[str] = [
     "lr_splag_1_ged_os",
 ]
 
-
-# ----------------------------------------------------------------------
-# Skip the whole suite if the validation parquet is not present.
-# ----------------------------------------------------------------------
-pytestmark = pytest.mark.skipif(
-    not PARQUET_PATH.exists(),
-    reason=f"Validation parquet not found at {PARQUET_PATH}",
-)
+# Synthetic-parquet geometry constants (mirrors conftest.py).
+N_ROWS: int = 20_000  # 200 countries × 100 months
+N_ENTITIES: int = 200
+N_TIME_STEPS: int = 100  # month_id 121..220 inclusive
+MONTH_ID_MIN: int = 121
+MONTH_ID_MAX: int = 220
 
 
 # ----------------------------------------------------------------------
@@ -56,10 +58,10 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def dataset() -> ViewsDatasetDarts:
-    """Load the validation parquet into a :class:`ViewsDatasetDarts`."""
+def dataset(synthetic_cm_parquet_small: Path) -> ViewsDatasetDarts:
+    """Load the synthetic cm parquet into a :class:`ViewsDatasetDarts`."""
     frame, feats, targs = load_views_parquet(
-        PARQUET_PATH, targets=TARGETS, features=FEATURES
+        synthetic_cm_parquet_small, targets=TARGETS, features=FEATURES
     )
     return ViewsDatasetDarts(
         feature_frame=frame,
@@ -77,16 +79,16 @@ class TestViewsDatasetLoad:
     """Top-level frame-load sanity tests."""
 
     def test_load_full_dataset(self, dataset: ViewsDatasetDarts) -> None:
-        """Frame must report 81192 rows / 213 entities / CM level."""
-        assert dataset.n_rows == 81192
-        assert dataset.n_entities == 213
+        """Frame must report 20000 rows / 200 entities / CM level."""
+        assert dataset.n_rows == N_ROWS
+        assert dataset.n_entities == N_ENTITIES
         assert dataset.targets == TARGETS
         assert dataset.features == FEATURES
         assert dataset.level == SpatialLevel.CM
         assert dataset.time_id == "month_id"
         assert dataset.entity_id == "country_id"
-        # n_time_steps = 552 - 121 + 1 = 432
-        assert dataset.n_time_steps == 432
+        # n_time_steps = 220 - 121 + 1 = 100
+        assert dataset.n_time_steps == N_TIME_STEPS
 
 
 class TestViewsDatasetSubset:
@@ -99,10 +101,10 @@ class TestViewsDatasetSubset:
         time_arr, entity_arr, values_2d = dataset.get_subset_arrays(
             entity_ids=[1, 2, 3]
         )
-        # Each of entities 1, 2, 3 has all 432 months → 1296 rows.
-        assert time_arr.shape[0] == 1296
-        assert entity_arr.shape[0] == 1296
-        assert values_2d.shape == (1296, len(FEATURES) + len(TARGETS))
+        # Each of entities 1, 2, 3 has all 100 months → 300 rows.
+        assert time_arr.shape[0] == 300
+        assert entity_arr.shape[0] == 300
+        assert values_2d.shape == (300, len(FEATURES) + len(TARGETS))
         assert set(np.unique(entity_arr).tolist()) == {1, 2, 3}
         # Time column dtype is int64.
         assert time_arr.dtype == np.int64
@@ -117,11 +119,12 @@ class TestViewsDatasetSubset:
         time_arr, entity_arr, values_2d = dataset.get_subset_arrays(
             time_ids=list(range(121, 133))
         )
-        # 213 entities × 12 months = 2556 rows — but some entities have only
-        # 1 row at month 140 (outside this window) so the count is lower.
-        # Verify each row is in [121, 132].
+        # All 200 entities have all 100 months (no missing entities, no
+        # single-row entities in the synthetic cm parquet) → 200 × 12 = 2400
+        # rows. Verify each row is in [121, 132].
         assert time_arr.min() == 121
         assert time_arr.max() == 132
+        assert time_arr.shape[0] == 2400
         # The values array must align with the time array.
         assert values_2d.shape[0] == time_arr.shape[0]
         assert values_2d.shape[1] == len(FEATURES) + len(TARGETS)
@@ -150,21 +153,23 @@ class TestViewsDatasetAsDarts:
         assert len(series_list) == 3
         for ts in series_list:
             assert isinstance(ts, TimeSeries)
-            assert len(ts) == 432  # all months present
+            assert len(ts) == N_TIME_STEPS  # all 100 months present
             # Components = features + targets.
             assert list(ts.components) == [*FEATURES, *TARGETS]
             # Time index spans the full month_id range.
-            assert int(ts.time_index.min()) == 121
-            assert int(ts.time_index.max()) == 552
+            assert int(ts.time_index.min()) == MONTH_ID_MIN
+            assert int(ts.time_index.max()) == MONTH_ID_MAX
             # Static covariate carries the entity id.
             assert "country_id" in ts.static_covariates.columns
 
     def test_as_darts_timeseries_all_entities(
-        self, dataset: ViewsDatasetDarts
+        self,
+        dataset: ViewsDatasetDarts,
+        synthetic_cm_parquet_small: Path,
     ) -> None:
-        """All 213 entities — regression for single-row entity 248 bug."""
+        """All 200 entities — regression for single-row entity 248 bug."""
         series_list = dataset.as_darts_timeseries()
-        assert len(series_list) == 213
+        assert len(series_list) == N_ENTITIES
         # Every series must be non-empty and carry the entity id.
         entity_ids: list[int] = []
         for ts in series_list:
@@ -173,23 +178,44 @@ class TestViewsDatasetAsDarts:
             entity_ids.append(int(ts.static_covariates["country_id"].iloc[0]))
         # The set of entity ids must match the parquet's unique country_id set.
         parquet_entities = set(
-            pq.read_table(PARQUET_PATH, columns=["country_id"])
+            pq.read_table(synthetic_cm_parquet_small, columns=["country_id"])
             .column("country_id")
             .to_numpy()
             .tolist()
         )
         assert set(entity_ids) == parquet_entities
 
-    def test_as_darts_timeseries_single_row_entity(
-        self, dataset: ViewsDatasetDarts
-    ) -> None:
-        """Entity 248 (1 row at month 140) must build a valid 1-step series."""
-        series_list = dataset.as_darts_timeseries(entity_ids=[248])
+    def test_as_darts_timeseries_single_row_entity(self) -> None:
+        """A single-row entity (1 row at month 140) must build a valid 1-step series.
+
+        The synthetic cm parquet has every country with all 100 months (no
+        single-row entities), so we build a synthetic :class:`FeatureFrame`
+        inline with one entity (id 248) having a single row at month_id 140.
+        This preserves the regression coverage for the Darts 1-step
+        TimeSeries construction bug (``freq=1`` must be passed explicitly to
+        bypass Darts' empty-diff step-inference failure on 1-element time
+        arrays).
+        """
+        feat = "lr_ged_sb_delta"
+        target = "lr_ged_sb"
+        time = np.array([140], dtype=np.int64)
+        entity = np.array([248], dtype=np.int64)
+        values = np.zeros((1, 2, 1), dtype=np.float32)
+        index = SpatioTemporalIndex(
+            time=time, unit=entity, level=SpatialLevel.CM
+        )
+        frame = FeatureFrame(values, index=index, feature_names=[feat, target])
+        ds = ViewsDatasetDarts(
+            feature_frame=frame,
+            targets=[target],
+            features=[feat],
+        )
+        series_list = ds.as_darts_timeseries(entity_ids=[248])
         assert len(series_list) == 1
         ts = series_list[0]
         assert len(ts) == 1
         assert int(ts.time_index.values[0]) == 140
-        assert list(ts.components) == [*FEATURES, *TARGETS]
+        assert list(ts.components) == [feat, target]
         assert int(ts.static_covariates["country_id"].iloc[0]) == 248
 
     def test_as_darts_timeseries_with_cyclic_encoders(
@@ -223,7 +249,7 @@ class TestViewsDatasetAsDarts:
         series_list = dataset.as_darts_timeseries(
             entity_ids=[1, 2, 3],
             inject_static_covariates=True,
-            stat_time_range=(121, 400),
+            stat_time_range=(MONTH_ID_MIN, MONTH_ID_MAX),
         )
         assert len(series_list) == 3
         for ts in series_list:
@@ -243,8 +269,9 @@ class TestViewsDatasetAsDarts:
         self, dataset: ViewsDatasetDarts
     ) -> None:
         """``AsinhTransform->MaxAbsScaler`` fingerprint: values bounded in [-1, 1]."""
-        # Use the first 20 entities actually present in the parquet
-        # (country_id 15 is absent from the validation frame).
+        # Use the first 20 entities actually present in the parquet. The
+        # synthetic cm parquet has all country_ids 1..200 with full 100-month
+        # coverage, so the first 20 are simply [1, 2, ..., 20].
         all_entities = sorted(
             set(np.unique(dataset.feature_frame.index.unit).tolist())
         )
@@ -252,7 +279,7 @@ class TestViewsDatasetAsDarts:
         series_list = dataset.as_darts_timeseries(
             entity_ids=entity_subset,
             inject_static_covariates=True,
-            stat_time_range=(121, 400),
+            stat_time_range=(MONTH_ID_MIN, MONTH_ID_MAX),
             static_cov_transform="AsinhTransform->MaxAbsScaler",
         )
         assert len(series_list) == 20
@@ -281,8 +308,18 @@ class TestViewsDatasetAsDarts:
 class TestViewsDatasetFactory:
     """``from_views_path`` factory tests."""
 
-    def test_dataset_from_views_path(self) -> None:
+    def test_dataset_from_views_path(
+        self,
+        synthetic_cm_parquet_small: Path,
+        tmp_path: Path,
+    ) -> None:
         """The factory loads via ``path_raw`` + ``run_type`` + config dict."""
+        # The factory looks for ``<run_type>_viewser_df.parquet`` inside
+        # ``path_raw`` — copy the synthetic cm parquet into the tmp dir under
+        # the expected filename so the factory can find it.
+        target_path = tmp_path / "validation_viewser_df.parquet"
+        shutil.copy(synthetic_cm_parquet_small, target_path)
+
         config: dict = {
             "targets": TARGETS,
             "features": FEATURES,
@@ -290,12 +327,12 @@ class TestViewsDatasetFactory:
             "entity_id": "country_id",
         }
         ds = ViewsDatasetDarts.from_views_path(
-            path_raw=UPLOAD_DIR,
+            path_raw=tmp_path,
             run_type="validation",
             config=config,
         )
-        assert ds.n_rows == 81192
-        assert ds.n_entities == 213
+        assert ds.n_rows == N_ROWS
+        assert ds.n_entities == N_ENTITIES
         assert ds.targets == TARGETS
         assert ds.features == FEATURES
         assert ds.level == SpatialLevel.CM
@@ -305,13 +342,17 @@ class TestViewsDatasetValidation:
     """Constructor-time validation errors."""
 
     @staticmethod
-    def _load_frame() -> tuple:
+    def _load_frame(parquet_path: Path) -> tuple:
         """Load the parquet once for the validation tests."""
-        return load_views_parquet(PARQUET_PATH, targets=TARGETS, features=FEATURES)
+        return load_views_parquet(
+            parquet_path, targets=TARGETS, features=FEATURES
+        )
 
-    def test_dataset_rejects_target_feature_overlap(self) -> None:
+    def test_dataset_rejects_target_feature_overlap(
+        self, synthetic_cm_parquet_small: Path
+    ) -> None:
         """A column in both ``targets`` and ``features`` must raise."""
-        frame, _, _ = self._load_frame()
+        frame, _, _ = self._load_frame(synthetic_cm_parquet_small)
         with pytest.raises(ValueError, match="both target and feature"):
             ViewsDatasetDarts(
                 feature_frame=frame,
@@ -319,9 +360,11 @@ class TestViewsDatasetValidation:
                 features=["lr_ged_sb"],
             )
 
-    def test_dataset_rejects_missing_target_column(self) -> None:
+    def test_dataset_rejects_missing_target_column(
+        self, synthetic_cm_parquet_small: Path
+    ) -> None:
         """A target column absent from the frame must raise."""
-        frame, _, _ = self._load_frame()
+        frame, _, _ = self._load_frame(synthetic_cm_parquet_small)
         with pytest.raises(ValueError, match="missing target columns"):
             ViewsDatasetDarts(
                 feature_frame=frame,
@@ -329,9 +372,11 @@ class TestViewsDatasetValidation:
                 features=FEATURES,
             )
 
-    def test_dataset_rejects_missing_feature_column(self) -> None:
+    def test_dataset_rejects_missing_feature_column(
+        self, synthetic_cm_parquet_small: Path
+    ) -> None:
         """A feature column absent from the frame must raise."""
-        frame, _, _ = self._load_frame()
+        frame, _, _ = self._load_frame(synthetic_cm_parquet_small)
         with pytest.raises(ValueError, match="missing feature columns"):
             ViewsDatasetDarts(
                 feature_frame=frame,
@@ -339,9 +384,11 @@ class TestViewsDatasetValidation:
                 features=["nonexistent_feature"],
             )
 
-    def test_dataset_rejects_empty_targets(self) -> None:
+    def test_dataset_rejects_empty_targets(
+        self, synthetic_cm_parquet_small: Path
+    ) -> None:
         """An empty targets list must raise at construction."""
-        frame, _, _ = self._load_frame()
+        frame, _, _ = self._load_frame(synthetic_cm_parquet_small)
         with pytest.raises(ValueError, match="non-empty"):
             ViewsDatasetDarts(feature_frame=frame, targets=[])
 

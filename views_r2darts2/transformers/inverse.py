@@ -35,24 +35,57 @@ def extract_fitted_sklearn_scaler(scaler: Scaler) -> object | None:
     """Extract the fitted sklearn object from a Darts :class:`Scaler`.
 
     The Darts ``Scaler`` stores its fitted sklearn transformer inside
-    ``_fitted_params``. The exact layout depends on the Darts version — older
-    versions used a tuple, newer versions may use a dict. This helper handles
-    both shapes.
+    ``_fitted_params``. The layout varies across Darts versions and fit modes:
+
+        * ``global_fit=True``  → ``list`` of length 1: ``[sklearn_scaler]``
+        * ``global_fit=False`` → ``list`` of length N: one per fitted series
+        * Older Darts versions → ``tuple`` of the same shapes
+        * Some Darts versions   → ``dict`` with a ``"fitted"`` key
+        * Edge case             → nested lists: ``[[sklearn_scaler]]``
+
+    Recursively unwraps lists/tuples until it finds an object with an
+    ``inverse_transform`` method (the sklearn transformer itself) or a dict
+    with a ``"fitted"`` key.
 
     Returns ``None`` when the scaler has not been fitted or the layout is
-    unrecognized (the caller should treat this as a passthrough).
+    unrecognized.
     """
     fitted_params = getattr(scaler, "_fitted_params", None)
     if not fitted_params:
         return None
-    if isinstance(fitted_params, tuple) and len(fitted_params) >= 1:
-        candidate = fitted_params[0]
-        if isinstance(candidate, dict) and "fitted" in candidate:
-            return candidate["fitted"]
-        return candidate
-    if isinstance(fitted_params, dict) and "fitted" in fitted_params:
-        return fitted_params["fitted"]
-    return fitted_params
+    return _unwrap_fitted_params(fitted_params)
+
+
+def _unwrap_fitted_params(obj: object, depth: int = 0) -> object | None:
+    """Recursively unwrap ``_fitted_params`` until we find the sklearn object.
+
+    Args:
+        obj: The current candidate (list, tuple, dict, or sklearn object).
+        depth: Recursion depth guard (max 5 to prevent infinite loops).
+
+    Returns:
+        The sklearn transformer (an object with ``inverse_transform``), or
+        ``None`` if not found.
+    """
+    if depth > 5:
+        return None
+
+    # Dict with "fitted" key — Darts' per-series layout.
+    if isinstance(obj, dict) and "fitted" in obj:
+        return _unwrap_fitted_params(obj["fitted"], depth + 1)
+
+    # List or tuple — unwrap the first element (global_fit=True) or recurse.
+    if isinstance(obj, (list, tuple)):
+        if len(obj) == 0:
+            return None
+        # Try the first element; if it unwraps to a transformer, return it.
+        return _unwrap_fitted_params(obj[0], depth + 1)
+
+    # Found an object with inverse_transform — this is the sklearn transformer.
+    if hasattr(obj, "inverse_transform"):
+        return obj
+
+    return None
 
 
 def inverse_transform_probabilistic_subset(
@@ -70,21 +103,45 @@ def inverse_transform_probabilistic_subset(
 
     Returns:
         Shape ``(n_time, n_features, n_samples)`` float32, inverse-transformed.
+
+    Fallback: If the sklearn transformer cannot be extracted from
+    ``_fitted_params`` (e.g., the layout is unrecognized), the function
+    applies the scaler's underlying ``transformer.inverse_func`` elementwise
+    on the 3-D array. This is correct for stateless transforms like
+    ``AsinhTransform`` (``FunctionTransformer`` with ``func=arcsinh``,
+    ``inverse_func=sinh``) which work elementwise and don't need 2-D input.
     """
     n_time, n_features, n_samples = subset_3d.shape
-    subset_2d = np.ascontiguousarray(
-        subset_3d.transpose(0, 2, 1).reshape(-1, n_features)
-    )
     sklearn_scaler = extract_fitted_sklearn_scaler(scaler)
     if sklearn_scaler is not None:
+        # Standard path: reshape to 2-D, inverse-transform, reshape back.
+        subset_2d = np.ascontiguousarray(
+            subset_3d.transpose(0, 2, 1).reshape(-1, n_features)
+        )
         inv_2d = sklearn_scaler.inverse_transform(
             subset_2d.astype(np.float64)
         )
-    else:
-        # Unfitted scaler — passthrough (preserves legacy behavior).
-        inv_2d = subset_2d.astype(np.float64)
-    inv_values = inv_2d.reshape(n_time, n_samples, n_features).transpose(0, 2, 1)
-    return inv_values.astype(np.float32)
+        inv_values = inv_2d.reshape(n_time, n_samples, n_features).transpose(0, 2, 1)
+        return inv_values.astype(np.float32)
+
+    # Fallback: use the Darts Scaler's underlying transformer directly.
+    # This works for stateless transforms (FunctionTransformer with
+    # func/inverse_func) which apply elementwise and don't need 2-D input.
+    underlying = getattr(scaler, "transformer", None)
+    if underlying is not None and hasattr(underlying, "inverse_func"):
+        # FunctionTransformer stores inverse_func; apply elementwise.
+        inv_func = underlying.inverse_func
+        if inv_func is not None:
+            # Clamp to prevent float32 overflow on the inverse. For AsinhTransform,
+            # the inverse is sinh — values > ~88 overflow float32. The RINorm
+            # patch already clamps to [-88, 88] before sinh; we mirror that here
+            # for the scaler inverse path.
+            clamped = np.clip(subset_3d.astype(np.float64), -88.0, 88.0)
+            inv_values = inv_func(clamped)
+            return inv_values.astype(np.float32)
+
+    # Last resort: passthrough (preserves legacy behavior for unfitted scalers).
+    return subset_3d.astype(np.float32, copy=True)
 
 
 def inverse_transform_deterministic_subset(
@@ -100,12 +157,27 @@ def inverse_transform_deterministic_subset(
 
     Returns:
         Shape ``(n_time, n_features)`` float32, inverse-transformed.
+
+    Fallback: If the sklearn transformer cannot be extracted, applies the
+    scaler's underlying ``transformer.inverse_func`` elementwise (correct for
+    stateless transforms like ``AsinhTransform``).
     """
     sklearn_scaler = extract_fitted_sklearn_scaler(scaler)
-    if sklearn_scaler is None:
-        return subset_2d.astype(np.float32, copy=True)
-    inv_2d = sklearn_scaler.inverse_transform(subset_2d.astype(np.float64))
-    return inv_2d.astype(np.float32)
+    if sklearn_scaler is not None:
+        inv_2d = sklearn_scaler.inverse_transform(subset_2d.astype(np.float64))
+        return inv_2d.astype(np.float32)
+
+    # Fallback: use the underlying transformer's inverse_func elementwise.
+    underlying = getattr(scaler, "transformer", None)
+    if underlying is not None and hasattr(underlying, "inverse_func"):
+        inv_func = underlying.inverse_func
+        if inv_func is not None:
+            # Clamp to prevent float32 overflow on the inverse (sinh overflow).
+            clamped = np.clip(subset_2d.astype(np.float64), -88.0, 88.0)
+            return inv_func(clamped).astype(np.float32)
+
+    # Last resort: passthrough.
+    return subset_2d.astype(np.float32, copy=True)
 
 
 def fit_scaler_on_concatenated_subset(

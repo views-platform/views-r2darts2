@@ -213,8 +213,15 @@ def full_config():
 
 @pytest.fixture
 def mock_device():
-    """Mock the device detection."""
-    with patch("views_r2darts2.infrastructure.device.get_device") as mock:
+    """Mock the device detection.
+
+    Patches ``get_device`` at the call site (``model_catalog.get_device``)
+    rather than at the definition site (``infrastructure.device.get_device``).
+    The ``from ... import get_device`` statement in ``model_catalog.py`` binds
+    the name locally, so patching the source module does not affect the
+    already-bound reference.
+    """
+    with patch("views_r2darts2.catalogs.model_catalog.get_device") as mock:
         mock.return_value = "cpu"
         yield mock
 

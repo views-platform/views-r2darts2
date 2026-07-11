@@ -4,27 +4,27 @@ Verifies that :func:`load_views_parquet` produces bit-identical float32 values
 to a direct ``pyarrow.parquet.read_table`` call, that the memmap cache works,
 and that the loader enforces the VIEWS viewser schema contract.
 
+Uses a session-scoped synthetic parquet fixture (see ``conftest.py``) so the
+tests run anywhere without the real validation parquet.
+
 Google Python Style.
 """
 
 from __future__ import annotations
 
-import shutil
 import tempfile
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from views_frames import FeatureFrame, SpatialLevel
+from views_frames import SpatialLevel
 from views_r2darts2.data.parquet_loader import (
     ParquetLoadError,
     load_views_parquet,
 )
-
-# Path to the user-provided validation parquet (12 MB, 87 cols, 81192 rows).
-PARQUET_PATH = Path("/home/z/my-project/upload/validation_viewser_df.parquet")
 
 TARGETS = ["lr_ged_sb", "lr_ged_ns", "lr_ged_os"]
 FEATURES = [
@@ -37,31 +37,20 @@ FEATURES = [
 ]
 
 
-# ----------------------------------------------------------------------
-# Skip the suite if the validation parquet is not present (e.g., CI without
-# the upload dir).
-# ----------------------------------------------------------------------
-
-pytestmark = pytest.mark.skipif(
-    not PARQUET_PATH.exists(),
-    reason=f"Validation parquet not found at {PARQUET_PATH}",
-)
-
-
 class TestParquetLoaderBitParity:
     """Bit-for-bit parity vs a direct pyarrow column read."""
 
-    def test_bit_parity_all_columns(self) -> None:
+    def test_bit_parity_all_columns(self, synthetic_cm_parquet_small: Path) -> None:
         """Every feature and target column must match pyarrow bit-for-bit."""
         frame, feats, targs = load_views_parquet(
-            PARQUET_PATH, targets=TARGETS, features=FEATURES
+            synthetic_cm_parquet_small, targets=TARGETS, features=FEATURES
         )
         assert feats == FEATURES
         assert targs == TARGETS
 
         for col in TARGETS + FEATURES:
             direct = (
-                pq.read_table(PARQUET_PATH, columns=[col])
+                pq.read_table(synthetic_cm_parquet_small, columns=[col])
                 .column(col)
                 .to_numpy()
                 .astype(np.float32)
@@ -71,30 +60,31 @@ class TestParquetLoaderBitParity:
             assert direct.shape == loaded.shape
             assert np.array_equal(direct, loaded), f"Bit parity failed for {col}"
 
-    def test_frame_shape_and_dtype(self) -> None:
+    def test_frame_shape_and_dtype(self, synthetic_cm_parquet_small: Path) -> None:
         """Frame must be (N, F, 1) float32 with F = n_features + n_targets."""
         frame, _, _ = load_views_parquet(
-            PARQUET_PATH, targets=TARGETS, features=FEATURES
+            synthetic_cm_parquet_small, targets=TARGETS, features=FEATURES
         )
         assert frame.values.dtype == np.float32
-        assert frame.values.shape == (81192, len(FEATURES) + len(TARGETS), 1)
-        assert frame.n_rows == 81192
+        n_rows_expected = 200 * 100  # 200 countries × 100 months
+        assert frame.values.shape == (n_rows_expected, len(FEATURES) + len(TARGETS), 1)
+        assert frame.n_rows == n_rows_expected
         assert frame.n_features == len(FEATURES) + len(TARGETS)
         assert frame.sample_count == 1
 
-    def test_index_arrays(self) -> None:
+    def test_index_arrays(self, synthetic_cm_parquet_small: Path) -> None:
         """The (time, unit) arrays must match the parquet month_id/country_id."""
         frame, _, _ = load_views_parquet(
-            PARQUET_PATH, targets=TARGETS, features=FEATURES
+            synthetic_cm_parquet_small, targets=TARGETS, features=FEATURES
         )
         time_direct = (
-            pq.read_table(PARQUET_PATH, columns=["month_id"])
+            pq.read_table(synthetic_cm_parquet_small, columns=["month_id"])
             .column("month_id")
             .to_numpy()
             .astype(np.int64)
         )
         entity_direct = (
-            pq.read_table(PARQUET_PATH, columns=["country_id"])
+            pq.read_table(synthetic_cm_parquet_small, columns=["country_id"])
             .column("country_id")
             .to_numpy()
             .astype(np.int64)
@@ -103,10 +93,10 @@ class TestParquetLoaderBitParity:
         assert np.array_equal(frame.index.unit, entity_direct)
         assert frame.index.level == SpatialLevel.CM
 
-    def test_value_axis_order(self) -> None:
+    def test_value_axis_order(self, synthetic_cm_parquet_small: Path) -> None:
         """Value axis must be ``[features..., targets...]``."""
         frame, _, _ = load_views_parquet(
-            PARQUET_PATH, targets=TARGETS, features=FEATURES
+            synthetic_cm_parquet_small, targets=TARGETS, features=FEATURES
         )
         assert frame.feature_names == [*FEATURES, *TARGETS]
 
@@ -114,18 +104,24 @@ class TestParquetLoaderBitParity:
 class TestParquetLoaderMemmapCache:
     """Memmap-backed cache must produce bit-identical values to in-memory load."""
 
-    def test_cache_round_trip(self) -> None:
+    def test_cache_round_trip(self, synthetic_cm_parquet_small: Path) -> None:
         """First read decodes parquet; second read memmaps the cache."""
         with tempfile.TemporaryDirectory() as cache_dir:
             frame1, _, _ = load_views_parquet(
-                PARQUET_PATH, targets=TARGETS, features=FEATURES, cache_dir=cache_dir
+                synthetic_cm_parquet_small,
+                targets=TARGETS,
+                features=FEATURES,
+                cache_dir=cache_dir,
             )
             assert not isinstance(
                 frame1.values, np.memmap
             ), "First read should not be memmap"
 
             frame2, _, _ = load_views_parquet(
-                PARQUET_PATH, targets=TARGETS, features=FEATURES, cache_dir=cache_dir
+                synthetic_cm_parquet_small,
+                targets=TARGETS,
+                features=FEATURES,
+                cache_dir=cache_dir,
             )
             assert isinstance(
                 frame2.values, np.memmap
@@ -135,24 +131,24 @@ class TestParquetLoaderMemmapCache:
             assert np.array_equal(frame1.index.time, frame2.index.time)
             assert np.array_equal(frame1.index.unit, frame2.index.unit)
 
-    def test_cache_invalidation_on_manifest_change(self) -> None:
+    def test_cache_invalidation_on_manifest_change(
+        self, synthetic_cm_parquet_small: Path
+    ) -> None:
         """Changing the features list must invalidate the cache."""
         with tempfile.TemporaryDirectory() as cache_dir:
-            # First load with FEATURES.
             load_views_parquet(
-                PARQUET_PATH, targets=TARGETS, features=FEATURES, cache_dir=cache_dir
+                synthetic_cm_parquet_small,
+                targets=TARGETS,
+                features=FEATURES,
+                cache_dir=cache_dir,
             )
-            # Second load with a different feature set.
-            new_features = FEATURES[:2]  # subset
+            new_features = FEATURES[:2]
             frame, _, _ = load_views_parquet(
-                PARQUET_PATH,
+                synthetic_cm_parquet_small,
                 targets=TARGETS,
                 features=new_features,
                 cache_dir=cache_dir,
             )
-            # The cache key is content-addressed by the manifest, so the new
-            # feature set produces a fresh cache miss and a frame with the
-            # smaller column count.
             assert frame.n_features == len(new_features) + len(TARGETS)
 
 
@@ -165,9 +161,6 @@ class TestParquetLoaderErrors:
 
     def test_missing_columns(self, tmp_path: Path) -> None:
         """Schema mismatch must raise ParquetLoadError."""
-        # Build a small parquet with only one column.
-        import pyarrow as pa
-
         table = pa.table({"lr_ged_sb": [1.0, 2.0]})
         pq.write_table(table, tmp_path / "tiny.parquet")
         with pytest.raises(ParquetLoadError, match="missing required columns"):
@@ -177,19 +170,18 @@ class TestParquetLoaderErrors:
                 features=FEATURES,
             )
 
-    def test_target_feature_overlap(self, tmp_path: Path) -> None:
+    def test_target_feature_overlap(self, synthetic_cm_parquet_small: Path) -> None:
         """A column cannot be both target and feature."""
-        # Use the real parquet — the manifest check happens before schema read.
         with pytest.raises(ParquetLoadError, match="both target and feature"):
             load_views_parquet(
-                PARQUET_PATH,
+                synthetic_cm_parquet_small,
                 targets=["lr_ged_sb"],
-                features=["lr_ged_sb"],  # same column
+                features=["lr_ged_sb"],
             )
 
-    def test_empty_targets(self, tmp_path: Path) -> None:
+    def test_empty_targets(self, synthetic_cm_parquet_small: Path) -> None:
         with pytest.raises(ParquetLoadError, match="non-empty"):
-            load_views_parquet(PARQUET_PATH, targets=[])
+            load_views_parquet(synthetic_cm_parquet_small, targets=[])
 
 
 class TestParquetLoaderPgmLevel:
@@ -197,8 +189,6 @@ class TestParquetLoaderPgmLevel:
 
     def test_pgm_level_inference(self, tmp_path: Path) -> None:
         """Passing ``entity_id='priogrid_id'`` must produce ``SpatialLevel.PGM``."""
-        import pyarrow as pa
-
         table = pa.table(
             {
                 "month_id": np.array([100, 100], dtype=np.int64),
@@ -214,3 +204,31 @@ class TestParquetLoaderPgmLevel:
             entity_id="priogrid_id",
         )
         assert frame.index.level == SpatialLevel.PGM
+
+    def test_large_pgm_parquet(self, synthetic_pgm_parquet: Path) -> None:
+        """The loader must handle the 1M-row PGM parquet without OOM.
+
+        This is the memmap stress test: the file is ~1M rows × 12 columns.
+        The full 25.9M-row file (259k cells × 100 months) would take too long
+        to generate in a test session; this 10k-cell subset exercises the same
+        code paths (memmap cache, multi-entity TimeSeries, PGM level inference)
+        in ~5 seconds.
+        """
+        frame, feats, targs = load_views_parquet(
+            synthetic_pgm_parquet,
+            targets=TARGETS,
+            features=FEATURES[:3],  # subset for speed
+            entity_id="priogrid_id",
+        )
+        assert frame.n_rows == 10_000 * 100
+        assert frame.values.dtype == np.float32
+        assert frame.index.level == SpatialLevel.PGM
+        # Verify a single column's bit parity.
+        direct = (
+            pq.read_table(synthetic_pgm_parquet, columns=["lr_ged_sb"])
+            .column("lr_ged_sb")
+            .to_numpy()
+            .astype(np.float32)
+        )
+        idx = frame.feature_names.index("lr_ged_sb")
+        assert np.array_equal(direct, frame.values[:, idx, 0])

@@ -50,7 +50,8 @@ from views_r2darts2.transformers.feature_scaler_manager import (
     FeatureScalerManager,
 )
 
-# Path to the user-provided validation parquet (12 MB, 87 cols, 81192 rows).
+# Path to the synthetic country-month parquet (session-scoped fixture from
+# conftest.py). 200 countries × 100 months = 20000 rows.
 PARQUET_PATH = Path("/home/z/my-project/upload/validation_viewser_df.parquet")
 
 # Three targets + six features used throughout the suite.
@@ -64,21 +65,15 @@ FEATURES: list[str] = [
     "lr_splag_1_ged_os",
 ]
 
-# Three entities (1, 2, 3) — all carry the full 432-month history.
+# Three entities (1, 2, 3) — all carry the full 100-month history.
 ENTITY_IDS: list[int] = [1, 2, 3]
 
-# Standard partition used across the suite (matches the validation parquet's
-# month_id range of 121..552).
+# Standard partition used across the suite (matches the synthetic parquet's
+# month_id range of 121..220).
 PARTITION: dict[str, tuple[int, int]] = {
-    "train": (121, 400),
-    "test": (401, 552),
+    "train": (121, 200),
+    "test": (201, 220),
 }
-
-# Skip the whole suite if the validation parquet is not present.
-pytestmark = pytest.mark.skipif(
-    not PARQUET_PATH.exists(),
-    reason=f"Validation parquet not found at {PARQUET_PATH}",
-)
 
 
 # ----------------------------------------------------------------------
@@ -87,14 +82,14 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def dataset() -> ViewsDatasetDarts:
-    """Load the validation parquet, subset to 3 entities, return a dataset.
+def dataset(synthetic_cm_parquet_small: Path) -> ViewsDatasetDarts:
+    """Load the synthetic cm parquet, subset to 3 entities, return a dataset.
 
-    The subset keeps all 432 months for entities 1, 2, 3 — 1296 rows total.
+    The subset keeps all 100 months for entities 1, 2, 3 — 300 rows total.
     Constructed once per module (the parquet decode is the slow step).
     """
     frame, feats, targs = load_views_parquet(
-        PARQUET_PATH, targets=TARGETS, features=FEATURES
+        synthetic_cm_parquet_small, targets=TARGETS, features=FEATURES
     )
     full_ds = ViewsDatasetDarts(
         feature_frame=frame, targets=targs, features=feats
@@ -194,9 +189,9 @@ class TestDartsForecasterInit:
             random_state=42,
         )
         assert fc._train_start == 121
-        assert fc._train_end == 400
-        assert fc._test_start == 401
-        assert fc._test_end == 552
+        assert fc._train_end == 200
+        assert fc._test_start == 201
+        assert fc._test_end == 220
         assert fc.scaler_fitted is False
         assert fc.device == "cpu"
 
@@ -339,7 +334,7 @@ class TestDartsForecasterPreprocess:
         """In train mode, the scalers are fitted and the gates pass.
 
         Mock model with ``input_chunk_length=12``, ``output_chunk_length=6``
-        — minimum length is 18, well below the 280-step train slice, so all
+        — minimum length is 18, well below the 80-step train slice, so all
         3 entities pass the filter.
         """
         fc = DartsForecaster(
@@ -352,14 +347,14 @@ class TestDartsForecasterPreprocess:
         )
         series = dataset.as_darts_timeseries()
         targets, past_cov = fc._preprocess_timeseries(
-            timeseries=series, start=121, end=400, train_mode=True
+            timeseries=series, start=121, end=200, train_mode=True
         )
         assert len(targets) == 3
         assert past_cov is not None
         assert len(past_cov) == 3
-        # Each target series spans the train window (280 steps).
+        # Each target series spans the train window (80 steps).
         for ts in targets:
-            assert len(ts) == 280
+            assert len(ts) == 80
         # Scalers are now fitted.
         assert fc.scaler_fitted is True
 
@@ -385,7 +380,7 @@ class TestDartsForecasterPreprocess:
         series = dataset.as_darts_timeseries()
         # Fit scalers via train-mode preprocess.
         fc._preprocess_timeseries(
-            timeseries=series, start=121, end=400, train_mode=True
+            timeseries=series, start=121, end=200, train_mode=True
         )
         assert fc.scaler_fitted is True
 
@@ -397,7 +392,7 @@ class TestDartsForecasterPreprocess:
 
         # Predict-mode preprocess.
         fc._preprocess_timeseries(
-            timeseries=series, start=121, end=400, train_mode=False
+            timeseries=series, start=121, end=200, train_mode=False
         )
         # transform was called once; fit_transform was NOT called.
         assert fc.target_scaler.transform.called, (
@@ -431,17 +426,17 @@ class TestDartsForecasterPreprocess:
             random_state=42,
         )
         # Use ALL entities (not just the 3-entity subset) to ensure some
-        # don't extend to end=552.
+        # don't extend to end=220.
         series = dataset.as_darts_timeseries()
-        # end=552 is the global max month_id; entities 1-3 all extend there,
+        # end=220 is the global max month_id; entities 1-3 all extend there,
         # so this should pass with 3 entities. To test the filter, we need
-        # an entity that DOESN'T extend to end. We'll use end=552 and verify
+        # an entity that DOESN'T extend to end. We'll use end=220 and verify
         # the filter runs without raising (all 3 entities in the subset
-        # extend to 552).
+        # extend to 220).
         targets, past_cov = fc._preprocess_timeseries(
-            timeseries=series, start=121, end=552, train_mode=True
+            timeseries=series, start=121, end=220, train_mode=True
         )
-        # All 3 entities in the subset extend to 552, so all pass.
+        # All 3 entities in the subset extend to 220, so all pass.
         assert len(targets) == 3
         assert fc.scaler_fitted is True
 
@@ -735,7 +730,7 @@ class TestDartsForecasterSaveLoad:
         # Fit scalers via preprocess so the saved state is genuine.
         series = dataset.as_darts_timeseries()
         fc_save._preprocess_timeseries(
-            timeseries=series, start=121, end=400, train_mode=True
+            timeseries=series, start=121, end=200, train_mode=True
         )
         assert fc_save.scaler_fitted is True
         path = str(tmp_path / "model.pt")

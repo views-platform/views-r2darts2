@@ -95,30 +95,40 @@ class TestResolveTotalSequenceNumber:
 
 class TestManagerLazyImport:
     """The manager class is importable without ``views_pipeline_core``, but
-    ``__init__`` raises ``ImportError`` at call time."""
+    ``__init__`` raises ``ImportError`` at call time.
+
+    These tests verify the lazy-import contract. When
+    ``views_pipeline_core`` IS installed (the user's production environment),
+    the tests skip — they only assert behavior in the absent-parent case.
+    """
 
     def test_manager_class_importable_without_views_pipeline_core(self) -> None:
-        """Importing :class:`DartsForecastingModelManager` must succeed even
-        when ``views_pipeline_core`` is absent.
+        """Importing :class:`DartsForecastingModelManager` must always succeed.
 
-        The class is a real ``type`` and, in the absent-parent case, inherits
-        from :class:`object` (verified via the ``_PARENT_CLASS`` sentinel
-        exported from the module).
+        When vpc is absent, ``_PARENT_CLASS`` is ``object`` and the class is a
+        bare ``type``. When vpc is present, ``_PARENT_CLASS`` is the real
+        ``ForecastingModelManager`` and the class inherits from it. Either way,
+        the class itself is importable and is a ``type``.
         """
         assert isinstance(DartsForecastingModelManager, type)
-        # When vpc is absent, the module-level _PARENT_CLASS sentinel is
-        # `object`. This is the lazy-import contract documented in the
-        # module's import-time try/except block.
-        assert _PARENT_CLASS is object, (
-            "Expected _PARENT_CLASS to be `object` when "
-            "views_pipeline_core is absent."
-        )
-        # The class itself inherits from object (no vpc parent class).
-        assert issubclass(DartsForecastingModelManager, object)
+        # The _PARENT_CLASS sentinel is either `object` (vpc absent) or the
+        # real ForecastingModelManager (vpc present). Both are valid.
+        assert _PARENT_CLASS is not None
+        # The class must inherit from _PARENT_CLASS (object when vpc absent,
+        # ForecastingModelManager when vpc present).
+        assert issubclass(DartsForecastingModelManager, _PARENT_CLASS)
 
+    @pytest.mark.skipif(
+        _PARENT_CLASS is not object,
+        reason="views_pipeline_core is installed — the ImportError path is "
+        "only exercised when vpc is absent.",
+    )
     def test_manager_init_raises_without_views_pipeline_core(self) -> None:
         """Calling ``DartsForecastingModelManager(model_path=...)`` raises
-        ``ImportError`` with a helpful message when vpc is absent."""
+        ``ImportError`` with a helpful message when vpc is absent.
+
+        Skipped when vpc IS installed (the ``__init__`` succeeds in that case).
+        """
         with pytest.raises(ImportError, match="views_pipeline_core"):
             DartsForecastingModelManager(model_path=MagicMock())
 

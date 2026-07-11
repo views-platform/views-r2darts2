@@ -26,6 +26,7 @@ from darts.dataprocessing import Pipeline
 from views_r2darts2.transformers.inverse import (
     extract_fitted_sklearn_scaler,
     fit_scaler_on_concatenated_subset,
+    inverse_transform_deterministic_subset,
     inverse_transform_probabilistic_subset,
     inverse_transform_subset_via_darts,
     transform_subset_via_darts,
@@ -294,15 +295,11 @@ class FeatureScalerManager:
                 arr[:, feature_indices, :] = inv_values
             else:
                 subset = arr[:, feature_indices]
-                sklearn_scaler = extract_fitted_sklearn_scaler(scaler)
-                if sklearn_scaler is not None:
-                    inv = sklearn_scaler.inverse_transform(
-                        subset.astype(np.float64)
-                    )
-                    arr[:, feature_indices] = inv.astype(np.float32)
-                else:
-                    # Unfitted — passthrough.
-                    pass
+                inv = inverse_transform_deterministic_subset(
+                    subset_2d=subset.astype(np.float32),
+                    scaler=scaler,
+                )
+                arr[:, feature_indices] = inv
 
         return TimeSeries.from_times_and_values(
             times=ts.time_index,

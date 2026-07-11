@@ -16,20 +16,33 @@ class SpotlightLossLogcosh(torch.nn.Module):
     The error is split into two complementary terms:
 
     * **Shape (temporal pattern).** Demeaned per‑series residual,
-      penalised with plain logcosh and standardised by the channel‑wise
+      penalised with logcosh and standardised by the channel‑wise
       temporal standard deviation of the true AC component.
-      This forces each series to learn its own dynamics and actively
-      penalises flat forecasts.
+      logcosh is chosen over quadratic for stability: the training data
+      contains noise and unexplainable spikes that destabilise unbounded
+      gradients. The bounded tanh gradient (≤ ±1) keeps optimisation
+      stable while still penalising flat forecasts through the
+      standardised residual.
 
-    * **Level (magnitude).** Per‑cell plain logcosh on raw error,
-      weighted by event magnitude (gate × (1 + abs_max)).
-      The gradient saturates at ±1; combined with magnitude weighting,
-      this provides sufficient force to correct level errors.
+    * **Level (magnitude).** ``logcosh`` of ``sum_t(pred) - sum_t(true)``
+      per series. The key insight: **aggregate magnitude BEFORE applying
+      logcosh**, not after. Per‑cell logcosh gives each cell its own
+      bounded gradient (tanh(e_t) ≤ 1), so a Ukraine‑scale error (e=9)
+      gets the same gradient as a small error (e=2) — magnitude is
+      invisible. By summing across timesteps first, the logcosh sees
+      the TOTAL error: 36 months of underprediction by 2 → sum=72 →
+      tanh(72)=1.0 → ALL cells get maximum gradient. 1 month of error
+      by 2 → sum=2 → tanh(2)=0.96 → 1 cell gets gradient. The gradient
+      is still bounded (≤ 1 per cell, stable) but now reflects TOTAL
+      magnitude — sustained underprediction triggers a broad, strong
+      correction rather than a weak per‑cell one.
 
     Both terms are gated by a sharp event mask
-    ``sigmoid(10·(|·| − τ))`` (τ = ``non_zero_threshold``) and
-    normalised with Hájek (self‑normalised weighted means).
-    Shape and level are added with equal weight – no extra scaling constant.
+    ``sigmoid(10·(|·| − τ))`` (τ = ``non_zero_threshold``) and the shape
+    term uses Hájek (self‑normalised weighted mean) normalisation. The
+    level term uses a plain mean (not Hájek) to avoid gradient starvation
+    at 90%+ peace series. Shape and level are added with equal weight –
+    no extra scaling constant.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -75,23 +88,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
         # ── Shape term: demeaned logcosh, standardised ─────────────
+        # logcosh (not quadratic) for stability against noise/spikes.
+        # The bounded tanh gradient (≤1) prevents destabilisation while
+        # the standardised residual still penalises flat forecasts.
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level term: per‑cell plain logcosh on raw error ─────────
-        raw_error = y_pred - y_true
-        level_cell_raw = self._Logcosh(raw_error)
+        # ── Level term: logcosh(SUM) — magnitude-aware ──────────────
+        # Sum across timesteps BEFORE logcosh. This aggregates total
+        # magnitude error: sustained underprediction → large sum →
+        # tanh(sum) ≈ ±1 → ALL cells get max gradient (bounded, stable).
+        # Per-cell logcosh cannot distinguish e=2 from e=9 (both tanh≈1);
+        # sum-then-logcosh distinguishes "1 month wrong" from "36 months
+        # wrong" by the number of cells that receive the gradient.
+        level_cell = self._Logcosh(y_pred.sum(dim=1) - y_true.sum(dim=1))
 
-        # Weight level cells by event magnitude (gate × (1 + abs_max))
-        mag_weight = gate * (1.0 + abs_max)                      # (B, T, C)
-        level_cell = mag_weight * level_cell_raw
+        # Per-series event mass for level weighting
+        w = gate.amax(dim=1)
 
-        # ── Normalisation (Hájek weighted means) ─────────────────────
+        # ── Normalisation ────────────────────────────────────────────
+        # Shape: Hájek (self-normalised) — composition-robust
+        # Level: plain mean — avoids gradient starvation at 90%+ peace
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = level_cell.sum(dim=(0, 1)) / mag_weight.sum(dim=(0, 1)).clamp_min(self._EPS)
+            level = (w * level_cell).mean(dim=0)
 
             per_channel = shape + level
             total_loss = per_channel.mean()
@@ -100,7 +122,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = level_cell.sum() / mag_weight.sum().clamp_min(self._EPS)
+            level = (w * level_cell).mean()
             total_loss = shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]

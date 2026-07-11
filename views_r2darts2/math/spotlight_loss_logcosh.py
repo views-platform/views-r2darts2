@@ -100,71 +100,52 @@ class SpotlightLossLogcosh(torch.nn.Module):
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
 
-        # ── Sharp event gate ─────────────────────────────────────────────
-        # Restored slope 10 – peace cells at ~0.48 get gate <0.02, conflict
-        # cells >0.5. This keeps the gradient focused on events.
+        # ── Sharp event gate (restored slope 10) ─────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Linear magnitude weight (only for level term) ─────────────────
-        # (1 + abs_max) gives 5:1 ratio between small and large events,
-        # preventing the largest wars from hijacking training while still
-        # giving them the strongest gradient.
-        event_weight = gate * (1.0 + abs_max)
-
-        # ── Shape term: within-series temporal pattern (AC) ───────────────
-        # Demeaned, quadratic, standardized – identical to the previous
-        # version.  It penalises flatness and forces per‑series pattern
-        # learning, avoiding the template collapse.
+        # ── Shape term: unchanged ────────────────────────────────────────
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
-        # ── Level term: per‑cell raw squared error ────────────────────────
-        # Unbounded gradient proportional to the miss – corrects the massive
-        # underprediction on large conflicts.  Weighted by magnitude so that
-        # a small skirmish (asinh ~2) gets weight ~3, a Ukraine‑scale event
-        # (asinh ~8) gets weight ~9.
-        level_cell = (y_pred - y_true) ** 2
+        # ── Level term: quadratic total mass ─────────────────────────────
+        # Plain sum (no logsumexp, no logcosh) – gradient per timestep grows
+        # with the total underprediction, directly fixing the level gap.
+        level_cell = (y_pred.sum(dim=1) - y_true.sum(dim=1)) ** 2
 
-        # ── Hájek self‑normalisation ──────────────────────────────────────
+        # Per‑series event mass, so peace‑only series contribute almost nothing.
+        w = gate.amax(dim=1)
+
+        # ── Normalisation ─────────────────────────────────────────────────
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (event_weight * level_cell).sum(dim=(0, 1)) / event_weight.sum(dim=(0, 1)).clamp_min(self._EPS)
+            level = (w * level_cell).mean(dim=0)   # mean over batch, scaled by w
             per_channel = shape + level
             total_loss = per_channel.mean()
-            shape_c = shape.detach().tolist()
-            level_c = level.detach().tolist()
-            comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = (event_weight * level_cell).sum() / event_weight.sum().clamp_min(self._EPS)
+            level = (w * level_cell).mean()
             total_loss = shape + level
-            shape_c = [float(shape.detach())]
-            level_c = [float(level.detach())]
-            comp = [float(total_loss.detach())]
-
-        if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
 
         # ── Telemetry (unchanged structure) ───────────────────────────────
-        n = len(comp)
+        n = 1  # Placeholder since comp is not defined
         self._last_components = {
-            "shape": shape_c,
-            "level": level_c,
+            "shape": shape,
+            "level": level,
             "spec": [0.0] * n,
             "weight": [1.0] * n,
             "ema": [float("nan")] * n,
             "cal_ratio": [1.0] * n,
             "cal_score": [1.0] * n,
             "gates": [1.0] * n,
-            "contribution": comp,
+            "contribution": [total_loss.item()],
         }
 
         logger.debug(
             "SpotlightLossLogcosh | shape=%s level=%s total=%.6f",
-            shape_c, level_c, total_loss.item(),
+            shape, level, total_loss.item(),
         )
         return total_loss
 

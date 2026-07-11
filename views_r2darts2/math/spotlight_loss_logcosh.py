@@ -85,31 +85,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level: T × logcosh(mean gap) — uniform DC bias shift ────
-        # The gradient is tanh(gap) per cell — uniform across all
-        # timesteps. This shifts the entire prediction up/down as a
-        # block without distorting the shape. No per-cell up/down
-        # oscillation. No Hájek dilution (T cancels the 1/T from mean).
-        # Total gradient: 36 × tanh(gap) ≤ 36 (within clip=100).
+        # ── Level: 2×sqrt(T) × logcosh(mean gap) — uniform DC shift ──
+        # Gradient per cell = 2×tanh(gap)/sqrt(T).
+        #   With T=36: 2 × 1.0 / 6 = 0.33 per cell
+        # Calibrated between three data points:
+        #   T (grad=1.0)    → 5.47× overpred
+        #   sqrt(T) (0.17)  → estimated ~0.8× (slight underpred)
+        #   mean (0.083)    → 0.42× underpred
+        # 2×sqrt(T) (0.33) targets the sweet spot ~1.0×.
+        # The gradient is UNIFORM (same for all cells) → pure DC bias
+        # shift, no conflict with shape, no oscillation/collapse.
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
-        level_cell = T * self._Logcosh(gap)
+        level_cell = (2.0 * (T ** 0.5)) * self._Logcosh(gap)
 
         # ── Per-series event weight for level ────────────────────────
         w = gate.amax(dim=1)  # (B,) or (B, C)
 
         # ── Combine ──────────────────────────────────────────────────
         # Shape: Hájek (sum/sum) — gradient ~0.5-1.0 per cell
-        # Level: mean over batch, sum over channels — gradient = tanh(gap)
-        #   per cell (T cancels 1/T from mean). mean(dim=0) prevents the
-        #   5.47× overprediction seen with SUM (which was B×C×tanh = 384).
-        #   sum() over channels keeps C×tanh = 3.0 per cell — 3× shape,
-        #   strong enough to correct level but not overshoot.
+        # Level: SUM over batch + SUM over channels — gradient = C×tanh/sqrt(T)
+        #   With T=36, C=3: 3 × 1.0 / 6 = 0.5 per cell (matches shape)
+        #   SUM (not mean) is needed because mean divides by B=128,
+        #   making gradient 0.023 (too weak, 0.40× underpred).
+        #   sqrt(T) scaling prevents the 5.47× overpred seen with T scaling.
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (w * level_cell).mean(dim=0)  # mean over batch (not SUM)
+            level = (w * level_cell).sum(dim=0)  # SUM over batch
 
             per_channel = shape + level
-            total_loss = per_channel.sum()  # sum over channels (not mean)
+            total_loss = per_channel.sum()  # SUM over channels
             shape_c = shape.detach().tolist()
             level_c = level.detach().tolist()
             comp = per_channel.detach().tolist()

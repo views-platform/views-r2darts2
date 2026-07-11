@@ -20,34 +20,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
       temporal standard deviation of the true AC component.
       logcosh is chosen for stability: the training data contains noise
       and unexplainable spikes that destabilise unbounded gradients.
-      The bounded tanh gradient (≤ ±1) keeps optimisation stable.
 
-    * **Level (magnitude).** ``(sum_t(pred) - sum_t(true))^2 / T`` per
-      series. This is MSE on the temporal sum — unbounded gradient that
-      grows with total magnitude error, so the model CAN distinguish
-      "2 below truth" from "5 below truth" (unlike logcosh which
-      saturates at ±1 for any sum > 3).
+    * **Level (magnitude).** Per‑cell logcosh on raw error, weighted by
+      event magnitude (gate × (1 + abs_max)). The (1+abs_max) weight IS
+      the magnitude signal: Ukraine cells get 10× the weight of small
+      events, so even though tanh saturates at ±1, the TOTAL gradient
+      per cell is (1+abs_max) × tanh(e) — magnitude‑proportional through
+      the weight, not through the gradient.
 
-      Stability comes from the SUM itself: aggregating across T=36
-      timesteps reduces per-spike variance by √T ≈ 6×, so individual
-      noise spikes get averaged out before the gradient is computed.
-      This is fundamentally safer than per-cell MSE (which sees each
-      spike at full force) while still providing the magnitude-
-      proportional gradient that logcosh cannot.
-
-      Per-series event mass ``gate.amax(dim=1)`` weights the level so
-      peace-only series don't drown the signal.
-
-    Both terms are gated by a sharp event mask
-    ``sigmoid(10·(|·| − τ))`` (τ = ``non_zero_threshold``). The shape
-    term uses Hájek (self‑normalised weighted mean) normalisation; the
-    level term uses a plain mean to avoid gradient starvation at 90%+
-    peace series.
+      The Hájek denominator uses ``sum(gate)`` (not ``sum(mag_weight)``)
+      so the denominator counts only event cells (gate ≈ 1 for events,
+      ≈ 0.018 for peace). This gives gradient ≈ (1+abs_max) × tanh(e) /
+      n_events — comparable to shape (tanh ≈ 0.5) rather than 20× weaker.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
-    All other quantities are data‑driven.
     """
 
     _EPS = 1e-6
@@ -63,18 +51,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
-    # ------------------------------------------------------------------
-    # Helper: stable logcosh
-    # ------------------------------------------------------------------
     @staticmethod
     def _Logcosh(z: torch.Tensor) -> torch.Tensor:
         """log(cosh(z)) without the additive constant log(2)."""
         a = z.abs()
         return a + F.softplus(-2.0 * a)
 
-    # ------------------------------------------------------------------
-    # Forward pass
-    # ------------------------------------------------------------------
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
@@ -82,49 +64,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
-        T = y_pred.size(1)
 
         # ── Sharp event gate ─────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
         # ── Shape term: demeaned logcosh, standardised ─────────────
-        # logcosh (not quadratic) for stability against noise/spikes.
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level term: per-cell MSE gated by event mask ────────────
-        # Every aggregation (mean/sum) over T cells introduces a 1/T
-        # factor in the per-cell gradient, making level 20-40x weaker
-        # than shape. The solution: NO aggregation — per-cell MSE on
-        # event cells only. The gate filters peace cells (gate ≈ 0.018
-        # for peace, ≈ 1.0 for events), so spikes in peace don't
-        # destabilize training. Event spikes are bounded by asinh space
-        # (max ~13). The gradient is 2*(pred-true) per event cell —
-        # magnitude-proportional and NOT attenuated by 1/T.
-        #
-        # Stability analysis:
-        # - Peace cells: gate ≈ 0.018 → gradient ≈ 0.018 * 2 * spike
-        #   → negligible (spike noise filtered by gate)
-        # - Event cells: gate ≈ 1.0 → gradient = 2 * (pred - true)
-        #   → bounded by asinh range: max 2 * 13 = 26 per cell
-        #   → total for 4 events: 4 * 26 = 104 (within clip=100)
-        # - The gate IS the stabilizer — it replaces the aggregation's
-        #   √T noise reduction with explicit event/peace separation.
-        level_cell = gate * (y_pred - y_true) ** 2
-
-        # Per-series event mass for level weighting
-        w = gate.amax(dim=1)
+        # ── Level term: per-cell logcosh, magnitude-weighted ────────
+        # (1+abs_max) is the magnitude signal: Ukraine (asinh=9) gets
+        # 10× the weight of a small event (asinh=2). Even though tanh
+        # saturates at ±1, the total gradient per cell is
+        # (1+abs_max) × tanh(e) / sum(gate) — magnitude-proportional.
+        raw_error = y_pred - y_true
+        level_cell_raw = self._Logcosh(raw_error)
+        mag_weight = gate * (1.0 + abs_max)
+        level_cell = mag_weight * level_cell_raw
 
         # ── Normalisation ────────────────────────────────────────────
         # Shape: Hájek (self-normalised) — composition-robust
-        # Level: plain SUM (not Hájek) — the gate already filters peace,
-        # so Hájek's 1/sum(gate) would dilute the event gradient by
-        # dividing by all peace cells' tiny gate values. The sum gives
-        # raw gradient = gate * 2*(pred-true) per cell — strong on
-        # events, ~0 on peace. The gate IS the stabilizer.
+        # Level: plain SUM (not Hájek) — Hájek dilutes by 1/sum(gate)
+        # which includes 90% peace cells → gradient 20× too weak.
+        # SUM + logcosh is stable: logcosh bounds per-cell gradient at
+        # ±1, (1+abs_max) gives magnitude weighting. The clip is the
+        # safety net for Ukraine-scale events (36 cells × 10 = 360,
+        # clipped to 100 → still 10× stronger than Hájek).
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
             level = level_cell.sum(dim=(0, 1))
@@ -145,7 +113,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if torch.isnan(total_loss):
             raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
 
-        # ── Telemetry ────────────────────────────────────────────────
         n = len(comp)
         self._last_components = {
             "shape": shape_c,

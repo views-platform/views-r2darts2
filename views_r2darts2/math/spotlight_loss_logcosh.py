@@ -12,32 +12,37 @@ class SpotlightLossLogcosh(torch.nn.Module):
     UCDP GED conflict fatality forecasting at country-month level:
     ~92% zeros for sb, ~97% for ns, ~98% for os.
 
-    ── v49d: evidence-based fixes from training dynamics ──────────────
+    ── v49e: level needs T-scale (evidence-based) ─────────────────────
 
-    1. **Level scale_factor = W** (kept from v47, reverted from T/(W+T)//2).
-       EVIDENCE: Any scale > W causes level to dominate (85-93% of loss).
-       At 90% sparsity, window means are near-zero in training but non-zero
-       in eval → model memorizes training window means → sb drops from
-       93% (train) to 43% (eval). W keeps level balanced with shape.
+    1. **Level scale_factor = T** (reverted from W).
+       EVIDENCE: With scale=W, level=77-85% but eval UNDERPREDICTS.
+       Root cause: level is intrinsically harder than shape:
+       - Shape loss operates on demeaned errors → gradient to ALL W cells
+       - Level loss operates on window means → 1/W gradient attenuation
+       - At 90% sparsity, only 10% of windows have non-zero level
+       - Shape gets gradient from ALL windows (demeaned ≠ 0)
+       Level needs T-scale to compensate for BOTH the 1/W attenuation
+       AND the 90% zero-dilution of window means.
 
-    2. **Event mag gate: linear (1+abs_max)** (reverted from squared).
-       EVIDENCE: The squared gate (v49a-c) caused level to dominate
-       (72-83%) because it shrank the shape Hájek denominator faster
-       than the numerator. Linear mag keeps the original v47 shape/level
-       balance. The std floor on calibration handles the ns explosion
-       that the squared gate was trying to fix.
+       Previous T runs failed because of the SQUARED MAG GATE (v49a-c),
+       not because of T itself. With linear mag + std floor, T is stable.
+
+    2. **Event mag gate: linear (1+abs_max)** (kept from v49d).
+       EVIDENCE: The squared gate caused level to dominate (72-83%) by
+       shrinking the shape Hájek denominator. Linear keeps shape/level
+       balance correct.
 
     3. **Calibration std floor: clamp(min=non_zero_threshold)** (kept).
        EVIDENCE: Without the floor, ns channel EMA exploded to 51,767
-       (vs 17 for sb, 12 for os) because sparse channels have tiny std
-       → z² explodes → channel router destabilizes.
+       because sparse channels have tiny std → z² explodes → router
+       destabilizes.
 
     ── Components (unchanged from v47) ─────────────────────────────────
 
     1. DC/AC decomposition — per-window demeaning.
     2. Gated + magnitude-graded event weighting (linear).
     3. Per-series temporal DRO (event-gated).
-    4. Windowed level anchor — W-scaled log_cosh on per-window means.
+    4. Windowed level anchor — T-scaled log_cosh on per-window means.
     5. Relative z-score calibration — per-channel mean-matching (z², std-floored).
     6. Multi-resolution STFT loss (disabled by default).
     """
@@ -169,7 +174,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate
 
-        scale_factor = W  # W is the exact gradient compensation for the mean operator. >W causes level to memorize training window means (near-zero at 90% sparsity), causing eval collapse.
+        scale_factor = T  # Level needs T-scale: compensates 1/W mean attenuation AND 90% sparsity (only 10% of windows have non-zero level). Shape gets gradient from ALL windows; level only from event windows. T restores the balance.
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))

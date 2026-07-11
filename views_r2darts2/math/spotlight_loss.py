@@ -36,7 +36,7 @@ class SpotlightLoss(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
 
-        logger.info("SpotlightLoss v49b-barron | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLoss barron-original | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -58,36 +58,13 @@ class SpotlightLoss(torch.nn.Module):
         """
         return (1.0 / 3.0) * ((2.0 * x * x + 1.0).pow(0.75) - 1.0)
 
-    def _dro_weights_2d(
-        self,
-        losses: torch.Tensor,
-        soft_event_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Event-aware per-series DRO with robust denominator."""
+    @staticmethod
+    def _dro_weights_2d(losses: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Per-series sqrt self-reweighting."""
         l = losses.detach()
-        m = soft_event_mask.detach().to(dtype=l.dtype).clamp(min=0.0, max=1.0)
-
-        def _wmean(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-            den = w.sum(dim=1, keepdim=True).clamp(min=self._EMA_EPS)
-            return (x * w).sum(dim=1, keepdim=True) / den
-
-        T = int(l.shape[1])
-        W = max(6, T // 3)
-        n_blocks = max(1, (T + W - 1) // W)
-
-        means = []
-        for lb, mb in zip(torch.tensor_split(l, n_blocks, dim=1), torch.tensor_split(m, n_blocks, dim=1)):
-            means.append(_wmean(lb, mb))
-        mom = torch.cat(means, dim=1)
-        mu = mom.median(dim=1, keepdim=True).values.clamp(min=self._EMA_EPS)
-
+        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)
         w = torch.sqrt(l / mu)
-
-        w_active_mean = _wmean(w, m).clamp(min=self._EMA_EPS)
-        w_normalized_active = w / w_active_mean
-
-        w = 1.0 + m * (w_normalized_active - 1.0)
-
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     # ------------------------------------------------------------------
@@ -129,11 +106,7 @@ class SpotlightLoss(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-gated windowed level anchor with W-scaled Hájek normalization.
-
-        scale_factor = W compensates the 1/W gradient attenuation from the
-        mean operator. This is the mathematically exact inverse.
-        """
+        """Event-magnitude-weighted windowed level anchor."""
         W = max(6, T // 3)
         window_means = torch.stack(
             [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
@@ -145,12 +118,12 @@ class SpotlightLoss(torch.nn.Module):
         else:
             abs_max_series = y_true.abs()
         series_mag = abs_max_series.max(dim=1).values
-        series_gate = torch.sigmoid(
-            10.0 * (series_mag - self.non_zero_threshold)
+        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
+            5.0 * (series_mag - self.non_zero_threshold)
         )
-        series_w = series_gate
+        series_w = series_gate * (1.0 + series_mag)
 
-        scale_factor = T  # Level needs T-scale: compensates 1/W mean attenuation AND 90% sparsity (only 10% of windows have non-zero level). Shape gets gradient from ALL windows; level only from event windows. T restores the balance.
+        scale_factor = T
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
@@ -232,19 +205,13 @@ class SpotlightLoss(torch.nn.Module):
         cell_loss = self._barron(e_shape)
 
         # ── Gated + magnitude-graded event weighting ──────────────────
-        # REVERTED to linear (1+abs_max). The squared version (v49a-c) caused
-        # level to dominate (72-83%) because it shrank the shape Hájek
-        # denominator faster than the numerator. Linear mag keeps the
-        # original v47 shape/level balance. The std floor on calibration
-        # handles the ns explosion that the squared gate was trying to fix.
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_gate = torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
-        event_mag = event_gate * (1.0 + abs_max)  # REVERTED: was squared
+        event_gate = 0.0125 + 0.9875 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
+        event_mag = event_gate * (1.0 + abs_max)
 
-        soft_event_mask = torch.sigmoid(
-            10.0 * (abs_max - self.non_zero_threshold)
-        )
-        w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)
+        w_dro = self._dro_weights_2d(cell_loss, y_true)
+        event_present = abs_max > self.non_zero_threshold
+        w_dro = torch.where(event_present, w_dro, torch.ones_like(w_dro))
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Hájek self-normalized shape ───────────────────────────────
@@ -257,7 +224,7 @@ class SpotlightLoss(torch.nn.Module):
             den = w_total.sum().clamp(min=self._EMA_EPS)
             loss_shape = num / den
 
-        # ── Windowed level anchor (T-scaled) ──────────────────────────
+        # ── Windowed level anchor ─────────────────────────────────────
         loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 
         # ── Spectral loss ──────────────────────────────────────────────
@@ -309,7 +276,7 @@ class SpotlightLoss(torch.nn.Module):
             )
 
         logger.debug(
-            "SpotlightLoss v49-barron | shape=%.6f level=%.6f spec=%.6f total=%.6f",
+            "SpotlightLoss barron-original | shape=%.6f level=%.6f spec=%.6f total=%.6f",
             loss_shape.item() if loss_shape.dim() == 0 else loss_shape.sum().item(),
             loss_level.item() if loss_level.dim() == 0 else loss_level.sum().item(),
             loss_spec.item() if loss_spec.dim() == 0 else loss_spec.sum().item(),

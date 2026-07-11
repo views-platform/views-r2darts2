@@ -343,7 +343,7 @@ class ReproducibilityGate:
             "PrismLoss": ["non_zero_threshold", "delta"],
             "SpotlightLoss": ["non_zero_threshold"],
             "SpotlightLossLogcosh": ["non_zero_threshold"],
-            "SpotlightLossHuber": ["delta", "non_zero_threshold"],
+            "SpotlightLossHuber": ["non_zero_threshold"],
             "SpotlightLossPowerLaw": ["non_zero_threshold"],
             "SpotlightLossAsinh": ["non_zero_threshold"],
             "CharbonnierLoss": [],

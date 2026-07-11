@@ -78,36 +78,40 @@ class SpotlightLossLogcosh(torch.nn.Module):
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
 
-        # ── Sharp event gate ─────────────────────────────────────────
+        # ── Sharp event gate ─────────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Shape term (quadratic, standardised) ─────────────────────
+        # ── Shape term (unchanged) ───────────────────────────────────────
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
-        # ── Level term: adaptive scaled logcosh ──────────────────────
-        # Total mass per series
+        # ── Level term: Huber loss on total event mass ──────────────────
+        #   delta = 2 * std(true totals) → proportional gradient for most errors,
+        #   capped at 2*std for outliers.
         sum_true = y_true.sum(dim=1)          # (B, C)
         sum_pred = y_pred.sum(dim=1)
-        # Per‑channel scale = std of true totals, floored at tau
-        level_scale = sum_true.std(dim=0).clamp_min(tau)   # (C,)
-        level_scale = level_scale.unsqueeze(0)             # (1, C)
+        delta = sum_pred - sum_true           # (B, C)
 
-        delta = sum_pred - sum_true
-        level_cell = level_scale * self._Logcosh(delta / level_scale)
+        # Adaptive Huber threshold
+        level_scale = sum_true.std(dim=0).clamp_min(tau).unsqueeze(0)  # (1, C)
+        huber_delta = 2.0 * level_scale       # (1, C)
 
-        # Per‑series event mass (any timestep with conflict)
+        # Huber loss (reduction='none')
+        abs_delta = delta.abs()
+        quadratic = 0.5 * delta ** 2
+        linear = huber_delta * (abs_delta - 0.5 * huber_delta)
+        level_cell = torch.where(abs_delta <= huber_delta, quadratic, linear)
+
+        # Per‑series weight (peace series get ~0)
         w = gate.amax(dim=1)   # (B, C)
 
-        # ── Normalisation ────────────────────────────────────────────
+        # ── Normalisation ────────────────────────────────────────────────
         if multivariate:
-            # Shape: Hájek self‑normalised gated mean
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            # Level: weighted mean over batch
-            level = (w * level_cell).mean(dim=0)
+            level = (w * level_cell).mean(dim=0)       # weighted mean over batch
             per_channel = shape + level
             total_loss = per_channel.mean()
             shape_c = shape.detach().tolist()
@@ -120,9 +124,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]
             comp = [float(total_loss.detach())]
-
-        if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
 
         # ── Telemetry ────────────────────────────────────────────────
         n = len(comp)

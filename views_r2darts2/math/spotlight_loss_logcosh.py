@@ -82,12 +82,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
-    def _dro_weights_2d(
+    def _dro_weights(
         self,
         losses: torch.Tensor,
         soft_event_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Event-aware per-series DRO with robust denominator."""
+        """Per-series temporal DRO weights with robust normalization."""
         l = losses.detach()
         m = soft_event_mask.detach().to(dtype=l.dtype).clamp(min=0.0, max=1.0)
 
@@ -110,7 +110,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_active_mean = _wmean(w, m).clamp(min=self._EMA_EPS)
         w_normalized_active = w / w_active_mean
 
-        w = 1.0 + m * (w_normalized_active - 1.0)
+        # Adaptive fallback: when effective active mass is too small to estimate
+        # stable event-conditioned stats, use neutral DRO weights.
+        active_mass = m.mean(dim=1, keepdim=True)
+        min_active_mass = 1.0 / max(T, 1)
+        has_enough_active = active_mass >= min_active_mass
+
+        w_event = 1.0 + m * (w_normalized_active - 1.0)
+        w = torch.where(has_enough_active, w_event, torch.ones_like(w_event))
 
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
@@ -265,10 +272,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         event_gate = torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)  # REVERTED: was squared
 
-        soft_event_mask = torch.sigmoid(
-            10.0 * (abs_max - self.non_zero_threshold)
-        )
-        w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)
+        # Avoid double-gating: event emphasis is already carried by event_mag.
+        # Use neutral mask for DRO normalization so sparse cells are not
+        # suppressed twice by the same gate.
+        soft_event_mask = torch.ones_like(event_mag)
+        w_dro = self._dro_weights(cell_loss, soft_event_mask)
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         # ── Hájek self-normalized shape ───────────────────────────────

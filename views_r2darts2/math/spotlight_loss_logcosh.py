@@ -18,31 +18,31 @@ class SpotlightLossLogcosh(torch.nn.Module):
     * **Shape (temporal pattern).** Demeaned per‑series residual,
       penalised with logcosh and standardised by the channel‑wise
       temporal standard deviation of the true AC component.
-      logcosh is chosen over quadratic for stability: the training data
-      contains noise and unexplainable spikes that destabilise unbounded
-      gradients. The bounded tanh gradient (≤ ±1) keeps optimisation
-      stable while still penalising flat forecasts through the
-      standardised residual.
+      logcosh is chosen for stability: the training data contains noise
+      and unexplainable spikes that destabilise unbounded gradients.
+      The bounded tanh gradient (≤ ±1) keeps optimisation stable.
 
-    * **Level (magnitude).** ``logcosh`` of ``sum_t(pred) - sum_t(true)``
-      per series. The key insight: **aggregate magnitude BEFORE applying
-      logcosh**, not after. Per‑cell logcosh gives each cell its own
-      bounded gradient (tanh(e_t) ≤ 1), so a Ukraine‑scale error (e=9)
-      gets the same gradient as a small error (e=2) — magnitude is
-      invisible. By summing across timesteps first, the logcosh sees
-      the TOTAL error: 36 months of underprediction by 2 → sum=72 →
-      tanh(72)=1.0 → ALL cells get maximum gradient. 1 month of error
-      by 2 → sum=2 → tanh(2)=0.96 → 1 cell gets gradient. The gradient
-      is still bounded (≤ 1 per cell, stable) but now reflects TOTAL
-      magnitude — sustained underprediction triggers a broad, strong
-      correction rather than a weak per‑cell one.
+    * **Level (magnitude).** ``(sum_t(pred) - sum_t(true))^2 / T`` per
+      series. This is MSE on the temporal sum — unbounded gradient that
+      grows with total magnitude error, so the model CAN distinguish
+      "2 below truth" from "5 below truth" (unlike logcosh which
+      saturates at ±1 for any sum > 3).
+
+      Stability comes from the SUM itself: aggregating across T=36
+      timesteps reduces per-spike variance by √T ≈ 6×, so individual
+      noise spikes get averaged out before the gradient is computed.
+      This is fundamentally safer than per-cell MSE (which sees each
+      spike at full force) while still providing the magnitude-
+      proportional gradient that logcosh cannot.
+
+      Per-series event mass ``gate.amax(dim=1)`` weights the level so
+      peace-only series don't drown the signal.
 
     Both terms are gated by a sharp event mask
-    ``sigmoid(10·(|·| − τ))`` (τ = ``non_zero_threshold``) and the shape
-    term uses Hájek (self‑normalised weighted mean) normalisation. The
-    level term uses a plain mean (not Hájek) to avoid gradient starvation
-    at 90%+ peace series. Shape and level are added with equal weight –
-    no extra scaling constant.
+    ``sigmoid(10·(|·| − τ))`` (τ = ``non_zero_threshold``). The shape
+    term uses Hájek (self‑normalised weighted mean) normalisation; the
+    level term uses a plain mean to avoid gradient starvation at 90%+
+    peace series.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -82,6 +82,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
+        T = y_pred.size(1)
 
         # ── Sharp event gate ─────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
@@ -89,28 +90,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Shape term: demeaned logcosh, standardised ─────────────
         # logcosh (not quadratic) for stability against noise/spikes.
-        # The bounded tanh gradient (≤1) prevents destabilisation while
-        # the standardised residual still penalises flat forecasts.
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level term: logcosh(SUM) — magnitude-aware ──────────────
-        # Sum across timesteps BEFORE logcosh. This aggregates total
-        # magnitude error: sustained underprediction → large sum →
-        # tanh(sum) ≈ ±1 → ALL cells get max gradient (bounded, stable).
-        # Per-cell logcosh cannot distinguish e=2 from e=9 (both tanh≈1);
-        # sum-then-logcosh distinguishes "1 month wrong" from "36 months
-        # wrong" by the number of cells that receive the gradient.
-        level_cell = self._Logcosh(y_pred.sum(dim=1) - y_true.sum(dim=1))
+        # ── Level term: MSE on temporal sum ─────────────────────────
+        # MSE on sum gives unbounded gradient (2*sum_error/T per cell)
+        # that grows with total magnitude error. Stability comes from
+        # the sum itself: aggregating T=36 timesteps reduces spike
+        # variance by √T ≈ 6×. This is safer than per-cell MSE while
+        # still providing magnitude-proportional gradient (unlike
+        # logcosh which saturates at ±1 for any sum > 3).
+        sum_error = y_pred.sum(dim=1) - y_true.sum(dim=1)
+        level_cell = (sum_error ** 2) / T
 
         # Per-series event mass for level weighting
         w = gate.amax(dim=1)
 
         # ── Normalisation ────────────────────────────────────────────
-        # Shape: Hájek (self-normalised) — composition-robust
-        # Level: plain mean — avoids gradient starvation at 90%+ peace
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
             level = (w * level_cell).mean(dim=0)

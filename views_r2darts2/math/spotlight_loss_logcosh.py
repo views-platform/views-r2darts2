@@ -18,24 +18,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
     * **Shape (temporal pattern).** Demeaned per‑series residual,
       penalised with plain logcosh and standardised by the channel‑wise
       temporal standard deviation of the true AC component.
-      This ensures each series is forced to learn its own dynamics
-      and flat forecasts are actively penalised.
+      This forces each series to learn its own dynamics and actively
+      penalises flat forecasts.
 
     * **Level (magnitude).** Per‑cell plain logcosh on raw error,
-      weighted by event magnitude.  The gradient saturates at ±1,
-      which is sufficient to correct level errors when combined with
-      the magnitude weighting and shape term.
+      weighted by event magnitude (gate × (1 + abs_max)).
+      The gradient saturates at ±1; combined with magnitude weighting,
+      this provides sufficient force to correct level errors.
 
     Both terms are gated by a sharp event mask
     ``sigmoid(10·(|·| − τ))`` (τ = ``non_zero_threshold``) and
     normalised with Hájek (self‑normalised weighted means).
-    The shape term is given an explicit relative weight of 5.0
-    to maintain its influence alongside the level signal.
+    Shape and level are added with equal weight – no extra scaling constant.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
-    All other quantities are data‑driven or fixed to robust values.
+    All other quantities are data‑driven.
     """
 
     _EPS = 1e-6
@@ -91,14 +90,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Normalisation (Hájek weighted means) ─────────────────────
         if multivariate:
-            # Shape: gated mean
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            # Level: weighted by mag_weight
             level = level_cell.sum(dim=(0, 1)) / mag_weight.sum(dim=(0, 1)).clamp_min(self._EPS)
 
-            # Boost shape influence to balance the level term
-            w_shape = 5.0
-            per_channel = w_shape * shape + level
+            per_channel = shape + level
             total_loss = per_channel.mean()
             shape_c = shape.detach().tolist()
             level_c = level.detach().tolist()
@@ -106,8 +101,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
             level = level_cell.sum() / mag_weight.sum().clamp_min(self._EPS)
-            w_shape = 5.0
-            total_loss = w_shape * shape + level
+            total_loss = shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]
             comp = [float(total_loss.detach())]

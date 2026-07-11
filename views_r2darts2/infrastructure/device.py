@@ -3,6 +3,8 @@
 Moved out of :class:`DartsForecaster` so that :class:`ModelCatalog` can call
 ``get_device()`` without importing the forecaster (which would create a
 circular import: ``catalogs → engines → catalogs``).
+
+Google Python Style.
 """
 
 from __future__ import annotations

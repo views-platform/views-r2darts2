@@ -22,6 +22,8 @@ Data flow:
 The class is pandas-free on its surface. The two Darts-boundary helpers in
 :mod:`views_r2darts2.transformers.darts_bridge` are the only places pandas is
 imported, and they are confined to that module.
+
+Google Python Style.
 """
 
 from __future__ import annotations
@@ -374,33 +376,68 @@ class DartsForecaster:
             # past_covariates=past_cov)`` pairs by list index, so any
             # entity-level mismatch silently trains the model on the wrong
             # covariate history.
-            paired = [
-                (
-                    s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets],
-                    s.slice(start_ts=start, end_ts=end + 1)[
-                        self.dataset.features
-                    ].astype(np.float32),
+            #
+            # The filter has TWO conditions:
+            #   1. ``len(sliced) >= min_length`` — enough rows for the
+            #      input/output chunk window.
+            #   2. ``sliced.time_index.max() == end`` — the series extends to
+            #      the training boundary. Entities that stop earlier (e.g., a
+            #      country that dissolved at month 379) are filtered out
+            #      rather than triggering a hard DataStarvationError in the
+            #      boundary audit below. This is the pragmatic choice: you
+            #      can't train on data that doesn't exist, and excluding a
+            #      handful of short-tail entities is preferable to aborting
+            #      the entire training run.
+            paired = []
+            skipped_short = 0
+            skipped_boundary = 0
+            for s in timeseries_float:
+                sliced = s.slice(start_ts=start, end_ts=end + 1)
+                if len(sliced) < min_length:
+                    skipped_short += 1
+                    continue
+                if int(sliced.time_index.max()) != end:
+                    skipped_boundary += 1
+                    continue
+                paired.append(
+                    (
+                        sliced[self.dataset.targets],
+                        sliced[self.dataset.features].astype(np.float32)
+                        if self.dataset.features
+                        else None,
+                    )
                 )
-                for s in timeseries_float
-                if len(s.slice(start_ts=start, end_ts=end + 1)) >= min_length
-            ]
             targets = [p[0] for p in paired]
-            past_cov = [p[1] for p in paired]
+            past_cov = [p[1] for p in paired] if self.dataset.features else None
             logger.info(
-                "Training filter: %d/%d entities passed minimum length >= %d.",
+                "Training filter: %d/%d entities passed (min_length >= %d AND "
+                "extends to end=%d). Skipped: %d too-short, %d boundary-miss.",
                 len(paired),
                 len(timeseries_float),
                 min_length,
+                end,
+                skipped_short,
+                skipped_boundary,
             )
         else:
+            # Prediction path: no min_length filter, no boundary check.
+            # All entities are included — the model needs to predict for every
+            # entity, even those with short histories.
             targets = [
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
                 for s in timeseries_float
             ]
             past_cov = None
 
-        # Slice past covariates (end + 1 to prevent feature leakage).
-        if self.dataset.features:
+        # Slice past covariates for the PREDICTION path only.
+        # In train_mode, past_cov was already built as a FILTERED list above
+        # (the paired filter ensures targets[i] and past_cov[i] come from the
+        # same entity). Rebuilding it here from the unfiltered timeseries_float
+        # would defeat the paired filter and cause entity misalignment — the
+        # exact bug the legacy code's comment at the top of this block warns
+        # about, yet the legacy code then immediately reintroduces by running
+        # this unfiltered rebuild unconditionally.
+        if not train_mode and self.dataset.features:
             past_cov = [
                 s.slice(start_ts=start, end_ts=end + 1)[
                     self.dataset.features
@@ -408,8 +445,11 @@ class DartsForecaster:
                 for s in timeseries_float
             ]
             past_cov = self._apply_log_to_features(past_cov)
-        else:
+        elif not train_mode:
             past_cov = None
+        # In train_mode with features, apply log to the already-filtered past_cov.
+        if train_mode and past_cov is not None:
+            past_cov = self._apply_log_to_features(past_cov)
 
         targets = self._apply_log_to_targets(targets)
 

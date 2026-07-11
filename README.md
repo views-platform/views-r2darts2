@@ -1,6 +1,6 @@
 # views-r2darts2
 
-Darts-based forecasting for the VIEWS platform
+Darts-based forecasting for the VIEWS platform — **pandas-free, FeatureFrame-backed, memmap-friendly**.
 
 ## What changed in v0.2.0
 

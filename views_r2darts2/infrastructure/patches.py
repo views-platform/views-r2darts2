@@ -15,6 +15,8 @@ add features that the upstream library does not yet expose:
 
 Call ``apply_all_patches()`` once at process startup (typically from
 ``DartsForecastingModelManager.__init__``).
+
+Google Python Style.
 """
 import torch
 import torch.nn as nn

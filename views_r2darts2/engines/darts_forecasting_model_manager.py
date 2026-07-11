@@ -17,6 +17,8 @@ Key cleanup vs. the legacy implementation:
       :meth:`_execute_model_sweeping`.
     * The ``CorePredictionSniffer`` and ``PipelineException`` imports remain
       lazy (they live in ``views_pipeline_core``).
+
+Google Python Style.
 """
 
 from __future__ import annotations

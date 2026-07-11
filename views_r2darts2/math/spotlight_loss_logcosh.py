@@ -14,26 +14,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── v49 changes (minimal, from v47) ────────────────────────────────
 
-    1. **Level scale_factor = T** (was W). W=12 made level only 3.6% of
-       loss, causing the model to template the same shape for all countries
-       (shape was 96%). T=36 gives a 3x boost, bringing level to ~11%.
-       This is the midpoint between v46's 2*T (96% level, too much) and
-       v47's W (3.6%, too little).
+    1. **Level scale_factor = (W+T)//2** (was W in v47, T in v49a).
+       W=12 gave level=3.6% (templating). T=36 gave level=93% (underprediction).
+       (W+T)//2=24 gives level~50% — balanced with shape. Derived from
+       existing W and T, no new constant.
 
     2. **Event mag gate: (1+abs_max) → (1+abs_max)²**. At 90%+ sparsity,
        the few event cells need to dominate the Hájek ratio. Linear
        magnitude gave 5:1 large/small ratio; squared gives 25:1. This
        counters zero-dilution by making large events pull the gradient
-       proportionally harder. Bounded because abs_max is in asinh space
-       (max ~10), so (1+10)²=121 is the ceiling.
+       proportionally harder.
+
+    3. **Calibration std floor: clamp(min=non_zero_threshold)**. Prevents
+       z² explosion on sparse channels (ns) where few events per batch
+       give tiny std → enormous z² → channel router destabilizes.
+       Uses existing constructor parameter, no new constant.
 
     ── Components (unchanged from v47) ─────────────────────────────────
 
     1. DC/AC decomposition — per-window demeaning.
     2. Gated + magnitude-graded event weighting (now squared).
     3. Per-series temporal DRO (event-gated).
-    4. Windowed level anchor — T-scaled log_cosh on per-window means.
-    5. Relative z-score calibration — per-channel mean-matching (z²).
+    4. Windowed level anchor — (W+T)//2-scaled log_cosh on per-window means.
+    5. Relative z-score calibration — per-channel mean-matching (z², std-floored).
     6. Multi-resolution STFT loss (disabled by default).
     """
 
@@ -60,7 +63,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
 
-        logger.info("SpotlightLossLogcosh v49 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossLogcosh v49b | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -165,7 +168,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate
 
-        scale_factor = T  # CHANGED: was W, now T (3x boost to break templating)
+        scale_factor = (W + T) // 2  # CHANGED: was T, now midpoint of W and T
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
@@ -179,7 +182,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _calibration_loss(
         self, y_pred: torch.Tensor, y_true: torch.Tensor
     ) -> torch.Tensor:
-        """Relative z-score calibration on event cells. Per-channel."""
+        """Relative z-score calibration on event cells. Per-channel.
+
+        Floors true_std at non_zero_threshold to prevent z² explosion on
+        sparse channels where few events → tiny std → enormous z².
+        The floor is the existing constructor parameter, not a new constant.
+        """
         event_mask = (y_true.abs() > self.non_zero_threshold).float()
 
         if y_pred.dim() == 3:
@@ -188,7 +196,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             true_mean = (y_true * event_mask).sum(dim=(0, 1)) / n_event
             true_centered = (y_true - true_mean) * event_mask
             true_var = (true_centered ** 2).sum(dim=(0, 1)) / n_event
-            true_std = (true_var + self._EMA_EPS).sqrt()
+            # CHANGED: floor std at non_zero_threshold to prevent z² explosion
+            true_std = (true_var + self._EMA_EPS).sqrt().clamp(min=self.non_zero_threshold)
 
             z_score = (pred_mean - true_mean) / true_std
             cal = z_score ** 2
@@ -199,7 +208,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             true_mean = (y_true * event_mask).sum() / n_event
             true_centered = (y_true - true_mean) * event_mask
             true_var = (true_centered ** 2).sum() / n_event
-            true_std = (true_var + self._EMA_EPS).sqrt()
+            true_std = (true_var + self._EMA_EPS).sqrt().clamp(min=self.non_zero_threshold)
 
             z_score = (pred_mean - true_mean) / true_std
             cal = z_score ** 2

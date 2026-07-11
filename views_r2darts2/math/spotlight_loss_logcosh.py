@@ -5,7 +5,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class SpotlightLossLogCosh(torch.nn.Module):
+class SpotlightLossLogcosh(torch.nn.Module):
     """Minimal scale-normalized loss for zero-inflated conflict forecasting.
 
     Operates in asinh space (AsinhTransform target scaler) on ``(B, T, C)``
@@ -23,12 +23,12 @@ class SpotlightLossLogCosh(torch.nn.Module):
     other and gradient reaches both:
 
       * **Shape (temporal pattern).** Per-series demeaned residual
-        ``(pred - mean_t pred) - (true - mean_t true)`` under ``logcosh``.
+        ``(pred - mean_t pred) - (true - mean_t true)`` under ``Logcosh``.
         This scores the within-series dynamics only; a constant-wrong
         prediction is NOT free because the level term below catches its
         magnitude.
 
-      * **Level (soft-peak magnitude).** ``logcosh`` of
+      * **Level (soft-peak magnitude).** ``Logcosh`` of
         ``logsumexp_t(pred) - logsumexp_t(true)`` per series. Because asinh
         values are already log-scale, ``logsumexp`` over time is a smooth
         maximum dominated by the event peak — matching it forces the model
@@ -46,14 +46,14 @@ class SpotlightLossLogCosh(torch.nn.Module):
     ``non_zero_threshold``) focuses both terms on conflict cells, and
     **Hájek** (self-normalized) gated means keep peace-heavy and event-heavy
     batches comparable. Both terms live in the same asinh units and are
-    ``logcosh``-bounded, so they are naturally comparable and need no
+    ``Logcosh``-bounded, so they are naturally comparable and need no
     weighting hyperparameter. Channels are combined by a plain mean.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` is the ONLY tunable — the asinh-space boundary
     that separates peace from conflict (default use ≈ 0.88 ≈ asinh(1)).
-    Everything else is parameter-free: ``logcosh`` and ``logsumexp`` have no
+    Everything else is parameter-free: ``Logcosh`` and ``logsumexp`` have no
     knobs, and the level/shape balance and the under-prediction asymmetry
     are both emergent from the data rather than set by constants.
     """
@@ -69,14 +69,14 @@ class SpotlightLossLogCosh(torch.nn.Module):
         self.non_zero_threshold = non_zero_threshold
         self._last_components: dict | None = None
 
-        logger.info("SpotlightLossLogCosh | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _logcosh(z: torch.Tensor) -> torch.Tensor:
+    def _Logcosh(z: torch.Tensor) -> torch.Tensor:
         # Numerically stable log(cosh(z)), up to an irrelevant additive
         # constant (log 2). Parameter-free robust penalty: quadratic near 0,
         # linear in the tails, no delta to tune. The 2 is the mathematical
@@ -107,7 +107,7 @@ class SpotlightLossLogCosh(torch.nn.Module):
         # cannot absorb a magnitude error — that is the level term's job.
         pred_bar = y_pred.mean(dim=1, keepdim=True)
         true_bar = y_true.mean(dim=1, keepdim=True)
-        shape_cell = self._logcosh((y_pred - pred_bar) - (y_true - true_bar))
+        shape_cell = self._Logcosh((y_pred - pred_bar) - (y_true - true_bar))
 
         # ── Level term: soft-peak magnitude (DC) ──────────────────────
         # logsumexp over time is a smooth max; in asinh (log-scale) units it
@@ -115,7 +115,7 @@ class SpotlightLossLogCosh(torch.nn.Module):
         # so the correction concentrates on the current peak and — since the
         # model sits below the true peak — pushes it up. Dynamic, data-driven
         # asymmetry with no coefficient.
-        level_cell = self._logcosh(
+        level_cell = self._Logcosh(
             torch.logsumexp(y_pred, dim=1) - torch.logsumexp(y_true, dim=1)
         )
         # Per-series event mass, so peace-only series don't drown the level
@@ -140,7 +140,7 @@ class SpotlightLossLogCosh(torch.nn.Module):
             comp = [float(total_loss.detach())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossLogCosh: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
 
         # Telemetry: shape/level now carry their real per-channel values.
         n = len(comp)
@@ -157,10 +157,10 @@ class SpotlightLossLogCosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossLogCosh | shape=%s level=%s total=%.6f",
+            "SpotlightLossLogcosh | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossLogCosh(non_zero_threshold={self.non_zero_threshold})"
+        return f"SpotlightLossLogcosh(non_zero_threshold={self.non_zero_threshold})"

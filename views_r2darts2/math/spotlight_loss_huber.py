@@ -17,24 +17,28 @@ class SpotlightLossHuber(torch.nn.Module):
     The loss scores the **raw error** ``e = y_pred - y_true`` — level and
     shape are penalized jointly, so a constant-correct prediction is
     correctly rewarded and bursty predictions are not "free" (no per-window
-    demeaning). Magnitude imbalance across series (Ukraine-scale asinh≈13 vs
-    low-intensity asinh≈1) is removed by **per-series, per-channel
-    standardization**: the error is divided by the series' own asinh-space
-    standard deviation, floored at ``non_zero_threshold``. This makes every
-    series contribute comparable gradient magnitude, which:
+    demeaning). Channel magnitude imbalance (sb/ns/os differ in sparsity and
+    scale) is removed by **per-channel standardization**: the error is
+    divided by the channel's own asinh-space standard deviation (computed
+    across series and time), floored at ``non_zero_threshold``. This is a
+    *shared* per-channel scale, deliberately NOT per-series — a per-series
+    scale divides each window by its own spread, shrinking the gradient on
+    the high-intensity windows that raw-space MSLE (≈ MSE-in-asinh) most
+    cares about, which causes chronic under-prediction of large events. The
+    shared scale instead:
 
-      * prevents templating (no single high-magnitude series dominates the
-        batch gradient), so a strong convex loss can be used without the
-        gradient saturation that causes underprediction; and
-      * scales automatically across the three channels despite very
-        different sparsity, with no per-channel hyperparameters.
+      * keeps the three channels contributing comparable gradient magnitude
+        (no per-channel hyperparameters); while
+      * preserving each series' true error magnitude, so large events are
+        pushed up rather than equalized away.
 
     A robust **Huber** penalty on the standardized error keeps large events
-    influential without exploding on outliers. A single soft **event gate**
-    (keyed to ``non_zero_threshold``) concentrates emphasis on conflict
-    cells, and a **Hájek** (self-normalized) gated mean keeps peace-heavy
-    and event-heavy batches comparable. Channels are combined by a plain
-    mean.
+    influential without letting any single series dominate the batch
+    gradient (its bounded gradient is what prevents templating). A single
+    soft **event gate** (keyed to ``non_zero_threshold``) concentrates
+    emphasis on conflict cells, and a **Hájek** (self-normalized) gated mean
+    keeps peace-heavy and event-heavy batches comparable. Channels are
+    combined by a plain mean.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -70,10 +74,17 @@ class SpotlightLossHuber(torch.nn.Module):
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
 
-        # ── Per-series, per-channel scale (data-driven) ───────────────
-        # std over the time axis; floored at tau so peace-only series
-        # (near-zero variance) do not blow up the normalized error.
-        s = y_true.std(dim=1, keepdim=True).clamp_min(tau)
+        # ── Per-channel scale (data-driven, across series) ────────────
+        # std over batch AND time, per channel, floored at tau. Crucially
+        # this is NOT per-series: a per-series std divides each window by
+        # its own spread, which shrinks the gradient on exactly the
+        # high-intensity windows that raw-space MSLE (≈ MSE-in-asinh) cares
+        # about → chronic under-prediction of large events. A shared
+        # per-channel scale keeps the three channels comparable (the
+        # anti-templating goal) while letting big events keep their full
+        # error magnitude; Huber still bounds any single cell so no one
+        # series can dominate the batch gradient.
+        s = y_true.std(dim=(0, 1), keepdim=True).clamp_min(tau)
 
         # ── Scale-normalized robust base loss ─────────────────────────
         # Level + shape penalized jointly on the raw error. Standardization

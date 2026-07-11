@@ -251,47 +251,26 @@ def apply_rinorm_compression_patch():
         return x
 
     def _raw_space_inverse(self, x: torch.Tensor):
-        # x shape: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
-            x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
-            x = x / (
-                self.affine_weight.view(self.affine_weight.shape + (1,))
-                + self.eps * self.eps
-            )
+            if x.dim() == 4:
+                aw = self.affine_weight.unsqueeze(-1)  # (1,1,C,1)
+                ab = self.affine_bias.unsqueeze(-1)
+            else:
+                aw = self.affine_weight  # (1,1,C)
+                ab = self.affine_bias
+            x = x - ab
+            x = x / aw.clamp(min=self.eps)  # FIX: eps not eps², use clamp
 
-        sigma = self.stdev.view(self.stdev.shape + (1,))
-        mu = self.mean.view(self.mean.shape + (1,))
+        sigma = self.stdev
+        mu = self.mean
 
-        # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
-        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
         x = torch.clamp(x, -50.0, 50.0)
 
-        # Expand and denormalize.
-        # When using a likelihood (e.g. Gaussian/Laplace), Darts passes the raw
-        # parameter tensor of shape (..., nr_params) through this inverse BEFORE
-        # loss computation.  Only the LOCATION parameter (index 0) should receive
-        # the full nonlinear inverse (asinh(sinh(x)×σ) + μ).
-        #
-        # SCALE parameters (index 1+) must NOT go through asinh(sinh(·)×σ).
-        # Reason: σ_raw for high-conflict series can be 100+.  The transform
-        # asinh(sinh(1.0)×100) ≈ 5.5, producing a Laplace b ≈ 5.5 in asinh-space.
-        # The 5% tail samples then land at μ±16.5 in asinh-space → sinh(16.5) ≈
-        # 7.3 million deaths.  But the ENTIRE target range in asinh-space is
-        # only ~7 (asinh(500)≈6.9).  The natural uncertainty scale is O(1-3).
-        #
-        # Fix: scale parameters pass through as IDENTITY.  The model learns the
-        # absolute scale of uncertainty directly in target (asinh) space.  The
-        # NLL gradient naturally calibrates scale to the empirical residual
-        # magnitude (~0.3 for peace, ~1-3 for conflict).  No σ amplification.
         if x.dim() == 4 and x.shape[-1] > 1:
-            # x[..., 0]: location parameter — full nonlinear inverse
-            loc = torch.asinh(torch.sinh(x[..., :1]) * sigma) + mu
-            # x[..., 1+]: scale/dispersion — identity (model learns in target space)
+            loc = torch.asinh(torch.sinh(x[..., :1]) * sigma.unsqueeze(-1)) + mu.unsqueeze(-1)
             sca = x[..., 1:]
             x = torch.cat([loc, sca], dim=-1)
         else:
-            # Point forecasting (nr_params == 1) — full inverse as before
             x = torch.asinh(torch.sinh(x) * sigma) + mu
 
         return x

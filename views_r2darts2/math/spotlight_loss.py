@@ -6,234 +6,240 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class SpotlightLoss(torch.nn.Module):
+class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v37 — asinh + RevIN compatible, with DRO aggregation.
-
     Operates in asinh space (AsinhTransform target scaler). Designed for
-    UCDP GED conflict fatality forecasting: ~90% zeros, 10% spanning
-    four orders of magnitude in raw deaths.
+    UCDP GED conflict fatality forecasting at country-month level:
+    ~92% zeros for sb, ~97% for ns, ~98% for os.
 
-    ── Design rationale ─────────────────────────────────────────────────
+    ── v49e: level needs T-scale (evidence-based) ─────────────────────
 
-    Four orthogonal components, each addressing a specific failure mode:
+    1. **Level scale_factor = T** (reverted from W).
+       EVIDENCE: With scale=W, level=77-85% but eval UNDERPREDICTS.
+       Root cause: level is intrinsically harder than shape:
+       - Shape loss operates on demeaned errors → gradient to ALL W cells
+       - Level loss operates on window means → 1/W gradient attenuation
+       - At 90% sparsity, only 10% of windows have non-zero level
+       - Shape gets gradient from ALL windows (demeaned ≠ 0)
+       Level needs T-scale to compensate for BOTH the 1/W attenuation
+       AND the 90% zero-dilution of window means.
 
-    1. **DC/AC decomposition** — prevents RevIN DC offset amplification.
-       Error is demeaned per series: e_shape = e − mean(e). The shape
-       gradient sums to exactly zero per series (structural, not tuned):
+       Previous T runs failed because of the SQUARED MAG GATE (v49a-c),
+       not because of T itself. With linear mag + std floor, T is stable.
 
-           Σᵢ ∂L_shape/∂ŷᵢ = 0    ∀ series
+    2. **Event mag gate: linear (1+abs_max)** (kept from v49d).
+       EVIDENCE: The squared gate caused level to dominate (72-83%) by
+       shrinking the shape Hájek denominator. Linear keeps shape/level
+       balance correct.
 
-       Proof: e_shape = J·e where J = I − 11ᵀ/T is the centering matrix.
-       J has zero column sums → backprop through J zeroes out the DC
-       component of the gradient, regardless of per-cell weights.
+    3. **Calibration std floor: clamp(min=non_zero_threshold)** (kept).
+       EVIDENCE: Without the floor, ns channel EMA exploded to 51,767
+       because sparse channels have tiny std → z² explodes → router
+       destabilizes.
 
-       Why this matters with RevIN: RevIN denormalizes as ŷ = ẑ·σ + μ.
-       A small bias b in normalized space becomes b·σ in asinh space.
-       Through sinh (convex for x > 0), Jensen's inequality amplifies
-       this to E[sinh(b·σ)] > sinh(E[b·σ]) — exponential overprediction
-       in raw counts. The DC/AC split makes it structurally impossible
-       for the shape loss to accumulate any DC bias, period.
+    ── Components (unchanged from v47) ─────────────────────────────────
 
-    2. **Adaptive compound weighting** — parameter-free, replaces alpha.
-
-       Per-cell weight is the product of two bounded signals:
-
-           difficulty  = 1 − exp(−|e_shape|)            ∈ [0, 1)
-           importance  = 1 − exp(−max(|y|, |ŷ_sg|))    ∈ [0, 1)
-           w_compound  = 1 + difficulty × importance     ∈ [1, 2)
-
-       Both must be present for high weight: a cell must be **both hard
-       AND important**. Detached — no gradient coupling. Normalised to
-       mean=1 jointly with DRO weights.
-
-       Replaces the alpha-tuned `w = 1 + log_cosh(α · mag)` from v35.
-       Alpha was a hyperparameter controlling event budget; compound
-       weighting achieves this automatically — cells the model already
-       predicts well get difficulty→0 → w→1 regardless of magnitude.
-
-    3. **KL-DRO tail aggregation (log-space)** — parameter-free.
-
-       Instead of a plain mean over weighted shape losses, z-score
-       log(cell_loss) and apply concave-compressed DRO weights:
-
-           log_l = log(l + ε)
-           z = (log_l − mean(log_l)) / std(log_l)
-           dro_w = log1p(clamp(1+z, min=0))
-           dro_w = dro_w / mean(dro_w)
-
-       KL-DRO detects *proportional* outliers, not absolute. A
-       5-death miss at 10× the median loss gets the same DRO emphasis
-       as a 1000-death miss at 10× the median. Aligned with the
-       proportional error sensitivity of asinh-space prediction.
-
-       Soft activation α = log_std/(log_std + 1.0) blends toward
-       uniform when log-loss variance is small (early training).
-
-       Compound weight and DRO are combined independently (product,
-       normalised jointly to mean=1) — they address orthogonal concerns:
-       compound steers *which cells matter*, DRO steers *how losses
-       are aggregated* across the 90/10 peace/event split.
-
-    4. **Level anchor** — T-scaled log_cosh on per-series mean error.
-
-           L_level = T · mean_over_series[ log_cosh(mean(ŷ) − mean(y)) ]
-
-       The ONLY mechanism that can shift per-series means. Necessary
-       because the shape loss (DC/AC decomposed) is structurally blind
-       to level. T-scaling compensates for the 1/T chain-rule factor.
-       Natural curriculum: large mean error early → level dominates →
-       calibrate means first. Small mean error later → shape takes over.
-       Not DRO-weighted — operates on a fundamentally different
-       aggregation dimension (per-series means, not per-cell losses).
-
-    5. **Spectral regularization** (optional, gated by δ > 0).
-       Multi-resolution STFT magnitude comparison with DC bin masked.
-       Unchanged from v35. Phase-invariant; log_cosh on magnitude diffs.
-
-    ── Base cell loss: Barron(α=1.5) ───────────────────────────────────
-
-    From "A General and Adaptive Robust Loss Function" (Barron, CVPR 2019,
-    arXiv:1701.03077). At α=1.5, c=1 the general form reduces to:
-
-        ρ(x) = (1/3) · ((2x² + 1)^(3/4) − 1)
-
-    Near zero: ≈ x²/2 (smooth quadratic, same as log_cosh and MSE).
-    Large |x|: ~ 0.56·|x|^1.5 (super-linear growth).
-
-    Gradient: x · (2x² + 1)^(−1/4)  — grows as √|x|, never saturates.
-
-    Comparison with log_cosh at key error magnitudes:
-
-        |x|   log_cosh'(x)   soft_power'(x)
-         1      0.76            0.76          (identical)
-         3      0.995           1.44          (+45%)
-         5      1.000           1.87          (+87%)
-         7      1.000           2.22          (+122%)
-        10      1.000           2.66          (+166%)
-
-    Why this matters: in asinh-space, a unit error at location x maps to
-    cosh(x) raw-space units through the sinh inverse.  log_cosh gradient
-    saturates at ±1, providing bounded pushback regardless of how
-    catastrophic the error is in raw space.  Architectures with bounded
-    output (N-BEATS basis projection) never produce large |e_shape|, so
-    saturation is irrelevant. Architectures with unconstrained output
-    (TSMixer fc_out, N-HiTS interpolation) can push cells beyond where
-    log_cosh provides meaningful correction — the saturated gradient
-    cannot train the model to tighten its predictions.
-
-    Barron(1.5) fixes this: the √|x| gradient growth provides
-    correction proportional to the overshoot without saturating.
-    Perfectly symmetric — no bias toward over- or underprediction.
-
-    Level anchor and spectral loss retain log_cosh: the level anchor's
-    saturating gradient is desirable (natural curriculum), and spectral
-    magnitudes are bounded in practice.
-
-    ── Changes from v36 ─────────────────────────────────────────────────
-
-    - Base cell loss changed from log_cosh to Barron(α=1.5).
-      No new hyperparameters — α=1.5 and c=1 are fixed design choices.
-    - Level anchor unchanged (log_cosh). Spectral unchanged (log_cosh).
-    - Weighting, DRO, DC/AC decomposition all unchanged.
-
-    ── Changes from v35 → v36 ───────────────────────────────────────────
-
-    - `alpha` parameter removed. Compound weighting is parameter-free.
-    - KL-DRO aggregation replaces simple weighted mean on shape loss.
-    - Compound weight (difficulty × importance) replaces alpha-scaled
-      log_cosh importance weight.
-    - Level anchor unchanged. Spectral unchanged.
-
-    ─────────────────────────────────────────────────────────────────────
-
-    Args:
-        delta: Spectral loss weight. 0.0 = disable.
-            0.10–0.15 = spectral is ~15–25% of gradient.
-            Range: [0.05, 0.20].
-        non_zero_threshold: Transformed-space cutoff for spectral signal
-            filtering (which series get spectral comparison).
-            Value depends on target scaler:
-            - AsinhTransform: 0.88 ≈ asinh(1)
-            - FourthRootTransform: 0.19 ≈ (1+1)^0.25 − 1
-
-    Example:
-        >>> loss_fn = SpotlightLoss(delta=0.10, non_zero_threshold=0.19)
-        >>> y_pred = torch.randn(8, 36)  # transformed-space predictions
-        >>> y_true = torch.zeros(8, 36)
-        >>> y_true[:, 10:15] = 2.5
-        >>> loss = loss_fn(y_pred, y_true)
-        >>> loss.backward()
+    1. DC/AC decomposition — per-window demeaning.
+    2. Gated + magnitude-graded event weighting (linear).
+    3. Per-series temporal DRO (event-gated).
+    4. Windowed level anchor — T-scaled log_cosh on per-window means.
+    5. Relative z-score calibration — per-channel mean-matching (z², std-floored).
+    6. Multi-resolution STFT loss (disabled by default).
     """
 
-    SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
+    _SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
+    _STFT = False
+    _EMA_BETA = 0.99
+    _EMA_EPS = 1e-6
 
     def __init__(
         self,
-        delta: float,
         non_zero_threshold: float,
-        alpha: float = 0.0,  # deprecated — ignored, kept for backward compat
     ):
-        if alpha != 0.0:
-            logger.warning(
-                "SpotlightLoss v36: alpha is deprecated and ignored. "
-                "Compound weighting + KL-DRO replaces alpha-based importance. "
-                "Remove alpha from your config. (received alpha=%.4f)",
-                alpha,
-            )
-        if delta < 0.0:
-            raise ValueError(f"SpotlightLoss: delta must be non-negative, got {delta}")
         if non_zero_threshold <= 0.0:
             raise ValueError(
-                f"SpotlightLoss: non_zero_threshold must be positive, got {non_zero_threshold}"
+                f"non_zero_threshold must be positive, got {non_zero_threshold}"
             )
 
         super().__init__()
-        self.delta = delta
         self.non_zero_threshold = non_zero_threshold
 
-        logger.info(
-            "SpotlightLoss v37 (DRO+Barron) | delta=%.4f threshold=%.4f",
-            delta, non_zero_threshold,
-        )
+        self._loss_ema: list[float] | None = None
+        self._loss_ema_slow: list[float] | None = None
+
+        self._last_components: dict | None = None
+        self._last_weights: list[float] | None = None
+
+        logger.info("SpotlightLossLogcosh v49b-barron | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Static helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
-        """log(cosh(x)), numerically stable: |x| + softplus(−2|x|) − ln2.
-
-        Used by level anchor and spectral loss (NOT shape loss).
-        """
+        """log(cosh(x)), numerically stable: |x| + softplus(−2|x|) − ln2."""
         abs_x = torch.abs(x)
         return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
 
     @staticmethod
-    def _soft_power(x: torch.Tensor) -> torch.Tensor:
-        """Barron's general loss at α=1.5, c=1 (CVPR 2019).
+    def _barron(x: torch.Tensor) -> torch.Tensor:
+        """Barron general robust loss at alpha=1.5, c=1.
 
-        ρ(x) = (1/3) · ((2x² + 1)^(3/4) − 1)
-
-        Near zero: ≈ x²/2 (smooth quadratic).
-        Large |x|: ~ 0.56·|x|^1.5 (super-linear, gradient never saturates).
-        Gradient: x · (2x² + 1)^(-1/4) — grows as √|x|.
-
-        Reference: "A General and Adaptive Robust Loss Function",
-        Jonathan T. Barron, CVPR 2019. arXiv:1701.03077
+        rho(x) = (1/3) * ((2x^2 + 1)^0.75 - 1)
+        Gradient: x * (2x^2 + 1)^{-0.25} — grows as O(|x|^0.5), never saturates.
+        Near zero: ~x^2/2 (quadratic, same as log-cosh).
         """
-        return ((2.0 * x * x + 1.0).pow(0.75) - 1.0) / 3.0
+        return (1.0 / 3.0) * ((2.0 * x * x + 1.0).pow(0.75) - 1.0)
+
+    def _dro_weights_2d(
+        self,
+        losses: torch.Tensor,
+        soft_event_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Event-aware per-series DRO with robust denominator."""
+        l = losses.detach()
+        m = soft_event_mask.detach().to(dtype=l.dtype).clamp(min=0.0, max=1.0)
+
+        def _wmean(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            den = w.sum(dim=1, keepdim=True).clamp(min=self._EMA_EPS)
+            return (x * w).sum(dim=1, keepdim=True) / den
+
+        T = int(l.shape[1])
+        W = max(6, T // 3)
+        n_blocks = max(1, (T + W - 1) // W)
+
+        means = []
+        for lb, mb in zip(torch.tensor_split(l, n_blocks, dim=1), torch.tensor_split(m, n_blocks, dim=1)):
+            means.append(_wmean(lb, mb))
+        mom = torch.cat(means, dim=1)
+        mu = mom.median(dim=1, keepdim=True).values.clamp(min=self._EMA_EPS)
+
+        w = torch.sqrt(l / mu)
+
+        w_active_mean = _wmean(w, m).clamp(min=self._EMA_EPS)
+        w_normalized_active = w / w_active_mean
+
+        w = 1.0 + m * (w_normalized_active - 1.0)
+
+        return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
+
+    # ------------------------------------------------------------------
+    # Loss Components
+    # ------------------------------------------------------------------
+
+    def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Combine per-channel losses by relative learning progress."""
+        C = per_channel_loss.shape[0]
+        batch_loss_det = per_channel_loss.detach()
+        beta = self._EMA_BETA
+
+        if (
+            self._loss_ema is None
+            or self._loss_ema_slow is None
+            or len(self._loss_ema) != C
+        ):
+            self._loss_ema = batch_loss_det.tolist()
+            self._loss_ema_slow = batch_loss_det.tolist()
+        else:
+            if self.training:
+                for c in range(C):
+                    self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
+                    self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
+
+        fast = per_channel_loss.new_tensor(self._loss_ema)
+        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
+        scores = fast / slow.clamp(min=self._EMA_EPS)
+        w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
+
+        self._last_weights = w_soft.tolist()
+        self._last_cal_ratio = scores.tolist()
+        self._last_cal_score = list(self._loss_ema)
+        self._last_gates = w_soft.tolist()
+
+        return (w_soft * per_channel_loss).sum()
+
+    def _windowed_level_loss(
+        self, e: torch.Tensor, y_true: torch.Tensor, T: int,
+        y_pred_det: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Event-gated windowed level anchor with W-scaled Hájek normalization.
+
+        scale_factor = W compensates the 1/W gradient attenuation from the
+        mean operator. This is the mathematically exact inverse.
+        """
+        W = max(6, T // 3)
+        window_means = torch.stack(
+            [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
+        )
+        level_losses = self._barron(window_means)
+
+        if y_pred_det is not None:
+            abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
+        else:
+            abs_max_series = y_true.abs()
+        series_mag = abs_max_series.max(dim=1).values
+        series_gate = torch.sigmoid(
+            10.0 * (series_mag - self.non_zero_threshold)
+        )
+        series_w = series_gate
+
+        scale_factor = T  # Level needs T-scale: compensates 1/W mean attenuation AND 90% sparsity (only 10% of windows have non-zero level). Shape gets gradient from ALL windows; level only from event windows. T restores the balance.
+        n_windows = level_losses.shape[1]
+        if level_losses.dim() == 3:
+            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
+            den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)
+            return scale_factor * num / den
+        else:
+            num = (series_w.unsqueeze(1) * level_losses).sum()
+            den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
+            return scale_factor * num / den
+
+    def _calibration_loss(
+        self, y_pred: torch.Tensor, y_true: torch.Tensor
+    ) -> torch.Tensor:
+        """Relative z-score calibration on event cells. Per-channel.
+
+        Floors true_std at non_zero_threshold to prevent z² explosion on
+        sparse channels where few events → tiny std → enormous z².
+        The floor is the existing constructor parameter, not a new constant.
+        """
+        event_mask = (y_true.abs() > self.non_zero_threshold).float()
+
+        if y_pred.dim() == 3:
+            n_event = event_mask.sum(dim=(0, 1)).clamp(min=1.0)
+            pred_mean = (y_pred * event_mask).sum(dim=(0, 1)) / n_event
+            true_mean = (y_true * event_mask).sum(dim=(0, 1)) / n_event
+            true_centered = (y_true - true_mean) * event_mask
+            true_var = (true_centered ** 2).sum(dim=(0, 1)) / n_event
+            # CHANGED: floor std at non_zero_threshold to prevent z² explosion
+            true_std = (true_var + self._EMA_EPS).sqrt().clamp(min=self.non_zero_threshold)
+
+            z_score = (pred_mean - true_mean) / true_std
+            cal = z_score ** 2
+            return cal
+        else:
+            n_event = event_mask.sum().clamp(min=1.0)
+            pred_mean = (y_pred * event_mask).sum() / n_event
+            true_mean = (y_true * event_mask).sum() / n_event
+            true_centered = (y_true - true_mean) * event_mask
+            true_var = (true_centered ** 2).sum() / n_event
+            true_std = (true_var + self._EMA_EPS).sqrt().clamp(min=self.non_zero_threshold)
+
+            z_score = (pred_mean - true_mean) / true_std
+            cal = z_score ** 2
+            return cal
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only)."""
         if y_pred.dim() == 3:
-            B, T, C = y_pred.shape
-            pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
-            true = y_true.permute(0, 2, 1).reshape(B * C, T)
-        else:
-            pred = y_pred
-            true = y_true
+            C = y_pred.shape[-1]
+            return torch.stack(
+                [self._spectral_loss(y_pred[..., c], y_true[..., c]) for c in range(C)]
+            )
+
+        pred = y_pred
+        true = y_true
 
         has_signal = (
             (torch.abs(true) > self.non_zero_threshold)
@@ -241,6 +247,7 @@ class SpotlightLoss(torch.nn.Module):
         ).any(dim=1)
         if not has_signal.any():
             return pred.new_tensor(0.0)
+
         pred = pred[has_signal]
         true = true[has_signal]
 
@@ -248,11 +255,10 @@ class SpotlightLoss(torch.nn.Module):
         total = pred.new_tensor(0.0)
         n_valid = 0
 
-        for n_fft, hop in self.SPECTRAL_RESOLUTIONS:
+        for n_fft, hop in self._SPECTRAL_RESOLUTIONS:
             if T < n_fft:
                 continue
-
-            window = torch.hann_window(n_fft, device=pred.device)
+            window = torch.hann_window(n_fft, device=pred.device, dtype=pred.dtype)
             S_pred = torch.stft(
                 pred, n_fft, hop_length=hop, win_length=n_fft,
                 window=window, center=False, return_complex=True,
@@ -261,19 +267,13 @@ class SpotlightLoss(torch.nn.Module):
                 true, n_fft, hop_length=hop, win_length=n_fft,
                 window=window, center=False, return_complex=True,
             )
-
-            # Safe magnitude: sqrt(re² + im² + ε) — bounded gradient.
-            # Do NOT use .abs() on pred side (gradient blows up at |z|→0).
             mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
             mag_true = S_true.abs()
-
-            # Mask DC bin — level is handled by the level anchor.
             mag_pred = mag_pred.clone()
             mag_true = mag_true.clone()
             mag_pred[:, 0, :] = 0.0
             mag_true[:, 0, :] = 0.0
-
-            total = total + self._log_cosh(mag_pred - mag_true).mean()
+            total = total + self._barron(mag_pred - mag_true).mean()
             n_valid += 1
 
         return total / max(n_valid, 1)
@@ -290,94 +290,110 @@ class SpotlightLoss(torch.nn.Module):
         T = y_pred.size(1)
         e = y_pred - y_true
 
-        # ── DC/AC decomposition ───────────────────────────────────────
-        # e_shape sums to zero per series → shape gradient is DC-free.
-        # This is the structural RevIN safety mechanism.
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
+        # ── Per-window DC/AC decomposition ────────────────────────────
+        W = max(6, T // 3)
+        windows = list(e.split(W, dim=1))
+        e_shape = torch.cat(
+            [w - w.mean(dim=1, keepdim=True) for w in windows], dim=1
+        )
 
-        # ── Base cell loss: Barron(1.5) on demeaned error ─────────────
-        cell_loss = self._soft_power(e_shape)
+        # ── Base cell loss ─────────────────────────────────────────────
+        cell_loss = self._barron(e_shape)
 
-        # ── Adaptive compound weighting (dynamic, self-correcting) ─────
-        # difficulty  = 1 − exp(−|e_shape|)  ∈ [0, 1) : how wrong
-        # importance  = 1 − exp(−|y_true|)   ∈ [0, 1) : how consequential
-        # w_compound  = 1 + difficulty × importance    ∈ [1, 2)
-        # Both signals must be present for high weight. Self-correcting:
-        # as |e|→0, difficulty→0 → w→1 regardless of |y|.
-        # Continuous importance: Syria (|y|≈5) → 0.993; 1-death (|y|≈0.88)
-        # → 0.59; peace (|y|=0) → 0. Proportional to actual fatality scale.
-        abs_e = torch.abs(e_shape.detach())
-        abs_y = torch.abs(y_true)
+        # ── Gated + magnitude-graded event weighting ──────────────────
+        # REVERTED to linear (1+abs_max). The squared version (v49a-c) caused
+        # level to dominate (72-83%) because it shrank the shape Hájek
+        # denominator faster than the numerator. Linear mag keeps the
+        # original v47 shape/level balance. The std floor on calibration
+        # handles the ns explosion that the squared gate was trying to fix.
+        abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
+        event_gate = torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
+        event_mag = event_gate * (1.0 + abs_max)  # REVERTED: was squared
 
-        difficulty = 1.0 - torch.exp(-abs_e)
-        importance = 1.0 - torch.exp(-abs_y)
-        w_compound = 1.0 + difficulty * importance
+        soft_event_mask = torch.sigmoid(
+            10.0 * (abs_max - self.non_zero_threshold)
+        )
+        w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)
+        w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
-        # ── KL-DRO tail aggregation (log-space z-scores) ──────────────
-        # Z-score log(cell_loss) for proportional outlier detection.
-        # Operates on raw cell_loss (before compound weighting).
-        # Flattened cross-series: event cells dominate the tail.
-        loss_flat = cell_loss.detach().flatten()
-        log_loss = torch.log(loss_flat + 1e-8)
-        log_std = log_loss.std()
+        # ── Hájek self-normalized shape ───────────────────────────────
+        if w_total.dim() == 3:
+            num = (w_total * cell_loss).sum(dim=(0, 1))
+            den = w_total.sum(dim=(0, 1)).clamp(min=self._EMA_EPS)
+            loss_shape = num / den
+        else:
+            num = (w_total * cell_loss).sum()
+            den = w_total.sum().clamp(min=self._EMA_EPS)
+            loss_shape = num / den
 
-        # CV-based alpha: self-normalizing, naturally bounded.
-        # CV=2→α≈0.52, CV=5→α≈0.64, CV=10→α≈0.71. Cannot saturate to 1.
-        log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
-        dro_alpha = log_cv / (log_cv + 1.0)
-        # Clamp at 0.1, not 1e-8: std<0.1 means losses span <1.1×,
-        # too little variation for meaningful z-scores. At 1e-8, z can
-        # reach 1e8 → log1p(1e8) ≈ 18.4 → NaN after normalisation × 0.
-        z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
-        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
-        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
-        w_dro = w_dro.view_as(cell_loss)
-        w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
+        # ── Windowed level anchor (T-scaled) ──────────────────────────
+        loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
 
-        # Combine compound × DRO, normalise jointly to mean=1
-        w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean()
-        # Safety: any residual NaN from degenerate batches → weight=1
-        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
+        # ── Calibration loss (relative z-score, z²) ───────────────────
+        loss_cal = self._calibration_loss(y_pred, y_true)
 
-        loss_shape = (w_total * cell_loss).mean()
+        # ── Spectral loss ──────────────────────────────────────────────
+        loss_spec = y_pred.new_tensor(0.0)
+        if self._STFT and T >= 6:
+            loss_spec = self._spectral_loss(y_pred, y_true)
 
-        # ── Level anchor: T-scaled Barron(1.5) on per-series mean error ──
-        # Only mechanism that can shift per-series means. Shape loss is
-        # structurally DC-blind. Not DRO-weighted — different dimension.
-        # T scaling: ∂L/∂ŷⱼ = T · ρ'(ē) · (1/T) = ρ'(ē) per cell.
-        # Barron replaces log_cosh: gradient grows as √|ē| instead of
-        # saturating at ±1. At ē=5 (Syria-level offset): Barron gives
-        # 1.87 vs log_cosh's saturated 1.0 — 87% more restoring force.
-        # No saturation → level correction scales with actual bias magnitude.
-        loss_level = T * self._soft_power(e_mean.squeeze(1)).mean()
+        # ── Assemble total ────────────────────────────────────────────
+        if loss_shape.dim() == 0:
+            total_loss = loss_shape + loss_level + loss_cal + loss_spec
+            self._last_components = {
+                "shape": [float(loss_shape.detach())],
+                "level": [float(loss_level.detach())],
+                "cal": [float(loss_cal.detach())],
+                "spec": [float(loss_spec.detach()) if loss_spec.dim() == 0 else float(loss_spec)],
+                "weight": [1.0],
+            }
+        else:
+            per_channel_total = loss_shape + loss_level + loss_cal
+            if loss_spec.dim() == 0:
+                per_channel_total = per_channel_total + float(loss_spec)
+            else:
+                per_channel_total = per_channel_total + loss_spec
 
-        # ── Spectral: AC bins only ────────────────────────────────────
-        loss_spectral = y_pred.new_tensor(0.0)
-        if self.delta > 0.0 and T >= 6:
-            loss_spectral = self._spectral_loss(y_pred, y_true)
+            total_loss = self._combine_channels(per_channel_total, y_pred, y_true)
 
-        total_loss = loss_shape + loss_level + self.delta * loss_spectral
+            C = per_channel_total.shape[0]
+            spec_list = loss_spec.detach().tolist() if loss_spec.dim() else [float(loss_spec)] * C
+            cal_list = loss_cal.detach().tolist() if loss_cal.dim() else [float(loss_cal)] * C
+            weights = self._last_weights or [1.0] * C
+            self._last_components = {
+                "shape": loss_shape.detach().tolist(),
+                "level": loss_level.detach().tolist(),
+                "cal": cal_list,
+                "spec": spec_list,
+                "weight": weights,
+                "ema": self._loss_ema_slow or [float("nan")] * C,
+                "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
+                "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
+                "gates": getattr(self, "_last_gates", [1.0] * C),
+                "contribution": [
+                    weights[c] * float(per_channel_total.detach()[c]) for c in range(C)
+                ],
+            }
 
         if torch.isnan(total_loss):
+            _s = float(loss_shape.sum()) if loss_shape.dim() else float(loss_shape)
+            _l = float(loss_level.sum()) if loss_level.dim() else float(loss_level)
+            _c = float(loss_cal.sum()) if loss_cal.dim() else float(loss_cal)
+            _sp = float(loss_spec.sum()) if loss_spec.dim() else float(loss_spec)
             raise RuntimeError(
-                f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} spectral={loss_spectral.item():.6f}"
+                f"NaN in SpotlightLossLogcosh: shape={_s:.6f} level={_l:.6f} "
+                f"cal={_c:.6f} spec={_sp:.6f}"
             )
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f level=%.6f spec=%.6f total=%.6f",
-            loss_shape.item(),
-            loss_level.item(),
-            loss_spectral.item(),
+            "SpotlightLossLogcosh v49-barron | shape=%.6f level=%.6f cal=%.6f spec=%.6f total=%.6f",
+            loss_shape.item() if loss_shape.dim() == 0 else loss_shape.sum().item(),
+            loss_level.item() if loss_level.dim() == 0 else loss_level.sum().item(),
+            loss_cal.item() if loss_cal.dim() == 0 else loss_cal.sum().item(),
+            loss_spec.item() if loss_spec.dim() == 0 else loss_spec.sum().item(),
             total_loss.item(),
         )
-
         return total_loss
 
     def __repr__(self) -> str:
-        return (
-            f"SpotlightLoss(delta={self.delta}, "
-            f"non_zero_threshold={self.non_zero_threshold})"
-        )
+        return f"SpotlightLossLogcosh(non_zero_threshold={self.non_zero_threshold})"

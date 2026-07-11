@@ -180,13 +180,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """Per-cell level loss on raw asinh error, no windowing.
 
         - Error is ``y_pred - y_true`` (both in asinh space).
-        - ``log_cosh`` on each cell, then weighted by ``event_mag``, summed over
-          time and batch, and self-normalized via the sum of ``event_mag``
-          (Hájek). This gives sustained conflict series proportionally more total
-          gradient and is composition-robust.
+        - Uses a *scaled* ``log_cosh`` on each cell with data-driven scale
+          ``c`` computed from event-weighted absolute error in the current
+          batch.
+        - Weighted by ``event_mag``, then self-normalized (Hájek), making the
+          level term composition-robust under heavy zero inflation.
         """
         e = y_pred - y_true
-        cell_lev = self._log_cosh(e)
+
+        # Data-driven robust scale per channel (or scalar in univariate):
+        # c = E_w[|e|], using the same event weights that define level mass.
+        if e.dim() == 3:
+            c = (event_mag * e.abs()).sum(dim=(0, 1), keepdim=True)
+            c = c / event_mag.sum(dim=(0, 1), keepdim=True).clamp_min(self._EMA_EPS)
+        else:
+            c = (event_mag * e.abs()).sum().view(1, 1)
+            c = c / event_mag.sum().clamp_min(self._EMA_EPS)
+
+        c = c.clamp_min(self._EMA_EPS)
+        z = e / c
+        cell_lev = c * (z.abs() + F.softplus(-2.0 * z.abs()) - math.log(2.0))
 
         weighted = event_mag * cell_lev
 

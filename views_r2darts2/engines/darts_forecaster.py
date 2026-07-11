@@ -420,34 +420,49 @@ class DartsForecaster:
                 skipped_boundary,
             )
         else:
-            # Prediction path: no min_length filter, no boundary check.
-            # All entities are included — the model needs to predict for every
-            # entity, even those with short histories.
-            targets = [
-                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
-                for s in timeseries_float
-            ]
-            past_cov = None
+            # Prediction path: filter out entities whose slice is EMPTY.
+            # Some entities in the validation parquet end before the val window
+            # starts (e.g., entity 59 ends at month 379, but the val window is
+            # [481, 553]). Slicing such an entity to the val window produces a
+            # zero-length TimeSeries, which then crashes the scaler's
+            # ``transform`` with ``Found array with 0 sample(s)``. Filter them
+            # out here — the model cannot predict for an entity with no input
+            # context anyway.
+            #
+            # Unlike train_mode, we do NOT enforce a min_length or boundary
+            # check here: prediction must include every entity that has ANY
+            # data in the window, even if its history is shorter than the
+            # ideal input chunk length (Darts will pad/truncate as needed).
+            targets = []
+            past_cov = []
+            skipped_empty = 0
+            for s in timeseries_float:
+                sliced_target = s.slice(start_ts=start, end_ts=end + 1)[
+                    self.dataset.targets
+                ]
+                if len(sliced_target) == 0:
+                    skipped_empty += 1
+                    continue
+                targets.append(sliced_target)
+                if self.dataset.features:
+                    sliced_cov = s.slice(start_ts=start, end_ts=end + 1)[
+                        self.dataset.features
+                    ].astype(np.float32)
+                    past_cov.append(sliced_cov)
+            if skipped_empty > 0:
+                logger.info(
+                    "Prediction filter: %d/%d entities had empty slices for "
+                    "window [%d, %d] and were skipped.",
+                    skipped_empty,
+                    len(timeseries_float),
+                    start,
+                    end,
+                )
+            past_cov = past_cov if self.dataset.features else None
 
-        # Slice past covariates for the PREDICTION path only.
-        # In train_mode, past_cov was already built as a FILTERED list above
-        # (the paired filter ensures targets[i] and past_cov[i] come from the
-        # same entity). Rebuilding it here from the unfiltered timeseries_float
-        # would defeat the paired filter and cause entity misalignment — the
-        # exact bug the legacy code's comment at the top of this block warns
-        # about, yet the legacy code then immediately reintroduces by running
-        # this unfiltered rebuild unconditionally.
-        if not train_mode and self.dataset.features:
-            past_cov = [
-                s.slice(start_ts=start, end_ts=end + 1)[
-                    self.dataset.features
-                ].astype(np.float32)
-                for s in timeseries_float
-            ]
+        # Apply log transforms.
+        if not train_mode and past_cov is not None:
             past_cov = self._apply_log_to_features(past_cov)
-        elif not train_mode:
-            past_cov = None
-        # In train_mode with features, apply log to the already-filtered past_cov.
         if train_mode and past_cov is not None:
             past_cov = self._apply_log_to_features(past_cov)
 

@@ -496,6 +496,66 @@ class TestDartsForecasterPreprocess:
         assert len(past_cov) == 1
         assert fc.scaler_fitted is True
 
+    def test_preprocess_prediction_skips_empty_slices(self) -> None:
+        """Prediction-mode preprocess must skip entities with empty slices.
+
+        An entity whose data ends before the prediction window starts produces
+        a zero-length TimeSeries when sliced. Passing that to the scaler's
+        ``transform`` crashes with ``Found array with 0 sample(s)``. The fix:
+        filter out empty slices in the prediction path.
+
+        Build a synthetic dataset where entity 1 has data 121..200 and
+        entity 2 has data 121..400. Predict for window [300, 400] — entity 1
+        (ends at 200) produces an empty slice and must be skipped.
+        """
+        from views_frames import (
+            FeatureFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+        )
+        from views_r2darts2.data.views_dataset import ViewsDatasetDarts
+
+        # Entity 1: 121..200 (80 rows). Entity 2: 121..400 (280 rows).
+        time_1 = np.arange(121, 201, dtype=np.int64)
+        time_2 = np.arange(121, 401, dtype=np.int64)
+        time = np.concatenate([time_1, time_2])
+        entity = np.concatenate(
+            [np.full(80, 1, dtype=np.int64), np.full(280, 2, dtype=np.int64)]
+        )
+        values = np.random.randn(360, 2, 1).astype(np.float32)
+        index = SpatioTemporalIndex(
+            time=time, unit=entity, level=SpatialLevel.CM
+        )
+        frame = FeatureFrame(values, index=index, feature_names=["feat1", "target"])
+        ds = ViewsDatasetDarts(
+            feature_frame=frame,
+            targets=["target"],
+            features=["feat1"],
+        )
+        fc = DartsForecaster(
+            dataset=ds,
+            model=_make_mock_model(input_chunk_length=12, output_chunk_length=6),
+            partition_dict={"train": (121, 400), "test": (401, 500)},
+            target_scaler="MinMaxScaler",
+            feature_scaler="RobustScaler",
+            random_state=42,
+        )
+        series = ds.as_darts_timeseries()
+        # First fit the scalers via train-mode preprocess.
+        fc._preprocess_timeseries(
+            timeseries=series, start=121, end=400, train_mode=True
+        )
+        assert fc.scaler_fitted is True
+
+        # Now predict for window [300, 400] — entity 1 (ends at 200) is empty.
+        targets, past_cov = fc._preprocess_timeseries(
+            timeseries=series, start=300, end=400, train_mode=False
+        )
+        # Only entity 2 has data in [300, 400] (101 rows). Entity 1 is skipped.
+        assert len(targets) == 1
+        assert past_cov is not None
+        assert len(past_cov) == 1
+
 
 # ----------------------------------------------------------------------
 # Predict contract tests

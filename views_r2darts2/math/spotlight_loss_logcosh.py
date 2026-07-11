@@ -100,52 +100,71 @@ class SpotlightLossLogcosh(torch.nn.Module):
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
 
-        # ── Sharp event gate (restored slope 10) ─────────────────────────
+        # ── Sharp event gate (restored slope 10) ─────────────────────
+        # Peace cells at ~0.48 → gate < 0.02; conflict cells > 0.5.
+        # This keeps gradient focused on real events.
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Shape term: unchanged ────────────────────────────────────────
+        # ── Shape term: within-series temporal pattern (AC) ───────────
+        # Demeaned per series, quadratic, standardized – unchanged.
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
-        # ── Level term: quadratic total mass ─────────────────────────────
-        # Plain sum (no logsumexp, no logcosh) – gradient per timestep grows
-        # with the total underprediction, directly fixing the level gap.
+        # ── Level term: quadratic total mass ──────────────────────────
+        # Sum over time matches total event mass; quadratic penalty gives
+        # gradient that grows with the underprediction, directly fixing
+        # the level gap without saturating. No logsumexp, no logcosh.
         level_cell = (y_pred.sum(dim=1) - y_true.sum(dim=1)) ** 2
 
         # Per‑series event mass, so peace‑only series contribute almost nothing.
-        w = gate.amax(dim=1)
+        w = gate.amax(dim=1)  # (B, C) – high if any timestep has an event
 
-        # ── Normalisation ─────────────────────────────────────────────────
+        # ── Normalisation ─────────────────────────────────────────────
         if multivariate:
-            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (w * level_cell).mean(dim=0)   # mean over batch, scaled by w
+            # Shape: Hájek self‑normalised gated mean
+            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(
+                dim=(0, 1)
+            ).clamp_min(self._EPS)
+            # Level: mean over batch, weighted by per‑series event mass
+            level = (w * level_cell).mean(dim=0)
             per_channel = shape + level
             total_loss = per_channel.mean()
+            shape_c = shape.detach().tolist()
+            level_c = level.detach().tolist()
+            comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
             level = (w * level_cell).mean()
             total_loss = shape + level
+            shape_c = [float(shape.detach())]
+            level_c = [float(level.detach())]
+            comp = [float(total_loss.detach())]
 
-        # ── Telemetry (unchanged structure) ───────────────────────────────
-        n = 1  # Placeholder since comp is not defined
+        if torch.isnan(total_loss):
+            raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
+
+        # ── Telemetry ─────────────────────────────────────────────────
+        n = len(comp)
         self._last_components = {
-            "shape": shape,
-            "level": level,
+            "shape": shape_c,
+            "level": level_c,
             "spec": [0.0] * n,
             "weight": [1.0] * n,
             "ema": [float("nan")] * n,
             "cal_ratio": [1.0] * n,
             "cal_score": [1.0] * n,
             "gates": [1.0] * n,
-            "contribution": [total_loss.item()],
+            "contribution": comp,
         }
 
         logger.debug(
             "SpotlightLossLogcosh | shape=%s level=%s total=%.6f",
-            shape, level, total_loss.item(),
+            shape_c,
+            level_c,
+            total_loss.item(),
         )
         return total_loss
 

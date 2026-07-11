@@ -95,15 +95,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level term: MSE on temporal sum ─────────────────────────
-        # MSE on sum gives unbounded gradient (2*sum_error/T per cell)
-        # that grows with total magnitude error. Stability comes from
-        # the sum itself: aggregating T=36 timesteps reduces spike
-        # variance by √T ≈ 6×. This is safer than per-cell MSE while
-        # still providing magnitude-proportional gradient (unlike
-        # logcosh which saturates at ±1 for any sum > 3).
-        sum_error = y_pred.sum(dim=1) - y_true.sum(dim=1)
-        level_cell = (sum_error ** 2) / T
+        # ── Level term: MSE on temporal MEAN (magnitude-aware, clip-safe) ─
+        # MSE on the temporal MEAN (not sum) gives gradient 2*mean_error/T
+        # per cell — magnitude-proportional but scaled down by T² vs sum-MSE.
+        # This keeps the gradient within the gradient_clip_val range so the
+        # clip doesn't neutralize the level signal (which caused the
+        # epoch-0 overshoot → epoch-2 collapse pattern with sum-MSE).
+        # The mean still aggregates T=36 timesteps (√T spike reduction).
+        #
+        # Gradient comparison (sustained 50% underprediction):
+        #   sb (truth=3): mean_error=-1.5, grad=2*(-1.5)/36=-0.083 per cell
+        #   os (truth=9): mean_error=-4.5, grad=2*(-4.5)/36=-0.250 per cell
+        #   Ratio: 3.0x (magnitude-proportional, NOT clipped)
+        #   (sum-MSE gave 4.0 and 12.0 per cell → total 144-432 → clipped to 20)
+        mean_error = y_pred.mean(dim=1) - y_true.mean(dim=1)
+        level_cell = mean_error ** 2
 
         # Per-series event mass for level weighting
         w = gate.amax(dim=1)

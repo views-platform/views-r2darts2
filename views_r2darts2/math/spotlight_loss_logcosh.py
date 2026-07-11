@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import logging
 
 logger = logging.getLogger(__name__)
@@ -39,41 +38,41 @@ class SpotlightLossLogcosh(torch.nn.Module):
         without shrinking the within-channel magnitude signal that separates
         a war from a quiet series.
 
-      * **Level (soft-peak magnitude).** ``Logcosh`` of
-        ``logsumexp_t(pred) - logsumexp_t(true)`` per series. Because asinh
-        values are already log-scale, ``logsumexp`` over time is a smooth
-        maximum that fixes the overall height. On its own it is
-        spread-degenerate (a flat forecast and a true peak can share the
-        same ``logsumexp``, differing only by the ``log T`` offset), but the
-        quadratic shape term pins the temporal pattern, so the level term is
-        free to do only what it is good at — setting magnitude — while
-        flatness is ruled out by shape.
+      * **Level (per-cell magnitude).** Squared error ``(pred - true)**2``
+        at every event cell, self-normalized over the gate. It is NOT
+        compressed over time: a ``logsumexp``/soft-max aggregate collapses
+        all ``T`` months into one scalar per series, which a flat forecast
+        satisfies by spreading mass (spread degeneracy), so the true peak
+        height is never pinned and eval forecasts collapse toward zero
+        (missed level, exploding MSLE on wars). Matching magnitude at each
+        event cell removes that escape route, and squaring makes the
+        gradient grow with the miss — this is exactly raw-space MSLE (MSE in
+        asinh units), so an under-predicted war peak is corrected far harder
+        than a skirmish and level dominates shape as a natural curriculum.
 
     The anti-under-prediction pressure is **dynamic and data-driven, not an
-    imposed constant**: the gradient of ``logsumexp`` is a softmax over
-    timesteps, so the level term's correction concentrates automatically on
-    the current peak month and, since the model sits below the true peak,
-    pushes it upward; and the quadratic shape term supplies gradient that
-    grows with the deviation, so large events lift themselves rather than
-    being averaged into a template. Both effects emerge from the data and
-    fade as the fit improves — there is no asymmetry or weighting
-    coefficient to set.
+    imposed constant**: both terms are squared, so their gradient grows with
+    the size of the miss. An under-predicted war peak — residual of several
+    asinh units — is therefore corrected far harder than a small skirmish,
+    and the pull fades to zero exactly as the height is matched. There is no
+    asymmetry or weighting coefficient to set; the emphasis on peaks is the
+    squared error itself.
 
     A soft **event gate** ``sigmoid((|·| - tau) / tau)`` (its only input is
     ``non_zero_threshold``) focuses both terms on conflict cells, and
     **Hájek** (self-normalized) gated means keep peace-heavy and event-heavy
-    batches comparable. The two terms are naturally comparable in scale (the
-    shape residual is standardized to unit deviation, the level term is
-    ``Logcosh`` of an asinh-space difference) and need no weighting
-    hyperparameter. Channels are combined by a plain mean.
+    batches comparable. The shape residual is standardized to unit deviation
+    while the level residual keeps its raw asinh scale, so level naturally
+    outweighs shape on large events — the intended curriculum — with no
+    weighting hyperparameter. Channels are combined by a plain mean.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` is the ONLY tunable — the asinh-space boundary
     that separates peace from conflict (default use ≈ 0.88 ≈ asinh(1)).
-    Everything else is parameter-free: ``Logcosh`` and ``logsumexp`` have no
-    knobs, and the level/shape balance and the under-prediction asymmetry
-    are both emergent from the data rather than set by constants.
+    Everything else is parameter-free: both terms are plain squared errors
+    with no knobs, and the level/shape balance and the emphasis on peaks are
+    emergent from the data rather than set by constants.
     """
 
     _EPS = 1e-6
@@ -88,19 +87,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
 
         logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _Logcosh(z: torch.Tensor) -> torch.Tensor:
-        # Numerically stable log(cosh(z)), up to an irrelevant additive
-        # constant (log 2). Parameter-free robust penalty: quadratic near 0,
-        # linear in the tails, no delta to tune. The 2 is the mathematical
-        # identity cosh(z) = (e^z + e^-z)/2, not a hyperparameter.
-        a = z.abs()
-        return a + F.softplus(-2.0 * a)
 
     # ------------------------------------------------------------------
     # Forward
@@ -138,23 +124,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
-        # ── Level term: soft-peak magnitude (DC) ──────────────────────
-        # logsumexp over time is a smooth max; in asinh (log-scale) units it
-        # tracks the raw event peak. Its gradient is a softmax over months,
-        # so the correction concentrates on the current peak and — since the
-        # model sits below the true peak — pushes it up. Dynamic, data-driven
-        # asymmetry with no coefficient.
-        level_cell = self._Logcosh(
-            torch.logsumexp(y_pred, dim=1) - torch.logsumexp(y_true, dim=1)
-        )
-        # Per-series event mass, so peace-only series don't drown the level
-        # signal (a whole flat series contributes almost nothing).
-        w = gate.amax(dim=1)
+        # ── Level term: per-cell event magnitude (DC) ─────────────────
+        # The peak height itself, matched at every event cell rather than
+        # compressed over time. A logsumexp/soft-max aggregate collapses all
+        # T months into ONE scalar per series, which a flat forecast can
+        # satisfy by spreading mass (spread degeneracy): the aggregate ratio
+        # looks calibrated (~1.0) while the peak is smeared, so in eval the
+        # forecast collapses toward zero and MSLE explodes on wars (Ukraine
+        # "missed level"). Matching magnitude per event cell removes that
+        # escape route. Squared, not saturating: the gradient grows with the
+        # miss, so a peak under-predicted by orders of magnitude is corrected
+        # orders of magnitude harder than a skirmish — this IS raw-space MSLE
+        # (MSE in asinh units), and because it keeps its raw scale (shape is
+        # standardized) level dominates shape as a natural curriculum:
+        # height first, pattern later. Same event gate as shape.
+        level_cell = (y_pred - y_true) ** 2
 
         # ── Hájek self-normalized gated means, then sum level + shape ──
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (w * level_cell).sum(dim=0) / w.sum(dim=0).clamp_min(self._EPS)
+            level = (gate * level_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
             per_channel = shape + level
             total_loss = per_channel.mean()
             shape_c = shape.detach().tolist()
@@ -162,7 +151,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = (w * level_cell).sum() / w.sum().clamp_min(self._EPS)
+            level = (gate * level_cell).sum() / gate.sum().clamp_min(self._EPS)
             total_loss = shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]

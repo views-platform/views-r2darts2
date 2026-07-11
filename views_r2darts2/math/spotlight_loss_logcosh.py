@@ -21,8 +21,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
        shape handles within-window patterns, level handles per-window DC.
 
     2. **Gated + magnitude-graded event weighting.**
-    event_mag = gate × (1 + abs_max), gate = 0.0125 + 0.9875 × σ(5 × (abs_max − τ)).
-    The gate suppresses peace (→ ~0.0125) vs conflict (→ ~1); the (1 + abs_max)
+    event_mag = gate × (1 + abs_max), gate = σ(5 × (abs_max − τ)).
+    The gate suppresses peace (→ ~0) vs conflict (→ ~1); the (1 + abs_max)
        factor — bounded because abs_max is in asinh space — restores magnitude
        sensitivity across the 4-OOM tail so large wars outweigh small skirmishes
        instead of saturating flat. No model-state dependency (abs_max detached).
@@ -244,7 +244,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Gate-only series weighting keeps the level anchor focused on
         # peace-vs-event composition without amplifying DC pull from the
         # highest-magnitude series.
-        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
+        series_gate = torch.sigmoid(
             10.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
         series_w = series_gate
@@ -366,14 +366,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
+        event_gate = torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO (soft event-aware) ───────────────
         # Soft mask preserves onset/offset gradients while keeping peace cells
         # near-neutral. Uses requested form:
         # m = m_floor + (1 - m_floor) * sigmoid(k * (|y| - tau)).
-        soft_event_mask = 0.0125 + (1.0 - 0.0125) * torch.sigmoid(
+        soft_event_mask = torch.sigmoid(
             10.0 * (abs_max - self.non_zero_threshold)
         )
         w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)  # (B, T) or (B, T, C)

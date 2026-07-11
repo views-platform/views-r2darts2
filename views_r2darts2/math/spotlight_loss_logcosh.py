@@ -78,52 +78,51 @@ class SpotlightLossLogcosh(torch.nn.Module):
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
 
-        # ── Sharp event gate ─────────────────────────────────────────────
+        # ── Sharp event gate ─────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Shape term (unchanged) ───────────────────────────────────────
+        # ── Shape term (unchanged quadratic, standardised) ───────────
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
-        # ── Level term: Huber loss on total event mass ──────────────────
-        #   delta = 2 * std(true totals) → proportional gradient for most errors,
-        #   capped at 2*std for outliers.
-        sum_true = y_true.sum(dim=1)          # (B, C)
+        # ── Level term: scaled logcosh with FIXED scale c=3.0 ──────
+        c = 3.0                     # gradient cap = 3, strong but bounded
+        sum_true = y_true.sum(dim=1)   # (B, C)
         sum_pred = y_pred.sum(dim=1)
-        delta = sum_pred - sum_true           # (B, C)
-
-        # Adaptive Huber threshold
-        level_scale = sum_true.std(dim=0).clamp_min(tau).unsqueeze(0)  # (1, C)
-        huber_delta = 2.0 * level_scale       # (1, C)
-
-        # Huber loss (reduction='none')
-        abs_delta = delta.abs()
-        quadratic = 0.5 * delta ** 2
-        linear = huber_delta * (abs_delta - 0.5 * huber_delta)
-        level_cell = torch.where(abs_delta <= huber_delta, quadratic, linear)
+        delta = sum_pred - sum_true
+        level_cell = c * self._Logcosh(delta / c)
 
         # Per‑series weight (peace series get ~0)
-        w = gate.amax(dim=1)   # (B, C)
+        w = gate.amax(dim=1)        # (B, C)
 
-        # ── Normalisation ────────────────────────────────────────────────
+        # ── Normalisation ────────────────────────────────────────────
         if multivariate:
+            # Shape: Hájek self‑normalised gated mean
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (w * level_cell).mean(dim=0)       # weighted mean over batch
-            per_channel = shape + level
+            # Level: weighted mean (no dilution) over batch
+            level = (w * level_cell).sum(dim=0) / w.sum(dim=0).clamp_min(self._EPS)
+
+            # Boost shape influence to balance level dominance
+            w_shape = 2.0
+            per_channel = w_shape * shape + level
             total_loss = per_channel.mean()
             shape_c = shape.detach().tolist()
             level_c = level.detach().tolist()
             comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = (w * level_cell).mean()
-            total_loss = shape + level
+            level = (w * level_cell).sum() / w.sum().clamp_min(self._EPS)
+            w_shape = 2.0
+            total_loss = w_shape * shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]
             comp = [float(total_loss.detach())]
+
+        if torch.isnan(total_loss):
+            raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
 
         # ── Telemetry ────────────────────────────────────────────────
         n = len(comp)

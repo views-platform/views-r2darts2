@@ -152,7 +152,7 @@ class GradientHealthCallback(Callback):
         How often to run the audit.
     warn_threshold : float, default 1e-7
         Maximum gradient norm below which gradients are flagged as vanishing.
-    explode_threshold : float, default 100.0
+    explode_threshold : float, default 500.0
         Minimum gradient norm above which gradients are flagged as exploding.
     """
 
@@ -464,7 +464,6 @@ class RevINMonitorCallback(Callback):
         # the z-space prediction variance (MC dropout, ~0.3). This is
         # independent of σ_raw/μ_raw — structurally eliminated.
         # Log sigma_raw/mu_raw ratio as a diagnostic for data distribution.
-        import math
         ratio_max = sigma_max / max(abs(mu_max), 1.0)
 
         metrics = {

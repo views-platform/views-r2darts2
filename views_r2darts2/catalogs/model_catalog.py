@@ -27,7 +27,7 @@ from darts.utils.likelihood_models import (
     WeibullLikelihood,
     QuantileRegression,
 )
-from views_r2darts2.engines.darts_forecaster import DartsForecaster
+from views_r2darts2.infrastructure.device import get_device
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
 
 # Darts likelihood objects keyed by config string.
@@ -105,7 +105,7 @@ class ModelCatalog:
             "TSMixerModel": self._get_tsmixer_model,
         }
         self.config = config
-        self.device = DartsForecaster.get_device()
+        self.device = get_device()
 
         # DELEGATION: Specialized catalogs handle genomic translation.
         # Darts Likelihood objects are mutually exclusive with loss_fn —

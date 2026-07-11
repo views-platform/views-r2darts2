@@ -1,96 +1,121 @@
-import os
-import pandas as pd
-import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
-import torch
-from darts import TimeSeries
-from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
-from views_r2darts2.transformers.scaler_selector import ScalerSelector
-from views_r2darts2.transformers.feature_scaler_manager import FeatureScalerManager
-from views_r2darts2.transformers.views_dataset_darts import _ViewsDatasetDarts
-from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+"""Darts forecaster engine — pandas-free, PredictionFrame-output.
+
+Wraps a Darts :class:`TorchForecastingModel` with the preprocessing pipeline
+(scalers, log transforms) needed for VIEWS conflict-fatality forecasting. The
+stateful coupling between model and scalers is the class's reason for existing:
+predictions are only meaningful once inverse-transformed back to raw space.
+
+Data flow:
+
+    FeatureFrame (memmap-backed)
+        ↓  ``ViewsDatasetDarts.as_darts_timeseries``  (Darts boundary)
+    List[TimeSeries]  (per-entity, with static covariates)
+        ↓  ``_preprocess_timeseries`` (slice + log + scale + audit)
+    List[TimeSeries] (scaled targets) + List[TimeSeries] (scaled past_cov)
+        ↓  ``model.fit`` / ``model.predict``
+    List[TimeSeries] (predictions, scaled space)
+        ↓  ``_inverse_transform_target_scaler`` + ``_inverse_log_on_predictions``
+    List[TimeSeries] (predictions, raw space)
+        ↓  ``prediction_frames_from_darts`` (Darts boundary, inverse direction)
+    dict[str, PredictionFrame]  (one per target column)
+
+The class is pandas-free on its surface. The two Darts-boundary helpers in
+:mod:`views_r2darts2.transformers.darts_bridge` are the only places pandas is
+imported, and they are confined to that module.
+"""
+
+from __future__ import annotations
 
 import logging
+import os
+from typing import Any, Mapping
+
+import numpy as np
+import torch
+from darts import TimeSeries
+from darts.dataprocessing import Pipeline
+from darts.dataprocessing.transformers import Scaler
+from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
+
+from views_frames import PredictionFrame
+
+from views_r2darts2.data.views_dataset import ViewsDatasetDarts
+from views_r2darts2.infrastructure.device import get_device as _get_device
+from views_r2darts2.infrastructure.exceptions import NumericalSanityError
+from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.transformers.darts_bridge import prediction_frames_from_darts
+from views_r2darts2.transformers.feature_scaler_manager import FeatureScalerManager
+from views_r2darts2.transformers.inverse import (
+    extract_fitted_sklearn_scaler,
+    inverse_transform_probabilistic_subset,
+)
+from views_r2darts2.transformers.scaler_selector import ScalerSelector
 
 logger = logging.getLogger(__name__)
 
 
 class DartsForecaster:
-    """
-    DartsForecaster is a wrapper class for time series forecasting using Darts models.
-    This class manages the workflow for training and predicting with a TorchForecastingModel,
-    including preprocessing, scaling, device management, and result formatting.
+    """Stateful wrapper coupling a Darts model with its preprocessing pipeline.
 
     Intent Contract:
-        - Purpose: Maintain the stateful coupling between a deep learning model and its required
-          preprocessing pipeline (scalers, log-transforms) to ensure predictions are on the correct scale.
-        - Non-Goals: Does not manage Weights & Biases logging or experiment orchestration.
+        - Purpose: Maintain the stateful coupling between a deep learning model
+          and its required preprocessing pipeline (scalers, log-transforms) so
+          that predictions are on the correct scale.
+        - Non-Goals: Does not manage Weights & Biases logging or experiment
+          orchestration (that's :class:`DartsForecastingModelManager`).
         - Guarantees:
-            - Ensures that data is downcast to float32 before entering the model.
-            - Guarantees that target scalers are fitted ONLY on training data and correctly applied
-              in inverse during prediction (preserving sample dimensions for probabilistic forecasts).
-            - Ensures physical boundaries are respected during preprocessing via ReproducibilityGate.
-        - Failure Behavior: Raises RuntimeError if prediction is attempted before scalers are fitted or
-          if numerical insanity is detected in the input tensors.
+            - Data is downcast to float32 before entering the model (ADR-010).
+            - Target scalers are fitted ONLY on training data and correctly
+              inverse-applied during prediction (preserving sample dimensions
+              for probabilistic forecasts).
+            - Physical boundaries are respected during preprocessing via
+              :class:`ReproducibilityGate`.
+        - Failure Behavior: Raises ``RuntimeError`` if prediction is attempted
+          before scalers are fitted or if numerical insanity is detected.
     """
 
     def __init__(
         self,
-        dataset: _ViewsDatasetDarts,
+        dataset: ViewsDatasetDarts,
         model: TorchForecastingModel,
         partition_dict: dict,
-        feature_scaler: str = None,
-        target_scaler: str = None,
+        feature_scaler: str | None = None,
+        target_scaler: str | None = None,
         log_targets: bool = False,
         log_features: list[str] | None = None,
-        feature_scaler_map: Optional[Dict[str, Any]] = None,
-        random_state: int = None,
-        static_covariate_stats: Optional[Dict[str, Any]] = None,
+        feature_scaler_map: Mapping[str, Any] | None = None,
+        random_state: int | None = None,
+        static_covariate_stats: Mapping[str, Any] | None = None,
         checkpoint_mode: str = "best",
         use_cyclic_encoders: bool = False,
-    ):
-        """
-        Initializes the forecaster with dataset, model, partition information, and optional scalers.
+    ) -> None:
+        """Initialize the forecaster.
 
         Args:
-            dataset (_ViewsDatasetDarts): The dataset to be used for forecasting.
-            model (TorchForecastingModel): The forecasting model instance.
-            partition_dict (dict): Dictionary containing 'train' and 'test' partition indices.
-            feature_scaler (str, optional): Name of the feature scaler to use for all features.
-                Ignored if feature_scaler_map is provided. Defaults to None.
-            target_scaler (str, optional): Name of the target scaler to use. Defaults to None.
-            log_targets (bool, optional): Whether to apply log1p transform to targets. Defaults to False.
-            log_features (list[str], optional): List of feature names to apply log1p transform. Defaults to None.
-            feature_scaler_map (dict, optional): Mapping of scalers to specific feature groups.
-                When provided, this takes precedence over feature_scaler.
-            random_state (int): Random seed for reproducibility. Mandatory.
-            static_covariate_stats (dict, optional): Configuration for per-entity
-                static covariate statistics injection. When provided, must contain:
-                  - 'transform' (str or None): Name of the element-wise transform to apply
-                    to mu, sigma, max, trend stats before injection. Supported:
-                    'AsinhTransform', 'LogTransform', 'SqrtTransform', 'FourthRootTransform'.
-                    When None, stats are injected in raw space.
-                When this parameter is None, static covariate stats are still injected
-                (backward compatible) in raw space.
-...
-        Attributes:
-            dataset (_ViewsDatasetDarts): The provided dataset.
-            model (TorchForecastingModel): The forecasting model.
-            _train_start (int): Start index for training partition.
-            _train_end (int): End index for training partition.
-            _test_start (int): Start index for testing partition.
-            _test_end (int): End index for testing partition.
-            _feature_scaler (str): Name of the feature scaler.
-            _target_scaler (str): Name of the target scaler.
-            scaler_fitted (bool): Indicates if scalers have been fitted.
-            target_scaler (Scaler or None): Target scaler instance if provided.
-            feature_scaler (Scaler, FeatureScalerManager, or None): Feature scaler instance.
-            device (torch.device): Device used for model computation.
-            random_state (int): Captured random seed for entropy locking.
-            _static_cov_transform (str or None): Transform name for static covariate stats.
+            dataset: The :class:`ViewsDatasetDarts` carrying the FeatureFrame.
+            model: A Darts :class:`TorchForecastingModel` instance.
+            partition_dict: ``{"train": (start, end), "test": (start, end)}``.
+            feature_scaler: Name of the feature scaler for all features.
+                Ignored when ``feature_scaler_map`` is provided.
+            target_scaler: Name of the target scaler.
+            log_targets: When ``True``, apply ``log1p`` to targets before
+                scaling and ``expm1`` to inverse-transformed predictions.
+            log_features: Feature names to apply ``log1p`` to (no inverse —
+                past covariates are not reconstructed post-prediction).
+            feature_scaler_map: Per-feature scaler map (takes precedence over
+                ``feature_scaler``). See :class:`FeatureScalerManager`.
+            random_state: Random seed for reproducibility. Mandatory.
+            static_covariate_stats: Optional config for per-entity static
+                covariate stats. Keys: ``transform`` (str|None), ``stats``
+                (list[str]|None), ``inject`` (bool).
+            checkpoint_mode: ``"best"`` (default) or ``"last"``.
+            use_cyclic_encoders: When ``True``, append sin/cos cyclic time
+                encoders to the feature axis.
 
-        Logs:
-            Information about selected scalers and device.
+        Raises:
+            ValueError: ``random_state`` is ``None``, ``checkpoint_mode`` is
+                invalid, or both ``log_features`` and
+                ``feature_scaler='LogTransform'`` are set.
         """
         self.dataset = dataset
         self.model = model
@@ -99,372 +124,287 @@ class DartsForecaster:
 
         if random_state is None:
             raise ValueError(
-                "MANDATORY PARAMETER MISSING: random_state must be provided to DartsForecaster."
+                "MANDATORY PARAMETER MISSING: random_state must be provided "
+                "to DartsForecaster."
             )
         self.random_state = random_state
 
-        # Static covariate stats transform (e.g. 'AsinhTransform' or None for raw)
-        # and optional stat subset (e.g. ['trend', 'sparsity'] for lightweight injection).
-        logger.info(
-            f"static_covariate_stats received: {static_covariate_stats!r} "
-            f"(type={type(static_covariate_stats).__name__})"
-        )
+        # Static covariate stats configuration.
         self._static_cov_transform = (
-            static_covariate_stats.get("transform") if static_covariate_stats else None
+            static_covariate_stats.get("transform")
+            if static_covariate_stats
+            else None
         )
         self._static_cov_stats = (
             static_covariate_stats.get("stats") if static_covariate_stats else None
         )
         self._static_cov_inject = (
-            static_covariate_stats.get("inject", False) if static_covariate_stats else False
+            static_covariate_stats.get("inject", False)
+            if static_covariate_stats
+            else False
         )
         logger.info(
-            f"_static_cov_transform resolved to: {self._static_cov_transform!r}, "
-            f"_static_cov_stats: {self._static_cov_stats!r}, "
-            f"_static_cov_inject: {self._static_cov_inject!r}"
+            "static_covariate_stats: transform=%r stats=%r inject=%r",
+            self._static_cov_transform,
+            self._static_cov_stats,
+            self._static_cov_inject,
         )
 
         if checkpoint_mode not in ("best", "last"):
-            raise ValueError(f"checkpoint_mode must be 'best' or 'last', got {checkpoint_mode!r}")
+            raise ValueError(
+                f"checkpoint_mode must be 'best' or 'last', got {checkpoint_mode!r}"
+            )
         self._checkpoint_mode = checkpoint_mode
-        logger.info(f"checkpoint_mode: {self._checkpoint_mode!r}")
-
         self._use_cyclic_encoders = use_cyclic_encoders
-        logger.info(f"use_cyclic_encoders: {self._use_cyclic_encoders!r}")
 
         self._feature_scaler_cfg = feature_scaler
         self._target_scaler_cfg = target_scaler
-        self._feature_scaler_map_cfg = feature_scaler_map
+        self._feature_scaler_map_cfg = (
+            dict(feature_scaler_map) if feature_scaler_map else None
+        )
         self._log_targets = bool(log_targets)
         self._log_features = set(log_features or [])
 
-        # Warn about potential double log transform
+        # Warn about double log transform on targets.
         if self._log_targets and target_scaler == "LogTransform":
             logger.warning(
-                "Both log_targets=True and target_scaler='LogTransform' are set. "
-                "This will apply log transform twice! Consider using only one. "
-                "Disabling manual log_targets to avoid double transformation."
+                "Both log_targets=True and target_scaler='LogTransform' are "
+                "set. This would apply log transform twice. Disabling "
+                "log_targets to avoid double transformation."
             )
             self._log_targets = False
-
+        # Raise on double log transform on features (asymmetric with the target
+        # warning, but the legacy contract raised here — preserve it).
         if self._log_features and feature_scaler == "LogTransform":
             raise ValueError(
                 "Both log_features and feature_scaler='LogTransform' are set. "
-                "This will apply log transform twice on overlapping features. "
+                "This would apply log transform twice on overlapping features. "
                 "Use only one transformation method."
             )
 
         self.scaler_fitted = False
 
-        # Initialize target scaler
+        # Initialize target scaler.
         self.target_scaler = self._instantiate_scaler(self._target_scaler_cfg)
 
-        # Initialize feature scaler(s)
+        # Initialize feature scaler(s).
         if not self.dataset.features:
             if self._feature_scaler_cfg or self._feature_scaler_map_cfg:
                 logger.info(
-                    "Dataset has no feature columns — disabling feature_scaler. "
-                    "This is expected for univariate models using datafactory."
+                    "Dataset has no feature columns — disabling feature_scaler."
                 )
             self.feature_scaler = None
         elif self._feature_scaler_map_cfg:
             self.feature_scaler = FeatureScalerManager(
                 feature_scaler_map=self._feature_scaler_map_cfg,
-                default_scaler=self._feature_scaler_cfg,  # fallback for unmapped features
+                default_scaler=self._feature_scaler_cfg,
                 all_features=self.dataset.features,
             )
-            logger.info(f"Using feature scaler map: {self.feature_scaler}")
+            logger.info("Using feature scaler map: %s", self.feature_scaler)
         else:
             self.feature_scaler = self._instantiate_scaler(self._feature_scaler_cfg)
-            logger.info(f"Using feature scaler: {self._feature_scaler_cfg}")
-
-        logger.info(f"Using target scaler: {self._target_scaler_cfg}")
+            logger.info(
+                "Using feature scaler: %s", self._feature_scaler_cfg
+            )
+        logger.info("Using target scaler: %s", self._target_scaler_cfg)
 
         self.device = self.get_device()
-        logger.info(f"Using device: {self.device}")
+        logger.info("Using device: %s", self.device)
         if hasattr(self.model, "to_device"):
             self.model.to_device(self.device)
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
             self.model.model.to(self.device)
 
+    # ------------------------------------------------------------------ scalers
+
     @staticmethod
-    def _instantiate_scaler(scaler_cfg):
-        """Delegate to ScalerSelector.instantiate_darts_scaler()."""
+    def _instantiate_scaler(scaler_cfg: Any) -> Scaler | Pipeline | None:
+        """Delegate to :meth:`ScalerSelector.instantiate_darts_scaler`."""
         if scaler_cfg is None:
             return None
         return ScalerSelector.instantiate_darts_scaler(scaler_cfg)
 
-    def _apply_log_to_targets(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
-        """
-        Vectorized log1p for target series.
-        FIX: Darts TimeSeries.map passes the full ndarray, not scalars. Prior lambda assumed scalar.
-        We now:
-          - Clip negatives to 0.
-          - Apply log1p.
-          - Cast back to float32 (numpy log1p returns float64).
-        """
+    # ------------------------------------------------------------------ log transforms
+
+    def _apply_log_to_targets(
+        self, series_list: list[TimeSeries]
+    ) -> list[TimeSeries]:
+        """Vectorized ``log1p`` for target series (clip negatives first)."""
         if not self._log_targets:
             return series_list
         logger.info("Applying vectorized log1p transform to target series...")
-        out = []
-        for ts in series_list:
-            out.append(
-                ts.map(lambda arr: np.log1p(np.maximum(arr, 0)).astype(np.float32))
-            )
-        return out
+        return [
+            ts.map(lambda arr: np.log1p(np.maximum(arr, 0)).astype(np.float32))
+            for ts in series_list
+        ]
 
     def _inverse_log_on_predictions(
-        self, series_list: List[TimeSeries]
-    ) -> List[TimeSeries]:
-        """
-        Inverse of _apply_log_to_targets.
-        - Ensure non-negative before expm1 (safety for any numerical drift).
-        - Cast to float32.
-        """
+        self, series_list: list[TimeSeries]
+    ) -> list[TimeSeries]:
+        """Inverse of :meth:`_apply_log_to_targets`: ``expm1`` (clip negatives)."""
         if not self._log_targets:
             return series_list
         logger.info(
             "Applying vectorized expm1 inverse transform to predicted series..."
         )
-        out = []
-        for ts in series_list:
-            out.append(
-                ts.map(lambda arr: np.expm1(np.maximum(arr, 0)).astype(np.float32))
-            )
-        return out
-
-    def _inverse_transform_target_scaler(
-        self, timeseries_pred: List[TimeSeries]
-    ) -> List[TimeSeries]:
-        """
-        Inverse transform predictions using target scaler, preserving samples for probabilistic forecasts.
-
-        For Darts Pipeline objects (used for chained scalers), the inverse_transform
-        properly handles probabilistic series. For single Darts Scaler wrapping sklearn
-        scalers, we need manual reshaping to preserve the sample dimension.
-        """
-        if not self.target_scaler or not self.scaler_fitted:
-            return timeseries_pred
-
-        from darts.dataprocessing import Pipeline
-
-        # DEBUG: Log model z-score outputs BEFORE inverse transform.
-        # Trillions in eval with sane z-scores in training means the explosion
-        # is happening inside the inverse pipeline, not in the model weights.
-        _pre_vals = np.concatenate([ts.all_values().ravel() for ts in timeseries_pred])
-        logger.info(
-            "INVERSE_TRANSFORM_DEBUG | pre-inverse z-scores: "
-            "min=%.4f  mean=%.4f  max=%.4f  std=%.4f  any_nan=%s  any_inf=%s",
-            float(np.nanmin(_pre_vals)), float(np.nanmean(_pre_vals)),
-            float(np.nanmax(_pre_vals)), float(np.nanstd(_pre_vals)),
-            bool(np.any(np.isnan(_pre_vals))), bool(np.any(np.isinf(_pre_vals))),
-        )
-
-        # If using Pipeline (for chained scalers), it handles samples correctly
-        if isinstance(self.target_scaler, Pipeline):
-            result = self.target_scaler.inverse_transform(timeseries_pred)
-            _post_vals = np.concatenate([ts.all_values().ravel() for ts in result])
-            logger.info(
-                "INVERSE_TRANSFORM_DEBUG | post-inverse raw counts: "
-                "min=%.4f  mean=%.4f  max=%.4f  std=%.4f  any_nan=%s  any_inf=%s",
-                float(np.nanmin(_post_vals)), float(np.nanmean(_post_vals)),
-                float(np.nanmax(_post_vals)), float(np.nanstd(_post_vals)),
-                bool(np.any(np.isnan(_post_vals))), bool(np.any(np.isinf(_post_vals))),
-            )
-            return result
-
-        # For single Scaler, we need to manually handle probabilistic series
-        result = []
-        for i, ts in enumerate(timeseries_pred):
-            arr = ts.all_values(copy=True)
-            is_probabilistic = arr.ndim == 3
-
-            if is_probabilistic:
-                n_time, n_features, n_samples = arr.shape
-
-                # Reshape to 2D for sklearn: (time * samples, features)
-                arr_2d = arr.transpose(0, 2, 1).reshape(-1, n_features)
-
-                # Get the fitted sklearn scaler from the Darts Scaler wrapper
-                # Darts stores fitted params as a list/tuple of parameters.
-                # If global_fit=True, the list has length 1.
-                # If global_fit=False, the list length matches the number of series.
-                sklearn_scaler = None
-                if (
-                    hasattr(self.target_scaler, "_fitted_params")
-                    and self.target_scaler._fitted_params
-                ):
-                    fitted_params = self.target_scaler._fitted_params
-                    # Use index 'i' if per-series, or index '0' if global
-                    param_idx = i if len(fitted_params) > 1 else 0
-                    if param_idx < len(fitted_params):
-                        param = fitted_params[param_idx]
-                        if isinstance(param, dict) and "fitted" in param:
-                            sklearn_scaler = param["fitted"]
-                        else:
-                            sklearn_scaler = param
-
-                if sklearn_scaler is not None and hasattr(
-                    sklearn_scaler, "inverse_transform"
-                ):
-                    inv_2d = sklearn_scaler.inverse_transform(arr_2d.astype(np.float64))
-                else:
-                    logger.warning(
-                        f"Target scaler fitted params not found for series {i}, skipping inverse transform"
-                    )
-                    inv_2d = arr_2d
-
-                # Reshape back to 3D: (time, features, samples)
-                inv_arr = inv_2d.reshape(n_time, n_samples, n_features).transpose(
-                    0, 2, 1
-                )
-
-                new_ts = TimeSeries.from_times_and_values(
-                    times=ts.time_index,
-                    values=inv_arr.astype(np.float32),
-                    columns=ts.components,
-                    freq=ts.freq,
-                    static_covariates=ts.static_covariates,
-                )
-            else:
-                # For deterministic, use standard Darts inverse_transform
-                # Standard Darts inverse_transform handles multiple series correctly
-                # by internally matching the series index to the fitted params.
-                new_ts = self.target_scaler.inverse_transform([ts])[0]
-
-            result.append(new_ts)
-
-        return result
+        return [
+            ts.map(lambda arr: np.expm1(np.maximum(arr, 0)).astype(np.float32))
+            for ts in series_list
+        ]
 
     def _apply_log_to_feature_series(self, ts: TimeSeries) -> TimeSeries:
-        """
-        Applies log1p to selected feature components in a single TimeSeries.
-        Only components whose names appear in self._log_features are transformed.
-        Rationale:
-          - Early weak signals (small positive feature counts) expanded.
-          - Variance stabilized for heavy-tailed covariates.
-        Note:
-          - No inverse needed; past covariates not reconstructed post-prediction.
-          - Negative values clipped to 0 before log1p.
-        """
+        """Apply ``log1p`` to selected feature components in a single series."""
         if not self._log_features:
             return ts
         comps = ts.components
         if not any(c in self._log_features for c in comps):
             return ts
         arr = ts.all_values(copy=True)
-        # Deterministic: (time, features); Probabilistic: (time, features, samples)
         if arr.ndim == 2:
             for idx, name in enumerate(comps):
                 if name in self._log_features:
                     arr[:, idx] = np.log1p(np.maximum(arr[:, idx], 0.0))
         elif arr.ndim == 3:
-            # Apply to each sample identically
             for idx, name in enumerate(comps):
                 if name in self._log_features:
                     arr[:, idx, :] = np.log1p(np.maximum(arr[:, idx, :], 0.0))
-        # Rebuild TimeSeries preserving metadata
-        new_ts = TimeSeries.from_times_and_values(
+        return TimeSeries.from_times_and_values(
             times=ts.time_index,
             values=arr.astype(np.float32),
             columns=comps,
             freq=ts.freq,
             static_covariates=ts.static_covariates,
         )
-        return new_ts
 
-    def _apply_log_to_features(self, series_list: List[TimeSeries]) -> List[TimeSeries]:
-        """
-        Batch wrapper to apply feature log transform.
-        """
+    def _apply_log_to_features(
+        self, series_list: list[TimeSeries]
+    ) -> list[TimeSeries]:
+        """Batch wrapper for :meth:`_apply_log_to_feature_series`."""
         if not self._log_features:
             return series_list
         logger.info(
-            f"Applying vectorized log1p transform to selected feature components: {self._log_features}..."
+            "Applying log1p transform to selected feature components: %s",
+            sorted(self._log_features),
         )
-        out = [self._apply_log_to_feature_series(ts) for ts in series_list]
-        return out
+        return [self._apply_log_to_feature_series(ts) for ts in series_list]
+
+    # ------------------------------------------------------------------ inverse target scaler
+
+    def _inverse_transform_target_scaler(
+        self, timeseries_pred: list[TimeSeries]
+    ) -> list[TimeSeries]:
+        """Inverse-transform predictions, preserving samples for probabilistic forecasts.
+
+        For Darts :class:`Pipeline` objects (chained scalers),
+        ``Pipeline.inverse_transform`` handles probabilistic series natively.
+        For single Darts :class:`Scaler` objects wrapping sklearn scalers, we
+        manually reshape to 2-D, inverse-transform, and reshape back to preserve
+        the sample dimension.
+        """
+        if not self.target_scaler or not self.scaler_fitted:
+            return timeseries_pred
+
+        if isinstance(self.target_scaler, Pipeline):
+            return self.target_scaler.inverse_transform(timeseries_pred)
+
+        result: list[TimeSeries] = []
+        for ts in timeseries_pred:
+            arr = ts.all_values(copy=True)
+            is_probabilistic = arr.ndim == 3
+            if is_probabilistic:
+                inv_values = inverse_transform_probabilistic_subset(
+                    subset_3d=arr.astype(np.float32),
+                    scaler=self.target_scaler,
+                )
+                new_ts = TimeSeries.from_times_and_values(
+                    times=ts.time_index,
+                    values=inv_values.astype(np.float32),
+                    columns=ts.components,
+                    freq=ts.freq,
+                    static_covariates=ts.static_covariates,
+                )
+            else:
+                # Deterministic path — use Darts' own inverse_transform.
+                new_ts = self.target_scaler.inverse_transform([ts])[0]
+            result.append(new_ts)
+        return result
+
+    # ------------------------------------------------------------------ device
 
     @staticmethod
     def get_device() -> str:
+        """Return the device type for model training (``mps``/``cuda``/``cpu``).
+
+        Delegates to :func:`views_r2darts2.infrastructure.device.get_device` to
+        avoid a circular import with :class:`ModelCatalog`.
         """
-        Returns the device type for model training.
-        """
-        if torch.backends.mps.is_available():
-            torch.set_default_dtype(torch.float32)
-            return "mps"
-        elif torch.cuda.is_available():
-            return "cuda"
-        else:
-            return "cpu"
+        return _get_device()
+
+    # ------------------------------------------------------------------ preprocessing
 
     def _preprocess_timeseries(
         self,
-        timeseries: List[TimeSeries],
+        timeseries: list[TimeSeries],
         start: int,
         end: int,
         train_mode: bool = False,
-    ) -> Tuple[List[TimeSeries], Optional[List[TimeSeries]]]:
-        """
-        Preprocesses time series for training or prediction.
+    ) -> tuple[list[TimeSeries], list[TimeSeries] | None]:
+        """Slice, log-transform, and scale the per-entity TimeSeries list.
 
         Args:
-            timeseries: Time series collection to preprocess.
-            start: Start timestamp for slicing.
-            end: End timestamp for slicing.
-            train_mode: If True, fits scalers and enforces reproducibility gates.
+            timeseries: Per-entity TimeSeries collection (from
+                :meth:`ViewsDatasetDarts.as_darts_timeseries`).
+            start: Start time id (inclusive) for the slice.
+            end: End time id (inclusive) for the slice — Darts ``slice`` is
+                exclusive for integer indices, so we pass ``end + 1``.
+            train_mode: When ``True``, fits scalers and enforces the temporal
+                firewall gates (boundary integrity, sequence contiguity).
 
         Returns:
-            Tuple of (targets, past_covariates). past_covariates is None for
-            univariate models (features=[]).
+            ``(targets, past_covariates)``. ``past_covariates`` is ``None`` for
+            univariate models (``dataset.features == []``).
         """
         timeseries_float = [s.astype(np.float32) for s in timeseries]
+        min_length = self.model.input_chunk_length + self.model.output_chunk_length
 
-        self.min_length = self.model.input_chunk_length + self.model.output_chunk_length
-
-        # Slice targets (end + 1 because Darts slice is exclusive for integer indices)
+        # Slice targets (end + 1 because Darts slice is exclusive for integer indices).
         if train_mode:
-            # Build aligned (target, past_cov) pairs and filter together.
-            #
-            # BUG FIXED: Previously targets was filtered by len(s) >= min_length but
-            # past_cov had no filter. This caused entity misalignment: targets[i] and
-            # past_cov[i] came from DIFFERENT entities whenever any shorter series was
-            # excluded. model.fit(series=targets, past_covariates=past_cov) pairs by
-            # list index, so every entity after the first filtered-out one was trained
-            # on the wrong covariate history.
-            #
-            # The filter now uses len(sliced_target) not len(s): the full series
-            # length includes the test partition, so a series with 10 training months
-            # and 74 test months would pass the old len(s)>=84 check while its
-            # training slice is far too short for a 48+36 window.
-            #
-            # We MUST slice past_cov up to 'end + 1' to prevent feature leakage.
+            # Build aligned (target, past_cov) pairs and filter together. The
+            # paired filter is critical: ``model.fit(series=targets,
+            # past_covariates=past_cov)`` pairs by list index, so any
+            # entity-level mismatch silently trains the model on the wrong
+            # covariate history.
             paired = [
                 (
                     s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets],
-                    s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(np.float32),
+                    s.slice(start_ts=start, end_ts=end + 1)[
+                        self.dataset.features
+                    ].astype(np.float32),
                 )
                 for s in timeseries_float
-                if len(s.slice(start_ts=start, end_ts=end + 1)) >= self.min_length
+                if len(s.slice(start_ts=start, end_ts=end + 1)) >= min_length
             ]
             targets = [p[0] for p in paired]
             past_cov = [p[1] for p in paired]
             logger.info(
-                f"Training filter: {len(paired)}/{len(timeseries_float)} entities "
-                f"passed minimum length >= {self.min_length}."
+                "Training filter: %d/%d entities passed minimum length >= %d.",
+                len(paired),
+                len(timeseries_float),
+                min_length,
             )
         else:
             targets = [
                 s.slice(start_ts=start, end_ts=end + 1)[self.dataset.targets]
                 for s in timeseries_float
             ]
+            past_cov = None
 
-        # Slice past covariates (end + 1 to prevent feature leakage)
+        # Slice past covariates (end + 1 to prevent feature leakage).
         if self.dataset.features:
             past_cov = [
-                s.slice(start_ts=start, end_ts=end + 1)[self.dataset.features].astype(
-                    np.float32
-                )
+                s.slice(start_ts=start, end_ts=end + 1)[
+                    self.dataset.features
+                ].astype(np.float32)
                 for s in timeseries_float
             ]
             past_cov = self._apply_log_to_features(past_cov)
@@ -474,7 +414,7 @@ class DartsForecaster:
         targets = self._apply_log_to_targets(targets)
 
         if train_mode:
-            # GATE 3, 4, 5: The Fortress Firewall
+            # GATE 3, 4, 5: the Fortress Firewall.
             ReproducibilityGate.Temporal.audit_boundary_integrity(targets, end)
             for ts in targets:
                 ReproducibilityGate.Temporal.audit_sequence_contiguity(
@@ -494,82 +434,31 @@ class DartsForecaster:
             if self.feature_scaler and self.scaler_fitted:
                 past_cov = self.feature_scaler.transform(past_cov)
 
-        # DOWNCAST after scaler/log (they yield float64)
+        # Downcast after scaler/log (they yield float64).
         targets = [ts.astype(np.float32) for ts in targets]
         if past_cov is not None:
             past_cov = [pc.astype(np.float32) for pc in past_cov]
 
         ReproducibilityGate.Data.audit_numerical_sanity(targets, "targets")
         if past_cov is not None:
-            ReproducibilityGate.Data.audit_numerical_sanity(past_cov, "past_covariates")
+            ReproducibilityGate.Data.audit_numerical_sanity(
+                past_cov, "past_covariates"
+            )
 
         return targets, past_cov
 
-    def _process_predictions(self, timeseries_pred: List[TimeSeries]) -> list:
-        """
-        Processes a list of TimeSeries prediction objects into a structured list of dictionaries.
-
-        Each dictionary in the returned list corresponds to a single time step and entity, containing:
-            - The timestamp for the prediction.
-            - The entity ID.
-            - Predicted samples for each target component, clipped to non-negative values.
-
-        Handles both deterministic and probabilistic forecasts by ensuring the prediction values are 3D arrays.
-        Clips negative prediction values to zero.
-        Converts prediction samples for each target and time step into lists.
-
-        Args:
-            timeseries_pred (List[TimeSeries]): List of TimeSeries prediction objects.
-
-        Returns:
-            list: List of dictionaries, each containing time, entity ID, and predicted samples for each target.
-        """
-        # HANDSHAKE: Audit model output for numerical sanity before processing
-        ReproducibilityGate.Data.audit_numerical_sanity(
-            timeseries_pred, name="Model Predictions"
-        )
-
-        # Process predictions into list format
-        results = []
-        for pred in timeseries_pred:
-            if pred.static_covariates is None:
-                raise ValueError(
-                    "Prediction TimeSeries is missing static_covariates. "
-                    "Ensure data was grouped by entity via TimeSeries.from_group_dataframe()."
-                )
-            entity_id = int(pred.static_covariates.iat[0, 0])
-            pred_values = pred.all_values(copy=False)
-            if pred_values.ndim == 2:
-                pred_values = pred_values[..., np.newaxis]
-
-            # Clamp: raw count predictions cannot be negative (deaths have a physical floor of 0).
-            # Sub-unit fractional counts (0 < pred < 1) are kept as-is; zeroing them
-            # collapses the [0, 0.88] asinh range and catastrophically inflates MSLE
-            # for low-conflict countries (1–5 deaths/month).
-            pred_values = np.maximum(pred_values, 0.0).astype(np.float32)
-            for time_idx in range(pred_values.shape[0]):
-                time_stamp = pred.start_time() + time_idx * pred.freq
-                row_data = {
-                    self.dataset._time_id: time_stamp,
-                    self.dataset._entity_id: entity_id,
-                }
-                for comp_idx, target in enumerate(self.dataset.targets):
-                    row_data[f"pred_{target}"] = pred_values[
-                        time_idx, comp_idx, :
-                    ].tolist()
-                results.append(row_data)
-        return results
+    # ------------------------------------------------------------------ train
 
     def train(self) -> None:
-        """
-        Trains the forecasting model using the dataset provided.
+        """Train the model on the train partition with a carved validation set.
 
-        Preprocesses training data, fits scalers, then prepares a validation set
-        from the test partition (transformed with train-fitted scalers, no leakage).
-        Val loss is computed every epoch for early stopping and monitoring.
-
-        Returns:
-            None
+        Preprocesses training data, fits scalers, then prepares a validation
+        set from the test partition (transformed with train-fitted scalers —
+        no leakage). For forecasting runs where the test partition is too
+        short to form a validation window, carves the last ``output_chunk_length``
+        steps from the training window as a holdout val set and refits scalers
+        on the trimmed window to prevent holdout-target leakage into scaler
+        statistics.
         """
         timeseries = self.dataset.as_darts_timeseries(
             stat_time_range=(self._train_start, self._train_end),
@@ -585,7 +474,6 @@ class DartsForecaster:
             end=self._train_end,
             train_mode=True,
         )
-
         target_series = [ts.astype(np.float32) for ts in target_series]
         if self.dataset.features:
             past_covariates = [
@@ -593,10 +481,7 @@ class DartsForecaster:
                 for pc in past_covariates
             ]
 
-        # --- Validation set: test partition, transformed with train-fitted scalers ---
-        # No leakage: scalers were fit above on train only; val is .transform()'ed.
-        # Static cov stats use train range (passed to as_darts_timeseries above).
-        # Val needs icl steps of history before test_start for context window.
+        # Validation set: test partition, transformed with train-fitted scalers.
         val_start = self._test_start - self.model.input_chunk_length
         val_end = self._test_end
         val_targets, val_past_cov = self._preprocess_timeseries(
@@ -612,33 +497,33 @@ class DartsForecaster:
                 for pc in val_past_cov
             ]
 
-        # Guard: if the test partition has no ground-truth output steps (e.g.
-        # run_type="forecasting" where test_start = train_end + 1), val series
-        # will be exactly icl steps long — too short for Darts to build even one
-        # sample (needs icl + ocl).
-        #
-        # Forecasting-mode fix: carve the last ocl steps from the training window
-        # as a holdout val set. Scalers are refit on the trimmed window to prevent
-        # leakage from holdout targets into the scaler statistics.
-        #
-        # The holdout months are still used at inference time: predict() slices up
-        # to self._train_end as context, so the model sees them as encoder input
-        # even though they never appeared in a gradient update.
-        _min_val_len = self.model.input_chunk_length + self.model.output_chunk_length
-        _max_val_len = max((len(ts) for ts in val_targets), default=0)
-        if _max_val_len < _min_val_len:
-            _ocl = self.model.output_chunk_length
-            _icl = self.model.input_chunk_length
-            trimmed_train_end = self._train_end - _ocl
-            carved_val_start = self._train_end - _ocl - _icl + 1
-
+        # Forecasting-mode carve: when the test partition has no ground-truth
+        # output steps (run_type="forecasting"), val series are too short for
+        # Darts to build even one sample. Carve the last ocl steps from the
+        # training window as holdout val and refit scalers on the trimmed
+        # window to prevent holdout leakage.
+        min_val_len = (
+            self.model.input_chunk_length + self.model.output_chunk_length
+        )
+        max_val_len = max((len(ts) for ts in val_targets), default=0)
+        used_carved_val = max_val_len < min_val_len
+        if used_carved_val:
+            ocl = self.model.output_chunk_length
+            icl = self.model.input_chunk_length
+            trimmed_train_end = self._train_end - ocl
+            carved_val_start = self._train_end - ocl - icl + 1
             logger.info(
-                f"Forecasting mode: val partition too short ({_max_val_len} < {_min_val_len}). "
-                f"Carving holdout val [{carved_val_start}, {self._train_end}] ({_icl + _ocl} steps). "
-                f"Refitting scalers on trimmed train [{self._train_start}, {trimmed_train_end}]."
+                "Forecasting mode: val partition too short "
+                "(%d < %d). Carving holdout val [%d, %d] (%d steps). "
+                "Refitting scalers on trimmed train [%d, %d].",
+                max_val_len,
+                min_val_len,
+                carved_val_start,
+                self._train_end,
+                icl + ocl,
+                self._train_start,
+                trimmed_train_end,
             )
-
-            # Refit on trimmed window — overwrites scaler fit from the full-range call above.
             target_series, past_covariates = self._preprocess_timeseries(
                 timeseries=timeseries,
                 start=self._train_start,
@@ -651,8 +536,6 @@ class DartsForecaster:
                     pc.astype(np.float32) if pc is not None else None
                     for pc in past_covariates
                 ]
-
-            # Build carved val (scalers already refitted above; transform only, no leakage).
             val_targets, val_past_cov = self._preprocess_timeseries(
                 timeseries=timeseries,
                 start=carved_val_start,
@@ -666,21 +549,19 @@ class DartsForecaster:
                     for pc in val_past_cov
                 ]
 
-        _used_carved_val = _max_val_len < _min_val_len
-        _log_val_start = carved_val_start if _used_carved_val else val_start
-        _log_val_end = self._train_end if _used_carved_val else val_end
+        log_val_start = carved_val_start if used_carved_val else val_start
+        log_val_end = self._train_end if used_carved_val else val_end
         logger.info(
-            f"Validation set: {len(val_targets) if val_targets is not None else 0} entities, "
-            f"range [{_log_val_start}, {_log_val_end}] "
-            f"({'carved from train end' if _used_carved_val else 'test partition'} "
-            f"with {self.model.input_chunk_length} steps of context)."
+            "Validation set: %d entities, range [%d, %d] (%s with %d steps of context).",
+            len(val_targets) if val_targets is not None else 0,
+            log_val_start,
+            log_val_end,
+            "carved from train end" if used_carved_val else "test partition",
+            self.model.input_chunk_length,
         )
 
-        # Train the model
-        # Auto-detect num_workers: use half of available CPUs, capped at 8, minimum 0
+        # Auto-detect num_workers: half of available CPUs, capped at 8.
         num_workers = min(max((os.cpu_count() or 1) // 2, 0), 8)
-        # Note: persistent_workers=False to avoid file descriptor exhaustion in sweeps
-        # Set persistent_workers=True only for single long runs where performance matters
         dataloader_kwargs = (
             {"num_workers": num_workers, "persistent_workers": False}
             if num_workers > 0
@@ -695,41 +576,48 @@ class DartsForecaster:
             verbose=True,
         )
 
-        # After fit(), Darts automatically reloads the best val_loss checkpoint.
-        # When checkpoint_mode='last', explicitly reload the final epoch weights
-        # instead — useful when the training objective diverges from val_loss
-        # (e.g. SpotlightLoss DRO shifts improve event_ratio late in training
-        # but don't reduce val_loss).
+        # checkpoint_mode='last' overrides Darts' default best-val-loss reload.
         if self._checkpoint_mode == "last":
             try:
                 self.model.load_weights_from_checkpoint(best=False)
                 logger.info("checkpoint_mode='last': reloaded final epoch weights.")
-            except Exception as e:
+            except Exception as exc:  # pragma: no cover - defensive
                 logger.warning(
-                    f"checkpoint_mode='last': failed to reload last checkpoint ({e}). "
-                    "Keeping best val_loss checkpoint."
+                    "checkpoint_mode='last': failed to reload last checkpoint "
+                    "(%s). Keeping best val_loss checkpoint.",
+                    exc,
                 )
+
+    # ------------------------------------------------------------------ predict
 
     def predict(
         self,
         sequence_number: int,
         output_length: int = 36,
-        **predict_kwargs,
-    ) -> pd.DataFrame:
-        """
-        Generates forecasts for a given sequence number using the trained model.
+        **predict_kwargs: Any,
+    ) -> dict[str, PredictionFrame]:
+        """Generate forecasts and return them as a per-target dict of frames.
 
         Args:
-            sequence_number (int): The index in the test set to start forecasting from.
-            output_length (int, optional): Number of time steps to forecast. Defaults to 36.
-            **predict_kwargs: Additional keyword arguments to pass to the model's predict method.
+            sequence_number: The index in the test set to start forecasting
+                from (0 = first test step).
+            output_length: Number of time steps to forecast (default 36).
+            **predict_kwargs: Forwarded to ``model.predict`` (e.g.
+                ``num_samples``, ``mc_dropout``).
 
         Returns:
-            pd.DataFrame: A DataFrame containing the forecasted values, indexed by time and entity.
+            A ``{target_name: PredictionFrame}`` mapping. Each frame has a
+            :class:`SpatioTemporalIndex` of ``(time, entity)`` pairs covering
+            all entities × all forecast time steps. The frame's value array
+            is ``(N, S)`` where ``S`` is the sample count (1 for deterministic,
+            ``num_samples`` for probabilistic). Negative predictions are
+            clipped to 0 (physical floor for fatality counts).
 
         Raises:
-            RuntimeError: If scalers are not fitted (call train() or load_model() first).
-            Exception: If an error occurs during prediction.
+            RuntimeError: Scalers are not fitted (call :meth:`train` or
+                :meth:`load_model` first).
+            NumericalSanityError: NaNs or Infs leaked through the inverse
+                pipeline into the final predictions.
         """
         if self.target_scaler and not self.scaler_fitted:
             raise RuntimeError(
@@ -737,26 +625,17 @@ class DartsForecaster:
                 "Call train() or load_model() first."
             )
 
-        # LOCK ENTROPY: Guarantee bit-perfect identity for probabilistic samples
+        # LOCK ENTROPY: guarantee bit-perfect identity for probabilistic samples.
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
-        # Scaler provenance log: confirms whether scalers are in-memory (sweep path,
-        # freshly fitted during train()) or disk-loaded (eval path, loaded via
-        # load_model()). For stateless transforms (AsinhTransform), both are
-        # functionally identical. For stateful scalers, divergence is silent if the
-        # disk artifact was saved from a different training run.
-        #
-        # NOTE (structural): the sweep path never calls save_model() — _train_model_artifact()
-        # skips save when config["sweep"]=True. Sweep eval always uses in-memory scalers.
-        # Regular eval always loads from the latest on-disk artifact. These are DIFFERENT
-        # scaler instances even if they produce identical outputs for stateless transforms.
-        # Any time you switch to a stateful scaler (StandardScaler, MinMaxScaler, etc.),
-        # verify that both paths load from the same artifact or retrain to refresh the disk scaler.
         logger.info(
-            f"predict() scaler state: "
-            f"target_scaler='{self._target_scaler_cfg}' (fitted={self.target_scaler is not None}), "
-            f"feature_scaler='{self._feature_scaler_cfg}' (fitted={self.feature_scaler is not None}), "
-            f"scaler_fitted={self.scaler_fitted}."
+            "predict() scaler state: target_scaler=%r (fitted=%s), "
+            "feature_scaler=%r (fitted=%s), scaler_fitted=%s.",
+            self._target_scaler_cfg,
+            self.target_scaler is not None,
+            self._feature_scaler_cfg,
+            self.feature_scaler is not None,
+            self.scaler_fitted,
         )
 
         timeseries = self.dataset.as_darts_timeseries(
@@ -767,34 +646,31 @@ class DartsForecaster:
             use_cyclic_encoders=self._use_cyclic_encoders,
         )
 
-        # Get the input window for forecasting based on sequence_number
+        # Slice the input window for forecasting based on sequence_number.
         target_series, past_covariates = self._preprocess_timeseries(
             timeseries=timeseries,
             start=self._test_start + sequence_number - self.model.input_chunk_length,
-            end=self._test_start - 1 + sequence_number,  # origin = test_start - 1 + seq (base_origin convention)
+            end=self._test_start - 1 + sequence_number,
         )
 
-        # Resilient Device Management: Ensure model is on the correct device
-        # Darts models often shift to CPU in teardown(); we restore them if needed.
+        # Resilient device management: Darts models can drift to CPU in
+        # teardown(); restore them if needed before prediction.
         current_device = next(self.model.model.parameters()).device
         if self.device != "cpu" and current_device.type == "cpu":
-            logger.info(f"Restoring model to {self.device} before prediction...")
+            logger.info("Restoring model to %s before prediction...", self.device)
             if hasattr(self.model, "to_device"):
                 self.model.to_device(self.device)
             elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
                 self.model.model.to(self.device)
-
-            # Final verification after restoration attempt
             current_device = next(self.model.model.parameters()).device
             if current_device.type == "cpu":
-                error_msg = (
-                    f"CRITICAL DEVICE FAILURE: Failed to move model from CPU to {self.device}. "
-                    "Prediction aborted to prevent inconsistent results."
+                raise RuntimeError(
+                    f"CRITICAL DEVICE FAILURE: failed to move model from CPU "
+                    f"to {self.device}. Prediction aborted to prevent "
+                    "inconsistent results."
                 )
-                logger.critical(error_msg)
-                raise RuntimeError(error_msg)
 
-        # Generate forecasts
+        # Generate forecasts.
         try:
             timeseries_pred = self.model.predict(
                 n=output_length,
@@ -803,43 +679,64 @@ class DartsForecaster:
                 verbose=True,
                 **predict_kwargs,
             )
-        except Exception as e:
-            logger.error(f"Error during prediction: {e}")
+        except Exception as exc:
+            logger.error("Error during prediction: %s", exc)
             raise
 
-        # Use sample-preserving inverse transform for probabilistic predictions
+        # Audit model output for numerical sanity BEFORE inverse-transform.
+        ReproducibilityGate.Data.audit_numerical_sanity(
+            timeseries_pred, name="Model Predictions"
+        )
+
+        # Sample-preserving inverse transform.
         if self.target_scaler:
             timeseries_pred = self._inverse_transform_target_scaler(timeseries_pred)
-
         timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
 
-        # Process predictions into list format
-        results = self._process_predictions(timeseries_pred)
+        # Audit again after inverse-transform.
+        ReproducibilityGate.Data.audit_numerical_sanity(
+            timeseries_pred, name="Inverse-Transformed Predictions"
+        )
 
-        # Create final DataFrame
-        df = pd.DataFrame(results)
-        df = df.set_index([self.dataset._time_id, self.dataset._entity_id])
+        # Convert Darts predictions → {target: PredictionFrame}. Negative
+        # predictions are clipped to 0 inside the bridge (physical floor).
+        predictions = prediction_frames_from_darts(
+            predictions=timeseries_pred,
+            entity_id_name=self.dataset.entity_id,
+            target_columns=self.dataset.targets,
+            level=self.dataset.level,
+            clip_negatives=True,
+        )
 
-        # Numerical Sanity Check: Ensure no NaNs leaked through the inverse pipeline
-        # (df.fillna(0) is forbidden by ADR-010 and ADR-008)
-        if df.isna().any().any():
-            from views_r2darts2.infrastructure.exceptions import NumericalSanityError
+        # Final NaN guard on the frame values (one of the per-target frames
+        # might have picked up a NaN that the per-series audit missed).
+        for target, frame in predictions.items():
+            if np.isnan(frame.values).any():
+                raise NumericalSanityError(
+                    f"Numerical Sanity Violation: NaNs detected in final "
+                    f"PredictionFrame for target '{target}'."
+                )
 
-            error_msg = "Numerical Sanity Violation: NaNs detected in final prediction DataFrame."
-            logger.critical(error_msg)
-            raise NumericalSanityError(error_msg)
+        return predictions
 
-        return df.sort_index()
+    # ------------------------------------------------------------------ persistence
 
     def save_model(self, path: str) -> None:
-        # Save scaler state along with model
+        """Save the Darts model and the scaler state to disk.
+
+        Writes two files:
+            * ``path`` — the Darts model artifact (via ``model.save``).
+            * ``path + ".scalers"`` — a torch-saved dict with the scalers,
+              log-transform flags, and scaler configs.
+
+        Args:
+            path: Base path for the model artifact. The scaler state is
+                written to ``path + ".scalers"``.
+        """
         path = str(path)
         self.model.save(path=path)
         scaler_path = path + ".scalers"
-
-        # Determine if using FeatureScalerManager
         using_feature_scaler_map = isinstance(self.feature_scaler, FeatureScalerManager)
-
         torch.save(
             {
                 "target_scaler": self.target_scaler,
@@ -850,16 +747,23 @@ class DartsForecaster:
                 "using_feature_scaler_map": using_feature_scaler_map,
                 "feature_scaler_map_cfg": self._feature_scaler_map_cfg,
                 "feature_scaler_cfg": self._feature_scaler_cfg,
-                # _target_scaler_cfg was previously missing from this dict, causing
-                # self._target_scaler_cfg to reflect the current config rather than
-                # the one used during training after a load_model() call.
                 "target_scaler_cfg": self._target_scaler_cfg,
             },
             scaler_path,
         )
 
     def load_model(self, path: str) -> None:
-        # Load scaler state
+        """Load the Darts model and scaler state from disk.
+
+        Args:
+            path: Base path for the model artifact. The scaler state is read
+                from ``path + ".scalers"``.
+
+        Raises:
+            FileNotFoundError: The scaler state file is missing.
+            ValueError: The saved ``target_scaler_cfg`` does not match the
+                current config (prevents silent scaler-mismatch bugs).
+        """
         path = str(path)
         scaler_path = path + ".scalers"
         try:
@@ -873,36 +777,36 @@ class DartsForecaster:
             self._log_features = set(scaler_data.get("log_features", []))
             self._feature_scaler_map_cfg = scaler_data.get("feature_scaler_map_cfg")
             self._feature_scaler_cfg = scaler_data.get("feature_scaler_cfg")
-            # Restore target_scaler_cfg from the saved artifact so that
-            # self._target_scaler_cfg reflects what was used during training,
-            # not whatever the current config says.
             saved_target_scaler_cfg = scaler_data.get("target_scaler_cfg")
             if saved_target_scaler_cfg is not None:
                 if saved_target_scaler_cfg != self._target_scaler_cfg:
                     raise ValueError(
                         f"SCALER CONFIG MISMATCH: artifact was saved with "
-                        f"target_scaler='{saved_target_scaler_cfg}' but current "
-                        f"config has target_scaler='{self._target_scaler_cfg}'. "
-                        "Retrain the model or align the config before loading this artifact."
+                        f"target_scaler='{saved_target_scaler_cfg}' but "
+                        f"current config has "
+                        f"target_scaler='{self._target_scaler_cfg}'. "
+                        "Retrain the model or align the config before loading."
                     )
                 self._target_scaler_cfg = saved_target_scaler_cfg
             logger.info(
-                f"Scalers loaded from {scaler_path}. "
-                f"target_scaler='{self._target_scaler_cfg}', "
-                f"feature_scaler='{self._feature_scaler_cfg}', "
-                f"scaler_fitted={self.scaler_fitted}."
+                "Scalers loaded from %s. target_scaler=%r, "
+                "feature_scaler=%r, scaler_fitted=%s.",
+                scaler_path,
+                self._target_scaler_cfg,
+                self._feature_scaler_cfg,
+                self.scaler_fitted,
             )
         except FileNotFoundError:
             logger.error("Scaler state not found. Please retrain the model.")
             raise
 
-        # Load the model - use the class method to get a new instance
-        self.model = self.model.__class__.load(path=path, map_location=str(self.device))
+        # Load the model (class method returns a new instance).
+        self.model = self.model.__class__.load(
+            path=path, map_location=str(self.device)
+        )
 
-        # Ensure model is on the correct device
         if hasattr(self.model, "to_device"):
             self.model.to_device(self.device)
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
             self.model.model.to(self.device)
-
-        logger.info(f"Model loaded and moved to device: {self.device}")
+        logger.info("Model loaded and moved to device: %s", self.device)

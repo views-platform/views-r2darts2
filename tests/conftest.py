@@ -1,38 +1,49 @@
-import os
-import pytest
-import views_r2darts2
+"""Top-level pytest configuration.
+
+Captures the clean ``torch.load`` reference before any monkey-patches
+(``apply_all_patches``) overwrite it. The legacy ``conftest`` did the same;
+we preserve the invariant because ``DartsForecastingModelManager`` and
+``patches.apply_torch_load_patch`` depend on it.
+
+Google Python Style.
+"""
+
+from __future__ import annotations
+
 import logging
+
 import torch
 
-# Capture the absolutely clean torch.load before any tests or mocks run
-# This is used by DartsForecastingModelManager to avoid 'Mock-in-the-Middle' bugs.
+# Capture the pristine torch.load BEFORE any test imports a module that calls
+# ``apply_all_patches()``. The captured reference is used by the patch itself
+# to fall back to the original behavior when the test session is over.
 CLEAN_TORCH_LOAD = torch.load
 
-logger = logging.getLogger(__name__)
 
+def pytest_sessionstart(session) -> None:  # noqa: ANN001
+    """Workspace-integrity check: ensure ``views_r2darts2`` resolves locally."""
+    import os
+    import sys
 
-def pytest_sessionstart(session):
-    """
-    Workspace Integrity Check:
-    Ensures that the library being tested is the one in the current workspace.
-    This prevents 'Ghost Imports' from stale temp folders in other projects.
-    """
-    expected_path = os.path.abspath(os.path.join(os.getcwd(), "views_r2darts2"))
-    actual_path = os.path.dirname(os.path.abspath(views_r2darts2.__file__))
+    # Find the project root (the directory containing this conftest.py).
+    here = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(here)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
 
-    if actual_path.lower() != expected_path.lower():
-        error_msg = (
-            "\n\n🚨 WORKSPACE INTEGRITY FAILURE 🚨\n"
-            "Environment Contamination Detected!\n"
-            f"Expected: {expected_path}\n"
-            f"Actual:   {actual_path}\n\n"
-            "You are importing 'views_r2darts2' from a location outside this project.\n"
-            "Common causes:\n"
-            "1. Stale 'temp-views-r2darts2' folders in other model directories.\n"
-            "2. PYTHONPATH pointing to a different experiment.\n"
-            "3. Package not installed in editable mode (pip install -e .).\n\n"
-            "Please run the 'Exorcism Protocol' to clear stale paths."
+    # Verify the package is importable from the local source tree (not from a
+    # pip-installed location that might be stale).
+    import views_r2darts2
+
+    pkg_path = os.path.dirname(os.path.abspath(views_r2darts2.__file__))
+    if not pkg_path.startswith(project_root):
+        raise SystemExit(
+            f"Workspace integrity check FAILED: views_r2darts2 resolves to "
+            f"{pkg_path}, expected under {project_root}. "
+            "Run pytest from the project root."
         )
-        pytest.exit(error_msg)
 
-    print(f"\n✅ Workspace Integrity Verified: {actual_path}")
+    # Quiet down the noisy loggers during tests.
+    logging.getLogger("darts").setLevel(logging.WARNING)
+    logging.getLogger("pytorch_lightning").setLevel(logging.WARNING)
+    print("\n✅ Workspace Integrity Verified (pandas-free)")

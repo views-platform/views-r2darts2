@@ -210,7 +210,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # is magnitude-blind across the tail; (1 + series_mag) restores bounded
         # asinh-space magnitude sensitivity so large wars pull more DC gradient
         # than small skirmishes. No new constant (asinh IS the scale).
-        series_gate = 0.0125 + 0.9875 * torch.sigmoid(
+        series_gate = 0.001 + 0.999 * torch.sigmoid(
             5.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
         series_w = series_gate * (1.0 + series_mag)  # magnitude-graded
@@ -224,13 +224,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # lag was the source of the flat-collapse oscillation): no running state,
         # no delayed feedback, no composition memory.
         #
-        # scale_factor = T restores the level term's STRENGTH relative to shape:
-        # the mean-over-window operator attenuates the DC gradient by 1/W, and T
-        # is a fixed, composition-INVARIANT multiplier (identical every batch),
-        # so it does not reintroduce composition dependence. When series_w
-        # averages ~1 this matches the previous (working) level magnitude, but
-        # now without the lagging denominator.
-        scale_factor = T
+        # scale_factor = 2*T: the effective level gradient per cell is
+        # scale_factor / (n_windows * W) * (series_w / Σ series_w) * tanh(·)
+        # = scale_factor / T * (series_w / Σ series_w) * tanh(·).
+        # With scale_factor = T the T/T cancels to 1 (no amplification);
+        # 2*T doubles the DC correction signal without any new constant,
+        # which is needed to overcome the DC-collapse tendency fast enough
+        # that the MSLE-based early stopping checkpoint captures a
+        # calibrated model rather than the underpredicting flat-output regime.
+        scale_factor = 2 * T
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))      # (C,)
@@ -333,7 +335,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_gate = 0.0125 + 0.9875 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
+        event_gate = 0.001 + 0.999 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO (event-gated) ─────────────────────

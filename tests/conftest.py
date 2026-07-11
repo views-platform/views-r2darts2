@@ -10,7 +10,7 @@ with ~259,000 unique pgm cells × ~100 months ≈ 25M rows — large enough to
 exercise the memmap cache path and the multi-entity TimeSeries construction,
 small enough to fit in a CI sandbox.
 
- Pandas-free.
+Pandas-free.
 """
 
 from __future__ import annotations

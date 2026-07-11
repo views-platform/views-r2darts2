@@ -13,7 +13,7 @@ model for save/load tests. For predict tests, the Darts model is mocked via
 real model while still exercising the full predict → inverse →
 ``PredictionFrame`` pipeline.
 
- ``pandas`` is used only at the Darts ``TimeSeries``
+``pandas`` is used only at the Darts ``TimeSeries``
 boundary (mirroring the production ``darts_bridge`` module confinement).
 """
 

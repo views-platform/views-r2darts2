@@ -60,14 +60,87 @@ class ParquetLoadError(ValueError):
 
 
 def _resolve_level(entity_id: str) -> SpatialLevel:
-    """Map an entity column name to its :class:`SpatialLevel`."""
-    try:
+    """Map an entity column name to its :class:`SpatialLevel`.
+
+    Recognizes both canonical names (``country_id``, ``priogrid_id``) and
+    aliases (``priogrid_gid`` → ``priogrid_id`` → ``PGM``).
+    """
+    # Canonical names.
+    if entity_id in _LEVEL_BY_ENTITY_COLUMN:
         return _LEVEL_BY_ENTITY_COLUMN[entity_id]
-    except KeyError as exc:  # pragma: no cover - defensive
-        raise ParquetLoadError(
-            f"Unrecognized entity column '{entity_id}'. "
-            f"Expected one of {sorted(_LEVEL_BY_ENTITY_COLUMN)}."
-        ) from exc
+    # Aliases.
+    if entity_id in _ENTITY_ALIASES:
+        canonical = _ENTITY_ALIASES[entity_id]
+        return _LEVEL_BY_ENTITY_COLUMN[canonical]
+    raise ParquetLoadError(
+        f"Unrecognized entity column '{entity_id}'. "
+        f"Expected one of {sorted(_LEVEL_BY_ENTITY_COLUMN)} "
+        f"or aliases {sorted(_ENTITY_ALIASES)}."
+    )
+
+
+# Aliases that the loader will silently normalize to the canonical name.
+# ``priogrid_gid`` is a typo that appears in some older viewser datasets; we
+# treat it as ``priogrid_id`` so callers don't need to know the exact spelling.
+_ENTITY_ALIASES: dict[str, str] = {
+    "priogrid_gid": "priogrid_id",
+}
+
+
+def _resolve_entity_column(declared: str, available: set[str]) -> str:
+    """Resolve the actual entity column name against the parquet schema.
+
+    The caller declares an ``entity_id`` (default ``"country_id"``), but the
+    parquet may use the other level's column (``"priogrid_id"`` for pgm data)
+    or a typo alias (``"priogrid_gid"``). This helper:
+
+        1. If the declared column is present, return it as-is.
+        2. If the declared column is absent, check the other level's canonical
+           column (``country_id`` ↔ ``priogrid_id``).
+        3. Check aliases (``priogrid_gid`` → ``priogrid_id``).
+        4. Log the resolution so the caller can see what happened.
+
+    Args:
+        declared: The entity column name the caller requested.
+        available: The set of column names in the parquet schema.
+
+    Returns:
+        The resolved entity column name (one of the canonical names
+        ``country_id`` or ``priogrid_id``).
+    """
+    # Step 1: declared column is present.
+    if declared in available:
+        return declared
+
+    # Step 2: check the other level's canonical column.
+    canonical_names = set(_LEVEL_BY_ENTITY_COLUMN.keys())
+    for canonical in canonical_names:
+        if canonical != declared and canonical in available:
+            logger.info(
+                "Entity column '%s' not found in parquet — falling back to "
+                "'%s'.", declared, canonical
+            )
+            return canonical
+
+    # Step 3: check aliases (e.g. priogrid_gid → priogrid_id).
+    for alias, canonical in _ENTITY_ALIASES.items():
+        if alias in available:
+            logger.info(
+                "Entity column '%s' not found in parquet — using alias '%s' "
+                "(will be normalized to '%s' in the frame index).",
+                declared, alias, canonical,
+            )
+            # Return the ALIAS name (the actual parquet column), not the
+            # canonical name — the caller needs to read this column from the
+            # parquet. The level is resolved from the canonical name via
+            # ``_resolve_level`` after we know which alias mapped to which
+            # canonical. To make that work, we return the alias here and
+            # adjust ``_resolve_level`` to recognize aliases.
+            return alias
+
+    # Step 4: none found — return the declared name so the caller gets the
+    # original "missing column" error message.
+    return declared
 
 
 def _read_parquet_columns(
@@ -153,6 +226,16 @@ def load_views_parquet(
     # Cache miss — decode parquet directly via pyarrow (no pandas).
     schema = pq.read_schema(str(path))
     available = set(schema.names)
+
+    # Auto-detect the entity column when the declared one is absent.
+    # The VIEWS viewser contract uses ``country_id`` for cm data and
+    # ``priogrid_id`` for pgm data, but some older datasets use
+    # ``priogrid_gid`` (a typo). Resolve the actual entity column here so
+    # callers don't need to know the level upfront — they can pass the default
+    # ``country_id`` and the loader will fall back to ``priogrid_id`` (or the
+    # ``priogrid_gid`` alias) when the parquet is pgm-level.
+    entity_id = _resolve_entity_column(entity_id, available)
+
     required = {time_id, entity_id, *targets, *features}
     missing = required - available
     if missing:

@@ -232,3 +232,107 @@ class TestParquetLoaderPgmLevel:
         )
         idx = frame.feature_names.index("lr_ged_sb")
         assert np.array_equal(direct, frame.values[:, idx, 0])
+
+
+class TestParquetLoaderEntityAutoDetection:
+    """Auto-detection of the entity column when the declared one is absent.
+
+    The loader should fall back from ``country_id`` → ``priogrid_id`` (or the
+    ``priogrid_gid`` alias) when the parquet is pgm-level, and vice versa.
+    """
+
+    def test_country_id_fallback_to_priogrid_id(self, tmp_path: Path) -> None:
+        """Declaring ``country_id`` on a pgm parquet falls back to ``priogrid_id``."""
+        table = pa.table(
+            {
+                "month_id": np.array([100, 100], dtype=np.int64),
+                "priogrid_id": np.array([1, 2], dtype=np.int64),
+                "lr_ged_sb": np.array([0.0, 1.0], dtype=np.float32),
+            }
+        )
+        pq.write_table(table, tmp_path / "pgm.parquet")
+        # Declare country_id (default) — the loader should auto-detect pgm.
+        frame, _, _ = load_views_parquet(
+            tmp_path / "pgm.parquet",
+            targets=["lr_ged_sb"],
+            features=None,
+            entity_id="country_id",  # absent in schema
+        )
+        assert frame.index.level == SpatialLevel.PGM
+        assert np.array_equal(frame.index.unit, np.array([1, 2], dtype=np.int64))
+
+    def test_priogrid_gid_alias(self, tmp_path: Path) -> None:
+        """``priogrid_gid`` (typo) is normalized to ``priogrid_id``."""
+        table = pa.table(
+            {
+                "month_id": np.array([100, 100], dtype=np.int64),
+                "priogrid_gid": np.array([1, 2], dtype=np.int64),
+                "lr_ged_sb": np.array([0.0, 1.0], dtype=np.float32),
+            }
+        )
+        pq.write_table(table, tmp_path / "pgm_gid.parquet")
+        # Declare country_id — neither country_id nor priogrid_id is present,
+        # but the priogrid_gid alias is. The loader should normalize it.
+        frame, _, _ = load_views_parquet(
+            tmp_path / "pgm_gid.parquet",
+            targets=["lr_ged_sb"],
+            features=None,
+            entity_id="country_id",
+        )
+        assert frame.index.level == SpatialLevel.PGM
+        assert np.array_equal(frame.index.unit, np.array([1, 2], dtype=np.int64))
+
+    def test_priogrid_id_fallback_to_country_id(self, tmp_path: Path) -> None:
+        """Declaring ``priogrid_id`` on a cm parquet falls back to ``country_id``."""
+        table = pa.table(
+            {
+                "month_id": np.array([100, 100], dtype=np.int64),
+                "country_id": np.array([1, 2], dtype=np.int64),
+                "lr_ged_sb": np.array([0.0, 1.0], dtype=np.float32),
+            }
+        )
+        pq.write_table(table, tmp_path / "cm.parquet")
+        frame, _, _ = load_views_parquet(
+            tmp_path / "cm.parquet",
+            targets=["lr_ged_sb"],
+            features=None,
+            entity_id="priogrid_id",  # absent in schema
+        )
+        assert frame.index.level == SpatialLevel.CM
+        assert np.array_equal(frame.index.unit, np.array([1, 2], dtype=np.int64))
+
+    def test_declared_entity_present_no_fallback(self, tmp_path: Path) -> None:
+        """When the declared entity column IS present, no fallback occurs."""
+        table = pa.table(
+            {
+                "month_id": np.array([100, 100], dtype=np.int64),
+                "country_id": np.array([1, 2], dtype=np.int64),
+                "lr_ged_sb": np.array([0.0, 1.0], dtype=np.float32),
+            }
+        )
+        pq.write_table(table, tmp_path / "cm.parquet")
+        frame, _, _ = load_views_parquet(
+            tmp_path / "cm.parquet",
+            targets=["lr_ged_sb"],
+            features=None,
+            entity_id="country_id",
+        )
+        assert frame.index.level == SpatialLevel.CM
+
+    def test_no_entity_column_found_raises(self, tmp_path: Path) -> None:
+        """When no entity column is present, the original error is raised."""
+        table = pa.table(
+            {
+                "month_id": np.array([100, 100], dtype=np.int64),
+                "some_other_id": np.array([1, 2], dtype=np.int64),
+                "lr_ged_sb": np.array([0.0, 1.0], dtype=np.float32),
+            }
+        )
+        pq.write_table(table, tmp_path / "bad.parquet")
+        with pytest.raises(ParquetLoadError, match="missing required columns"):
+            load_views_parquet(
+                tmp_path / "bad.parquet",
+                targets=["lr_ged_sb"],
+                features=None,
+                entity_id="country_id",
+            )

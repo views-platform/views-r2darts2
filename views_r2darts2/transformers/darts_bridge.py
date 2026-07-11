@@ -15,7 +15,7 @@ Confining the pandas import here means:
     * The memmap-backed :class:`FeatureFrame` stays the source of truth; Darts
       TimeSeries are short-lived view objects built on demand.
 
-Google Python Style: this module has a single public function
+this module has a single public function
 ``build_entity_timeseries`` and a single helper ``build_prediction_frame``.
 """
 

@@ -15,7 +15,7 @@ Verifies that:
 The tests use a session-scoped synthetic parquet fixture (see ``conftest.py``)
 so they run anywhere without the real validation parquet.
 
- Pandas-free (except the Darts boundary).
+Pandas-free (except the Darts boundary).
 """
 
 from __future__ import annotations

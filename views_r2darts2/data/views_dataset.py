@@ -150,22 +150,29 @@ class ViewsDatasetDarts:
         features = _resolve_features_from_config(config, targets)
 
         time_id = config.get("time_id", "month_id")
-        entity_id = config.get("entity_id", "country_id")
+        declared_entity_id = config.get("entity_id", "country_id")
 
         frame, features, _ = load_views_parquet(
             file_path,
             targets=targets,
             features=features,
             time_id=time_id,
-            entity_id=entity_id,
+            entity_id=declared_entity_id,
             cache_dir=cache_dir,
         )
+
+        # The loader may have auto-detected a different entity column (e.g.,
+        # ``priogrid_id`` when ``country_id`` was declared). Resolve the actual
+        # entity_id from the frame's spatial level so the dataset labels output
+        # rows with the correct column name.
+        actual_entity_id = frame.index.level.entity_column
+
         return cls(
             feature_frame=frame,
             targets=targets,
             features=features,
             time_id=time_id,
-            entity_id=entity_id,
+            entity_id=actual_entity_id,
         )
 
     # ------------------------------------------------------------------ accessors

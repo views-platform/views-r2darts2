@@ -5,7 +5,7 @@ factory (``instantiate_darts_scaler``) over the full 12-name vocabulary and
 all four chain-spec forms. Includes round-trip numerical tests for the
 elementwise transforms (AsinhTransform, LogTransform, FourthRootTransform).
 
- ``pandas`` is used only at the Darts boundary (for
+``pandas`` is used only at the Darts boundary (for
 ``pd.Index``/``pd.DataFrame`` construction in :class:`TimeSeries`).
 """
 

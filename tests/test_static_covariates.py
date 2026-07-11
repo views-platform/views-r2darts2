@@ -5,7 +5,7 @@ Verifies the per-entity static-covariate fingerprint (``mu``, ``sigma``,
 (``AsinhTransform``/``MaxAbsScaler``/``StandardScaler``), and bit-for-bit
 parity with the equivalent pandas ``groupby`` path.
 
- ``pandas`` is imported ONLY in
+``pandas`` is imported ONLY in
 ``test_parity_with_pandas_groupby`` as the reference oracle — the production
 module is pandas-free.
 """

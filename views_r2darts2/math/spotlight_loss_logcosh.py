@@ -95,29 +95,39 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level term: MSE on temporal MEAN (magnitude-aware, clip-safe) ─
-        # MSE on the temporal MEAN (not sum) gives gradient 2*mean_error/T
-        # per cell — magnitude-proportional but scaled down by T² vs sum-MSE.
-        # This keeps the gradient within the gradient_clip_val range so the
-        # clip doesn't neutralize the level signal (which caused the
-        # epoch-0 overshoot → epoch-2 collapse pattern with sum-MSE).
-        # The mean still aggregates T=36 timesteps (√T spike reduction).
+        # ── Level term: per-cell MSE gated by event mask ────────────
+        # Every aggregation (mean/sum) over T cells introduces a 1/T
+        # factor in the per-cell gradient, making level 20-40x weaker
+        # than shape. The solution: NO aggregation — per-cell MSE on
+        # event cells only. The gate filters peace cells (gate ≈ 0.018
+        # for peace, ≈ 1.0 for events), so spikes in peace don't
+        # destabilize training. Event spikes are bounded by asinh space
+        # (max ~13). The gradient is 2*(pred-true) per event cell —
+        # magnitude-proportional and NOT attenuated by 1/T.
         #
-        # Gradient comparison (sustained 50% underprediction):
-        #   sb (truth=3): mean_error=-1.5, grad=2*(-1.5)/36=-0.083 per cell
-        #   os (truth=9): mean_error=-4.5, grad=2*(-4.5)/36=-0.250 per cell
-        #   Ratio: 3.0x (magnitude-proportional, NOT clipped)
-        #   (sum-MSE gave 4.0 and 12.0 per cell → total 144-432 → clipped to 20)
-        mean_error = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = mean_error ** 2
+        # Stability analysis:
+        # - Peace cells: gate ≈ 0.018 → gradient ≈ 0.018 * 2 * spike
+        #   → negligible (spike noise filtered by gate)
+        # - Event cells: gate ≈ 1.0 → gradient = 2 * (pred - true)
+        #   → bounded by asinh range: max 2 * 13 = 26 per cell
+        #   → total for 4 events: 4 * 26 = 104 (within clip=100)
+        # - The gate IS the stabilizer — it replaces the aggregation's
+        #   √T noise reduction with explicit event/peace separation.
+        level_cell = gate * (y_pred - y_true) ** 2
 
         # Per-series event mass for level weighting
         w = gate.amax(dim=1)
 
         # ── Normalisation ────────────────────────────────────────────
+        # Shape: Hájek (self-normalised) — composition-robust
+        # Level: plain SUM (not Hájek) — the gate already filters peace,
+        # so Hájek's 1/sum(gate) would dilute the event gradient by
+        # dividing by all peace cells' tiny gate values. The sum gives
+        # raw gradient = gate * 2*(pred-true) per cell — strong on
+        # events, ~0 on peace. The gate IS the stabilizer.
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (w * level_cell).mean(dim=0)
+            level = level_cell.sum(dim=(0, 1))
 
             per_channel = shape + level
             total_loss = per_channel.mean()
@@ -126,7 +136,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = (w * level_cell).mean()
+            level = level_cell.sum()
             total_loss = shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]

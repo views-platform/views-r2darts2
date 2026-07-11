@@ -12,19 +12,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
     UCDP GED conflict fatality forecasting at country-month level:
     ~92% zeros for sb, ~97% for ns, ~98% for os.
 
-    ── v49c: evidence-based fixes from training dynamics ──────────────
+    ── v49d: evidence-based fixes from training dynamics ──────────────
 
-    1. **Level scale_factor = W** (reverted from T and (W+T)//2).
+    1. **Level scale_factor = W** (kept from v47, reverted from T/(W+T)//2).
        EVIDENCE: Any scale > W causes level to dominate (85-93% of loss).
        At 90% sparsity, window means are near-zero in training but non-zero
        in eval → model memorizes training window means → sb drops from
-       103% (train) to 46% (eval). W keeps level at ~4% — the squared
-       event_mag gate (fix #2) handles dilution instead.
+       93% (train) to 43% (eval). W keeps level balanced with shape.
 
-    2. **Event mag gate: (1+abs_max) → (1+abs_max)²** (kept from v49a).
-       EVIDENCE: With linear mag, large events got 5:1 weight vs small.
-       Squared gives 25:1 — large events dominate the Hájek numerator,
-       countering zero-dilution without inflating the level loss.
+    2. **Event mag gate: linear (1+abs_max)** (reverted from squared).
+       EVIDENCE: The squared gate (v49a-c) caused level to dominate
+       (72-83%) because it shrank the shape Hájek denominator faster
+       than the numerator. Linear mag keeps the original v47 shape/level
+       balance. The std floor on calibration handles the ns explosion
+       that the squared gate was trying to fix.
 
     3. **Calibration std floor: clamp(min=non_zero_threshold)** (kept).
        EVIDENCE: Without the floor, ns channel EMA exploded to 51,767
@@ -34,7 +35,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     ── Components (unchanged from v47) ─────────────────────────────────
 
     1. DC/AC decomposition — per-window demeaning.
-    2. Gated + magnitude-graded event weighting (now squared).
+    2. Gated + magnitude-graded event weighting (linear).
     3. Per-series temporal DRO (event-gated).
     4. Windowed level anchor — W-scaled log_cosh on per-window means.
     5. Relative z-score calibration — per-channel mean-matching (z², std-floored).
@@ -147,11 +148,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Event-gated windowed level anchor with T-scaled Hájek normalization.
+        """Event-gated windowed level anchor with W-scaled Hájek normalization.
 
-        scale_factor = T (changed from W). W=12 made level only 3.6% of
-        loss, causing templating. T=36 gives 3x boost, bringing level to
-        ~11% — enough to differentiate countries by magnitude.
+        scale_factor = W compensates the 1/W gradient attenuation from the
+        mean operator. This is the mathematically exact inverse.
         """
         W = max(6, T // 3)
         window_means = torch.stack(
@@ -169,7 +169,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         )
         series_w = series_gate
 
-        scale_factor = W  # REVERTED to W: >W causes level to memorize training window means (near-zero at 90% sparsity), causing eval collapse. The squared event_mag gate already counters dilution.
+        scale_factor = W  # W is the exact gradient compensation for the mean operator. >W causes level to memorize training window means (near-zero at 90% sparsity), causing eval collapse.
         n_windows = level_losses.shape[1]
         if level_losses.dim() == 3:
             num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
@@ -286,14 +286,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         cell_loss = self._log_cosh(e_shape)
 
         # ── Gated + magnitude-graded event weighting ──────────────────
-        # CHANGED: (1+abs_max) -> (1+abs_max)^2
-        # Squared magnitude gives 25:1 large/small ratio (was 5:1).
-        # Counters zero-dilution: at 90%+ sparsity, the few large events
-        # must dominate the Hájek numerator to pull the model away from
-        # templating a flat shape.
+        # REVERTED to linear (1+abs_max). The squared version (v49a-c) caused
+        # level to dominate (72-83%) because it shrank the shape Hájek
+        # denominator faster than the numerator. Linear mag keeps the
+        # original v47 shape/level balance. The std floor on calibration
+        # handles the ns explosion that the squared gate was trying to fix.
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_gate = torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
-        event_mag = event_gate * (1.0 + abs_max) ** 2  # CHANGED: squared
+        event_mag = event_gate * (1.0 + abs_max)  # REVERTED: was squared
 
         soft_event_mask = torch.sigmoid(
             10.0 * (abs_max - self.non_zero_threshold)

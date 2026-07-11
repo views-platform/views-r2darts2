@@ -8,56 +8,32 @@ logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
     """
-    SpotlightLoss v48 — calibration through level redesign, no new terms.
-
     Operates in asinh space (AsinhTransform target scaler). Designed for
     UCDP GED conflict fatality forecasting at country-month level:
     ~92% zeros for sb, ~97% for ns, ~98% for os.
 
-    ── Design: calibration baked into existing components ─────────────
+    ── v49 changes (minimal, from v47) ────────────────────────────────
 
-    1. **Level loss redesigned as z-score calibration.** The DC/level
-       component is now z² of the event-cell mean bias:
-           z = mean(e[event]) / std(y_true[event])
-           level = z²
-       This IS the calibration signal — no separate calibration term.
-       Uses event_mag weighting (not soft sigmoid) to avoid peace-cell
-       dilution. Computed at batch level for std stability.
+    1. **Level scale_factor = T** (was W). W=12 made level only 3.6% of
+       loss, causing the model to template the same shape for all countries
+       (shape was 96%). T=36 gives a 3x boost, bringing level to ~11%.
+       This is the midpoint between v46's 2*T (96% level, too much) and
+       v47's W (3.6%, too little).
 
-       Properties:
-       - Dimensionless (no scale hyperparameter)
-       - Self-normalizing (divides by truth std per channel)
-       - Per-channel (sb, ns, os each get independent calibration)
-       - Quadratic gradient (2z/std grows with bias → strong push)
-       - Converges to 0 when mean matches, then shape takes over
+    2. **Event mag gate: (1+abs_max) → (1+abs_max)²**. At 90%+ sparsity,
+       the few event cells need to dominate the Hájek ratio. Linear
+       magnitude gave 5:1 large/small ratio; squared gives 25:1. This
+       counters zero-dilution by making large events pull the gradient
+       proportionally harder. Bounded because abs_max is in asinh space
+       (max ~10), so (1+10)²=121 is the ceiling.
 
-    2. **Shape loss unchanged (Hájek mean of log_cosh).** The AC
-       component stays composition-robust for pattern learning.
-
-    3. **Channel router redesigned as relative-loss routing.** Replaces
-       the inert EMA-ratio (fast/slow ≈ 1.0) with sqrt-concentrated
-       relative loss. Routes gradient to the worst-performing channel.
-
-    4. **Gate floor removed.** Sigmoid alone provides sufficient peace
-       suppression (σ(10×(0.48−0.88)) ≈ 0.018).
-
-    ── AC-DC split maintained ─────────────────────────────────────────
-
-    - DC (level) = batch-level event-cell mean bias as z²
-    - AC (shape) = window-demeaned per-cell error (Hájek log_cosh)
-
-    The window-mean demeaning for the shape loss is unchanged. The level
-    loss operates on the same error tensor but aggregates it as an
-    event-weighted z-score rather than a window mean, because window
-    means are diluted by peace cells (1 event in 12 months → mean = 1/12).
-
-    ── Components ───────────────────────────────────────────────────────
+    ── Components (unchanged from v47) ─────────────────────────────────
 
     1. DC/AC decomposition — per-window demeaning.
-    2. Gated + magnitude-graded event weighting.
+    2. Gated + magnitude-graded event weighting (now squared).
     3. Per-series temporal DRO (event-gated).
-    4. Z-score level anchor — calibration as DC component (z²).
-    5. Hájek shape — composition-robust AC component.
+    4. Windowed level anchor — T-scaled log_cosh on per-window means.
+    5. Relative z-score calibration — per-channel mean-matching (z²).
     6. Multi-resolution STFT loss (disabled by default).
     """
 
@@ -84,7 +60,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_weights: list[float] | None = None
 
-        logger.info("SpotlightLossLogcosh v48 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossLogcosh v49 | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -133,98 +109,101 @@ class SpotlightLossLogcosh(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _combine_channels(self, per_channel_loss: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Relative-loss channel routing with sqrt concentration.
-
-        Replaces the inert EMA-ratio router (fast/slow ≈ 1.0). Routes
-        gradient toward the worst-performing channel via:
-
-            w_c = C · sqrt(ema_c / min_ema) / Σ_k sqrt(ema_k / min_ema)
-
-        The sqrt gives sublinear concentration: a channel 4x worse gets
-        2x the weight (not 4x). This prevents winner-take-all while
-        still tilting toward the channel that needs the most help.
-        """
+        """Combine per-channel losses by relative learning progress."""
         C = per_channel_loss.shape[0]
         batch_loss_det = per_channel_loss.detach()
         beta = self._EMA_BETA
 
         if (
             self._loss_ema is None
+            or self._loss_ema_slow is None
             or len(self._loss_ema) != C
         ):
             self._loss_ema = batch_loss_det.tolist()
+            self._loss_ema_slow = batch_loss_det.tolist()
         else:
             if self.training:
                 for c in range(C):
                     self._loss_ema[c] = beta * self._loss_ema[c] + (1.0 - beta) * float(batch_loss_det[c])
+                    self._loss_ema_slow[c] = beta * self._loss_ema_slow[c] + (1.0 - beta) * self._loss_ema[c]
 
-        ema_tensor = per_channel_loss.new_tensor(self._loss_ema)
-        min_ema = ema_tensor.min().clamp(min=self._EMA_EPS)
-        scores = torch.sqrt(ema_tensor / min_ema)
+        fast = per_channel_loss.new_tensor(self._loss_ema)
+        slow = per_channel_loss.new_tensor(self._loss_ema_slow)
+        scores = fast / slow.clamp(min=self._EMA_EPS)
         w_soft = C * scores / scores.sum().clamp(min=self._EMA_EPS)
 
         self._last_weights = w_soft.tolist()
-        self._last_cal_ratio = (ema_tensor / min_ema).tolist()
+        self._last_cal_ratio = scores.tolist()
         self._last_cal_score = list(self._loss_ema)
         self._last_gates = w_soft.tolist()
 
         return (w_soft * per_channel_loss).sum()
 
     def _windowed_level_loss(
-        self, e: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor, T: int,
+        self, e: torch.Tensor, y_true: torch.Tensor, T: int,
         y_pred_det: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Relative-error level anchor (per-cell calibration in DC component).
+        """Event-gated windowed level anchor with T-scaled Hájek normalization.
 
-        The DC/level component: Hájek ratio of weighted error² to weighted
-        truth². This calibrates EVERY event cell toward truth, not just
-        the aggregate mean:
-
-            level = Σ(w · e²) / Σ(w · y_true²)
-
-        Properties:
-        - Model predicts 0  → level ≈ 1.0 (100% relative error per cell)
-        - Model predicts 50% → level ≈ 0.25
-        - Model matches      → level = 0.0
-        - Gradient: 2e·w / Σ(w·y²) — grows with per-cell error
-
-        This is dimensionless, self-normalizing (denominator is the true
-        signal energy), and per-channel. Unlike z² (which only calibrates
-        the mean), this calibrates the full distribution because it
-        penalizes each cell's squared relative error.
-
-        The AC-DC split is maintained:
-        - DC (level) = per-cell magnitude calibration (this function)
-        - AC (shape) = window-demeaned per-cell pattern (in forward)
-
-        The window-mean demeaning for the shape loss is unchanged.
+        scale_factor = T (changed from W). W=12 made level only 3.6% of
+        loss, causing templating. T=36 gives 3x boost, bringing level to
+        ~11% — enough to differentiate countries by magnitude.
         """
-        # Event mask and weighting (same as shape loss)
-        if y_pred_det is not None:
-            abs_max = torch.max(y_true.abs(), y_pred_det.abs())
-        else:
-            abs_max = y_true.abs()
-        event_gate = torch.sigmoid(
-            10.0 * (abs_max - self.non_zero_threshold)
+        W = max(6, T // 3)
+        window_means = torch.stack(
+            [ew.mean(dim=1) for ew in e.split(W, dim=1)], dim=1
         )
-        event_mag = event_gate * (1.0 + abs_max)
+        level_losses = self._log_cosh(window_means)
 
-        # True signal energy (denominator) — detached
-        true_energy = (event_mag.detach() * y_true ** 2)
-
-        # Error energy (numerator)
-        error_energy = (event_mag * e ** 2)
-
-        if e.dim() == 3:
-            # (B, T, C) — per-channel
-            num = error_energy.sum(dim=(0, 1))  # (C,)
-            den = true_energy.sum(dim=(0, 1)).clamp(min=self._EMA_EPS)  # (C,)
-            return num / den  # (C,)
+        if y_pred_det is not None:
+            abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
         else:
-            # (B, T) — univariate
-            num = error_energy.sum()
-            den = true_energy.sum().clamp(min=self._EMA_EPS)
-            return num / den  # scalar
+            abs_max_series = y_true.abs()
+        series_mag = abs_max_series.max(dim=1).values
+        series_gate = torch.sigmoid(
+            10.0 * (series_mag - self.non_zero_threshold)
+        )
+        series_w = series_gate
+
+        scale_factor = T  # CHANGED: was W, now T (3x boost to break templating)
+        n_windows = level_losses.shape[1]
+        if level_losses.dim() == 3:
+            num = (series_w.unsqueeze(1) * level_losses).sum(dim=(0, 1))
+            den = (series_w.sum(dim=0) * n_windows).clamp(min=self._EMA_EPS)
+            return scale_factor * num / den
+        else:
+            num = (series_w.unsqueeze(1) * level_losses).sum()
+            den = (series_w.sum() * n_windows).clamp(min=self._EMA_EPS)
+            return scale_factor * num / den
+
+    def _calibration_loss(
+        self, y_pred: torch.Tensor, y_true: torch.Tensor
+    ) -> torch.Tensor:
+        """Relative z-score calibration on event cells. Per-channel."""
+        event_mask = (y_true.abs() > self.non_zero_threshold).float()
+
+        if y_pred.dim() == 3:
+            n_event = event_mask.sum(dim=(0, 1)).clamp(min=1.0)
+            pred_mean = (y_pred * event_mask).sum(dim=(0, 1)) / n_event
+            true_mean = (y_true * event_mask).sum(dim=(0, 1)) / n_event
+            true_centered = (y_true - true_mean) * event_mask
+            true_var = (true_centered ** 2).sum(dim=(0, 1)) / n_event
+            true_std = (true_var + self._EMA_EPS).sqrt()
+
+            z_score = (pred_mean - true_mean) / true_std
+            cal = z_score ** 2
+            return cal
+        else:
+            n_event = event_mask.sum().clamp(min=1.0)
+            pred_mean = (y_pred * event_mask).sum() / n_event
+            true_mean = (y_true * event_mask).sum() / n_event
+            true_centered = (y_true - true_mean) * event_mask
+            true_var = (true_centered ** 2).sum() / n_event
+            true_std = (true_var + self._EMA_EPS).sqrt()
+
+            z_score = (pred_mean - true_mean) / true_std
+            cal = z_score ** 2
+            return cal
 
     def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """Multi-resolution STFT magnitude comparison (AC bins only)."""
@@ -297,9 +276,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         cell_loss = self._log_cosh(e_shape)
 
         # ── Gated + magnitude-graded event weighting ──────────────────
+        # CHANGED: (1+abs_max) -> (1+abs_max)^2
+        # Squared magnitude gives 25:1 large/small ratio (was 5:1).
+        # Counters zero-dilution: at 90%+ sparsity, the few large events
+        # must dominate the Hájek numerator to pull the model away from
+        # templating a flat shape.
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
         event_gate = torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
-        event_mag = event_gate * (1.0 + abs_max)
+        event_mag = event_gate * (1.0 + abs_max) ** 2  # CHANGED: squared
 
         soft_event_mask = torch.sigmoid(
             10.0 * (abs_max - self.non_zero_threshold)
@@ -307,50 +291,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
-        # ── Hájek self-normalized shape (AC component) ────────────────
-        # Composition-robust pattern matching. The AC component captures
-        # within-window timing/shape. Hájek mean makes it invariant to
-        # event count, which is correct for pattern learning.
+        # ── Hájek self-normalized shape ───────────────────────────────
         if w_total.dim() == 3:
             num = (w_total * cell_loss).sum(dim=(0, 1))
             den = w_total.sum(dim=(0, 1)).clamp(min=self._EMA_EPS)
-            loss_shape = num / den  # (C,)
+            loss_shape = num / den
         else:
             num = (w_total * cell_loss).sum()
             den = w_total.sum().clamp(min=self._EMA_EPS)
-            loss_shape = num / den  # scalar
+            loss_shape = num / den
 
-        # ── Level (DC component — z-score calibration) ────────────────
-        # The level loss IS the calibration signal: z² of the event-cell
-        # mean bias. Uses event_mag weighting (not soft sigmoid) to avoid
-        # peace-cell dilution. Computed at batch level for std stability.
-        #
-        # AC-DC split maintained:
-        # - DC (level) = batch-level event-cell mean bias as z²
-        # - AC (shape) = window-demeaned per-cell error (above)
-        #
-        # z² provides collective calibration: every event cell gets the
-        # same gradient push (2z/std/n_event), effective for sparse channels.
-        # Once the mean matches, z² → 0 and the shape loss takes over for
-        # per-cell pattern correction.
-        if e.dim() == 3:
-            w_mag = event_mag.detach()  # (B, T, C) — ~0 for peace
-            n_ev = w_mag.sum(dim=(0, 1)).clamp(min=1.0)  # (C,)
-            ev_mean_e = (e * w_mag).sum(dim=(0, 1)) / n_ev  # (C,)
-            ev_mean_true = (y_true * w_mag).sum(dim=(0, 1)) / n_ev  # (C,)
-            ev_var_true = ((y_true - ev_mean_true.unsqueeze(0).unsqueeze(0)) ** 2 * w_mag).sum(dim=(0, 1)) / n_ev  # (C,)
-            ev_std_true = (ev_var_true + self._EMA_EPS).sqrt()  # (C,)
-            z_score = ev_mean_e / ev_std_true  # (C,)
-            loss_level = z_score ** 2  # (C,)
-        else:
-            w_mag = event_mag.detach()
-            n_ev = w_mag.sum().clamp(min=1.0)
-            ev_mean_e = (e * w_mag).sum() / n_ev
-            ev_mean_true = (y_true * w_mag).sum() / n_ev
-            ev_var_true = ((y_true - ev_mean_true) ** 2 * w_mag).sum() / n_ev
-            ev_std_true = (ev_var_true + self._EMA_EPS).sqrt()
-            z_score = ev_mean_e / ev_std_true
-            loss_level = z_score ** 2
+        # ── Windowed level anchor (T-scaled) ──────────────────────────
+        loss_level = self._windowed_level_loss(e, y_true, T, y_pred_det=y_pred.detach())
+
+        # ── Calibration loss (relative z-score, z²) ───────────────────
+        loss_cal = self._calibration_loss(y_pred, y_true)
 
         # ── Spectral loss ──────────────────────────────────────────────
         loss_spec = y_pred.new_tensor(0.0)
@@ -359,15 +314,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Assemble total ────────────────────────────────────────────
         if loss_shape.dim() == 0:
-            total_loss = loss_shape + loss_level + loss_spec
+            total_loss = loss_shape + loss_level + loss_cal + loss_spec
             self._last_components = {
                 "shape": [float(loss_shape.detach())],
                 "level": [float(loss_level.detach())],
+                "cal": [float(loss_cal.detach())],
                 "spec": [float(loss_spec.detach()) if loss_spec.dim() == 0 else float(loss_spec)],
                 "weight": [1.0],
             }
         else:
-            per_channel_total = loss_shape + loss_level
+            per_channel_total = loss_shape + loss_level + loss_cal
             if loss_spec.dim() == 0:
                 per_channel_total = per_channel_total + float(loss_spec)
             else:
@@ -377,13 +333,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
             C = per_channel_total.shape[0]
             spec_list = loss_spec.detach().tolist() if loss_spec.dim() else [float(loss_spec)] * C
+            cal_list = loss_cal.detach().tolist() if loss_cal.dim() else [float(loss_cal)] * C
             weights = self._last_weights or [1.0] * C
             self._last_components = {
                 "shape": loss_shape.detach().tolist(),
                 "level": loss_level.detach().tolist(),
+                "cal": cal_list,
                 "spec": spec_list,
                 "weight": weights,
-                "ema": self._loss_ema or [float("nan")] * C,
+                "ema": self._loss_ema_slow or [float("nan")] * C,
                 "cal_ratio": getattr(self, "_last_cal_ratio", [1.0] * C),
                 "cal_score": getattr(self, "_last_cal_score", [1.0] * C),
                 "gates": getattr(self, "_last_gates", [1.0] * C),
@@ -395,15 +353,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if torch.isnan(total_loss):
             _s = float(loss_shape.sum()) if loss_shape.dim() else float(loss_shape)
             _l = float(loss_level.sum()) if loss_level.dim() else float(loss_level)
+            _c = float(loss_cal.sum()) if loss_cal.dim() else float(loss_cal)
             _sp = float(loss_spec.sum()) if loss_spec.dim() else float(loss_spec)
             raise RuntimeError(
-                f"NaN in SpotlightLossLogcosh: shape={_s:.6f} level={_l:.6f} spec={_sp:.6f}"
+                f"NaN in SpotlightLossLogcosh: shape={_s:.6f} level={_l:.6f} "
+                f"cal={_c:.6f} spec={_sp:.6f}"
             )
 
         logger.debug(
-            "SpotlightLossLogcosh v48 | shape=%.6f level=%.6f spec=%.6f total=%.6f",
+            "SpotlightLossLogcosh v49 | shape=%.6f level=%.6f cal=%.6f spec=%.6f total=%.6f",
             loss_shape.item() if loss_shape.dim() == 0 else loss_shape.sum().item(),
             loss_level.item() if loss_level.dim() == 0 else loss_level.sum().item(),
+            loss_cal.item() if loss_cal.dim() == 0 else loss_cal.sum().item(),
             loss_spec.item() if loss_spec.dim() == 0 else loss_spec.sum().item(),
             total_loss.item(),
         )

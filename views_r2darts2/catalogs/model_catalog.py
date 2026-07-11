@@ -10,6 +10,7 @@ from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 import torch
 import logging
@@ -144,7 +145,9 @@ class ModelCatalog:
         # Wire EarlyStopping if patience is set in config
         early_stopping_patience = self.config.get("early_stopping_patience", None)
         early_stopping_min_delta = self.config.get("early_stopping_min_delta", 0.0)
-        early_stopping_monitor = self.config.get("early_stopping_monitor", "val_loss")
+        early_stopping_monitor = self.config.get(
+            "early_stopping_monitor", "val_metrics/BALANCE_GM_RATIO"
+        )
         if early_stopping_patience is not None:
             callbacks.append(
                 EarlyStopping(
@@ -155,6 +158,19 @@ class ModelCatalog:
                     verbose=True,
                 )
             )
+
+        # Explicit checkpoint monitor so "best" model follows the same
+        # multi-metric objective as EarlyStopping.
+        checkpoint_monitor = self.config.get("checkpoint_monitor", early_stopping_monitor)
+        callbacks.append(
+            ModelCheckpoint(
+                monitor=checkpoint_monitor,
+                mode="min",
+                save_top_k=1,
+                save_last=True,
+                filename="{epoch:03d}-best",
+            )
+        )
 
         # LearningRateMonitor makes LR reductions visible in WandB
         callbacks.append(LearningRateMonitor(logging_interval="epoch"))

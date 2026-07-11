@@ -1057,13 +1057,15 @@ class ValMetricsCallback(Callback):
         - Purpose: Provide calibration-quality metrics (MSLE, RMSLE, MSE) on the
           held-out validation fold so that overprediction bias visible in training
           calibration is also tracked on unseen windows.
-        - Mechanism: ``on_validation_batch_end`` runs a fresh ``no_grad`` forward
-          pass using the batch that was just processed.  The model is already in
-          ``eval()`` mode, so RevIN and dropout behave identically to what the
-          ``validation_step`` already computed — the extra overhead is one
-          forward pass per val batch with no gradient tape.
-        - Guarantees: Logs ``val_metrics/MSLE``, ``val_metrics/RMSLE``,
-          ``val_metrics/MSE`` to WandB at the end of each validation epoch.
+                - Mechanism: ``on_validation_batch_end`` runs a fresh ``no_grad`` forward
+                    pass using the batch that was just processed.  The model is already in
+                    ``eval()`` mode, so RevIN and dropout behave identically to what the
+                    ``validation_step`` already computed — the extra overhead is one
+                    forward pass per val batch with no gradient tape.
+                - Guarantees: Logs ``val_metrics/MSLE``, ``val_metrics/RMSLE``,
+                    ``val_metrics/MSE``, ``val_metrics/GM_MSLE_MSE``,
+                    ``val_metrics/PARETO_GATE`` (strict both-must-improve), and
+                    ``val_metrics/BALANCE_GM_RATIO`` (trade-off balance) at epoch end.
         - Non-Goals: Does not recompute val_loss or interfere with early stopping.
 
     Parameters
@@ -1087,6 +1089,8 @@ class ValMetricsCallback(Callback):
         self._inverse_fn = (
             torch.sinh if target_scaler == "AsinhTransform" else torch.expm1
         )
+        self._best_msle = float("inf")
+        self._best_mse = float("inf")
 
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
@@ -1152,11 +1156,32 @@ class ValMetricsCallback(Callback):
         # MSE in raw space
         mse = ((raw_preds - raw_truths) ** 2).mean().item()
 
+        # Composite objective in raw/log space trade-off.
+        gm_msle_mse = (msle * mse) ** 0.5
+
+        # Ratios are computed against BEST PREVIOUS values (before update).
+        msle_ref = max(self._best_msle, 1e-12)
+        mse_ref = max(self._best_mse, 1e-12)
+        ratio_msle = msle / msle_ref if msle_ref < float("inf") else 1.0
+        ratio_mse = mse / mse_ref if mse_ref < float("inf") else 1.0
+
+        # Strict "both must not regress" gate: < 1 only when both are better.
+        pareto_gate = max(ratio_msle, ratio_mse)
+        # Balanced trade-off gate: allows one-up one-down if joint GM improves.
+        balance_gm_ratio = (ratio_msle * ratio_mse) ** 0.5
+
         metrics = {
             "val_metrics/MSLE": msle,
             "val_metrics/RMSLE": rmsle,
             "val_metrics/MSE": mse,
+            "val_metrics/GM_MSLE_MSE": gm_msle_mse,
+            "val_metrics/PARETO_GATE": pareto_gate,
+            "val_metrics/BALANCE_GM_RATIO": balance_gm_ratio,
         }
+
+        # Update per-metric bests after ratio computation.
+        self._best_msle = min(self._best_msle, msle)
+        self._best_mse = min(self._best_mse, mse)
 
         # Log to PyTorch Lightning callback_metrics so EarlyStopping/checkpointing can monitor them
         for k, v in metrics.items():
@@ -1167,7 +1192,8 @@ class ValMetricsCallback(Callback):
 
         logger.info(
             f"[Epoch {trainer.current_epoch}] Val Metrics | "
-            f"MSLE={msle:.5f}  RMSLE={rmsle:.4f}  MSE={mse:.2f}"
+            f"MSLE={msle:.5f}  RMSLE={rmsle:.4f}  MSE={mse:.2f}  "
+            f"GM={gm_msle_mse:.4f}  Pareto={pareto_gate:.4f}  Balance={balance_gm_ratio:.4f}"
         )
 
 

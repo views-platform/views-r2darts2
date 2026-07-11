@@ -175,13 +175,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self,
         y_pred: torch.Tensor,
         y_true: torch.Tensor,
-        abs_max: torch.Tensor,
         event_mag: torch.Tensor,
     ) -> torch.Tensor:
         """Per-cell level loss on raw asinh error, no windowing.
 
-        - ``abs_max`` and ``event_mag`` are the same tensors used in the shape
-          computation (gate * (1 + abs_max)).
         - Error is ``y_pred - y_true`` (both in asinh space).
         - ``log_cosh`` on each cell, then weighted by ``event_mag``, summed over
           time and batch, and self-normalized via the sum of ``event_mag``
@@ -321,7 +318,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = num / den                                  # scalar
 
         # ── Per-cell level anchor ─────────────────────────────────────
-        loss_level = self._level_loss_per_cell(y_pred, y_true, abs_max, event_mag)
+        loss_level = self._level_loss_per_cell(y_pred, y_true, event_mag)
 
         # ── Multi-resolution spectral loss (always on) ──────────────
         loss_spec = y_pred.new_tensor(0.0)

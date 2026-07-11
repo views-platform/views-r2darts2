@@ -23,31 +23,49 @@ class SpotlightLossLogcosh(torch.nn.Module):
     other and gradient reaches both:
 
       * **Shape (temporal pattern).** Per-series demeaned residual
-        ``(pred - mean_t pred) - (true - mean_t true)`` under ``Logcosh``.
-        This scores the within-series dynamics only; a constant-wrong
-        prediction is NOT free because the level term below catches its
-        magnitude.
+        ``(pred - mean_t pred) - (true - mean_t true)``, penalized
+        *quadratically* and standardized by each channel's own
+        temporal-deviation scale. This scores the within-series dynamics
+        only; a constant-wrong prediction is NOT free because the level term
+        below catches its magnitude. The penalty is deliberately NOT
+        saturating: a bounded (logcosh/L1) shape term gives every series the
+        same tail gradient regardless of event size, so the model collapses
+        onto one shared "median" template and never accumulates the gradient
+        to sharpen a flat forecast into a real peak (large series such as
+        Ukraine are then left flat). A quadratic residual keeps the gradient
+        proportional to the deviation, so each series is fit to its own shape
+        and flatness is actively driven out; per-channel standardization
+        (data-driven, not a constant) keeps the three channels comparable
+        without shrinking the within-channel magnitude signal that separates
+        a war from a quiet series.
 
       * **Level (soft-peak magnitude).** ``Logcosh`` of
         ``logsumexp_t(pred) - logsumexp_t(true)`` per series. Because asinh
         values are already log-scale, ``logsumexp`` over time is a smooth
-        maximum dominated by the event peak — matching it forces the model
-        to reproduce raw peak magnitude, which is exactly what a symmetric
-        cell loss leaves under-predicted.
+        maximum that fixes the overall height. On its own it is
+        spread-degenerate (a flat forecast and a true peak can share the
+        same ``logsumexp``, differing only by the ``log T`` offset), but the
+        quadratic shape term pins the temporal pattern, so the level term is
+        free to do only what it is good at — setting magnitude — while
+        flatness is ruled out by shape.
 
     The anti-under-prediction pressure is **dynamic and data-driven, not an
     imposed constant**: the gradient of ``logsumexp`` is a softmax over
     timesteps, so the level term's correction concentrates automatically on
     the current peak month and, since the model sits below the true peak,
-    pushes it upward. That asymmetry emerges from the data and fades to zero
-    as the peak is matched — there is no asymmetry coefficient to set.
+    pushes it upward; and the quadratic shape term supplies gradient that
+    grows with the deviation, so large events lift themselves rather than
+    being averaged into a template. Both effects emerge from the data and
+    fade as the fit improves — there is no asymmetry or weighting
+    coefficient to set.
 
     A soft **event gate** ``sigmoid((|·| - tau) / tau)`` (its only input is
     ``non_zero_threshold``) focuses both terms on conflict cells, and
     **Hájek** (self-normalized) gated means keep peace-heavy and event-heavy
-    batches comparable. Both terms live in the same asinh units and are
-    ``Logcosh``-bounded, so they are naturally comparable and need no
-    weighting hyperparameter. Channels are combined by a plain mean.
+    batches comparable. The two terms are naturally comparable in scale (the
+    shape residual is standardized to unit deviation, the level term is
+    ``Logcosh`` of an asinh-space difference) and need no weighting
+    hyperparameter. Channels are combined by a plain mean.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -105,9 +123,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Shape term: within-series temporal pattern (AC) ───────────
         # Demeaned per series over time, so this scores dynamics only and
         # cannot absorb a magnitude error — that is the level term's job.
-        pred_bar = y_pred.mean(dim=1, keepdim=True)
-        true_bar = y_true.mean(dim=1, keepdim=True)
-        shape_cell = self._Logcosh((y_pred - pred_bar) - (y_true - true_bar))
+        # Quadratic, NOT logcosh: a saturating shape penalty gives every
+        # series the same ±1 tail gradient regardless of event size, so the
+        # model collapses onto one shared "median" template and can never
+        # accumulate the gradient to sharpen a flat forecast into a real
+        # peak (Ukraine left flat). A squared residual keeps the gradient
+        # proportional to the deviation, so large events are fit to their
+        # own shape and flatness is actively driven out. Standardized by
+        # each channel's own temporal-deviation scale (data-driven, floored
+        # at tau) so the three channels stay comparable without shrinking
+        # the within-channel magnitude signal.
+        pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
+        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
+        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
+        shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
         # ── Level term: soft-peak magnitude (DC) ──────────────────────
         # logsumexp over time is a smooth max; in asinh (log-scale) units it

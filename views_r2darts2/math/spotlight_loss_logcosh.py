@@ -100,50 +100,38 @@ class SpotlightLossLogcosh(torch.nn.Module):
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
 
-        # ── Soft event gate (its only input is tau) ───────────────────
-        # Focuses both terms on conflict cells; catches false negatives
-        # (via y_true) and false positives (via y_pred).
+        # ── Sharp event gate ─────────────────────────────────────────────
+        # Restored slope 10 – peace cells at ~0.48 get gate <0.02, conflict
+        # cells >0.5. This keeps the gradient focused on events.
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = torch.sigmoid((abs_max - tau) / tau)
+        gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Shape term: within-series temporal pattern (AC) ───────────
-        # Demeaned per series over time, so this scores dynamics only and
-        # cannot absorb a magnitude error — that is the level term's job.
-        # Quadratic, NOT logcosh: a saturating shape penalty gives every
-        # series the same ±1 tail gradient regardless of event size, so the
-        # model collapses onto one shared "median" template and can never
-        # accumulate the gradient to sharpen a flat forecast into a real
-        # peak (Ukraine left flat). A squared residual keeps the gradient
-        # proportional to the deviation, so large events are fit to their
-        # own shape and flatness is actively driven out. Standardized by
-        # each channel's own temporal-deviation scale (data-driven, floored
-        # at tau) so the three channels stay comparable without shrinking
-        # the within-channel magnitude signal.
+        # ── Linear magnitude weight (only for level term) ─────────────────
+        # (1 + abs_max) gives 5:1 ratio between small and large events,
+        # preventing the largest wars from hijacking training while still
+        # giving them the strongest gradient.
+        event_weight = gate * (1.0 + abs_max)
+
+        # ── Shape term: within-series temporal pattern (AC) ───────────────
+        # Demeaned, quadratic, standardized – identical to the previous
+        # version.  It penalises flatness and forces per‑series pattern
+        # learning, avoiding the template collapse.
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
-        # ── Level term: per-cell event magnitude (DC) ─────────────────
-        # The peak height itself, matched at every event cell rather than
-        # compressed over time. A logsumexp/soft-max aggregate collapses all
-        # T months into ONE scalar per series, which a flat forecast can
-        # satisfy by spreading mass (spread degeneracy): the aggregate ratio
-        # looks calibrated (~1.0) while the peak is smeared, so in eval the
-        # forecast collapses toward zero and MSLE explodes on wars (Ukraine
-        # "missed level"). Matching magnitude per event cell removes that
-        # escape route. Squared, not saturating: the gradient grows with the
-        # miss, so a peak under-predicted by orders of magnitude is corrected
-        # orders of magnitude harder than a skirmish — this IS raw-space MSLE
-        # (MSE in asinh units), and because it keeps its raw scale (shape is
-        # standardized) level dominates shape as a natural curriculum:
-        # height first, pattern later. Same event gate as shape.
+        # ── Level term: per‑cell raw squared error ────────────────────────
+        # Unbounded gradient proportional to the miss – corrects the massive
+        # underprediction on large conflicts.  Weighted by magnitude so that
+        # a small skirmish (asinh ~2) gets weight ~3, a Ukraine‑scale event
+        # (asinh ~8) gets weight ~9.
         level_cell = (y_pred - y_true) ** 2
 
-        # ── Hájek self-normalized gated means, then sum level + shape ──
+        # ── Hájek self‑normalisation ──────────────────────────────────────
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (gate * level_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
+            level = (event_weight * level_cell).sum(dim=(0, 1)) / event_weight.sum(dim=(0, 1)).clamp_min(self._EPS)
             per_channel = shape + level
             total_loss = per_channel.mean()
             shape_c = shape.detach().tolist()
@@ -151,7 +139,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = (gate * level_cell).sum() / gate.sum().clamp_min(self._EPS)
+            level = (event_weight * level_cell).sum() / event_weight.sum().clamp_min(self._EPS)
             total_loss = shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]
@@ -160,7 +148,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if torch.isnan(total_loss):
             raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
 
-        # Telemetry: shape/level now carry their real per-channel values.
+        # ── Telemetry (unchanged structure) ───────────────────────────────
         n = len(comp)
         self._last_components = {
             "shape": shape_c,

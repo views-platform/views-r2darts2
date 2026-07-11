@@ -100,36 +100,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
 
-        # ── Sharp event gate (restored slope 10) ─────────────────────
-        # Peace cells at ~0.48 → gate < 0.02; conflict cells > 0.5.
-        # This keeps gradient focused on real events.
+        # ── Sharp event gate ─────────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Shape term: within-series temporal pattern (AC) ───────────
-        # Demeaned per series, quadratic, standardized – unchanged.
+        # ── Shape term: unchanged quadratic, standardized ────────────────
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = ((pred_ac - true_ac) / ac_scale) ** 2
 
-        # ── Level term: quadratic total mass ──────────────────────────
-        # Sum over time matches total event mass; quadratic penalty gives
-        # gradient that grows with the underprediction, directly fixing
-        # the level gap without saturating. No logsumexp, no logcosh.
-        level_cell = (y_pred.sum(dim=1) - y_true.sum(dim=1)) ** 2
+        # ── Level term: total mass with SCALED logcosh ───────────────────
+        # c controls max gradient; c=10 gives 10× stronger push than plain
+        # logcosh, enough to lift underprediction without exploding.
+        c = getattr(self, 'level_scale', 10.0)   # default 10, tunable
+        delta_sum = y_pred.sum(dim=1) - y_true.sum(dim=1)
+        level_cell = c * self._Logcosh(delta_sum / c)
 
-        # Per‑series event mass, so peace‑only series contribute almost nothing.
-        w = gate.amax(dim=1)  # (B, C) – high if any timestep has an event
+        # Per‑series event mass (gate.max over time)
+        w = gate.amax(dim=1)   # (B, C)
 
-        # ── Normalisation ─────────────────────────────────────────────
+        # ── Normalisation ─────────────────────────────────────────────────
         if multivariate:
-            # Shape: Hájek self‑normalised gated mean
-            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(
-                dim=(0, 1)
-            ).clamp_min(self._EPS)
-            # Level: mean over batch, weighted by per‑series event mass
-            level = (w * level_cell).mean(dim=0)
+            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
+            level = (w * level_cell).mean(dim=0)        # mean over batch, weighted
             per_channel = shape + level
             total_loss = per_channel.mean()
             shape_c = shape.detach().tolist()
@@ -146,7 +140,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if torch.isnan(total_loss):
             raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
 
-        # ── Telemetry ─────────────────────────────────────────────────
+        # ── Telemetry ─────────────────────────────────────────────────────
         n = len(comp)
         self._last_components = {
             "shape": shape_c,
@@ -162,9 +156,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         logger.debug(
             "SpotlightLossLogcosh | shape=%s level=%s total=%.6f",
-            shape_c,
-            level_c,
-            total_loss.item(),
+            shape_c, level_c, total_loss.item(),
         )
         return total_loss
 

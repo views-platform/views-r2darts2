@@ -19,7 +19,7 @@ which takes a :class:`views_frames.FeatureFrame`. The checks are equivalent:
     * Warn on float64 columns → the frame is always float32 by construction,
       so the check is informational only.
 
-Google Python Style.
+
 """
 
 from __future__ import annotations

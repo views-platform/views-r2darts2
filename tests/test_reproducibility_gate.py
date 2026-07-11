@@ -4,7 +4,7 @@ Exercises the three nested gate classes (``Config``, ``Temporal``, ``Data``) on
 the new pandas-free :class:`ReproducibilityGate`. All frame-based checks consume
 :class:`views_frames.FeatureFrame` objects — never ``pd.DataFrame``.
 
-Google Python Style. Pandas-free (only at the Darts ``TimeSeries`` boundary for
+ Pandas-free (only at the Darts ``TimeSeries`` boundary for
 the numerical-sanity gates).
 """
 

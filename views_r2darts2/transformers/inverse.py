@@ -15,7 +15,7 @@ This module unifies the two paths into a single set of helpers that:
     * Drop the dead ``fit=True`` branch (the legacy ``_transform_single_series``
       ``fit=True`` path was never called by any production code path).
 
-Google Python Style.
+
 """
 
 from __future__ import annotations

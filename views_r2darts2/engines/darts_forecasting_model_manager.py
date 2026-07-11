@@ -18,7 +18,7 @@ Key cleanup vs. the legacy implementation:
     * The ``CorePredictionSniffer`` and ``PipelineException`` imports remain
       lazy (they live in ``views_pipeline_core``).
 
-Google Python Style.
+
 """
 
 from __future__ import annotations

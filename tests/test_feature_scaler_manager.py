@@ -4,7 +4,7 @@ Covers config parsing (simple + named-group formats), default-scaler
 assignment, fit/transform/inverse round-trip, error paths, and the user's
 full 82-feature conflict-feature mapping (synthetic 3-entity round-trip).
 
-Google Python Style. ``pandas`` is used only at the Darts boundary (for
+ ``pandas`` is used only at the Darts boundary (for
 ``pd.Index``/``pd.DataFrame`` construction in :class:`TimeSeries`).
 """
 

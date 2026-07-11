@@ -8,7 +8,7 @@ Verifies the two public functions:
       :class:`views_frames.PredictionFrame` converter (single-target and
       multi-target variants, plus clip-negatives and error paths).
 
-Google Python Style. ``pandas`` is used only at the Darts boundary (mirroring
+ ``pandas`` is used only at the Darts boundary (mirroring
 the production ``darts_bridge`` module).
 """
 

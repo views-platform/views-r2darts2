@@ -11,7 +11,7 @@ The legacy ``get_chained_scaler``, ``get_scaler_or_chain``, and ``is_chain_spec`
 helpers have been removed — they were dead code (never called by the production
 path; ``instantiate_darts_scaler`` is the sole entry point).
 
-Google Python Style.
+
 """
 
 from __future__ import annotations

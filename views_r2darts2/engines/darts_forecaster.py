@@ -23,7 +23,7 @@ The class is pandas-free on its surface. The two Darts-boundary helpers in
 :mod:`views_r2darts2.transformers.darts_bridge` are the only places pandas is
 imported, and they are confined to that module.
 
-Google Python Style.
+
 """
 
 from __future__ import annotations

@@ -7,7 +7,7 @@ and that the loader enforces the VIEWS viewser schema contract.
 Uses a session-scoped synthetic parquet fixture (see ``conftest.py``) so the
 tests run anywhere without the real validation parquet.
 
-Google Python Style.
+
 """
 
 from __future__ import annotations

@@ -7,7 +7,7 @@ fixture mirrors the schema of the real ``validation_viewser_df.parquet`` but
 with dummy data so the suite runs anywhere without the real parquet — see
 ``tests/conftest.py`` for the fixture API.
 
-Google Python Style. ``pandas`` is used only at the Darts boundary (for
+ ``pandas`` is used only at the Darts boundary (for
 ``pd.Index``/``pd.DataFrame`` construction in :class:`TimeSeries`), mirroring
 the production package's confinement rule.
 """

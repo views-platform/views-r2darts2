@@ -12,7 +12,7 @@ Also covers the lazy-import contract (the manager class is importable without
 absent), the ``_get_predict_kwargs`` validation, and the ``_build_forecaster``
 factory.
 
-Google Python Style. Pandas-free.
+ Pandas-free.
 """
 
 from unittest.mock import MagicMock

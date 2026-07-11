@@ -4,7 +4,7 @@ Exercises the four cyclic encoders (``month_*``, ``week_of_year_*``,
 ``day_of_week_*``, ``day_of_year_*``), the :data:`CYCLIC_ENCODERS_BY_RESOLUTION`
 mapping, and the input-coercion contract (numpy array, list, scalar).
 
-Google Python Style. Pandas-free.
+ Pandas-free.
 """
 
 from __future__ import annotations

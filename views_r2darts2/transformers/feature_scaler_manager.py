@@ -11,7 +11,7 @@ The fit / transform / inverse_transform paths use the shared helpers in
 access to a single location and to avoid the duplicated probabilistic reshape
 logic that lived in this class and in :class:`DartsForecaster` previously.
 
-Google Python Style.
+
 """
 
 from __future__ import annotations

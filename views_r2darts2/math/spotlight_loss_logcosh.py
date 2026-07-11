@@ -99,16 +99,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Combine ──────────────────────────────────────────────────
         # Shape: Hájek (sum/sum) — gradient ~0.5-1.0 per cell
-        # Level: SUM (not mean) — gradient = tanh(gap) per cell
-        #   The .mean(dim=0) and .mean() over channels divided by B*C,
-        #   making level 12× weaker than shape. SUM removes this.
-        #   logcosh bounds per-cell gradient at tanh ≤ 1 → no explosion.
+        # Level: mean over batch, sum over channels — gradient = tanh(gap)
+        #   per cell (T cancels 1/T from mean). mean(dim=0) prevents the
+        #   5.47× overprediction seen with SUM (which was B×C×tanh = 384).
+        #   sum() over channels keeps C×tanh = 3.0 per cell — 3× shape,
+        #   strong enough to correct level but not overshoot.
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (w * level_cell).sum(dim=0)  # SUM over batch, not mean
+            level = (w * level_cell).mean(dim=0)  # mean over batch (not SUM)
 
             per_channel = shape + level
-            total_loss = per_channel.sum()  # SUM over channels, not mean
+            total_loss = per_channel.sum()  # sum over channels (not mean)
             shape_c = shape.detach().tolist()
             level_c = level.detach().tolist()
             comp = per_channel.detach().tolist()

@@ -245,7 +245,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # peace-vs-event composition without amplifying DC pull from the
         # highest-magnitude series.
         series_gate = 0.0125 + 0.9875 * torch.sigmoid(
-            10.0 * (series_mag - self.non_zero_threshold)
+            5.0 * (series_mag - self.non_zero_threshold)
         )  # (B,) or (B, C)
         series_w = series_gate
 
@@ -366,7 +366,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # |y_pred.detach()|) keeps it feedback-loop-safe (under-predicting a
         # true event keeps |y_true| large; the detach prevents gaming).
         abs_max = torch.max(torch.abs(y_true), torch.abs(y_pred.detach()))
-        event_gate = 0.0125 + 0.9875 * torch.sigmoid(10.0 * (abs_max - self.non_zero_threshold))
+        event_gate = 0.0125 + 0.9875 * torch.sigmoid(5.0 * (abs_max - self.non_zero_threshold))
         event_mag = event_gate * (1.0 + abs_max)
 
         # ── Per-series temporal DRO (soft event-aware) ───────────────
@@ -374,7 +374,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # near-neutral. Uses requested form:
         # m = m_floor + (1 - m_floor) * sigmoid(k * (|y| - tau)).
         soft_event_mask = 0.0125 + (1.0 - 0.0125) * torch.sigmoid(
-            10.0 * (abs_max - self.non_zero_threshold)
+            5.0 * (abs_max - self.non_zero_threshold)
         )
         w_dro = self._dro_weights_2d(cell_loss, soft_event_mask)  # (B, T) or (B, T, C)
         w_total = torch.nan_to_num(event_mag * w_dro, nan=1.0, posinf=1.0, neginf=0.0)
@@ -455,4 +455,4 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossLogcosh(non_zero_threshold={self.non_zero_threshold})"
+        return f"SpotlightLossLogcosh(non_zero_threshold={self.non_zero_threshold})" 

@@ -103,13 +103,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # number of active (gated/event) samples in the batch.
         #
         # Shape: Hájek over space and batch; gradient ~0.5-1.0 per cell
-        # Level: Hájek over batch; symmetric logcosh on mean gap, peace-filtered
-        #   With peace filtering, w[peace_series] = 0. Hájek normalization
-        #   makes gradient robust to sparse batches: only event series drive
-        #   the signal, but they do so with consistent magnitude.
+        # Level: Hájek over batch, SCALED by sqrt(T) to compensate for mean dilution.
+        #   When gap = mean(y_pred) - mean(y_true), the gradient per cell is
+        #   d(loss)/d(y_pred_cell) = d(loss)/d(gap) / T.
+        #   Without scaling, this is ~0.007 per cell; shape is ~0.04-0.08.
+        #   Scaling by sqrt(T) ≈ 6 brings level to comparable magnitude.
+        #   With peace filtering, this ensures event series receive meaningful signal.
+        scaler = T
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (w * level_cell).sum(dim=0) / w.sum(dim=0).clamp_min(self._EPS)  # Hájek over batch
+            level = scaler * (w * level_cell).sum(dim=0) / w.sum(dim=0).clamp_min(self._EPS)  # Hájek, scaled
 
             per_channel = shape + level
             total_loss = per_channel.sum()  # SUM over channels
@@ -118,7 +121,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = (w * level_cell).sum() / w.sum().clamp_min(self._EPS)  # Hájek over batch
+            level = scaler * (w * level_cell).sum() / w.sum().clamp_min(self._EPS)  # Hájek, scaled
             total_loss = shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]

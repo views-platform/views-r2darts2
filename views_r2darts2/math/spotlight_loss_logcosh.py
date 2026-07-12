@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class SpotlightLossV5(torch.nn.Module):
+class SpotlightLossLogcosh(torch.nn.Module):
     """
     Symmetric 2-term loss with safe per-series shape DRO.
     Shape = log_cosh + soft DRO (hard cell focus without noise amplification).

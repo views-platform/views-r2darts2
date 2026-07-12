@@ -161,16 +161,26 @@ class ModelCatalog:
 
         # Explicit checkpoint monitor so "best" model follows the same
         # multi-metric objective as EarlyStopping.
+        #
+        # Darts already installs its own ModelCheckpoint when
+        # save_checkpoints=True. If we also add one here with monitor=val_loss,
+        # Lightning sees two stateful ModelCheckpoint callbacks with the same
+        # state_key and raises at Trainer init.
         checkpoint_monitor = self.config.get("checkpoint_monitor", early_stopping_monitor)
-        callbacks.append(
-            ModelCheckpoint(
-                monitor=checkpoint_monitor,
-                mode="min",
-                save_top_k=1,
-                save_last=True,
-                filename="{epoch:03d}-best",
+        if checkpoint_monitor != "val_loss":
+            callbacks.append(
+                ModelCheckpoint(
+                    monitor=checkpoint_monitor,
+                    mode="min",
+                    save_top_k=1,
+                    save_last=True,
+                    filename="{epoch:03d}-best",
+                )
             )
-        )
+        else:
+            logger.info(
+                "Skipping custom ModelCheckpoint for monitor=val_loss to avoid duplicate callback with Darts."
+            )
 
         # LearningRateMonitor makes LR reductions visible in WandB
         callbacks.append(LearningRateMonitor(logging_interval="epoch"))

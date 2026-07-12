@@ -98,15 +98,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w = w * (~peace_mask).float()  # Mask out peace series
 
         # ── Combine ──────────────────────────────────────────────────
-        # Shape: Hájek (sum/sum) — gradient ~0.5-1.0 per cell
-        # Level: SUM over batch, peace-filtered — symmetric logcosh gradient
-        #   Peace-filtered reduces noise: no gradient from series where both
-        #   y_true and y_pred are entirely below τ. This focuses gradient on
-        #   the event series where magnitude calibration matters.
-        #   SUM (not mean) preserves gradient scale across batches.
+        # Both terms use Hájek (sum/sum) aggregation: composition-robust,
+        # stable under masking, and ensures gradients scale with the actual
+        # number of active (gated/event) samples in the batch.
+        #
+        # Shape: Hájek over space and batch; gradient ~0.5-1.0 per cell
+        # Level: Hájek over batch; symmetric logcosh on mean gap, peace-filtered
+        #   With peace filtering, w[peace_series] = 0. Hájek normalization
+        #   makes gradient robust to sparse batches: only event series drive
+        #   the signal, but they do so with consistent magnitude.
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = (w * level_cell).sum(dim=0)  # SUM over batch
+            level = (w * level_cell).sum(dim=0) / w.sum(dim=0).clamp_min(self._EPS)  # Hájek over batch
 
             per_channel = shape + level
             total_loss = per_channel.sum()  # SUM over channels
@@ -115,7 +118,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = per_channel.detach().tolist()
         else:
             shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = (w * level_cell).sum()
+            level = (w * level_cell).sum() / w.sum().clamp_min(self._EPS)  # Hájek over batch
             total_loss = shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]

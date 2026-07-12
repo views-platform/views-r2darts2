@@ -84,16 +84,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
         w_dro_shape = self._dro_weights(shape_cell)
 
-        # ── Level: per-cell gated logcosh, log-magnitude, DRO, /n_event ──
-        # DRO on level is the key to sharpening flat forecasts.
-        # Without DRO, peak underprediction and valley overprediction
-        # cancel (equal magnitude, opposite sign). DRO upweights the
-        # harder direction → breaks symmetry → model must vary predictions.
+        # ── Level: per-cell gated logcosh, log-magnitude, /n_event ──
+        # NO DRO on level — DRO on raw error amplifies peace noise
+        # (mean ≈ 0 at 90% zeros → sqrt(loss/mean) explodes for noise).
         raw_error = y_pred - y_true
-        level_loss_raw = self._Logcosh(raw_error)
-        w_dro_level = self._dro_weights(level_loss_raw)
         mag_weight = torch.log1p(abs_max)
-        level_raw = gate * mag_weight * w_dro_level * level_loss_raw
+        level_raw = gate * mag_weight * self._Logcosh(raw_error)
 
         n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)
         level_cell = level_raw / n_event

@@ -10,7 +10,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
     Shape = log_cosh with raw-error DRO (sharpens flat forecasts).
-    Level = log_cosh on mean gap (uniform DC bias, no shape conflict).
+    Level = per-cell log_cosh on raw error (V12 — fixes V11 underprediction).
 
     ── Design ─────────────────────────────────────────────────────────
 
@@ -22,15 +22,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
       neutral. But ``|raw_error|`` is large at peaks/valleys and zero
       at the mean → DRO upweights the cells that need sharpening.
 
-    * **Level (DC magnitude).** ``T × log_cosh(mean(pred) − mean(true))``
-      per series, gate-weighted, Hájek-normalised.
+    * **Level (DC magnitude).** Per-cell ``log_cosh(e)`` on raw error,
+      gate-weighted, Hájek-normalised.
 
-      Uses the per-series MEAN GAP, not per-cell raw_error. The gradient
-      is ``tanh(gap)`` — **uniform** across all cells. This means shape
-      DRO can reweight individual cells without the level term fighting
-      back (uniform gradient = no relative reweighting = no conflict).
+      V11 used ``T × log_cosh(mean gap)`` whose gradient ``tanh(gap)``
+      saturates for ``|gap| > 3`` — the model gets the SAME gradient
+      whether it is off by 5 or 15 on sparse channels (ch_1, ch_2).
+      Per-cell ``log_cosh(e)`` also saturates at ``tanh ≤ 1`` for big
+      ``|e|``, BUT the gradient is FOCUSED on event cells (via gate)
+      rather than diluted uniformly across all 36 cells. The network
+      is told "increase output HERE" instead of "increase mean across
+      all cells," which is a different gradient direction that doesn't
+      rely on the network translating a bias-push into event-cell
+      increases.
 
       Both terms use log_cosh → both bounded at ``tanh ≤ 1`` → balanced.
+      Per-cell Level includes AC components that overlap with Shape —
+      this REINFORCES Shape on AC (both push toward y_true at event
+      cells), so no conflict. The DC push comes from the per-cell raw
+      errors at event cells.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -48,7 +58,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Set by backward hook in forward(); holds d(loss)/d(y_pred) for gradient diagnostics.
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV11 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV12 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -104,16 +114,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: T × log_cosh(mean gap), gate-weighted, Hájek ─────
-        # Uses per-series MEAN GAP (not per-cell raw_error).
-        # Gradient = tanh(gap) per cell — UNIFORM → no shape conflict.
-        # T compensates 1/T dilution from the mean operator.
-        gap = y_pred.sum(dim=1) - y_true.sum(dim=1)  # (B,) or (B, C)
-        level_cell = self._log_cosh(gap)
-        w_level = gate.amax(dim=1)  # per-series event mass
+        # ── LEVEL: per-cell log_cosh on raw error, gate-weighted, Hájek ─
+        # V12 change: per-cell log_cosh(e) instead of T * log_cosh(mean gap).
+        #
+        # V11's mean-gap formulation saturates: tanh(gap) ≈ -1 for |gap| > 3,
+        # so the model gets the same gradient whether off by 5 or 15. On sparse
+        # channels (ch_1, ch_2) where mean gap = -5 to -15 even after training,
+        # the gradient is fully saturated and cannot push harder.
+        #
+        # Per-cell log_cosh(e) also saturates at tanh ≤ 1 for big |e|, BUT:
+        #  (a) no mean dilution — tanh(e_event) saturates at the cell-level
+        #      error magnitude, not the per-series mean (which is 36× smaller).
+        #  (b) gradient FOCUSED on event cells (gate ≈ 1) and zero on peace
+        #      cells (gate ≈ 0) — network is told "increase output HERE."
+        #  (c) loss scale preserved: for one event of magnitude M, both V11
+        #      (T * log_cosh(-M/36) ≈ M) and V12 (log_cosh(-M) ≈ M) give M.
+        #
+        # AC/DC overlap with Shape is REINFORCEMENT (both push toward y_true
+        # at event cells), not conflict. DC push comes from per-cell raw
+        # errors at event cells — the component V11 was missing.
+        level_cell = self._log_cosh(e)
+        w_level = gate
 
         if multivariate:
-            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum(dim=(0, 1)) / w_level.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
             loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
@@ -134,6 +158,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── Diagnostic telemetry (detached, no extra grad) ────────────────
         # Computed before NaN check so they're always populated on a valid step.
         with torch.no_grad():
+            # Per-series mean gap (still computed for diagnostics even though
+            # V12 Level no longer uses it — this is the y_hat_bar/ch_X_ratio signal).
+            gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
+
             if multivariate:
                 _n_ev   = event_mask.sum(dim=(0, 1)).clamp_min(1.0)           # (C,)
                 _w_ev   = w_dro * event_mask
@@ -152,6 +180,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 # mean over batch. Pure AC projection gives 0; any leak indicates
                 # gate weighting reintroducing a DC component.
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
+                # ── NEW (V12): per-cell raw-error stats over event cells ──
+                # |e| at event cells — directly measures what the new Level sees.
+                _e_ev   = e.abs() * event_mask
+                level_e_mean_l = (_e_ev.sum(dim=(0, 1)) / _n_ev).tolist()
+                level_e_max_l  = (_e_ev.amax(dim=(0, 1))).tolist()
+                # Fraction of event cells where |e| > 3 (tanh saturated zone).
+                # High value → most event cells are at maximum gradient (can't
+                # push harder); low value → headroom for gradient to scale with error.
+                level_e_sat_l  = ((e.abs() > 3.0) * event_mask).sum(dim=(0, 1)).div(_n_ev).tolist()
             else:
                 _n_ev   = event_mask.sum().clamp_min(1.0)
                 _w_ev   = w_dro * event_mask
@@ -166,9 +203,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_mean_l    = [_ga.mean().item()]
                 gap_max_l     = [_ga.max().item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
+                _e_ev   = e.abs() * event_mask
+                level_e_mean_l = [(_e_ev.sum() / _n_ev).item()]
+                level_e_max_l  = [_e_ev.max().item()]
+                level_e_sat_l  = [((e.abs() > 3.0) * event_mask).sum().item() / _n_ev.item()]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV11: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV12: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -187,16 +228,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "dro_w_max":      dro_wmax_l,     # max  DRO weight (tail upweighting)
             "dro_frac_up":    dro_frac_up_l,  # fraction of event cells with w_dro > 1
             "event_frac":     event_frac_l,   # fraction of cells that are events
-            "level_gap_mean": gap_mean_l,     # mean |gap| per channel (level convergence)
+            "level_gap_mean": gap_mean_l,     # mean |gap| per channel (per-series mean calibration; y_hat_bar ratio signal)
             "level_gap_max":  gap_max_l,      # max  |gap| per channel
             "shape_dc":       shape_dc_l,     # gated shape-error DC leak (should be ≈ 0)
+            # ── NEW (V12): per-cell raw-error diagnostics ──
+            "level_e_mean":   level_e_mean_l, # mean |e| over event cells (what V12 Level actually sees)
+            "level_e_max":    level_e_max_l,  # max  |e| over event cells
+            "level_e_sat":    level_e_sat_l,  # frac of event cells with |e|>3 (tanh saturated — gradient capped)
         }
 
         logger.debug(
-            "SpotlightLossV11 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV12 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV11(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV12(non_zero_threshold={self.tau})"

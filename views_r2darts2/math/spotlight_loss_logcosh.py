@@ -7,11 +7,34 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """
-    2-term loss for zero-inflated conflict fatality forecasting.
-    Shape = log_cosh (prevents templating).
-    Level = asymmetric Hájek MSE (fixes underprediction via heavy left-tail penalty).
-    No temporal component.
+    """2-term loss for zero-inflated conflict fatality forecasting.
+
+    Shape = log_cosh with raw-error DRO (sharpens flat forecasts).
+    Level = log_cosh on mean gap (uniform DC bias, no shape conflict).
+
+    ── Design ─────────────────────────────────────────────────────────
+
+    * **Shape (AC pattern).** Demeaned log_cosh residual, gated,
+      DRO-weighted on ``|raw_error|``, Hájek-normalised.
+
+      The DRO uses ``|raw_error|`` (not shape loss) as the signal.
+      On a flat forecast, shape loss is the same at all cells → DRO is
+      neutral. But ``|raw_error|`` is large at peaks/valleys and zero
+      at the mean → DRO upweights the cells that need sharpening.
+
+    * **Level (DC magnitude).** ``T × log_cosh(mean(pred) − mean(true))``
+      per series, gate-weighted, Hájek-normalised.
+
+      Uses the per-series MEAN GAP, not per-cell raw_error. The gradient
+      is ``tanh(gap)`` — **uniform** across all cells. This means shape
+      DRO can reweight individual cells without the level term fighting
+      back (uniform gradient = no relative reweighting = no conflict).
+
+      Both terms use log_cosh → both bounded at ``tanh ≤ 1`` → balanced.
+
+    ── Hyperparameters ────────────────────────────────────────────────
+
+    ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
     """
 
     _EPS = 1e-6
@@ -23,7 +46,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
 
-        logger.info("SpotlightLossV10 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV11 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -39,11 +62,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         B, T = y_pred.shape[:2]
         e = y_pred - y_true
 
-        # ── Event gate (soft floor, 5× slope) ─────────────────────────
+        # ── Event gate ───────────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.tau))
+        gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── SHAPE: log_cosh on full-sequence demeaned errors ────────
+        # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ──
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
@@ -51,33 +74,38 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
         shape_cell = self._log_cosh(e_shape / ac_scale)
 
-        if multivariate:
-            loss_shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-        else:
-            loss_shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
+        # DRO on |raw_error| (detached) — upweights peaks/valleys on
+        # flat forecasts where shape loss alone is uniform.
+        # Event-only mean to prevent peace-noise amplification.
+        raw_abs = e.abs().detach()
+        event_mask = (abs_max > self.tau).float()
+        n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
+        w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
+        w_dro_mean = (w_dro * event_mask).sum(dim=1, keepdim=True) / n_ev
+        w_dro = w_dro / w_dro_mean.clamp_min(1e-8)
+        w_dro = 1.0 + event_mask * (w_dro - 1.0)
+        w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
-        # ── LEVEL: Asymmetric Hájek MSE ─────────────────────────────
-        # Asymmetric penalty: underprediction (e < 0, pred < true) is penalized
-        # more heavily. This directly corrects the systematic underprediction bias.
-        # 
-        # For e < 0 (underpredict): penalty = 2.0 * e^2  (2x weight)
-        # For e > 0 (overpredict):  penalty = 1.0 * e^2  (normal)
-        # 
-        # The asymmetry factor is applied BEFORE the Hájek normalization so it
-        # genuinely shifts the optimal prediction upward.
-        mag_weight = torch.log1p(abs_max)
-        
-        # Asymmetric squared error
-        asym_factor = torch.where(e < 0, 2.0, 1.0)  # 2x for underprediction
-        level_raw = gate * mag_weight * asym_factor * (e ** 2)
-
-        # Hájek normalization: sum over all event cells in batch, divide by total gate mass
-        # This is batch-size invariant and gives each event cell gradient proportional
-        # to its error, NOT diluted by n_event per series.
         if multivariate:
-            loss_level = level_raw.sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
+            shape_w = gate * w_dro
+            loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
-            loss_level = level_raw.sum() / gate.sum().clamp_min(self._EPS)
+            shape_w = gate * w_dro
+            loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
+
+        # ── LEVEL: T × log_cosh(mean gap), gate-weighted, Hájek ─────
+        # Uses per-series MEAN GAP (not per-cell raw_error).
+        # Gradient = tanh(gap) per cell — UNIFORM → no shape conflict.
+        # T compensates 1/T dilution from the mean operator.
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
+        level_cell = T * self._log_cosh(gap)
+        w_level = gate.amax(dim=1)  # per-series event mass
+
+        if multivariate:
+            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+        else:
+            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
@@ -94,7 +122,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = [float(total_loss.detach())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV10: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV11: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -110,10 +138,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV10 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV11 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV10(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV11(non_zero_threshold={self.tau})"

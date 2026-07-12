@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class SpotlightLossV7(torch.nn.Module):
+class SpotlightLossLogcosh(torch.nn.Module):
     """
     Fixed V6: hard shape gate eliminates DC/AC conflict on peace cells.
     DRO on raw error with reference-mean normalization (not self-mean).

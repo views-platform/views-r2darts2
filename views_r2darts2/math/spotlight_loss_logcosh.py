@@ -12,24 +12,31 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (per‑cell pattern).** Demeaned logcosh residual, weighted
-      by ``|error_ac|``, gated, and Hájek‑normalised.
-
-      The ``|error_ac|`` weight breaks the gradient cancellation that
-      causes flat forecasts. On a flat forecast at the correct mean,
-      ``error_ac`` is symmetric (``+x`` at valleys, ``−x`` at peaks) →
-      ``tanh`` gradient cancels to zero. With ``|error_ac|``, the
-      gradient becomes ``sign(e_ac) × logcosh + |e_ac| × tanh / scale``
-      — both terms are antisymmetric and **add** instead of cancelling.
-
-      The weight is on the **AC component** (demeaned), which is
-      orthogonal to the mean. Its gradient w.r.t. the per‑series mean
-      is zero, so it cannot distort the level → no shape‑level conflict.
+    * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated
+      and Hájek‑normalised. Scores temporal dynamics only.
 
     * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error
-      (``pred − true``), weighted by ``gate × log1p(abs_max)``, summed,
-      and NORMALISED BY EVENT COUNT per series. Unchanged from the
-      working version.
+      (``pred − true``), weighted by ``gate × log1p(abs_max) × focal``,
+      summed, and NORMALISED BY EVENT COUNT per series.
+
+      The **focal** weight ``(1 − exp(−|raw_error|))`` down‑weights
+      well‑fit cells (small error → focal ≈ 0) and preserves full
+      gradient on large errors (spikes/dips → focal ≈ 1). This turns
+      the level gradient from a flat push (``tanh ≈ 1`` for all events)
+      into a **variable push** that tracks the error magnitude:
+      cells that are most wrong get the strongest correction.
+
+      This is fundamentally different from DRO:
+      - Focal is a **per‑cell** scaling (0 to 1), no series‑level mean
+      - No mean computation → no peace‑noise amplification at 90% zeros
+      - Does NOT change relative weights within a series (each cell
+        scaled independently by its own error)
+      - Shape Hájek is completely unaffected (focal is on level only)
+
+      The result: the model is incentivised to produce **variable**
+      forecasts (high at true peaks, low at true valleys) because
+      well‑fit cells cost nothing and wrong cells cost proportionally
+      more.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -67,20 +74,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Shape: demeaned |error_ac|-weighted logcosh, Hájek ──────
-        # |error_ac| breaks the tanh symmetry that causes gradient
-        # cancellation on flat forecasts. AC is orthogonal to DC →
-        # no level conflict.
+        # ── Shape: demeaned logcosh, standardised, Hájek ────────────
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
-        error_ac = pred_ac - true_ac
-        shape_cell = error_ac.abs() * self._Logcosh(error_ac / ac_scale)
+        shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level: per-cell gated logcosh, log-magnitude, /n_event ──
+        # ── Level: per-cell gated logcosh, log-magnitude, focal, /n_event ──
+        # focal = (1 - exp(-|raw_error|)) — down-weights well-fit cells,
+        # preserves full gradient on large errors. Per-cell scaling (no
+        # series-level mean → no peace noise amplification).
         raw_error = y_pred - y_true
+        focal = 1.0 - torch.exp(-raw_error.abs())
         mag_weight = torch.log1p(abs_max)
-        level_raw = gate * mag_weight * self._Logcosh(raw_error)
+        level_raw = gate * mag_weight * focal * self._Logcosh(raw_error)
 
         n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)
         level_cell = level_raw / n_event

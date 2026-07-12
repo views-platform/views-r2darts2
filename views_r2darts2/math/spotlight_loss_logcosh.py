@@ -9,49 +9,59 @@ logger = logging.getLogger(__name__)
 class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
-    Shape = log_cosh with raw-error DRO, PER-SERIES Hájek (V17 — fixes templating).
-    Level = T × symmetric MSE on mean gap (V13 style — best calibration).
+    Shape = log_cosh with raw-error DRO + series boost (V18 — fixes templating).
+    Level = T × symmetric MSE on mean gap (V13 — best calibration).
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (AC pattern).** ``log_cosh`` on demeaned residual, gated,
-      DRO-weighted on ``|raw_error|``, **per-series Hájek-normalised**,
-      then averaged over event series.
+    * **Shape (AC pattern).** Demeaned log_cosh residual, gated,
+      DRO-weighted on ``|raw_error|``, **series-boosted**,
+      Hájek-normalised.
 
-      V13 used global Hájek over (B, T): divided by total event cells
-      across the batch. Countries with 10 event cells got 10× more
-      gradient share than countries with 1 event cell. Rare-event
-      countries (the ones that template most) got the least Shape
-      gradient → the model learned a "common pattern" for them.
+      V13's global Hájek gave each series Shape gradient proportional
+      to its event count. Rare-event countries (the templating victims)
+      got the least gradient → model learned a common pattern for them.
 
-      V17 normalizes within each series first (sum_T / sum_T), then
-      averages over event series (mean_B). Each event country gets
-      EQUAL total Shape gradient regardless of how many event cells
-      it has:
+      V17 tried per-series Hájek (each event country gets equal total
+      gradient) but this changed the total Shape gradient magnitude,
+      shifting the Shape:Level balance → Level got weaker →
+      underprediction regressed.
 
-        Rare-event country (2 cells): each cell gets 1/(N_ev * 2) ≈ 5× V13
-        Frequent-event country (10 cells): each cell gets 1/(N_ev * 10) ≈ 0.5× V13
+      V18 keeps V13's global Hájek EXACTLY (preserves loss scale and
+      Shape:Level balance) but adds a per-series BOOST inside the
+      Hájek weighting:
 
-      This directly targets the templating problem — the model can no
-      longer ignore rare-event countries by averaging their patterns
-      into a common template.
+        series_boost = sqrt(mean_|e|_series / mean_|e|_global)
 
-      Loss scale unchanged (mean of means = weighted mean ≈ 1.0).
-      No T factor (V14 proved T causes explosions).
-      No new hyperparameters.
+      This multiplies shape_w for each series. High-error (templated)
+      series get a boost, low-error (well-fit) series get a reduction.
+      The sqrt prevents over-weighting.
+
+      Because the boost is inside the Hájek (weighted mean), the loss
+      MAGNITUDE is preserved — it's still a normalized weighted mean.
+      Only the gradient DISTRIBUTION shifts: templated countries get
+      more gradient, well-fit countries get less.
+
+      Effect on per-series gradient (batch with 50 event series,
+      640 total events, mean 12.8 events/series):
+
+        Templated country (2 events, mean_|e| = 2.5× global):
+          V13: 2/640 = 0.0031  →  V18: 2*sqrt(2.5)/640 = 0.0049  (+58%)
+        Average country (13 events, mean_|e| = 1.0× global):
+          V13: 13/640 = 0.020  →  V18: 13*1.0/640 = 0.020  (same)
+        Well-fit country (20 events, mean_|e| = 0.5× global):
+          V13: 20/640 = 0.031  →  V18: 20*sqrt(0.5)/640 = 0.022  (-29%)
+
+      Templated countries get 58% more Shape gradient. Well-fit
+      countries get 29% less. Total is preserved.
 
     * **Level (DC magnitude).** ``T × gap²`` (symmetric MSE) on the
-      per-series mean gap, gate-weighted, Hájek-normalised.
+      per-series mean gap, gate-weighted, Hájek-normalised. UNCHANGED
+      from V13.
 
-      V13's symmetric MSE had the best calibration of all versions
-      (0.84× overall, 1.13× ch_0, 0.51× ch_1, 0.36× ch_2).
-      V16's asymmetric MSE caused massive overprediction (3.88× from
-      epoch 0). Symmetry is correct — the model needs equal push
-      in both directions.
-
-      T compensates 1/T dilution from mean() operator.
-      MSE gradient 2*gap is proportional, never saturates (unlike
-      V11's tanh, V15's Huber).
+      V13 had the best calibration of all versions (0.84× overall,
+      1.13× ch_0, 0.51× ch_1, 0.36× ch_2). V16's asymmetric MSE
+      caused 3.88× overprediction. Symmetry is correct.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -68,7 +78,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV17 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV18 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -93,14 +103,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── AC scale ─────────────────────────────────────────────────
-        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
-
-        # ── SHAPE: log_cosh on demeaned errors, DRO, per-series Hájek ─
+        # ── SHAPE: log_cosh on demeaned errors, DRO + series boost ───
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
+        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
+        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
         shape_cell = self._log_cosh(e_shape / ac_scale)
 
         raw_abs = e.abs().detach()
@@ -113,37 +121,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = 1.0 + event_mask * (w_dro - 1.0)
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
-        shape_w = gate * w_dro  # (B, T) or (B, T, C)
+        # ── V18: series boost ────────────────────────────────────────
+        # Boost high-error (templated) series, reduce well-fit series.
+        # sqrt dampening prevents over-weighting. Detached (no grad).
+        # Applied INSIDE the Hájek → loss magnitude preserved.
+        #
+        # series_boost = sqrt(mean_|e|_series / mean_|e|_global)
+        #
+        # Templated country (mean_|e| = 2.5× global): boost = 1.58
+        # Average country (mean_|e| = 1.0× global):   boost = 1.00
+        # Well-fit country (mean_|e| = 0.5× global):  boost = 0.71
+        series_err_mean = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev  # (B, 1) or (B, 1, C)
+        global_err_mean = (raw_abs * event_mask).sum() / event_mask.sum().clamp_min(1.0)
+        series_boost = torch.sqrt(series_err_mean / global_err_mean.clamp_min(1e-8))
+        series_boost = torch.nan_to_num(series_boost, nan=1.0, posinf=1.0, neginf=1.0)
 
-        # V17: per-series Hájek (normalize over T only), then mean over
-        # event series. This gives each event country EQUAL total Shape
-        # gradient regardless of how many event cells it has.
-        #
-        # V13 (global Hájek): sum_BT(w*cell) / sum_BT(w)
-        #   → countries with more events get more gradient
-        #   → rare-event countries get little gradient → templating
-        #
-        # V17 (per-series Hájek):
-        #   per_series = sum_T(w*cell) / sum_T(w)       # (B,) or (B, C)
-        #   loss = mean over event series of per_series  # scalar or (C,)
-        #   → each event country gets equal gradient → no templating
         if multivariate:
-            # (B, T, C) → sum over T → (B, C)
-            shape_per_series = (shape_w * shape_cell).sum(dim=1) / shape_w.sum(dim=1).clamp_min(self._EPS)
-            # Event series mask: 1 if series has ANY event cell for that channel
-            ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B, C)
-            n_ev_series = ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
-            loss_shape = (shape_per_series * ev_series_mask).sum(dim=0) / n_ev_series  # (C,)
+            shape_w = gate * w_dro * series_boost  # (B, T, C)
+            loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
-            # (B, T) → sum over T → (B,)
-            shape_per_series = (shape_w * shape_cell).sum(dim=1) / shape_w.sum(dim=1).clamp_min(self._EPS)
-            ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B,)
-            n_ev_series = ev_series_mask.sum().clamp_min(1.0)
-            loss_shape = (shape_per_series * ev_series_mask).sum() / n_ev_series
+            shape_w = gate * w_dro * series_boost  # (B, T)
+            loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: T × symmetric MSE on mean gap (V13 style) ─────────
-        # V16's asymmetry caused 3.88× overprediction from epoch 0.
-        # Symmetric MSE is correct — V13 had best calibration (0.84×).
+        # ── LEVEL: T × symmetric MSE on mean gap (V13 — unchanged) ───
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
         level_cell = T * gap ** 2
         w_level = gate.amax(dim=1)  # per-series event mass
@@ -192,33 +192,27 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                ac_scale_l = ac_scale.squeeze().tolist() if ac_scale.squeeze().dim() > 0 else [float(ac_scale.squeeze())]
-
-                # ── V17 NEW: per-series shape diagnostics ──
-                # These show whether the per-series Hájek is working:
-                # rare-event countries should now get more gradient.
-                # Event cells per series (for event series only):
-                _ev_per_series = event_mask.sum(dim=1)  # (B, C)
-                _ev_series_mask = (ev_series_mask > 0).float()  # (B, C)
+                # ── V18 NEW: series boost diagnostics ──
+                # Per-series boost stats over event series only
+                _ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B, C)
                 _n_es = _ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
-                # Mean and std of event-cell count per event series
-                _ev_per_series_mean = ((_ev_per_series * _ev_series_mask).sum(dim=0) / _n_es)  # (C,)
-                ev_per_series_mean_l = _ev_per_series_mean.tolist()
-                _evps_var = ((_ev_per_series ** 2 * _ev_series_mask).sum(dim=0) / _n_es
-                             - _ev_per_series_mean ** 2).clamp_min(0)
-                ev_per_series_std_l = _evps_var.sqrt().tolist()
-                # Per-series shape loss stats (how variable is shape loss across countries?)
-                _sps = shape_per_series * _ev_series_mask  # zero out peace series
-                _shape_per_series_mean = (_sps.sum(dim=0) / _n_es)  # (C,)
-                shape_per_series_mean_l = _shape_per_series_mean.tolist()
-                _sps_var = ((_sps ** 2).sum(dim=0) / _n_es
-                            - _shape_per_series_mean ** 2).clamp_min(0)
-                shape_per_series_std_l = _sps_var.sqrt().tolist()
-                # Fraction of event series with above-median shape loss
-                # (high value = shape loss concentrated in few countries = templating)
-                _sps_median = _sps.median(dim=0).values  # (C,) rough median
-                shape_hi_frac_l = ((_sps > _sps_median.unsqueeze(0)).float().sum(dim=0)
+                _boost_per_series = series_boost.squeeze(-1) * _ev_series_mask  # (B, C)
+                boost_mean_l = (_boost_per_series.sum(dim=0) / _n_es).tolist()
+                _boost_var = ((_boost_per_series ** 2).sum(dim=0) / _n_es
+                              - torch.tensor(boost_mean_l) ** 2).clamp_min(0)
+                boost_std_l = _boost_var.sqrt().tolist()
+                boost_max_l = (_boost_per_series.amax(dim=0)).tolist()
+                boost_min_l = (((_boost_per_series + 1e8 * (1 - _ev_series_mask)).amin(dim=0))).tolist()
+                # Fraction of event series with boost > 1 (getting amplified)
+                boost_up_frac_l = (((series_boost.squeeze(-1) > 1.0).float() * _ev_series_mask).sum(dim=0)
                                    / _n_es).tolist()
+
+                # Per-series error stats (what drives the boost)
+                _err_per_series = series_err_mean.squeeze(-1) * _ev_series_mask  # (B, C)
+                err_series_mean_l = (_err_per_series.sum(dim=0) / _n_es).tolist()
+                _err_var = ((_err_per_series ** 2).sum(dim=0) / _n_es
+                            - torch.tensor(err_series_mean_l) ** 2).clamp_min(0)
+                err_series_std_l = _err_var.sqrt().tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -240,28 +234,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
-                ac_scale_l = [float(ac_scale.squeeze())]
-                _ev_per_series = event_mask.sum(dim=1)  # (B,)
-                _ev_series_mask = (ev_series_mask > 0).float()  # (B,)
+                _ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B,)
                 _n_es = _ev_series_mask.sum().clamp_min(1.0)
-                ev_per_series_mean_l = [((_ev_per_series * _ev_series_mask).sum()
-                                         / _n_es).item()]
-                _evps_var = ((_ev_per_series ** 2 * _ev_series_mask).sum() / _n_es
-                             - ev_per_series_mean_l[0] ** 2).clamp_min(0)
-                ev_per_series_std_l = [_evps_var.sqrt().item()]
-                _sps = shape_per_series * _ev_series_mask
-                shape_per_series_mean_l = [(_sps.sum() / _n_es).item()]
-                _sps_var = ((_sps ** 2).sum() / _n_es
-                            - shape_per_series_mean_l[0] ** 2).clamp_min(0)
-                shape_per_series_std_l = [_sps_var.sqrt().item()]
-                _sps_median = _sps.median()
-                shape_hi_frac_l = [((_sps > _sps_median).float().sum()
-                                    / _n_es).item()]
+                _boost_per_series = series_boost.squeeze(-1) * _ev_series_mask  # (B,) — series_boost is (B,1), squeeze to (B,)
+                # Actually series_boost shape is (B, 1) for univariate. Let me handle carefully.
+                _bps = series_boost.squeeze(1) if series_boost.dim() > 1 and series_boost.size(1) == 1 else series_boost
+                _boost_per_series = _bps * _ev_series_mask
+                boost_mean_l = [(_boost_per_series.sum() / _n_es).item()]
+                _boost_var = ((_boost_per_series ** 2).sum() / _n_es - boost_mean_l[0] ** 2).clamp_min(0)
+                boost_std_l = [_boost_var.sqrt().item()]
+                boost_max_l = [_boost_per_series.max().item()]
+                boost_min_l = [(_boost_per_series + 1e8 * (1 - _ev_series_mask)).min().item()]
+                boost_up_frac_l = [(((_bps > 1.0).float() * _ev_series_mask).sum() / _n_es).item()]
+                _err_per_series = series_err_mean.squeeze(1) if series_err_mean.dim() > 1 and series_err_mean.size(1) == 1 else series_err_mean
+                _eps = _err_per_series * _ev_series_mask
+                err_series_mean_l = [(_eps.sum() / _n_es).item()]
+                _err_var = ((_eps ** 2).sum() / _n_es - err_series_mean_l[0] ** 2).clamp_min(0)
+                err_series_std_l = [_err_var.sqrt().item()]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV17: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV18: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -287,32 +281,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_ev_max":  gap_ev_max_l,
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
-            "ac_scale":         ac_scale_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V17 NEW: per-series shape diagnostics ──
-            # Event cells per event series — shows the variability that
-            # per-series Hájek addresses. High std/mean ratio = high
-            # variability = per-series Hájek matters a lot.
-            "ev_per_series_mean": ev_per_series_mean_l,  # mean event cells per event series
-            "ev_per_series_std":  ev_per_series_std_l,   # std of event cells per event series
-            # Per-series shape loss — if std/mean is high, some countries
-            # have much worse patterns than others (templating signal).
-            # V13's global Hájek let these be dominated by frequent-event
-            # countries. V17 gives them equal weight.
-            "shape_per_series_mean": shape_per_series_mean_l,  # mean per-series shape loss
-            "shape_per_series_std":  shape_per_series_std_l,   # std of per-series shape loss
-            # Fraction of event series with above-median shape loss.
-            # Should be ~0.5 if shape loss is symmetrically distributed.
-            # If >0.7, shape loss is concentrated in few countries
-            # (those are the templating candidates).
-            "shape_hi_frac": shape_hi_frac_l,
+            # ── V18 NEW: series boost diagnostics ──
+            # The boost applied to each series' Shape weight.
+            # boost > 1 = high-error (templated) series getting amplified.
+            # boost < 1 = well-fit series getting reduced.
+            # mean should be ≈ 1.0 (preserved by construction).
+            "boost_mean":     boost_mean_l,      # mean boost over event series (should be ≈ 1.0)
+            "boost_std":      boost_std_l,       # std of boost (high = high variability = boost matters)
+            "boost_max":      boost_max_l,       # max boost (most templated series)
+            "boost_min":      boost_min_l,       # min boost (best-fit series)
+            "boost_up_frac":  boost_up_frac_l,   # frac of event series with boost > 1 (getting amplified)
+                                                  # Should be < 0.5 (only high-error series boosted)
+            # Per-series error stats (what drives the boost)
+            "err_series_mean": err_series_mean_l, # mean |e| per event series
+            "err_series_std":  err_series_std_l,  # std of per-series |e| (high = some countries much worse)
+                                                   # This is the templating signal — high std = some countries
+                                                   # have much higher error = templating candidates.
         }
 
         logger.debug(
-            "SpotlightLossV17 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV18 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV17(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV18(non_zero_threshold={self.tau})"

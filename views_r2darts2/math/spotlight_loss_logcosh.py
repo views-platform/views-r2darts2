@@ -202,16 +202,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ev_series_mask = (ev_series_mask > 0).float()  # (B, C)
                 _n_es = _ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
                 # Mean and std of event-cell count per event series
-                ev_per_series_mean_l = ((_ev_per_series * _ev_series_mask).sum(dim=0)
-                                        / _n_es).tolist()
+                _ev_per_series_mean = ((_ev_per_series * _ev_series_mask).sum(dim=0) / _n_es)  # (C,)
+                ev_per_series_mean_l = _ev_per_series_mean.tolist()
                 _evps_var = ((_ev_per_series ** 2 * _ev_series_mask).sum(dim=0) / _n_es
-                             - torch.tensor(ev_per_series_mean_l) ** 2).clamp_min(0)
+                             - _ev_per_series_mean ** 2).clamp_min(0)
                 ev_per_series_std_l = _evps_var.sqrt().tolist()
                 # Per-series shape loss stats (how variable is shape loss across countries?)
                 _sps = shape_per_series * _ev_series_mask  # zero out peace series
-                shape_per_series_mean_l = (_sps.sum(dim=0) / _n_es).tolist()
+                _shape_per_series_mean = (_sps.sum(dim=0) / _n_es)  # (C,)
+                shape_per_series_mean_l = _shape_per_series_mean.tolist()
                 _sps_var = ((_sps ** 2).sum(dim=0) / _n_es
-                            - torch.tensor(shape_per_series_mean_l) ** 2).clamp_min(0)
+                            - _shape_per_series_mean ** 2).clamp_min(0)
                 shape_per_series_std_l = _sps_var.sqrt().tolist()
                 # Fraction of event series with above-median shape loss
                 # (high value = shape loss concentrated in few countries = templating)

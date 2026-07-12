@@ -12,29 +12,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Design ─────────────────────────────────────────────────────────
 
-    The raw error ``e = pred - true`` is split into DC (per‑series mean)
-    and AC (demeaned residual). Each term sees ONLY its component:
+    * **Shape (per‑cell pattern).** Demeaned logcosh residual, weighted
+      by ``|error_ac|``, gated, and Hájek‑normalised.
 
-    * **Shape (AC pattern).** ``|error_ac| × logcosh(error_ac / scale)``
-      — the AC component, weighted by its own magnitude.
+      The ``|error_ac|`` weight breaks the gradient cancellation that
+      causes flat forecasts. On a flat forecast at the correct mean,
+      ``error_ac`` is symmetric (``+x`` at valleys, ``−x`` at peaks) →
+      ``tanh`` gradient cancels to zero. With ``|error_ac|``, the
+      gradient becomes ``sign(e_ac) × logcosh + |e_ac| × tanh / scale``
+      — both terms are antisymmetric and **add** instead of cancelling.
 
-      The ``|error_ac|`` weight is critical: without it, a flat forecast
-      at the correct mean has symmetric errors (``+x`` at valleys, ``−x``
-      at peaks) → ``tanh`` gradient cancels → **zero shape gradient** →
-      model is stuck flat. With ``|error_ac|``, the gradient becomes
-      ``sign(e_ac) × logcosh + |e_ac| × tanh / scale`` — it does NOT
-      cancel because the ``sign`` term is antisymmetric but the
-      ``|e_ac| × tanh`` term is also antisymmetric and they ADD rather
-      than subtract.
+      The weight is on the **AC component** (demeaned), which is
+      orthogonal to the mean. Its gradient w.r.t. the per‑series mean
+      is zero, so it cannot distort the level → no shape‑level conflict.
 
-      The DC is **detached** in the shape term → shape cannot shift the
-      mean → DRO on shape is safe (no level conflict).
-
-    * **Level (DC magnitude).** ``logcosh(error_mean)`` per series — the
-      DC component only. The AC is **detached** → level sees only the
-      mean error → **uniform gradient** (same sign for all cells) → no
-      peak/valley cancellation. Weighted by ``gate × log1p(abs_max) /
-      n_event``, SUM.
+    * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error
+      (``pred − true``), weighted by ``gate × log1p(abs_max)``, summed,
+      and NORMALISED BY EVENT COUNT per series. Unchanged from the
+      working version.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -59,22 +54,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         a = z.abs()
         return a + F.softplus(-2.0 * a)
 
-    @staticmethod
-    def _dro_weights(losses: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Per-series sqrt DRO with masked (event-only) mean."""
-        l = losses.detach()
-        m = mask.detach().to(dtype=l.dtype)
-
-        n_active = m.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        mu = (l * m).sum(dim=1, keepdim=True) / n_active
-
-        w = torch.sqrt(l / mu.clamp_min(1e-6))
-        w_active_mean = (w * m).sum(dim=1, keepdim=True) / n_active
-        w = w / w_active_mean.clamp_min(1e-8)
-
-        w = 1.0 + m * (w - 1.0)
-        return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
-
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
@@ -82,38 +61,33 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         multivariate = y_pred.dim() == 3
         tau = self.non_zero_threshold
+        T = y_pred.size(1)
 
         # ── Event gate ───────────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Orthogonal DC/AC split ──────────────────────────────────
-        raw_error = y_pred - y_true
-        error_mean = raw_error.mean(dim=1, keepdim=True)  # DC
-        error_ac = raw_error - error_mean                  # AC
-
-        # ── Shape: AC-only, |e_ac|-weighted logcosh, DRO, Hájek ────
-        # |error_ac| breaks the symmetry that causes gradient cancellation
-        # on flat forecasts. DC is detached → no level conflict.
-        ac_scale = error_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
+        # ── Shape: demeaned |error_ac|-weighted logcosh, Hájek ──────
+        # |error_ac| breaks the tanh symmetry that causes gradient
+        # cancellation on flat forecasts. AC is orthogonal to DC →
+        # no level conflict.
+        pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
+        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
+        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
+        error_ac = pred_ac - true_ac
         shape_cell = error_ac.abs() * self._Logcosh(error_ac / ac_scale)
 
-        event_mask = (abs_max > tau).float()
-        w_dro = self._dro_weights(shape_cell, event_mask)
-
-        # ── Level: DC-only, gated logcosh, log-magnitude, /n_event ─
-        # AC is detached → level sees only mean error → uniform gradient.
-        level_error = raw_error - error_ac.detach()  # = error_mean (broadcast)
+        # ── Level: per-cell gated logcosh, log-magnitude, /n_event ──
+        raw_error = y_pred - y_true
         mag_weight = torch.log1p(abs_max)
-        level_raw = gate * mag_weight * self._Logcosh(level_error)
+        level_raw = gate * mag_weight * self._Logcosh(raw_error)
 
         n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)
         level_cell = level_raw / n_event
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
-            shape_w = gate * w_dro
-            shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
+            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
             level = level_cell.sum(dim=(0, 1))
 
             per_channel = shape + level
@@ -122,8 +96,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             level_c = level.detach().tolist()
             comp = per_channel.detach().tolist()
         else:
-            shape_w = gate * w_dro
-            shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
+            shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
             level = level_cell.sum()
             total_loss = shape + level
             shape_c = [float(shape.detach())]

@@ -16,26 +16,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
       and Hájek‑normalised. Scores temporal dynamics only.
 
     * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error
-      (``pred − true``), weighted by ``gate × (1 + abs_max)`` and
-      summed (NOT Hájek‑normalised).
+      (``pred − true``), weighted by ``gate × (1 + abs_max)``, summed,
+      and NORMALISED BY EVENT COUNT per series.
 
-      The signal is simple and direct: each event cell gets gradient
-      ``gate × (1 + abs_max) × tanh(e)``. This pushes ONLY event cells
-      (gate ≈ 1 for events, ≈ 0.018 for peace) toward their true value,
-      with magnitude proportional to ``1 + abs_max`` (Ukraine gets 10×
-      the weight of a small event). Peace cells get ≈ 0.01 gradient —
-      effectively left alone.
+      This fixes the templating problem: without ``(1+abs_max)``, every
+      event cell gets the same gradient (tanh ≈ 1), so the model learns
+      one flat event level for all events. With ``(1+abs_max)``, Ukraine
+      (asinh=9) gets 10× the weight of a small event (asinh=2) — but
+      summing without normalisation caused explosions (36 cells × 10 = 360).
 
-      Previous level formulations (mean gap, batch gap, sum gap) all
-      pushed ALL cells uniformly — including peace cells that should
-      stay at 0. This created a conflict: level pushes peace up, shape
-      pushes peace down → oscillation → calibration stuck.
+      Normalising by event count (``n_event``) keeps the per-cell gradient
+      bounded:
+        Ukraine (36 events): 10 × 1.0 / 36 = 0.28 per cell
+        Sparse (3 events):    4 × 1.0 / 3  = 1.33 per cell
+        Total: 10 or 4 — both within clip=100.
 
-      The per‑cell approach avoids this entirely: only event cells
-      receive level gradient, peace cells are untouched. The SUM (not
-      Hájek) prevents the 1/sum(gate) dilution that made the original
-      variant 20× too weak. logcosh bounds each cell at ±1, so the
-      total gradient for 3–4 events is ≈ 12–16 (within clip=100).
+      The normalisation also makes the total level loss comparable
+      across series with different event counts, preventing the SUM
+      from being dominated by high-event-count series.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -79,30 +77,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level: per-cell gated logcosh, SUM ──────────────────────
-        # The RIGHT signal: push ONLY event cells toward their true value.
-        # gate * logcosh(pred - true), summed (not Hájek).
-        #
-        # Why this is the right signal (not the wrong one):
-        # 1. gate ≈ 1 for events, ≈ 0.018 for peace → only events pushed
-        # 2. logcosh bounds per-cell gradient at tanh ≤ 1 → stable
-        # 3. SUM (not Hájek) prevents 1/sum(gate) dilution
-        # 4. No (1+abs_max) weight → no explosion on Ukraine (was 10× per cell)
-        # 5. Magnitude comes from EVENT COUNT: Ukraine (36 events) gets
-        #    36× more total gradient than a 1-event series. This IS
-        #    magnitude-proportional through count, not through weight.
-        #
-        # Previous approaches that failed:
-        # - Mean/batch gap: pushed ALL cells uniformly (including peace) → conflict
-        # - (1+abs_max) weight: exploded on Ukraine (10× per cell → 360 total)
-        # - Hájek: diluted by 1/sum(gate) → 20× too weak
+        # ── Level: per-cell gated logcosh, magnitude-weighted,
+        #            normalised by event count ────────────────────────
+        # (1+abs_max) gives magnitude: Ukraine gets 10× small event.
+        # Normalising by n_event per series prevents explosion:
+        #   Ukraine: 10 × 1.0 / 36 = 0.28/cell (total 10)
+        #   Sparse:  4 × 1.0 / 3  = 1.33/cell (total 4)
+        # This breaks templating (events get different gradients based
+        # on their magnitude) while staying clip-safe.
         raw_error = y_pred - y_true
-        level_cell = gate * self._Logcosh(raw_error)
+        level_raw = gate * (1.0 + abs_max) * self._Logcosh(raw_error)
+
+        # n_event per series (sum gate over time)
+        n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1) or (B, 1, C)
+        level_cell = level_raw / n_event  # normalise per series
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = level_cell.sum(dim=(0, 1))  # SUM, not Hájek
+            level = level_cell.sum(dim=(0, 1))  # SUM over all cells
 
             per_channel = shape + level
             total_loss = per_channel.sum()  # SUM over channels

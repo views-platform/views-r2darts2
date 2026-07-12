@@ -13,31 +13,40 @@ class SpotlightLossLogcosh(torch.nn.Module):
     ── Design ─────────────────────────────────────────────────────────
 
     * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated
-      and Hájek‑normalised. Scores temporal dynamics only.
+      and Hájek‑normalised. Scores temporal dynamics only. The gate
+      filters peace (no pattern to learn in zeros).
 
     * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error
-      (``pred − true``), weighted by ``gate × (1 + abs_max)``, summed,
-      and NORMALISED BY EVENT COUNT per series.
+      (``pred − true``), weighted by ``log1p(abs_max)``, summed.
 
-      This fixes the templating problem: without ``(1+abs_max)``, every
-      event cell gets the same gradient (tanh ≈ 1), so the model learns
-      one flat event level for all events. With ``(1+abs_max)``, Ukraine
-      (asinh=9) gets 10× the weight of a small event (asinh=2) — but
-      summing without normalisation caused explosions (36 cells × 10 = 360).
+      No gate, no event‑count normalisation. The weight
+      ``log1p(abs_max)`` is the natural and only filter:
 
-      Normalising by event count (``n_event``) keeps the per-cell gradient
-      bounded:
-        Ukraine (36 events): 10 × 1.0 / 36 = 0.28 per cell
-        Sparse (3 events):    4 × 1.0 / 3  = 1.33 per cell
-        Total: 10 or 4 — both within clip=100.
+        - **True peace** (``pred≈0, true=0``): ``abs_max≈0`` →
+          ``log1p(0)=0`` → zero weight → correctly ignored.
+        - **False positive** (``pred>0, true=0``): ``abs_max=pred`` →
+          ``log1p(pred)>0`` → penalised → pushed DOWN toward 0.
+        - **Underprediction** (``pred<true``): ``abs_max≥true`` →
+          ``log1p(true)>0`` → penalised → pushed UP toward true.
+        - **Correct prediction** (``pred=true``): ``raw_error=0`` →
+          ``logcosh(0)=0`` → zero gradient → correctly ignored.
 
-      The normalisation also makes the total level loss comparable
-      across series with different event counts, preventing the SUM
-      from being dominated by high-event-count series.
+      This naturally focuses on spikes AND dips: false positives (dips
+      in the forecast that should be 0) get strong downward gradient,
+      and underpredicted events (spikes that should be higher) get
+      strong upward gradient. The model learns to produce VARIABLE
+      forecasts — high at events, zero at peace — instead of flat lines.
+
+      Magnitude is proportional through EVENT COUNT: Ukraine (36 events
+      × ``log1p(9)=2.3``) gets 25× more total gradient than a 1‑event
+      series (1 × ``log1p(3)=1.4``). No normalisation is needed because
+      ``log1p`` bounds the per‑cell weight at ``log1p(14)=2.7``, so the
+      total for 36 cells is ``≈97`` (within ``gradient_clip_val=100``).
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
+    Used only in the event gate for the shape term.
     """
 
     _EPS = 1e-6
@@ -67,7 +76,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         tau = self.non_zero_threshold
         T = y_pred.size(1)
 
-        # ── Event gate ───────────────────────────────────────────────
+        # ── Event gate (for shape only) ──────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
@@ -77,30 +86,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level: per-cell gated logcosh, log-magnitude-weighted,
-        #            normalised by event count ────────────────────────
-        # log(1 + abs_max) gives bounded magnitude weighting:
-        #   Ukraine (asinh=9):  log(10) = 2.3
-        #   Small (asinh=2):    log(3)  = 1.1
-        #   Extreme (asinh=14): log(15) = 2.7
-        # This prevents the os overprediction caused by unbounded (1+abs_max)
-        # where extreme os events (asinh=14) got 15× weight.
-        # Normalising by n_event per series prevents explosion:
-        #   Ukraine (36 events): 2.3 × 1.0 / 36 = 0.064 per cell
-        #   Sparse (3 events):   1.1 × 1.0 / 3  = 0.37 per cell
-        #   Single large:         2.3 × 1.0 / 1  = 2.3 per cell
+        # ── Level: log1p(abs_max) × logcosh(raw_error), SUM ─────────
+        # No gate, no /n_event. log1p(abs_max) is the natural filter:
+        #   true peace (pred=0,true=0) → abs_max=0 → weight=0
+        #   false positive (pred>0,true=0) → abs_max=pred → penalised
+        #   underprediction (pred<true) → abs_max≥true → penalised
+        #   correct (pred=true) → raw_error=0 → logcosh=0 → no gradient
         raw_error = y_pred - y_true
-        mag_weight = torch.log1p(abs_max)
-        level_raw = gate * mag_weight * self._Logcosh(raw_error)
-
-        # n_event per series (sum gate over time)
-        n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1) or (B, 1, C)
-        level_cell = level_raw / n_event  # normalise per series
+        level_cell = torch.log1p(abs_max) * self._Logcosh(raw_error)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = level_cell.sum(dim=(0, 1))  # SUM over all cells
+            level = level_cell.sum(dim=(0, 1))  # SUM, no gate, no /n_event
 
             per_channel = shape + level
             total_loss = per_channel.sum()  # SUM over channels

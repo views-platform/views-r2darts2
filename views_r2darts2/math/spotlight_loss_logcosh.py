@@ -1,136 +1,86 @@
 import torch
 import torch.nn.functional as F
+import math
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """Loss for zero‑inflated conflict fatality forecasting.
-
-    Operates in asinh space on ``(B, T, C)`` tensors (sb/ns/os).
-
-    ── Design ─────────────────────────────────────────────────────────
-
-    * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated
-      and Hájek‑normalised. Scores temporal dynamics only.
-
-    * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error
-      (``pred − true``), weighted by ``gate × log1p(abs_max) × focal``,
-      summed, and NORMALISED BY EVENT COUNT per series.
-
-      The **focal** weight ``(1 − exp(−|raw_error|))`` down‑weights
-      well‑fit cells (small error → focal ≈ 0) and preserves full
-      gradient on large errors (spikes/dips → focal ≈ 1). This turns
-      the level gradient from a flat push (``tanh ≈ 1`` for all events)
-      into a **variable push** that tracks the error magnitude:
-      cells that are most wrong get the strongest correction.
-
-      This is fundamentally different from DRO:
-      - Focal is a **per‑cell** scaling (0 to 1), no series‑level mean
-      - No mean computation → no peace‑noise amplification at 90% zeros
-      - Does NOT change relative weights within a series (each cell
-        scaled independently by its own error)
-      - Shape Hájek is completely unaffected (focal is on level only)
-
-      The result: the model is incentivised to produce **variable**
-      forecasts (high at true peaks, low at true valleys) because
-      well‑fit cells cost nothing and wrong cells cost proportionally
-      more.
-
-    ── Hyperparameters ────────────────────────────────────────────────
-
-    ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
+    """
+        3-term loss for zero-inflated conflict fatality forecasting.
+        Shape = log_cosh (prevents templating). Level = MSE (fixes underprediction).
+        Temporal = MSE on diffs (fixes persistence).
     """
 
     _EPS = 1e-6
 
-    def __init__(self, non_zero_threshold: float):
-        if non_zero_threshold <= 0.0:
-            raise ValueError(
-                f"non_zero_threshold must be positive, got {non_zero_threshold}"
-            )
+    def __init__(self, non_zero_threshold: float = 0.88, temporal_weight: float = 0.1):
         super().__init__()
-        self.non_zero_threshold = non_zero_threshold
-        self._last_components: dict | None = None
-
-        logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
+        self.tau = non_zero_threshold
+        self.lambda_t = temporal_weight
 
     @staticmethod
-    def _Logcosh(z: torch.Tensor) -> torch.Tensor:
-        a = z.abs()
-        return a + F.softplus(-2.0 * a)
+    def _log_cosh(x: torch.Tensor) -> torch.Tensor:
+        a = x.abs()
+        return a + F.softplus(-2.0 * a) - math.log(2.0)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        # Squeeze univariate channel dim if present
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
         multivariate = y_pred.dim() == 3
-        tau = self.non_zero_threshold
-        T = y_pred.size(1)
+        B, T = y_pred.shape[:2]
+        e = y_pred - y_true
 
-        # ── Event gate ───────────────────────────────────────────────
+        # ── Event gate (soft floor, 5× slope) ─────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = torch.sigmoid(10.0 * (abs_max - tau))
+        gate = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.tau))
 
-        # ── Shape: demeaned logcosh, standardised, Hájek ────────────
-        pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
+        # ── SHAPE: log_cosh on full-sequence demeaned errors ────────
+        e_mean = e.mean(dim=1, keepdim=True)
+        e_shape = e - e_mean
+
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
-        shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
+        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
+        shape_cell = self._log_cosh(e_shape / ac_scale)
 
-        # ── Level: per-cell gated logcosh, log-magnitude, focal, /n_event ──
-        # focal = (1 - exp(-|raw_error|)) — down-weights well-fit cells,
-        # preserves full gradient on large errors. Per-cell scaling (no
-        # series-level mean → no peace noise amplification).
-        raw_error = y_pred - y_true
-        focal = 1.0 - torch.exp(-raw_error.abs())
-        mag_weight = torch.log1p(abs_max)
-        level_raw = gate * mag_weight * focal * self._Logcosh(raw_error)
+        if multivariate:
+            loss_shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
+        else:
+            loss_shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
+
+        # ── LEVEL: MSE on raw errors (strong gradients) ─────────────
+        mag_weight = torch.log1p(abs_max)          # bounded magnitude
+        level_raw = gate * mag_weight * (e ** 2)   # MSE, not log_cosh
 
         n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)
         level_cell = level_raw / n_event
 
-        # ── Combine ──────────────────────────────────────────────────
+        # BUG FIX from v1: mean over batch+time so level is batch-invariant
         if multivariate:
-            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = level_cell.sum(dim=(0, 1))
-
-            per_channel = shape + level
-            total_loss = per_channel.sum()
-            shape_c = shape.detach().tolist()
-            level_c = level.detach().tolist()
-            comp = per_channel.detach().tolist()
+            loss_level = level_cell.mean(dim=(0, 1))  # (C,)
         else:
-            shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = level_cell.sum()
-            total_loss = shape + level
-            shape_c = [float(shape.detach())]
-            level_c = [float(level.detach())]
-            comp = [float(total_loss.detach())]
+            loss_level = level_cell.mean()
 
-        if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
+        # ── TEMPORAL: MSE on first differences (persistence fix) ──────
+        pred_diff = y_pred[:, 1:] - y_pred[:, :-1]
+        true_diff = y_true[:, 1:] - y_true[:, :-1]
+        diff_error = (pred_diff - true_diff) ** 2
 
-        n = len(comp)
-        self._last_components = {
-            "shape": shape_c,
-            "level": level_c,
-            "spec": [0.0] * n,
-            "weight": [1.0] * n,
-            "ema": [float("nan")] * n,
-            "cal_ratio": [1.0] * n,
-            "cal_score": [1.0] * n,
-            "gates": [1.0] * n,
-            "contribution": comp,
-        }
+        gate_diff = gate[:, 1:]
+        if multivariate:
+            loss_temporal = (gate_diff * diff_error).mean(dim=(0, 1))  # (C,)
+        else:
+            loss_temporal = (gate_diff * diff_error).mean()
 
-        logger.debug(
-            "SpotlightLossLogcosh | shape=%s level=%s total=%.6f",
-            shape_c, level_c, total_loss.item(),
-        )
-        return total_loss
+        # ── Combine ───────────────────────────────────────────────────
+        if multivariate:
+            per_channel = loss_shape + loss_level + self.lambda_t * loss_temporal
+            total = per_channel.sum()
+        else:
+            total = loss_shape + loss_level + self.lambda_t * loss_temporal
 
-    def __repr__(self) -> str:
-        return f"SpotlightLossLogcosh(non_zero_threshold={self.non_zero_threshold})"
+        return total

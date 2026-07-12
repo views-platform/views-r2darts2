@@ -12,28 +12,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Design ─────────────────────────────────────────────────────────
 
-    The loss splits the error into two **orthogonal** components:
-    the per‑series DC (mean) and the per‑series AC (demeaned residual).
+    * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated,
+      event‑only DRO‑weighted, and Hájek‑normalised. The per‑series mean
+      in the demeaning is **detached** so the shape gradient flows only
+      through the AC component — it cannot shift the overall level.
 
-    * **Shape (AC pattern).** Operates on the demeaned prediction
-      ``pred - pred_mean.detach()`` and demeaned truth. Because the
-      mean is **detached**, the shape gradient flows *only* through the
-      AC component of ``y_pred``. It cannot affect the DC level, so it
-      cannot trigger a level counter‑correction. This eliminates the
-      shape–level conflict that caused underprediction in previous
-      versions (where shape DRO or |raw_error| weighting distorted the
-      mean, causing the level term to push back down).
-
-    * **Level (DC magnitude).** Operates on the per‑series mean gap
-      ``pred_mean - true_mean``, weighted by event count and magnitude.
-      Because the shape term is detached from the mean, the level term
-      has full control over the DC component — it can raise or lower
-      the entire forecast without fighting shape.
-
-    This orthogonality means **any weighting applied to shape (DRO,
-    |raw_error|, quadratic) no longer conflicts with level**, because
-    the shape gradient physically cannot reach the mean. The two terms
-    optimize disjoint subspaces of the prediction.
+    * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error,
+      weighted by ``gate × log1p(abs_max)``, summed, and normalised by
+      event count per series.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -60,7 +46,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _dro_weights(losses: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Per-series sqrt DRO with masked mean."""
+        """Per-series sqrt DRO with masked (event-only) mean."""
         l = losses.detach()
         m = mask.detach().to(dtype=l.dtype)
 
@@ -86,28 +72,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Orthogonal decomposition ────────────────────────────────
-        # Detach the mean so shape gradient doesn't flow through it.
-        # This makes shape and level operate on disjoint subspaces:
-        #   shape → AC component only (pred - mean.detach())
-        #   level → DC component only (mean)
+        # ── Shape: demeaned logcosh, standardised, event-DRO, Hájek ─
+        # Detach the mean so shape gradient cannot shift the level.
         pred_mean = y_pred.mean(dim=1, keepdim=True)
-        true_mean = y_true.mean(dim=1, keepdim=True)
-
-        # ── Shape: AC-only, logcosh, standardised, DRO, Hájek ───────
-        # DRO is now SAFE because it cannot distort the mean (detached).
-        # DRO upweights the hardest AC cells → sharpens flat forecasts.
         pred_ac = y_pred - pred_mean.detach()
-        true_ac = y_true - true_mean
+        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # DRO with event-only mean
         event_mask = (abs_max > tau).float()
         w_dro = self._dro_weights(shape_cell, event_mask)
 
-        # ── Level: DC-only, gated logcosh, log-magnitude, /n_event ──
-        # Level operates on the detached-mean gap. Shape cannot interfere.
+        # ── Level: per-cell gated logcosh, log-magnitude, /n_event ──
         raw_error = y_pred - y_true
         mag_weight = torch.log1p(abs_max)
         level_raw = gate * mag_weight * self._Logcosh(raw_error)

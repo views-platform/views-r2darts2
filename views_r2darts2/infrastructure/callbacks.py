@@ -1492,6 +1492,12 @@ class LossGradientDiagnosticsCallback(Callback):
         for key in (
             "dro_w_mean", "dro_w_std", "dro_w_max", "dro_frac_up",
             "event_frac", "level_gap_mean", "level_gap_max", "shape_dc",
+            "level_gap_ev_mean", "level_gap_ev_max", "level_gap_sat",
+            "shape_level_ratio",
+            "gap_v13_mean", "gap_v13_max", "dilution",
+            "hit_frac", "false_alarm_of_mask", "missed_frac",
+            "mean_pred_lm", "mean_true_lm", "lm_per_series",
+            "e_fa_mean", "e_me_mean",
         ):
             vals = comp.get(key)
             if vals is None:
@@ -1596,6 +1602,16 @@ class LossGradientDiagnosticsCallback(Callback):
                 dro_max   = metrics.get(f"{pfx}/dro_w_max",       float("nan"))
                 dro_fup   = metrics.get(f"{pfx}/dro_frac_up",     float("nan"))
                 gap_mean  = metrics.get(f"{pfx}/level_gap_mean",  float("nan"))
+                gap_ev    = metrics.get(f"{pfx}/level_gap_ev_mean", float("nan"))
+                gap_sat   = metrics.get(f"{pfx}/level_gap_sat",    float("nan"))
+                gap_v13   = metrics.get(f"{pfx}/gap_v13_mean",     float("nan"))
+                dilution  = metrics.get(f"{pfx}/dilution",         float("nan"))
+                sl_ratio  = metrics.get(f"{pfx}/shape_level_ratio", float("nan"))
+                hit_frac  = metrics.get(f"{pfx}/hit_frac",         float("nan"))
+                fa_mask   = metrics.get(f"{pfx}/false_alarm_of_mask", float("nan"))
+                miss_frac = metrics.get(f"{pfx}/missed_frac",      float("nan"))
+                e_fa      = metrics.get(f"{pfx}/e_fa_mean",        float("nan"))
+                e_me      = metrics.get(f"{pfx}/e_me_mean",        float("nan"))
                 shape_dc  = metrics.get(f"{pfx}/shape_dc",        float("nan"))
                 ev_frac   = metrics.get(f"{pfx}/event_frac",      float("nan"))
                 parts.append(
@@ -1603,7 +1619,9 @@ class LossGradientDiagnosticsCallback(Callback):
                     f"dc%={dc_frac:.0%} ac%={ac_frac:.0%} sign↑={sign_frac:.2f} "
                     f"dcMag={dc_mag:.4f} acMag={ac_mag:.4f} | "
                     f"dro={dro_mean:.2f}±{dro_max:.1f}× ↑{dro_fup:.0%} | "
-                    f"gap={gap_mean:.3f} shDC={shape_dc:.4f} ev={ev_frac:.2f}]"
+                    f"gap={gap_mean:.3f}/{gap_ev:.3f} sat={gap_sat:.0%} v13={gap_v13:.3f} dil={dilution:.2f} sl={sl_ratio:.2f} | "
+                    f"hit={hit_frac:.0%} faM={fa_mask:.0%} miss={miss_frac:.0%} e_fa={e_fa:.3f} e_me={e_me:.3f} | "
+                    f"shDC={shape_dc:.4f} ev={ev_frac:.2f}]"
                 )
             fcout_norm = metrics.get("grad_diag/fcout_grad_norm_mean", float("nan"))
             fcout_sign = metrics.get("grad_diag/fcout_grad_sign_frac", float("nan"))

@@ -19,33 +19,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
       against noise and spikes. The demeaning ensures this term scores
       temporal dynamics only — it cannot absorb a magnitude error.
 
-    * **Level (aggregate magnitude).** ``T × logcosh(mean(pred) − mean(true))``
-      per series. This is a SCALAR loss (one value per series per channel)
-      that acts as a UNIFORM bias shift across all timesteps:
-
-        gradient per cell = T × tanh(gap) × (1/T) = tanh(gap)
-
-      For a typical gap of 2 asinh units: tanh(2) ≈ 0.96 per cell —
-      comparable to the shape gradient (tanh ≈ 0.5‑1.0). The T factor
-      cancels the 1/T dilution from the mean operator, so the level
-      gradient is NOT diluted.
-
-      Because the gradient is the SAME for every cell in the series,
-      it acts as a pure DC offset — it shifts the entire prediction up
-      or down without distorting the temporal pattern. This avoids the
-      conflict with the shape term (which adjusts individual cells)
-      and prevents the oscillation / collapse seen with per‑cell level
-      losses where up‑pushes and down‑pushes cancel out.
-
-      Stability: the mean aggregates T=36 timesteps (√T noise
-      reduction), and tanh bounds the per‑cell gradient at ±1. Total
-      gradient for 36 cells: 36 × 1.0 = 36 (within clip=100). No
-      explosion because the mean (unlike the sum) stays in the
-      single‑digit range where tanh is well‑behaved.
+    * **Level (aggregate magnitude).** logcosh(mean(pred) − mean(true))
+      per series, filtered to exclude pure-peace series (both means < τ).
+      
+      Logcosh is symmetric: both over and under prediction contribute
+      equally to the loss. The gradient tanh(gap) is antisymmetric, so
+      it always pushes predictions toward the true mean (no sign flip).
+      
+      Why filter peace series? In zero-inflated data, most series have
+      mean ≈ 0. For these series, |gap| is small (usually < 0.5 asinh
+      units), yet logcosh(gap) can still be nonzero. This wastes capacity
+      on high-frequency noise. By ignoring series where BOTH y_true and
+      y_pred are entirely below τ (no events in either), the level loss
+      focuses gradient only on series with meaningful events — where
+      calibration and magnitude actually matter.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
+    Used to define the event gate and to filter peace series.
     """
 
     _EPS = 1e-6
@@ -85,29 +77,33 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level: 2×sqrt(T) × logcosh(mean gap) — uniform DC shift ──
-        # Gradient per cell = 2×tanh(gap)/sqrt(T).
-        #   With T=36: 2 × 1.0 / 6 = 0.33 per cell
-        # Calibrated between three data points:
-        #   T (grad=1.0)    → 5.47× overpred
-        #   sqrt(T) (0.17)  → estimated ~0.8× (slight underpred)
-        #   mean (0.083)    → 0.42× underpred
-        # 2×sqrt(T) (0.33) targets the sweet spot ~1.0×.
-        # The gradient is UNIFORM (same for all cells) → pure DC bias
-        # shift, no conflict with shape, no oscillation/collapse.
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
+        # ── Level: logcosh(mean gap), symmetric, peace-filtered ──────
+        # Logcosh is symmetric: penalizes over and under equally.
+        # Gradient: tanh(gap) is antisymmetric, so it always pushes toward truth.
+        #
+        # Filter: ignore series where BOTH y_true and y_pred are entirely
+        # below non_zero_threshold (pure peace series). These contribute only
+        # noise to the level signal; the shape term handles temporal dynamics.
+        #
+        # Peace mask: True where series should be ignored (both means < tau)
+        series_mean_true = y_true.mean(dim=1)  # (B,) or (B, C)
+        series_mean_pred = y_pred.mean(dim=1)
+        peace_mask = (series_mean_true.abs() < tau) & (series_mean_pred.abs() < tau)
+
+        gap = series_mean_pred - series_mean_true  # (B,) or (B, C)
         level_cell = self._Logcosh(gap)
 
-        # ── Per-series event weight for level ────────────────────────
+        # ── Per-series event weight for level (zero out peace series) ──
         w = gate.amax(dim=1)  # (B,) or (B, C)
+        w = w * (~peace_mask).float()  # Mask out peace series
 
         # ── Combine ──────────────────────────────────────────────────
         # Shape: Hájek (sum/sum) — gradient ~0.5-1.0 per cell
-        # Level: SUM over batch + SUM over channels — gradient = C×tanh/sqrt(T)
-        #   With T=36, C=3: 3 × 1.0 / 6 = 0.5 per cell (matches shape)
-        #   SUM (not mean) is needed because mean divides by B=128,
-        #   making gradient 0.023 (too weak, 0.40× underpred).
-        #   sqrt(T) scaling prevents the 5.47× overpred seen with T scaling.
+        # Level: SUM over batch, peace-filtered — symmetric logcosh gradient
+        #   Peace-filtered reduces noise: no gradient from series where both
+        #   y_true and y_pred are entirely below τ. This focuses gradient on
+        #   the event series where magnitude calibration matters.
+        #   SUM (not mean) preserves gradient scale across batches.
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
             level = (w * level_cell).sum(dim=0)  # SUM over batch

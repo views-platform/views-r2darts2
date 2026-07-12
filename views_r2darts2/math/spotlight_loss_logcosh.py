@@ -12,14 +12,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated,
-      event‑only DRO‑weighted, and Hájek‑normalised. The per‑series mean
-      in the demeaning is **detached** so the shape gradient flows only
-      through the AC component — it cannot shift the overall level.
+    The raw error ``e = pred - true`` is split into DC (per‑series mean)
+    and AC (demeaned residual). Each term sees ONLY its component:
 
-    * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error,
-      weighted by ``gate × log1p(abs_max)``, summed, and normalised by
-      event count per series.
+    * **Shape (AC pattern).** ``|error_ac| × logcosh(error_ac / scale)``
+      — the AC component, weighted by its own magnitude.
+
+      The ``|error_ac|`` weight is critical: without it, a flat forecast
+      at the correct mean has symmetric errors (``+x`` at valleys, ``−x``
+      at peaks) → ``tanh`` gradient cancels → **zero shape gradient** →
+      model is stuck flat. With ``|error_ac|``, the gradient becomes
+      ``sign(e_ac) × logcosh + |e_ac| × tanh / scale`` — it does NOT
+      cancel because the ``sign`` term is antisymmetric but the
+      ``|e_ac| × tanh`` term is also antisymmetric and they ADD rather
+      than subtract.
+
+      The DC is **detached** in the shape term → shape cannot shift the
+      mean → DRO on shape is safe (no level conflict).
+
+    * **Level (DC magnitude).** ``logcosh(error_mean)`` per series — the
+      DC component only. The AC is **detached** → level sees only the
+      mean error → **uniform gradient** (same sign for all cells) → no
+      peak/valley cancellation. Weighted by ``gate × log1p(abs_max) /
+      n_event``, SUM.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -72,21 +87,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
-        # ── Shape: demeaned logcosh, standardised, event-DRO, Hájek ─
-        # Detach the mean so shape gradient cannot shift the level.
-        pred_mean = y_pred.mean(dim=1, keepdim=True)
-        pred_ac = y_pred - pred_mean.detach()
-        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
-        shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
+        # ── Orthogonal DC/AC split ──────────────────────────────────
+        raw_error = y_pred - y_true
+        error_mean = raw_error.mean(dim=1, keepdim=True)  # DC
+        error_ac = raw_error - error_mean                  # AC
+
+        # ── Shape: AC-only, |e_ac|-weighted logcosh, DRO, Hájek ────
+        # |error_ac| breaks the symmetry that causes gradient cancellation
+        # on flat forecasts. DC is detached → no level conflict.
+        ac_scale = error_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
+        shape_cell = error_ac.abs() * self._Logcosh(error_ac / ac_scale)
 
         event_mask = (abs_max > tau).float()
         w_dro = self._dro_weights(shape_cell, event_mask)
 
-        # ── Level: per-cell gated logcosh, log-magnitude, /n_event ──
-        raw_error = y_pred - y_true
+        # ── Level: DC-only, gated logcosh, log-magnitude, /n_event ─
+        # AC is detached → level sees only mean error → uniform gradient.
+        level_error = raw_error - error_ac.detach()  # = error_mean (broadcast)
         mag_weight = torch.log1p(abs_max)
-        level_raw = gate * mag_weight * self._Logcosh(raw_error)
+        level_raw = gate * mag_weight * self._Logcosh(level_error)
 
         n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)
         level_cell = level_raw / n_event

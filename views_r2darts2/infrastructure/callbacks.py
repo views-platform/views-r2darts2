@@ -1492,6 +1492,9 @@ class LossGradientDiagnosticsCallback(Callback):
         for key in (
             "dro_w_mean", "dro_w_std", "dro_w_max", "dro_frac_up",
             "event_frac", "level_gap_mean", "level_gap_max", "shape_dc",
+            # V18 series-boost diagnostics
+            "boost_mean", "boost_std", "boost_max", "boost_min", "boost_up_frac",
+            "err_series_mean", "err_series_std",
         ):
             vals = comp.get(key)
             if vals is None:
@@ -1595,6 +1598,12 @@ class LossGradientDiagnosticsCallback(Callback):
                 dro_mean  = metrics.get(f"{pfx}/dro_w_mean",      float("nan"))
                 dro_max   = metrics.get(f"{pfx}/dro_w_max",       float("nan"))
                 dro_fup   = metrics.get(f"{pfx}/dro_frac_up",     float("nan"))
+                boost_m   = metrics.get(f"{pfx}/boost_mean",      float("nan"))
+                boost_sd  = metrics.get(f"{pfx}/boost_std",       float("nan"))
+                boost_mx  = metrics.get(f"{pfx}/boost_max",       float("nan"))
+                boost_fu  = metrics.get(f"{pfx}/boost_up_frac",   float("nan"))
+                err_m     = metrics.get(f"{pfx}/err_series_mean", float("nan"))
+                err_sd    = metrics.get(f"{pfx}/err_series_std",  float("nan"))
                 gap_mean  = metrics.get(f"{pfx}/level_gap_mean",  float("nan"))
                 shape_dc  = metrics.get(f"{pfx}/shape_dc",        float("nan"))
                 ev_frac   = metrics.get(f"{pfx}/event_frac",      float("nan"))
@@ -1603,6 +1612,8 @@ class LossGradientDiagnosticsCallback(Callback):
                     f"dc%={dc_frac:.0%} ac%={ac_frac:.0%} sign↑={sign_frac:.2f} "
                     f"dcMag={dc_mag:.4f} acMag={ac_mag:.4f} | "
                     f"dro={dro_mean:.2f}±{dro_max:.1f}× ↑{dro_fup:.0%} | "
+                    f"boost={boost_m:.2f}±{boost_sd:.2f} max{boost_mx:.2f} ↑{boost_fu:.0%} "
+                    f"err={err_m:.3f}±{err_sd:.3f} | "
                     f"gap={gap_mean:.3f} shDC={shape_dc:.4f} ev={ev_frac:.2f}]"
                 )
             fcout_norm = metrics.get("grad_diag/fcout_grad_norm_mean", float("nan"))

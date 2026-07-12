@@ -197,9 +197,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B, C)
                 _n_es = _ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
                 _boost_per_series = series_boost.squeeze(-1) * _ev_series_mask  # (B, C)
-                boost_mean_l = (_boost_per_series.sum(dim=0) / _n_es).tolist()
+                _boost_mean = (_boost_per_series.sum(dim=0) / _n_es)
+                boost_mean_l = _boost_mean.tolist()
                 _boost_var = ((_boost_per_series ** 2).sum(dim=0) / _n_es
-                              - torch.tensor(boost_mean_l) ** 2).clamp_min(0)
+                              - _boost_mean ** 2).clamp_min(0)
                 boost_std_l = _boost_var.sqrt().tolist()
                 boost_max_l = (_boost_per_series.amax(dim=0)).tolist()
                 boost_min_l = (((_boost_per_series + 1e8 * (1 - _ev_series_mask)).amin(dim=0))).tolist()
@@ -209,9 +210,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 # Per-series error stats (what drives the boost)
                 _err_per_series = series_err_mean.squeeze(-1) * _ev_series_mask  # (B, C)
-                err_series_mean_l = (_err_per_series.sum(dim=0) / _n_es).tolist()
+                _err_mean = (_err_per_series.sum(dim=0) / _n_es)
+                err_series_mean_l = _err_mean.tolist()
                 _err_var = ((_err_per_series ** 2).sum(dim=0) / _n_es
-                            - torch.tensor(err_series_mean_l) ** 2).clamp_min(0)
+                            - _err_mean ** 2).clamp_min(0)
                 err_series_std_l = _err_var.sqrt().tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()

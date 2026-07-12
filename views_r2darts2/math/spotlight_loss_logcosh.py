@@ -10,54 +10,57 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
     Shape = log_cosh with raw-error DRO (V13 — unchanged).
-    Level = T × per-series Hájek of per-cell log_cosh(e) (V21b — fixes V21).
+    Level = T × mean(e²) per-cell with per-series Hájek (V22 — catches spikes).
 
     ── Design ─────────────────────────────────────────────────────────
 
     * **Shape (AC pattern).** Demeaned log_cosh residual, gated,
-      DRO-weighted on ``|raw_error|``, Hájek-normalised. Unchanged.
+      DRO-weighted on ``|raw_error|``, Hájek-normalised. Unchanged from
+      V13 — this component works.
 
-    * **Level (DC + AC magnitude).** ``T × per-series Hájek(log_cosh(e))``
-      — per-cell log_cosh on raw error, normalized per-series first,
-      then Hájek-normalized over series, T-scaled.
+    * **Level (DC + AC magnitude).** ``T × mean_T(e²)`` per series,
+      per-series Hájek-normalised. ``e = y_pred - y_true`` (raw error,
+      ALL cells, no cell-level gating).
 
-      V13 used ``T × gap²`` (mean-gap MSE). The mean is deceptive —
-      it hides the true distribution. The model satisfies it with
-      zeros+spikes. On training, spikes align with events. On eval,
-      spikes land on wrong months → overprediction (V20 eval: sb 1.96×
-      vs training 0.66×).
+      V13 used ``T × mean(e)²`` (mean-gap MSE). The mean is a first-
+      moment statistic — it cannot distinguish a uniform distribution
+      from a spike distribution with the same mean. The model satisfies
+      ``mean(y_pred) ≈ mean(y_true)`` with zeros+spikes. On training,
+      spikes align with events. On eval, spikes misalign → overprediction
+      (V20 eval: sb 1.96× vs training 0.66×).
 
-      V21 used ``T × per-cell Hájek(log_cosh(e))`` — normalizes over
-      (B,T) = 6400 event cells. This dilutes the gradient 64× more
-      than V13 (which normalizes over (B) = 100 series). DC gradient
-      was 5× weaker than V13 → plateaued at 0.40× underprediction.
+      V22 uses ``T × mean_T(e²)``:
+        mean(e²) = var(e) + mean(e)²
 
-      V21b fixes this with **per-series Hájek**: normalize over T
-      first (per-series mean of log_cosh(e)), then Hájek over B.
-      The denominator is ~100 (event series) like V13, not ~6400
-      (event cells) like V21.
+      This sees BOTH the first moment (DC, same as V13) AND the second
+      moment (AC variance, catches spikes). A spike distribution has
+      34× higher mean(e²) than a uniform distribution with the same mean.
 
-      Gradient at event cell:
-        V13:   2*gap / N_series = 0.4/100 = 0.004 (all 36 cells)
-        V21:   T*tanh(e) / N_cells = 36/6400 = 0.0056 (5 cells)
-        V21b:  T*w*tanh(e) / (N_ev_per_series * N_series) = 36/(5*100) = 0.072 (5 cells)
+      Why MSE doesn't blow up here (unlike V21):
+        V21 used per-CELL Hájek (denominator ≈ 6400 event cells).
+        Gradient at a 10000-spike: 2*9.8/5 = 3.9 (concentrated on 5 cells).
+        V22 uses per-SERIES Hájek (denominator ≈ 100 event series).
+        Gradient at a 10000-spike: 2*9.8/100 = 0.196 (bounded by 1/sum(w)).
+        V13's total gradient at severe underprediction: 0.04*36 = 1.44.
+        V22's spike gradient (0.196) is 7× WEAKER than V13's worst case.
 
-      Total DC push per series:
-        V13:   36 * 0.004 = 0.144
-        V21:   5 * 0.0056 = 0.028 (5× too weak → underprediction)
-        V21b:  5 * 0.072 = 0.36 (2.5× V13 → strong calibration)
+      DC gradient comparison (per cell, with Hájek 1/sum(w) ≈ 1/100):
+        V13: 2*gap/100 = 2*1.24/100 = 0.025 (ALL 36 cells, uniform)
+        V22: 2*e[t]/100 = 2*1.24/100 = 0.025 (5 event cells, targeted)
+        — Same per-cell DC gradient! V22 just doesn't waste it on peace cells.
 
-      DC component of gradient (what drives calibration):
-        V13:   0.004 (uniform)
-        V21:   5*0.0056/36 = 0.00078 (3× weaker than V13)
-        V21b:  5*0.072/36 = 0.01 (2.5× stronger than V13)
+      AC gradient (what V13 lacks, V22 adds):
+        At event cell: 2*(e[t] - mean(e))/100 ≈ 2*0/100 = 0 (if e[t] = mean)
+        At spike cell: 2*(5 - 0.14)/100 = 0.097 (directly pushes spike down)
+        At false-alarm peace cell: 2*(0.5 - 0.14)/100 = 0.007 (catches it)
 
-      V21b gives both strong DC (calibration, 2.5× V13) AND strong AC
-      at event cells (spike catching, 18× V13 per cell).
-
-      Loss value unchanged (~T * 1.0 = 36) → Shape:Level balance
-      preserved. log_cosh bounds gradient at tanh ≤ 1 → no blow-up
-      on 10000-fatality spikes.
+      Why no cell-level gating (unlike V21):
+        V21 used ``gate`` as per-cell weight, excluding peace cells.
+        This made it blind to false alarms — spikes at peace cells got
+        gate ≈ 0 → no penalty. V22 uses V13's series-level gate only
+        (``gate.amax(dim=1)``). ALL cells in event series are included.
+        A spike at a peace cell gives e = spike → e² = large → loss
+        increases → model is penalized for the false alarm.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -74,7 +77,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV21b | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV22 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -125,35 +128,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: T × per-series Hájek of per-cell log_cosh(e) ──────
-        # V21b: fixes V21's weak DC gradient.
+        # ── LEVEL: T × mean_T(e²), per-series Hájek — V22 ────────────
+        # Replaces V13's T × mean(e)² (mean-gap MSE).
         #
-        # V21 normalized over (B,T) = 6400 event cells → gradient
-        # diluted 64× more than V13 → DC 5× weaker → underprediction.
+        # mean(e²) = var(e) + mean(e)² — sees BOTH DC (mean) and AC (variance).
+        # A spike distribution has 34× higher mean(e²) than uniform with same mean.
         #
-        # V21b normalizes per-series first (sum_T / sum_T), then
-        # Hájek over B (like V13). Denominator is ~100 event series,
-        # not ~6400 event cells.
+        # No cell-level gating — ALL cells in event series are included.
+        # This catches false alarms (spikes at peace cells), which V21's
+        # cell-level gating missed.
         #
-        # Per-series mean: (gate * log_cosh(e)).sum(dim=1) / gate.sum(dim=1)
-        # This gives each series' mean log_cosh error ≈ 1.0.
-        # Then Hájek over series with w_level = gate.amax(dim=1).
-        # Then T scales to ≈ 36.
-        level_cell = self._log_cosh(e)  # raw error, no demeaning, no /ac_scale
-        w_level = gate  # same gate as Shape
+        # Per-series Hájek (not per-cell) — denominator ≈ 100 event series.
+        # Gradient at 10000-spike: 2*9.8/100 = 0.196 (bounded, no blow-up).
+        # V21's per-cell Hájek gave 2*9.8/5 = 3.9 (concentrated, unstable).
+        #
+        # T factor: same as V13. T * mean_T(e²) has gradient 2*e[t] per cell.
+        # Without T, gradient would be 2*e[t]/T — diluted by 1/T.
+        level_per_series = (e ** 2).mean(dim=1)  # mean over T, ALL cells, (B,) or (B, C)
+        level_cell = T * level_per_series
+        w_level = gate.amax(dim=1)  # per-series event mass (same as V13)
 
         if multivariate:
-            # Per-series mean: (B, T, C) → sum over T → (B, C)
-            per_series_level = (w_level * level_cell).sum(dim=1) / w_level.sum(dim=1).clamp_min(self._EPS)
-            # Hájek over series with event-mass weight
-            w_level_series = gate.amax(dim=1)  # (B, C) — per-series event mass
-            loss_level = T * (w_level_series * per_series_level).sum(dim=0) / w_level_series.sum(dim=0).clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            # Per-series mean: (B, T) → sum over T → (B,)
-            per_series_level = (w_level * level_cell).sum(dim=1) / w_level.sum(dim=1).clamp_min(self._EPS)
-            # Hájek over series
-            w_level_series = gate.amax(dim=1)  # (B,)
-            loss_level = T * (w_level_series * per_series_level).sum() / w_level_series.sum().clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
@@ -188,39 +186,45 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga    = gap.abs()
                 gap_mean_l    = _ga.mean(dim=0).tolist()
                 gap_max_l     = _ga.amax(dim=0).tolist()
-                _ev_mask_s = (w_level_series > 0.5).float()
+                _ev_mask_s = (w_level > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
+                gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # ── V21b: per-cell Level diagnostics ──
-                _e_ev = e.abs() * event_mask  # zero out peace cells
+                # ── V22: mean obfuscation diagnostics ──
+                # The deception signal: compare mean(|e|) to |mean(e)|.
+                # If mean(|e|) >> |mean(e)|, the mean is hiding error
+                # (errors cancel out in the mean but are large individually).
+                _mean_abs_e = e.abs().mean(dim=1)  # (B, C) — mean |e| per series
+                _mean_e = e.mean(dim=1)  # (B, C) — mean e per series (= gap)
+                _deception = _mean_abs_e / _mean_e.abs().clamp_min(1e-6)  # (B, C)
+                _deception_ev = _deception * _ev_mask_s  # only event series
+                _n_deception = _ev_mask_s.sum(dim=0).clamp_min(1.0)
+                deception_mean_l = (_deception_ev.sum(dim=0) / _n_deception).tolist()
+                deception_max_l = (_deception_ev.amax(dim=0)).tolist()
+
+                # Per-cell error stats (what V22 sees, V13 doesn't)
+                _e_ev = e.abs() * event_mask  # event cells only
                 _e_ev_mean = _e_ev.sum(dim=(0, 1)) / _n_ev  # (C,)
                 e_ev_mean_l = _e_ev_mean.tolist()
                 e_ev_max_l = (_e_ev.amax(dim=(0, 1))).tolist()
-                _lc_ev = level_cell * event_mask
-                lc_ev_mean_l = (_lc_ev.sum(dim=(0, 1)) / _n_ev).tolist()
-                lc_ev_max_l = (_lc_ev.amax(dim=(0, 1))).tolist()
 
-                # Effective per-cell gradient for V21b:
-                # T * w_level_series * gate * tanh(e) / (sum_T(gate) * sum_B(w_level_series))
-                # ≈ T * tanh(e) / (N_ev_per_series * N_series)
-                _sum_gate_per_series = w_level.sum(dim=1).clamp_min(1.0)  # (B, C)
-                _sum_w_series = w_level_series.sum(dim=0).clamp_min(1.0)  # (C,)
-                _eff_grad = T * w_level_series.unsqueeze(1) * w_level * torch.tanh(e) \
-                            / (_sum_gate_per_series.unsqueeze(1) * _sum_w_series.unsqueeze(0).unsqueeze(0))
-                # _eff_grad shape: (B, T, C) — but need to be careful with broadcasting
-                # Actually w_level_series is (B, C), unsqueeze(1) → (B, 1, C)
-                # w_level is (B, T, C)
-                # _sum_gate_per_series is (B, C), unsqueeze(1) → (B, 1, C)
-                # _sum_w_series is (C,), unsqueeze(0).unsqueeze(0) → (1, 1, C)
-                _eff_grad_ev = _eff_grad.abs() * event_mask
-                eff_grad_mean_l = (_eff_grad_ev.sum(dim=(0, 1)) / _n_ev).tolist()
-                eff_grad_max_l = (_eff_grad_ev.amax(dim=(0, 1))).tolist()
+                # Peace cell false alarms (spikes at peace cells in event series)
+                _peace_mask = (1 - event_mask) * _ev_mask_s.unsqueeze(1)  # (B, T, C)
+                # Actually _ev_mask_s is (B, C), need to broadcast to (B, T, C)
+                _peace_mask = (1 - event_mask) * _ev_mask_s.unsqueeze(1)
+                _e_peace = e.abs() * _peace_mask
+                _n_peace = _peace_mask.sum(dim=(0, 1)).clamp_min(1.0)
+                e_peace_mean_l = (_e_peace.sum(dim=(0, 1)) / _n_peace).tolist()
+                e_peace_max_l = (_e_peace.amax(dim=(0, 1))).tolist()
+                # Fraction of peace cells (in event series) with |e| > 0.5 (false alarms)
+                false_alarm_frac_l = (((e.abs() > 0.5) * _peace_mask).sum(dim=(0, 1))
+                                      / _n_peace).tolist()
 
-                # Spike diagnostics
+                # Spike diagnostics (event cells)
                 spike_frac_l = (((e.abs() > 2.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
                 spike_severe_l = (((e.abs() > 4.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
                 overpred_frac_l = (((e > 0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
@@ -229,12 +233,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 overpred_mag_l = (_overpred / _n_overpred).tolist()
                 underpred_frac_l = (((e < 0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
 
-                # Event cells per series (affects gradient strength)
-                _ev_per_series = event_mask.sum(dim=1)  # (B, C)
-                _ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B, C)
-                _n_es = _ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
-                _eps_mean_t = (_ev_per_series * _ev_series_mask).sum(dim=0) / _n_es
-                ev_per_series_l = _eps_mean_t.tolist()
+                # mean(e²) decomposition: var(e) + mean(e)²
+                _var_e = e.var(dim=1)  # (B, C) — variance of e per series
+                _mean_e_sq = gap ** 2  # (B, C) — mean(e)² = V13's signal
+                _var_e_ev = _var_e * _ev_mask_s
+                _mean_e_sq_ev = _mean_e_sq * _ev_mask_s
+                var_e_mean_l = (_var_e_ev.sum(dim=0) / _n_deception).tolist()
+                mean_e_sq_mean_l = (_mean_e_sq_ev.sum(dim=0) / _n_deception).tolist()
+                # Ratio: var(e) / mean(e)² — if high, AC dominates (spiky).
+                # If ~0, DC dominates (uniform, V13 is fine).
+                # If >10, V13 was hiding 10× more error than it showed.
+                var_mean_ratio_l = ((_var_e_ev.sum(dim=0) / _n_deception)
+                                    / (_mean_e_sq_ev.sum(dim=0) / _n_deception).clamp_min(1e-8)).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -251,25 +261,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga    = gap.abs()
                 gap_mean_l    = [_ga.mean().item()]
                 gap_max_l     = [_ga.max().item()]
-                _ev_mask_s = (w_level_series > 0.5).float()
+                _ev_mask_s = (w_level > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
+                gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
+                _mean_abs_e = e.abs().mean(dim=1)
+                _mean_e = e.mean(dim=1)
+                _deception = _mean_abs_e / _mean_e.abs().clamp_min(1e-6)
+                _deception_ev = _deception * _ev_mask_s
+                _n_deception = _ev_mask_s.sum().clamp_min(1.0)
+                deception_mean_l = [(_deception_ev.sum() / _n_deception).item()]
+                deception_max_l = [_deception_ev.max().item()]
                 _e_ev = e.abs() * event_mask
                 _e_ev_mean = _e_ev.sum() / _n_ev
                 e_ev_mean_l = [_e_ev_mean.item()]
                 e_ev_max_l = [_e_ev.max().item()]
-                _lc_ev = level_cell * event_mask
-                lc_ev_mean_l = [(_lc_ev.sum() / _n_ev).item()]
-                lc_ev_max_l = [_lc_ev.max().item()]
-                _sum_gate_per_series = w_level.sum(dim=1).clamp_min(1.0)  # (B,)
-                _sum_w_series = w_level_series.sum().clamp_min(1.0)  # scalar
-                _eff_grad = T * w_level_series.unsqueeze(1) * w_level * torch.tanh(e) \
-                            / (_sum_gate_per_series.unsqueeze(1) * _sum_w_series)
-                _eff_grad_ev = _eff_grad.abs() * event_mask
-                eff_grad_mean_l = [(_eff_grad_ev.sum() / _n_ev).item()]
-                eff_grad_max_l = [_eff_grad_ev.max().item()]
+                _peace_mask = (1 - event_mask) * _ev_mask_s.unsqueeze(1)
+                _e_peace = e.abs() * _peace_mask
+                _n_peace = _peace_mask.sum().clamp_min(1.0)
+                e_peace_mean_l = [(_e_peace.sum() / _n_peace).item()]
+                e_peace_max_l = [_e_peace.max().item()]
+                false_alarm_frac_l = [(((e.abs() > 0.5) * _peace_mask).sum() / _n_peace).item()]
                 spike_frac_l = [(((e.abs() > 2.0) * event_mask).sum() / _n_ev).item()]
                 spike_severe_l = [(((e.abs() > 4.0) * event_mask).sum() / _n_ev).item()]
                 overpred_frac_l = [(((e > 0) * event_mask).sum() / _n_ev).item()]
@@ -277,15 +291,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _n_overpred = ((e > 0).float() * event_mask).sum().clamp_min(1.0)
                 overpred_mag_l = [(_overpred / _n_overpred).item()]
                 underpred_frac_l = [(((e < 0) * event_mask).sum() / _n_ev).item()]
-                _ev_per_series = event_mask.sum(dim=1)
-                _ev_series_mask = (event_mask.sum(dim=1) > 0).float()
-                _n_es = _ev_series_mask.sum().clamp_min(1.0)
-                ev_per_series_l = [((_ev_per_series * _ev_series_mask).sum() / _n_es).item()]
+                _var_e = e.var(dim=1)
+                _mean_e_sq = gap ** 2
+                _var_e_ev = _var_e * _ev_mask_s
+                _mean_e_sq_ev = _mean_e_sq * _ev_mask_s
+                var_e_mean_l = [(_var_e_ev.sum() / _n_deception).item()]
+                mean_e_sq_mean_l = [(_mean_e_sq_ev.sum() / _n_deception).item()]
+                var_mean_ratio_l = [((_var_e_ev.sum() / _n_deception).item()
+                                     / max(1e-8, (_mean_e_sq_ev.sum() / _n_deception).item()))]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV21b: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV22: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -309,36 +327,47 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_max":  gap_max_l,
             "level_gap_ev_mean": gap_ev_mean_l,
             "level_gap_ev_max":  gap_ev_max_l,
+            "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V21b: per-cell Level diagnostics ──
-            # Compare e_ev_mean to gap_ev_mean:
-            #   gap_ev_mean ≈ 0.2 (V13's diluted signal)
-            #   e_ev_mean ≈ 1.5 (V21b's true per-cell error)
-            # If e_ev_mean >> gap_ev_mean, the mean was hiding error.
-            "e_ev_mean":        e_ev_mean_l,
-            "e_ev_max":         e_ev_max_l,
-            "lc_ev_mean":       lc_ev_mean_l,
-            "lc_ev_max":        lc_ev_max_l,
-            # Effective per-cell gradient (V21b):
-            # T * tanh(e) / (N_ev_per_series * N_series)
-            # Should be ≈ 0.072 at event cells (vs V13's 0.004, V21's 0.0056)
-            "eff_grad_mean":    eff_grad_mean_l,
-            "eff_grad_max":     eff_grad_max_l,
-            # ── Spike diagnostics ──
-            "spike_frac":       spike_frac_l,
-            "spike_severe":     spike_severe_l,
-            "overpred_frac":    overpred_frac_l,
-            "overpred_mag":     overpred_mag_l,
-            "underpred_frac":   underpred_frac_l,
-            "ev_per_series":    ev_per_series_l,
+            # ── V22: mean obfuscation diagnostics ──
+            # The deception ratio: mean(|e|) / |mean(e)|.
+            # = 1.0 if all errors have the same sign (no cancellation)
+            # = high if errors cancel (spikes offset by zeros)
+            # V13 only sees |mean(e)|. V22 sees mean(|e|) via mean(e²).
+            # If deception > 3, V13 was hiding 3× more error than it showed.
+            "deception_mean":   deception_mean_l,   # mean deception ratio over event series
+            "deception_max":    deception_max_l,    # max deception (most obfuscated series)
+            # ── V22: mean(e²) decomposition ──
+            # mean(e²) = var(e) + mean(e)²
+            # var(e) = AC component (what V13 misses, V22 catches)
+            # mean(e)² = DC component (what V13 sees)
+            # var_mean_ratio = var(e) / mean(e)² — if >10, V13 was hiding 10× more
+            "var_e_mean":       var_e_mean_l,       # mean var(e) over event series (AC)
+            "mean_e_sq_mean":   mean_e_sq_mean_l,   # mean mean(e)² over event series (DC = V13's signal)
+            "var_mean_ratio":   var_mean_ratio_l,    # var(e) / mean(e)² (obfuscation factor)
+            # ── V22: per-cell error diagnostics ──
+            "e_ev_mean":        e_ev_mean_l,        # mean |e| at event cells
+            "e_ev_max":         e_ev_max_l,         # max |e| at event cells (largest spike)
+            # ── V22: false alarm diagnostics (spikes at peace cells) ──
+            # These are what cause eval overprediction. V13 can't see them
+            # (mean dilutes). V21 gated them out. V22 catches them.
+            "e_peace_mean":     e_peace_mean_l,     # mean |e| at peace cells in event series
+            "e_peace_max":      e_peace_max_l,      # max |e| at peace cells (largest false alarm)
+            "false_alarm_frac": false_alarm_frac_l, # frac of peace cells with |e|>0.5 (false alarms)
+            # ── V22: spike diagnostics ──
+            "spike_frac":       spike_frac_l,       # frac of event cells with |e|>2
+            "spike_severe":     spike_severe_l,     # frac with |e|>4 (should decrease over training)
+            "overpred_frac":    overpred_frac_l,    # frac of event cells where y_pred > y_true
+            "overpred_mag":     overpred_mag_l,     # mean overprediction magnitude
+            "underpred_frac":   underpred_frac_l,   # frac where y_pred < y_true
         }
 
         logger.debug(
-            "SpotlightLossV21b | shape=%s level=%s total=%.6f",
+            "SpotlightLossV22 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV21b(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV22(non_zero_threshold={self.tau})"

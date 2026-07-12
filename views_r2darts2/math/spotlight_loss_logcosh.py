@@ -10,59 +10,62 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
     Shape = log_cosh with raw-error DRO (V13 — unchanged).
-    Level = T × MSE(gate-weighted event-mean gap) — V23.
+    Level = T × MSE(true-event-mean gap) — V24.
 
     ── Design ─────────────────────────────────────────────────────────
 
     * **Shape (AC pattern).** Demeaned log_cosh residual, gated,
-      DRO-weighted on ``|raw_error|``, Hájek-normalised. Unchanged from
-      V13 — this component works.
+      DRO-weighted on ``|raw_error|``, Hájek-normalised. Unchanged.
 
     * **Level (DC magnitude).** ``T × gap²`` where ``gap`` is the
-      **gate-weighted event-mean gap** (not the all-cell mean gap).
+      **true-event-mean gap** — mean over cells where ``y_true > tau``
+      only (NOT y_pred).
 
-      V13 used ``gap = mean(y_pred) - mean(y_true)`` over ALL 36 cells.
-      This diluted the gap by 31 peace cells. For 5 events at error 1.5:
-        V13 gap = 5×1.5/36 = 0.21  (diluted 7×)
-        V23 gap = 5×1.5/5  = 1.50  (undiluted)
-      V23's gap is 7× larger → 50× larger gap² → much stronger DC push.
+      V13 used all-cell mean: gap = mean(y_pred) - mean(y_true) over
+      ALL 36 cells. Diluted by 31 peace cells. Gap 7× too small.
 
-      V23 computes the mean over EVENT cells only, using the same gate
-      as Shape (detached to avoid second-order gradients):
-        gate_d = gate.detach()
-        mean_pred_ev = sum(gate_d * y_pred) / sum(gate_d)
-        mean_true_ev = sum(gate_d * y_true) / sum(gate_d)
-        gap = mean_pred_ev - mean_true_ev
+      V23 used gate-weighted event mean: gate = sigmoid(max(|y_true|,
+      |y_pred|) - tau). The gate depends on y_pred → the model can
+      game it by spiking at any cell → gate turns on → mean includes
+      spike → gap small. Training/eval gap: training 0.98× but eval
+      MCR 0.27× on sb. The model learned to spike, not to calibrate.
 
-      Everything else is V13 exactly:
-        level_cell = T * gap²
-        w_level = gate.amax(dim=1)
-        Hájek: (w_level * level_cell).sum / w_level.sum
+      V24 uses TRUE-event mean: mask = (y_true > tau). The mask
+      depends ONLY on y_true → FIXED target the model cannot game.
+      No dilution (only true event cells counted). No gaming (mask
+      doesn't depend on y_pred).
 
-      Why this is DC-only (no AC entanglement):
-        gap is a SCALAR per series (weighted mean → scalar).
-        d(gap)/d(y_pred[t]) = gate_d[t] / sum(gate_d)  (uniform for gate>0)
-        d(T*gap²)/d(y_pred[t]) = 2*gap * gate_d[t]/sum(gate_d)
-        This is UNIFORM across event cells → pure DC, zero AC.
-        No Shape conflict (unlike V22's mean(e²) which had AC component).
+      gap = mean(y_pred, where y_true > tau) - mean(y_true, where y_true > tau)
 
-      Why this solves underprediction:
-        V13's diluted gap (0.21) gives gradient 2*0.21 = 0.42 per cell.
-        V23's undiluted gap (1.50) gives gradient 2*1.50 = 3.0 per cell.
-        7× stronger DC push → model can calibrate.
+      This is the mean prediction error AT TRUE EVENT CELLS. The model
+      must predict the right level where events actually are — it
+      can't satisfy the loss by spiking elsewhere.
 
-      Why this is robust to spikes:
-        A single huge spike at an event cell raises mean_pred_ev, but
-        only by spike/N_ev (not spike/36). The model doesn't need to
-        lift ALL cells — just the event cells. Shape (with DRO) then
-        distributes the mass correctly.
+      Why this is DC-only:
+        gap is a scalar per series (weighted mean → scalar).
+        d(gap)/d(y_pred[t]) = mask[t] / sum(mask)  (uniform for true events)
+        d(T*gap²)/d(y_pred[t]) = 2*gap * mask[t]/sum(mask)
+        This is UNIFORM across true event cells → pure DC, zero AC.
 
-      Why gate is detached:
-        Detaching avoids second-order gradients through the weighting.
-        The gate is a function of y_pred (via abs_max), so without
-        detach, the gap computation would create a feedback loop.
-        Detach keeps the Level gradient flowing only through y_pred
-        in the numerator, not through the gate weights.
+      Why this fixes dilution:
+        V13: gap = sum(e over 36 cells) / 36 ≈ 0.2 (diluted)
+        V24: gap = sum(e over 5 true events) / 5 ≈ 1.5 (undiluted)
+        7× larger gap → 7× stronger DC push.
+
+      Why this fixes gaming:
+        V23's gate turned on at y_pred spikes → model could spike
+        anywhere → gap stayed small. V24's mask only counts y_true
+        events → spiking at a peace cell doesn't change the gap →
+        the model MUST predict the right level at true event cells.
+
+      Why ch_1, ch_2 will calibrate (V23 failed):
+        V23's gate-weighted mean was dominated by wherever the model
+        spiked. For ch_1 (rare events), the model couldn't find the
+        events, so it spiked at wrong cells → gate turned on there →
+        mean was dominated by wrong cells → 89% AC gradient → never
+        learned the level. V24's mask points at TRUE events → the
+        model is told "raise your prediction HERE" → DC gradient
+        at the right cells → calibration.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -79,7 +82,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV23 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV24 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -100,9 +103,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         e = y_pred - y_true
 
-        # ── Event gate ───────────────────────────────────────────────
+        # ── Event gate (for Shape, uses both y_true and y_pred) ──────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
+
+        # ── TRUE-event mask (for Level, uses y_true ONLY) ────────────
+        # V24: FIXED mask that the model cannot game.
+        # V23's gate depended on y_pred → model could spike anywhere
+        # → gaming → training/eval gap.
+        # V24's mask depends only on y_true → fixed target → no gaming.
+        true_mask = (y_true.abs() > self.tau).float()
 
         # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ───
         # Unchanged from V13.
@@ -130,20 +140,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: T × MSE(gate-weighted event-mean gap) — V23 ───────
-        # Replaces V13's T × mean(e)² (all-cell mean gap).
+        # ── LEVEL: T × MSE(true-event-mean gap) — V24 ────────────────
+        # Replaces V13's all-cell mean and V23's gate-weighted mean.
         #
-        # Gate-weighted event mean: mean over EVENT cells only (gate > 0).
-        # Detached gate avoids second-order gradients through weighting.
-        # Gap is a SCALAR per series → DC-only → no Shape conflict.
+        # true_mask depends ONLY on y_true → FIXED target, no gaming.
+        # mean over TRUE event cells only → no dilution by peace cells.
         #
-        # 7× larger gap than V13 (no peace-cell dilution) → 50× larger
-        # gap² → 7× stronger DC gradient → fixes underprediction.
-        gate_d = gate.detach()
-        sum_g = gate_d.sum(dim=1, keepdim=True).clamp_min(1.0)
-        mean_pred_ev = (gate_d * y_pred).sum(dim=1, keepdim=True) / sum_g
-        mean_true_ev = (gate_d * y_true).sum(dim=1, keepdim=True) / sum_g
-        gap = (mean_pred_ev - mean_true_ev).squeeze(1)  # (B,) or (B, C)
+        # gap = mean(y_pred at true events) - mean(y_true at true events)
+        #     = mean(e at true events)  (since y_pred - y_true = e)
+        #
+        # Gradient: 2*gap * true_mask[t] / sum(true_mask) per cell.
+        # Uniform across true event cells → DC-only → no Shape conflict.
+        sum_tm = true_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        mean_pred_te = (true_mask * y_pred).sum(dim=1, keepdim=True) / sum_tm
+        mean_true_te = (true_mask * y_true).sum(dim=1, keepdim=True) / sum_tm
+        gap = (mean_pred_te - mean_true_te).squeeze(1)  # (B,) or (B, C)
 
         level_cell = T * gap ** 2
         w_level = gate.amax(dim=1)  # per-series event mass (same as V13)
@@ -181,16 +192,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 dro_frac_up_l = (((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
                 event_frac_l  = event_mask.mean(dim=(0, 1)).tolist()
 
-                # Gap diagnostics — compare V23's event-gap to V13's all-cell gap
-                gap_v13 = y_pred.mean(dim=1) - y_true.mean(dim=1)  # V13's diluted gap
-                _ga     = gap.abs()         # V23's event-gap (undiluted)
-                _ga_v13 = gap_v13.abs()     # V13's all-cell gap (diluted)
+                # Gap diagnostics — compare V24's true-event gap to V13's all-cell gap
+                gap_v13 = y_pred.mean(dim=1) - y_true.mean(dim=1)
+                _ga     = gap.abs()
+                _ga_v13 = gap_v13.abs()
                 gap_mean_l     = _ga.mean(dim=0).tolist()
                 gap_max_l      = _ga.amax(dim=0).tolist()
                 gap_v13_mean_l = _ga_v13.mean(dim=0).tolist()
                 gap_v13_max_l  = _ga_v13.amax(dim=0).tolist()
-                # Dilution factor: V23 gap / V13 gap. Should be ~7× (36/5).
-                # If low, events are spread across many cells (less dilution).
                 dilution_l = (_ga.mean(dim=0) / _ga_v13.mean(dim=0).clamp_min(1e-8)).tolist()
 
                 _ev_mask_s = (w_level > 0.5).float()
@@ -201,17 +210,34 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # ── V23: event-mean diagnostics ──
-                # What the gate-weighted event mean actually sees
-                _mean_pred_ev = mean_pred_ev.squeeze(1)  # (B, C)
-                _mean_true_ev = mean_true_ev.squeeze(1)  # (B, C)
-                mean_pred_ev_l = (_mean_pred_ev.mean(dim=0)).tolist()
-                mean_true_ev_l = (_mean_true_ev.mean(dim=0)).tolist()
-                # Event cells per series (affects dilution)
-                _ev_per_series = event_mask.sum(dim=1)  # (B, C)
-                _ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B, C)
-                _n_es = _ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
-                ev_per_series_l = ((_ev_per_series * _ev_series_mask).sum(dim=0) / _n_es).tolist()
+                # ── V24: true-event diagnostics ──
+                # True event cells per series
+                _n_te_per_series = true_mask.sum(dim=1)  # (B, C)
+                _te_series_mask = (true_mask.sum(dim=1) > 0).float()  # (B, C)
+                _n_tes = _te_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
+                n_te_per_series_l = ((_n_te_per_series * _te_series_mask).sum(dim=0) / _n_tes).tolist()
+
+                # Mean pred/true at true event cells
+                _mean_pred_te = mean_pred_te.squeeze(1)  # (B, C)
+                _mean_true_te = mean_true_te.squeeze(1)  # (B, C)
+                mean_pred_te_l = (_mean_pred_te.mean(dim=0)).tolist()
+                mean_true_te_l = (_mean_true_te.mean(dim=0)).tolist()
+
+                # ── V24: spike misplacement diagnostics ──
+                # False alarms: y_pred > tau at cells where y_true < tau
+                _false_alarm_mask = ((y_pred.abs() > self.tau).float() * (1 - true_mask)) * _te_series_mask.unsqueeze(1)
+                _n_fa = _false_alarm_mask.sum(dim=(0, 1)).clamp_min(1.0)
+                false_alarm_frac_l = (_false_alarm_mask.sum(dim=(0, 1))
+                                      / true_mask.sum(dim=(0, 1)).clamp_min(1.0)).tolist()
+                # Mean y_pred at false alarm cells (should be ~0 if no spiking)
+                _fa_pred = (y_pred.abs() * _false_alarm_mask).sum(dim=(0, 1)) / _n_fa
+                false_alarm_mag_l = _fa_pred.tolist()
+
+                # True events missed: y_pred < tau at cells where y_true > tau
+                _missed_mask = (true_mask * (y_pred.abs() < self.tau).float()) * _te_series_mask.unsqueeze(1)
+                _n_missed = _missed_mask.sum(dim=(0, 1)).clamp_min(1.0)
+                missed_frac_l = (_missed_mask.sum(dim=(0, 1))
+                                 / true_mask.sum(dim=(0, 1)).clamp_min(1.0)).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -238,19 +264,27 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
-                _mean_pred_ev = mean_pred_ev.squeeze(1) if mean_pred_ev.dim() > 1 else mean_pred_ev
-                _mean_true_ev = mean_true_ev.squeeze(1) if mean_true_ev.dim() > 1 else mean_true_ev
-                mean_pred_ev_l = [_mean_pred_ev.mean().item()]
-                mean_true_ev_l = [_mean_true_ev.mean().item()]
-                _ev_per_series = event_mask.sum(dim=1)
-                _ev_series_mask = (event_mask.sum(dim=1) > 0).float()
-                _n_es = _ev_series_mask.sum().clamp_min(1.0)
-                ev_per_series_l = [((_ev_per_series * _ev_series_mask).sum() / _n_es).item()]
+                _n_te_per_series = true_mask.sum(dim=1)
+                _te_series_mask = (true_mask.sum(dim=1) > 0).float()
+                _n_tes = _te_series_mask.sum().clamp_min(1.0)
+                n_te_per_series_l = [((_n_te_per_series * _te_series_mask).sum() / _n_tes).item()]
+                _mean_pred_te = mean_pred_te.squeeze(1) if mean_pred_te.dim() > 1 else mean_pred_te
+                _mean_true_te = mean_true_te.squeeze(1) if mean_true_te.dim() > 1 else mean_true_te
+                mean_pred_te_l = [_mean_pred_te.mean().item()]
+                mean_true_te_l = [_mean_true_te.mean().item()]
+                _false_alarm_mask = ((y_pred.abs() > self.tau).float() * (1 - true_mask)) * _te_series_mask.unsqueeze(1)
+                _n_fa = _false_alarm_mask.sum().clamp_min(1.0)
+                false_alarm_frac_l = [(_false_alarm_mask.sum() / max(1.0, true_mask.sum().item())).item()]
+                _fa_pred = (y_pred.abs() * _false_alarm_mask).sum() / _n_fa
+                false_alarm_mag_l = [_fa_pred.item()]
+                _missed_mask = (true_mask * (y_pred.abs() < self.tau).float()) * _te_series_mask.unsqueeze(1)
+                _n_missed = _missed_mask.sum().clamp_min(1.0)
+                missed_frac_l = [(_missed_mask.sum() / max(1.0, true_mask.sum().item())).item()]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV23: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV24: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -270,31 +304,40 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "dro_frac_up":    dro_frac_up_l,
             "event_frac":     event_frac_l,
             # ── Gap diagnostics ──
-            "level_gap_mean": gap_mean_l,         # V23's event-gap (undiluted)
+            "level_gap_mean": gap_mean_l,
             "level_gap_max":  gap_max_l,
             "level_gap_ev_mean": gap_ev_mean_l,
             "level_gap_ev_max":  gap_ev_max_l,
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V23: dilution diagnostics ──
-            # Compare V23's event-gap to V13's all-cell gap.
-            # dilution = V23_gap / V13_gap ≈ 36/N_ev ≈ 7×
-            # If dilution > 5, V13 was hiding 5× more error than it showed.
-            "gap_v13_mean":   gap_v13_mean_l,     # V13's diluted gap (what V13 saw)
+            # ── V24: dilution diagnostics ──
+            "gap_v13_mean":   gap_v13_mean_l,
             "gap_v13_max":    gap_v13_max_l,
-            "dilution":       dilution_l,         # V23_gap / V13_gap (should be ~7×)
-            # ── V23: event-mean diagnostics ──
-            "mean_pred_ev":   mean_pred_ev_l,     # gate-weighted mean of y_pred over events
-            "mean_true_ev":   mean_true_ev_l,     # gate-weighted mean of y_true over events
-            "ev_per_series":  ev_per_series_l,    # mean event cells per series (drives dilution)
+            "dilution":       dilution_l,
+            # ── V24: true-event diagnostics ──
+            "n_te_per_series": n_te_per_series_l,  # true event cells per series
+            "mean_pred_te":   mean_pred_te_l,       # mean y_pred at true events
+            "mean_true_te":   mean_true_te_l,       # mean y_true at true events
+            # ── V24: spike misplacement diagnostics ──
+            # False alarms: y_pred > tau where y_true < tau.
+            # V23's gate-weighted mean was gameable because it counted
+            # these. V24's true_mask ignores them.
+            # If false_alarm_frac is high, the model is spiking at
+            # wrong cells. V24 doesn't penalize this directly (Level
+            # only looks at true events), but Shape should catch it.
+            "false_alarm_frac": false_alarm_frac_l,  # false alarms / true events
+            "false_alarm_mag":  false_alarm_mag_l,   # mean |y_pred| at false alarms
+            # Missed events: y_pred < tau where y_true > tau.
+            # If high, the model is underpredicting at true events.
+            "missed_frac":      missed_frac_l,       # missed events / true events
         }
 
         logger.debug(
-            "SpotlightLossV23 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV24 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV23(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV24(non_zero_threshold={self.tau})"

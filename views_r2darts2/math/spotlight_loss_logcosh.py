@@ -6,12 +6,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class SpotlightLossLogcosh(torch.nn.Module):
+class SpotlightLossV7(torch.nn.Module):
     """
-    Symmetric 2-term loss with signal-gated sqrt-DRO on raw error.
-    DRO operates on raw error magnitude (not demeaned shape) to avoid
-    demeaning-oscillation coupling. Gated by signal presence in either
-    y_true or y_pred to prevent noise amplification at 97% sparsity.
+    Fixed V6: hard shape gate eliminates DC/AC conflict on peace cells.
+    DRO on raw error with reference-mean normalization (not self-mean).
     """
 
     _EPS = 1e-6
@@ -23,7 +21,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
 
-        logger.info("SpotlightLossV6 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV7 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -33,44 +31,38 @@ class SpotlightLossLogcosh(torch.nn.Module):
     @staticmethod
     def _dro_sqrt_gated(losses: torch.Tensor, signal_mask: torch.Tensor) -> torch.Tensor:
         """
-        Signal-gated sqrt-DRO on raw errors.
-
-        - losses: raw cell losses, shape (B, T) or (B, T, C)
-        - signal_mask: bool tensor, True where |y_true|>tau OR |y_pred|>tau
-
-        Design:
-        1. Compute per-series mean on SIGNAL cells only (not all cells).
-           Using all cells at 97% sparsity gives mu ≈ 0, amplifying noise.
-        2. sqrt(l/mu) gives sublinear concentration.
-        3. Renormalize to mean 1.0 on SIGNAL cells per series.
-           Without this, a series with 1 signal cell gets w≈1 on that cell
-           (sqrt(1/1)=1), but the cell's weight mass is 1/36 of the series.
-           Normalizing within-signal-region makes the weight mass proper.
-        4. Peace cells get w=1.0 (neutral, no DRO noise).
-
-        The detach on losses prevents the model from gaming DRO weights.
+        Signal-gated sqrt-DRO with BATCH reference mean.
+        
+        Key fix: mu is the BATCH-WIDE mean on signal cells, not per-series.
+        This prevents the "uniform error → w=1 everywhere" cancellation.
+        A series with uniform |e|=2.0 in a batch where mean |e|=5.0 gets
+        w_raw = sqrt(2/5) = 0.63, properly downweighted.
         """
         l = losses.detach()
-
-        # Per-series mean on SIGNAL cells only
+        
+        # Batch-wide mean on signal cells (not per-series)
+        # This maintains relative differences across series
+        global_mu = l[signal_mask].mean() if signal_mask.any() else l.mean()
+        global_mu = global_mu.clamp(min=1e-8)
+        
+        # Per-series mean for normalization (preserves within-series structure)
         signal_sum = signal_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-        mu = (l * signal_mask).sum(dim=1, keepdim=True) / signal_sum
-        mu = mu.clamp(min=1e-8)
-
-        # Raw sqrt weights
-        w_raw = torch.sqrt(l / mu)
-
-        # Renormalize to mean 1.0 on SIGNAL cells per series
+        local_mu = (l * signal_mask).sum(dim=1, keepdim=True) / signal_sum
+        local_mu = local_mu.clamp(min=1e-8)
+        
+        # Hybrid: use global mu for ratio (cross-series discrimination),
+        # local mu for normalization (per-series stability)
+        w_raw = torch.sqrt(l / global_mu)
+        
+        # Normalize to mean 1.0 on signal cells per series
         w_raw_mean = (w_raw * signal_mask).sum(dim=1, keepdim=True) / signal_sum
         w_raw_mean = w_raw_mean.clamp(min=1e-8)
-
-        # Apply normalized weight on signal, 1.0 on peace
+        
         w = torch.where(
             signal_mask,
             w_raw / w_raw_mean,
             torch.ones_like(w_raw)
         )
-
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=1.0)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -82,46 +74,46 @@ class SpotlightLossLogcosh(torch.nn.Module):
         B, T = y_pred.shape[:2]
         e = y_pred - y_true
 
-        # ── Signal detection (for gating and DRO) ───────────────────
+        # Signal detection
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.tau))
-        signal_mask = abs_max > self.tau  # bool, True if event in true OR pred
+        gate_soft = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.tau))
+        signal_mask = abs_max > self.tau
 
-        # ── SHAPE: log_cosh on full-sequence demeaned errors, DRO-weighted
-        # DRO operates on RAW error magnitude to avoid demeaning coupling
+        # ── SHAPE: log_cosh on demeaned errors, HARD GATE (only events)
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
-
+        
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
         shape_cell = self._log_cosh(e_shape / ac_scale)
-
-        # DRO on raw |error| (not shape loss) — avoids demeaning oscillation
-        raw_loss_for_dro = e.abs()  # (B, T) or (B, T, C)
+        
+        # HARD gate for shape: peace cells contribute ZERO
+        # This eliminates the DC/AC conflict
+        gate_shape = signal_mask.float()  # 1.0 on signal, 0.0 on peace
+        
+        # DRO on raw |error|, but apply to shape
+        raw_loss_for_dro = e.abs()
         w_dro = self._dro_sqrt_gated(raw_loss_for_dro, signal_mask)
-
-        # Combine: gate suppresses peace, DRO upweights hard event cells
-        w_shape = gate * w_dro
-
+        w_shape = gate_shape * w_dro
+        
         if multivariate:
             loss_shape = (w_shape * shape_cell).sum(dim=(0, 1)) / w_shape.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
             loss_shape = (w_shape * shape_cell).sum() / w_shape.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: Hájek MSE (symmetric, unbounded, batch-normalized)
+        # ── LEVEL: Hájek MSE, SOFT gate (all cells contribute)
         mag_weight = torch.log1p(abs_max)
-        level_raw = gate * mag_weight * (e ** 2)
-
+        level_raw = gate_soft * mag_weight * (e ** 2)
+        
         if multivariate:
-            loss_level = level_raw.sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
+            loss_level = level_raw.sum(dim=(0, 1)) / gate_soft.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
-            loss_level = level_raw.sum() / gate.sum().clamp_min(self._EPS)
+            loss_level = level_raw.sum() / gate_soft.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
             per_channel = loss_shape + loss_level
             total_loss = per_channel.sum()
-
             shape_c = loss_shape.detach().tolist()
             level_c = loss_level.detach().tolist()
             comp = per_channel.detach().tolist()
@@ -132,7 +124,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = [float(total_loss.detach())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV6: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV7: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -148,10 +140,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV6 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV7 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV6(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV7(non_zero_threshold={self.tau})"

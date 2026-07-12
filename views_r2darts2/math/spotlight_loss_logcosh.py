@@ -12,29 +12,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated
-      and Hájek‑normalised. Scores temporal dynamics only.
+    * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated,
+      event‑only DRO‑weighted, and Hájek‑normalised.
 
-    * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error
-      (``pred − true``), weighted by ``gate × log1p(abs_max)``, summed,
-      and NORMALISED BY EVENT COUNT per series.
+      The DRO (``sqrt(loss / mean)``) is computed with an **event‑only
+      mean**: only cells where ``abs_max > tau`` contribute to the
+      denominator. This prevents the 90% peace cells (loss ≈ 0) from
+      dragging the mean to zero and amplifying noise. The event‑only
+      mean is ≈ 0.5–1.0, giving stable DRO weights of 0.5–2×.
 
-      This fixes the templating problem: without ``log1p(abs_max)``, every
-      event cell gets the same gradient (tanh ≈ 1), so the model learns
-      one flat event level for all events. With ``log1p(abs_max)``, Ukraine
-      (asinh=9) gets 2.3× the weight of a small event (asinh=2) — but
-      summing without normalisation caused explosions (36 cells × 2.3 = 83).
+      DRO on shape sharpens flat forecasts: a flat line has large
+      shape errors at high‑magnitude peaks (``|e_ac|`` proportional to
+      ``true − mean``) and small errors at low‑magnitude events. DRO
+      upweights the high‑magnitude peaks → the model is pushed to fix
+      them first → the forecast becomes variable instead of flat.
 
-      Normalising by event count (``n_event``) keeps the per-cell gradient
-      bounded:
-        Ukraine (36 events): 2.3 × 1.0 / 36 = 0.064 per cell
-        Sparse (3 events):    1.1 × 1.0 / 3  = 0.37 per cell
-        Single large:         2.3 × 1.0 / 1  = 2.3 per cell
-        Total: 2.3 or 4 — both within clip=100.
-
-      The normalisation also makes the total level loss comparable
-      across series with different event counts, preventing the SUM
-      from being dominated by high-event-count series.
+    * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error,
+      weighted by ``gate × log1p(abs_max)``, summed, and normalised by
+      event count per series. No DRO on level (amplifies peace noise
+      because raw‑error mean ≈ 0 at 90% zeros).
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -60,21 +56,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return a + F.softplus(-2.0 * a)
 
     @staticmethod
-    def _dro_weights(losses: torch.Tensor) -> torch.Tensor:
-        """Per-series sqrt self-reweighting.
+    def _dro_weights(losses: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Per-series sqrt DRO with event-only mean.
 
-        w_it = sqrt(loss_it / mean_i(loss))
+        ``mask`` selects which cells contribute to the mean (event cells
+        where ``abs_max > tau``). Peace cells (mask=0) get weight 1.0
+        (neutral). This prevents the 90% peace cells from dragging the
+        mean to zero and amplifying noise.
 
-        Sublinear concentration: a cell 16× harder than average gets 4×
-        the gradient (not 16×).  Redistributes enough signal to fix
-        systematic bias while still focusing on spikes.
-
-        Returns weights with mean ≈ 1 per series, shape (B, T) or (B, T, C).
+        Returns weights with mean ≈ 1 on the active (masked) region.
         """
         l = losses.detach()
-        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)
-        w = torch.sqrt(l / mu)
-        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)
+        m = mask.detach().to(dtype=l.dtype)
+
+        # Event-only mean (not all-cell mean)
+        n_active = m.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        mu = (l * m).sum(dim=1, keepdim=True) / n_active
+
+        w = torch.sqrt(l / mu.clamp_min(1e-6))
+        # Normalize to mean 1 on active region
+        w_active_mean = (w * m).sum(dim=1, keepdim=True) / n_active
+        w = w / w_active_mean.clamp_min(1e-8)
+
+        # Peace cells (mask=0) stay at weight 1.0
+        w = 1.0 + m * (w - 1.0)
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -86,23 +91,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
         tau = self.non_zero_threshold
         T = y_pred.size(1)
 
-        # ── Event gate ───────────────────────────────────────────────
+        # ── Event gate and mask ──────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - tau))
+        # Hard mask for DRO: only event cells contribute to DRO mean
+        event_mask = (abs_max > tau).float()
 
-        # ── Shape: demeaned logcosh, standardised, DRO, Hájek ───────
+        # ── Shape: demeaned logcosh, standardised, event-DRO, Hájek ─
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # DRO on shape only: upweights hardest cells per series.
-        # Shape is demeaned → mean is not near-zero → DRO is stable.
-        # Does NOT amplify peace noise (unlike DRO on raw error).
-        w_dro = self._dro_weights(shape_cell)
+        # DRO with event-only mean: prevents peace-noise amplification
+        w_dro = self._dro_weights(shape_cell, event_mask)
 
-        # ── Level: per-cell gated logcosh, log-magnitude-weighted,
-        #            normalised by event count ────────────────────────
+        # ── Level: per-cell gated logcosh, log-magnitude, /n_event ──
+        # NO DRO on level — raw error mean ≈ 0 at 90% zeros → noise amplification
         raw_error = y_pred - y_true
         mag_weight = torch.log1p(abs_max)
         level_raw = gate * mag_weight * self._Logcosh(raw_error)

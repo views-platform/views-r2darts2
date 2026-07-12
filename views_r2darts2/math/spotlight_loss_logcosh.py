@@ -109,7 +109,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         #   Without scaling, this is ~0.007 per cell; shape is ~0.04-0.08.
         #   Scaling by sqrt(T) ≈ 6 brings level to comparable magnitude.
         #   With peace filtering, this ensures event series receive meaningful signal.
-        scaler = T
+        scaler = T ** 0.5
         if multivariate:
             shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
             level = scaler * (w * level_cell).sum(dim=0) / w.sum(dim=0).clamp_min(self._EPS)  # Hájek, scaled

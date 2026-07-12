@@ -63,6 +63,7 @@ from views_r2darts2.infrastructure.callbacks import (
     ValMetricsCallback,
     InputBatchMonitorCallback,
     LossComponentCallback,
+    LossGradientDiagnosticsCallback,
 )
 
 
@@ -141,6 +142,7 @@ class ModelCatalog:
             ValMetricsCallback(),
             InputBatchMonitorCallback(),
             LossComponentCallback(),
+            LossGradientDiagnosticsCallback(),
         ]
         # Wire EarlyStopping if patience is set in config
         early_stopping_patience = self.config.get("early_stopping_patience", None)

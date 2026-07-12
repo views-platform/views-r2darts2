@@ -1424,3 +1424,194 @@ class LossComponentCallback(Callback):
 
         self._buf.clear()
 
+
+# ---------------------------------------------------------------------------
+# Loss Gradient Diagnostics
+# ---------------------------------------------------------------------------
+
+
+class LossGradientDiagnosticsCallback(Callback):
+    """
+    Detailed per-term gradient diagnostics for SpotlightLossLogcosh.
+
+    Combines three diagnostic sources each batch/epoch:
+
+    1. **Loss telemetry** — reads extended ``_last_components`` keys written by
+       ``SpotlightLossLogcosh.forward``:
+       - DRO weight distribution per channel (mean, std, max, fraction > 1).
+         A high max (> 5) or high frac_up means DRO is concentrating gradient
+         on a few cells; a low mean (≪ 1) after renorm means DRO is mostly idle.
+       - Level gap magnitude per channel.  Decreasing gap_mean = level converging.
+         Stuck gap_mean = level not learning (gradient budget stolen or LR too low).
+       - Shape DC leak per channel.  ``shape_dc`` is the batch-mean of the
+         per-series gated mean of e_shape.  Should be ≈ 0 for a DC-neutral shape
+         term; a large value indicates gate weighting is reintroducing a DC bias
+         that fights the level anchor.
+       - Event cell fraction per channel (sparsity diagnostic).
+
+    2. **Input-gradient decomposition** — reads ``_last_input_grad`` tensor
+       (``d(loss)/d(y_pred)``), set by a backward hook registered in
+       ``SpotlightLossLogcosh.forward``:
+       - DC fraction: ``|mean_t(grad)| / (|mean_t(grad)| + RMS_AC(grad))``.
+         Should be ≈ 0 for a pure shape loss; will be > 0 when level dominates.
+         Target for this loss design: dc_frac ≈ 0.30–0.60 (neither starves).
+       - AC fraction: complement of DC fraction.
+       - Sign fraction: fraction of gradient entries > 0.  < 0.5 means the loss
+         is predominantly pushing predictions DOWN (under-prediction correction).
+       - DC and AC gradient magnitudes per channel (absolute scale).
+
+    3. **Output-layer gradient** — captures ``fc_out.weight.grad`` in
+       ``on_before_optimizer_step``:
+       - Row-norm mean/max/std over the output projection's weight matrix.
+       - Sign fraction of the fc_out gradient (direction of output update).
+
+    wandb keys:
+        ``grad_diag/ch_{c}/{dro_w_mean, dro_w_std, dro_w_max, dro_frac_up,
+        event_frac, level_gap_mean, level_gap_max, shape_dc, grad_dc_frac,
+        grad_ac_frac, grad_sign_frac, grad_dc_mag, grad_ac_mag, grad_total_norm}``
+        ``grad_diag/{fcout_grad_norm_mean, fcout_grad_norm_max, fcout_grad_norm_std,
+        fcout_grad_sign_frac}``
+    """
+
+    def __init__(self, log_every_n_epochs: int = 1):
+        super().__init__()
+        self.log_every_n_epochs = log_every_n_epochs
+        self._buf: dict = defaultdict(list)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        crit = getattr(pl_module, "train_criterion", None)
+        comp = getattr(crit, "_last_components", None) if crit is not None else None
+        if not comp:
+            return
+
+        C = len(comp.get("shape", []))
+        if C == 0:
+            return
+
+        # ── 1. Loss telemetry from _last_components ─────────────────────
+        for key in (
+            "dro_w_mean", "dro_w_std", "dro_w_max", "dro_frac_up",
+            "event_frac", "level_gap_mean", "level_gap_max", "shape_dc",
+        ):
+            vals = comp.get(key)
+            if vals is None:
+                continue
+            for c, v in enumerate(vals):
+                self._buf[f"grad_diag/ch_{c}/{key}"].append(v)
+
+        # ── 2. Input-gradient decomposition ─────────────────────────────
+        # _last_input_grad = d(loss)/d(y_pred), shape (B,T) or (B,T,C).
+        # Decompose per-channel into:
+        #   DC = mean_over_time component  → driven by level (uniform gradient)
+        #   AC = demeaned component        → driven by shape (zero-mean gradient)
+        grad = getattr(crit, "_last_input_grad", None)
+        if grad is not None:
+            g = grad.float().cpu()
+            if g.dim() == 2:
+                g = g.unsqueeze(-1)              # → (B, T, 1)
+
+            dc = g.mean(dim=1, keepdim=True)     # (B, 1, C) — DC per series
+            ac = g - dc                          # (B, T, C) — AC per series
+
+            # Per-series norm magnitudes
+            dc_norm  = dc.squeeze(1).abs()                        # (B, C)
+            ac_norm  = ac.norm(dim=1) / (g.shape[1] ** 0.5 + 1e-8)  # (B, C) RMS
+            tot_norm = dc_norm + ac_norm + 1e-12
+
+            dc_frac   = (dc_norm / tot_norm).mean(dim=0)          # (C,)
+            ac_frac   = (ac_norm / tot_norm).mean(dim=0)          # (C,)
+            sign_frac = (g > 0).float().mean(dim=(0, 1))          # (C,)
+            dc_mag    = dc_norm.mean(dim=0)                       # (C,)
+            ac_mag    = ac_norm.mean(dim=0)                       # (C,)
+            total_g   = g.norm(dim=1).mean(dim=0)                 # (C,)
+
+            for c in range(min(g.shape[-1], C)):
+                self._buf[f"grad_diag/ch_{c}/grad_dc_frac"].append(dc_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_ac_frac"].append(ac_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_sign_frac"].append(sign_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_dc_mag"].append(dc_mag[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_ac_mag"].append(ac_mag[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_total_norm"].append(total_g[c].item())
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        """Capture output-layer (fc_out) gradient statistics before weight update."""
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+
+        # Try fc_out directly (TSMixer), then fall back to last Linear with a gradient.
+        out_layer = getattr(pl_module, "fc_out", None)
+        if (
+            out_layer is None
+            or not hasattr(out_layer, "weight")
+            or out_layer.weight.grad is None
+        ):
+            out_layer = None
+            for _, mod in reversed(list(pl_module.named_modules())):
+                if (
+                    isinstance(mod, torch.nn.Linear)
+                    and hasattr(mod, "weight")
+                    and mod.weight.grad is not None
+                ):
+                    out_layer = mod
+                    break
+
+        if out_layer is None:
+            return
+
+        g = out_layer.weight.grad.detach().float()   # (out_features, in_features)
+        row_norms = g.norm(dim=1)                    # (out_features,)
+        self._buf["grad_diag/fcout_grad_norm_mean"].append(row_norms.mean().item())
+        self._buf["grad_diag/fcout_grad_norm_max"].append(row_norms.max().item())
+        self._buf["grad_diag/fcout_grad_norm_std"].append(row_norms.std().item())
+        self._buf["grad_diag/fcout_grad_sign_frac"].append((g > 0).float().mean().item())
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            self._buf.clear()
+            return
+        if not self._buf:
+            return
+
+        metrics = {k: float(np.mean(v)) for k, v in self._buf.items() if v}
+
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        # Determine number of channels from keys
+        C = max(
+            (int(k.split("/ch_")[1].split("/")[0]) for k in metrics if "/ch_" in k),
+            default=-1,
+        ) + 1
+
+        if C > 0:
+            parts = []
+            for c in range(C):
+                pfx = f"grad_diag/ch_{c}"
+                dc_frac   = metrics.get(f"{pfx}/grad_dc_frac",    float("nan"))
+                ac_frac   = metrics.get(f"{pfx}/grad_ac_frac",    float("nan"))
+                sign_frac = metrics.get(f"{pfx}/grad_sign_frac",  float("nan"))
+                dc_mag    = metrics.get(f"{pfx}/grad_dc_mag",     float("nan"))
+                ac_mag    = metrics.get(f"{pfx}/grad_ac_mag",     float("nan"))
+                dro_mean  = metrics.get(f"{pfx}/dro_w_mean",      float("nan"))
+                dro_max   = metrics.get(f"{pfx}/dro_w_max",       float("nan"))
+                dro_fup   = metrics.get(f"{pfx}/dro_frac_up",     float("nan"))
+                gap_mean  = metrics.get(f"{pfx}/level_gap_mean",  float("nan"))
+                shape_dc  = metrics.get(f"{pfx}/shape_dc",        float("nan"))
+                ev_frac   = metrics.get(f"{pfx}/event_frac",      float("nan"))
+                parts.append(
+                    f"ch{c}["
+                    f"dc%={dc_frac:.0%} ac%={ac_frac:.0%} sign↑={sign_frac:.2f} "
+                    f"dcMag={dc_mag:.4f} acMag={ac_mag:.4f} | "
+                    f"dro={dro_mean:.2f}±{dro_max:.1f}× ↑{dro_fup:.0%} | "
+                    f"gap={gap_mean:.3f} shDC={shape_dc:.4f} ev={ev_frac:.2f}]"
+                )
+            fcout_norm = metrics.get("grad_diag/fcout_grad_norm_mean", float("nan"))
+            fcout_sign = metrics.get("grad_diag/fcout_grad_sign_frac", float("nan"))
+            logger.info(
+                f"[Epoch {trainer.current_epoch}] GradDiag | "
+                + " ".join(parts)
+                + f" | fc_out[norm={fcout_norm:.4f} sign↑={fcout_sign:.2f}]"
+            )
+
+        self._buf.clear()
+

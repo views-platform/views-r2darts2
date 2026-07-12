@@ -13,17 +13,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
     ── Design ─────────────────────────────────────────────────────────
 
     * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated,
-      DRO‑weighted, and Hájek‑normalised. The DRO (sqrt concentration)
-      upweights the hardest cells per series — a flat forecast has
-      large errors at peaks and small errors at valleys; DRO amplifies
-      the peak errors, pushing the model to sharpen its temporal pattern
-      instead of outputting a flat line.
+      DRO‑weighted, and Hájek‑normalised.
 
     * **Level (per‑cell magnitude).** Per‑cell logcosh on the raw error,
-      weighted by ``gate × log1p(abs_max)``, normalised by event count,
-      and summed. ``log1p`` gives bounded magnitude weighting (Ukraine
-      gets 2.3×, small event gets 1.1×). Event‑count normalisation
-      prevents explosion (Ukraine 36 events → 0.064/cell).
+      weighted by ``gate × log1p(abs_max) × DRO``, normalised by event
+      count, and summed. DRO on level is what actually sharpens flat
+      forecasts: a flat line at the mean has equal-magnitude errors at
+      peaks (underprediction) and valleys (overprediction). Without DRO
+      these cancel. DRO upweights whichever direction is harder,
+      breaking the symmetry and pushing the model to vary its
+      predictions.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -48,36 +47,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         a = z.abs()
         return a + F.softplus(-2.0 * a)
 
-    def _dro_weights(self, losses: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Per-series sqrt DRO: upweight hardest cells within each series.
+    @staticmethod
+    def _dro_weights(losses: torch.Tensor) -> torch.Tensor:
+        """Per-series sqrt self-reweighting.
 
-        w = sqrt(loss / median_of_means(loss))
-        A cell 4× harder than the series median gets 2× weight (sublinear).
-        The median-of-means denominator is robust to outliers.
+        w_it = sqrt(loss_it / mean_i(loss))
 
-        Peace cells (mask ≈ 0) keep weight ≈ 1 (neutral).
+        Sublinear concentration: a cell 16× harder than average gets 4×
+        the gradient (not 16×).  Redistributes enough signal to fix
+        systematic bias while still focusing on spikes.
+
+        Returns weights with mean ≈ 1 per series, shape (B, T) or (B, T, C).
         """
         l = losses.detach()
-        m = mask.detach().to(dtype=l.dtype).clamp(min=0.0, max=1.0)
-
-        def _wmean(x, w):
-            den = w.sum(dim=1, keepdim=True).clamp_min(self._EPS)
-            return (x * w).sum(dim=1, keepdim=True) / den
-
-        T = int(l.shape[1])
-        W = max(6, T // 3)
-        n_blocks = max(1, (T + W - 1) // W)
-        means = []
-        for lb, mb in zip(torch.tensor_split(l, n_blocks, dim=1),
-                          torch.tensor_split(m, n_blocks, dim=1)):
-            means.append(_wmean(lb, mb))
-        mom = torch.cat(means, dim=1)
-        mu = mom.median(dim=1, keepdim=True).values.clamp_min(self._EPS)
-
+        mu = l.mean(dim=1, keepdim=True).clamp(min=1e-6)
         w = torch.sqrt(l / mu)
-        w_active_mean = _wmean(w, m).clamp_min(self._EPS)
-        w = w / w_active_mean  # normalise to mean 1 on active region
-        w = 1.0 + m * (w - 1.0)  # peace cells stay at 1
+        w = w / w.mean(dim=1, keepdim=True).clamp(min=1e-8)
         return torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -93,28 +78,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
         # ── Shape: demeaned logcosh, standardised, DRO, Hájek ───────
-        # DRO upweights hardest cells per series → sharpens flat forecasts.
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
+        w_dro_shape = self._dro_weights(shape_cell)
 
-        # DRO weights on shape (sqrt concentration, median-of-means)
-        w_dro = self._dro_weights(shape_cell, gate)
-        shape_weighted = gate * w_dro * shape_cell
-
-        # ── Level: per-cell gated logcosh, log-magnitude-weighted,
-        #            normalised by event count ────────────────────────
+        # ── Level: per-cell gated logcosh, log-magnitude, DRO, /n_event ──
+        # DRO on level is the key to sharpening flat forecasts.
+        # Without DRO, peak underprediction and valley overprediction
+        # cancel (equal magnitude, opposite sign). DRO upweights the
+        # harder direction → breaks symmetry → model must vary predictions.
         raw_error = y_pred - y_true
+        level_loss_raw = self._Logcosh(raw_error)
+        w_dro_level = self._dro_weights(level_loss_raw)
         mag_weight = torch.log1p(abs_max)
-        level_raw = gate * mag_weight * self._Logcosh(raw_error)
+        level_raw = gate * mag_weight * w_dro_level * level_loss_raw
 
         n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)
         level_cell = level_raw / n_event
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
-            shape = shape_weighted.sum(dim=(0, 1)) / (gate * w_dro).sum(dim=(0, 1)).clamp_min(self._EPS)
+            shape_w = gate * w_dro_shape
+            shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
             level = level_cell.sum(dim=(0, 1))
 
             per_channel = shape + level
@@ -123,7 +110,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             level_c = level.detach().tolist()
             comp = per_channel.detach().tolist()
         else:
-            shape = shape_weighted.sum() / (gate * w_dro).sum().clamp_min(self._EPS)
+            shape_w = gate * w_dro_shape
+            shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
             level = level_cell.sum()
             total_loss = shape + level
             shape_c = [float(shape.detach())]

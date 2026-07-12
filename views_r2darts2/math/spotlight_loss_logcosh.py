@@ -77,16 +77,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level: per-cell gated logcosh, magnitude-weighted,
+        # ── Level: per-cell gated logcosh, log-magnitude-weighted,
         #            normalised by event count ────────────────────────
-        # (1+abs_max) gives magnitude: Ukraine gets 10× small event.
+        # log(1 + abs_max) gives bounded magnitude weighting:
+        #   Ukraine (asinh=9):  log(10) = 2.3
+        #   Small (asinh=2):    log(3)  = 1.1
+        #   Extreme (asinh=14): log(15) = 2.7
+        # This prevents the os overprediction caused by unbounded (1+abs_max)
+        # where extreme os events (asinh=14) got 15× weight.
         # Normalising by n_event per series prevents explosion:
-        #   Ukraine: 10 × 1.0 / 36 = 0.28/cell (total 10)
-        #   Sparse:  4 × 1.0 / 3  = 1.33/cell (total 4)
-        # This breaks templating (events get different gradients based
-        # on their magnitude) while staying clip-safe.
+        #   Ukraine (36 events): 2.3 × 1.0 / 36 = 0.064 per cell
+        #   Sparse (3 events):   1.1 × 1.0 / 3  = 0.37 per cell
+        #   Single large:         2.3 × 1.0 / 1  = 2.3 per cell
         raw_error = y_pred - y_true
-        level_raw = gate * (1.0 + abs_max) * self._Logcosh(raw_error)
+        mag_weight = torch.log1p(abs_max)
+        level_raw = gate * mag_weight * self._Logcosh(raw_error)
 
         # n_event per series (sum gate over time)
         n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)  # (B, 1) or (B, 1, C)

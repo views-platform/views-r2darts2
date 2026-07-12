@@ -9,39 +9,49 @@ logger = logging.getLogger(__name__)
 class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
-    Shape = log_cosh with raw-error DRO (V11 style — no T).
-    Level = T × asymmetric MSE on mean gap (V16 — V13 MSE + 2:1 asymmetry).
+    Shape = log_cosh with raw-error DRO, PER-SERIES Hájek (V17 — fixes templating).
+    Level = T × symmetric MSE on mean gap (V13 style — best calibration).
 
     ── Design ─────────────────────────────────────────────────────────
 
     * **Shape (AC pattern).** ``log_cosh`` on demeaned residual, gated,
-      DRO-weighted on ``|raw_error|``, Hájek-normalised. Unchanged from
-      V11/V13/V15 — no T factor (V14 proved T causes explosions).
+      DRO-weighted on ``|raw_error|``, **per-series Hájek-normalised**,
+      then averaged over event series.
 
-    * **Level (DC magnitude).** ``T × asym_w × gap²`` where ``asym_w = 2``
-      for underprediction (gap < 0) and ``1`` for overprediction (gap > 0).
+      V13 used global Hájek over (B, T): divided by total event cells
+      across the batch. Countries with 10 event cells got 10× more
+      gradient share than countries with 1 event cell. Rare-event
+      countries (the ones that template most) got the least Shape
+      gradient → the model learned a "common pattern" for them.
 
-      V15 used Huber(gap, delta=ac_scale) — gradient saturates at 1.0
-      for |gap| > ac_scale. For ch_1 (ac_scale≈0.88), gap≈1.24 is
-      already in the linear regime → gradient stuck at 1.0 → model
-      can't push harder → plateaus at 0.40× (vs V13's 0.84×).
+      V17 normalizes within each series first (sum_T / sum_T), then
+      averages over event series (mean_B). Each event country gets
+      EQUAL total Shape gradient regardless of how many event cells
+      it has:
 
-      V13 used T × gap² (MSE) — gradient 2*gap is proportional to
-      error, never saturates → best calibration of all versions
+        Rare-event country (2 cells): each cell gets 1/(N_ev * 2) ≈ 5× V13
+        Frequent-event country (10 cells): each cell gets 1/(N_ev * 10) ≈ 0.5× V13
+
+      This directly targets the templating problem — the model can no
+      longer ignore rare-event countries by averaging their patterns
+      into a common template.
+
+      Loss scale unchanged (mean of means = weighted mean ≈ 1.0).
+      No T factor (V14 proved T causes explosions).
+      No new hyperparameters.
+
+    * **Level (DC magnitude).** ``T × gap²`` (symmetric MSE) on the
+      per-series mean gap, gate-weighted, Hájek-normalised.
+
+      V13's symmetric MSE had the best calibration of all versions
       (0.84× overall, 1.13× ch_0, 0.51× ch_1, 0.36× ch_2).
-      Problems: (1) gradient explosions from outlier series
-      (5/18 epochs, max 1452), (2) ch_0 overshoot from 1.13× to 6.64×
-      after epoch 12 (MSE pushes equally in both directions, model
-      builds momentum, overshoots).
+      V16's asymmetric MSE caused massive overprediction (3.88× from
+      epoch 0). Symmetry is correct — the model needs equal push
+      in both directions.
 
-      V16 asymmetric MSE fixes both V13 problems:
-        - Underprediction (gap < 0): weight 2.0 → gradient 4*|gap|
-          → 2× stronger push → faster calibration of ch_1, ch_2
-        - Overprediction (gap > 0): weight 1.0 → gradient 2*|gap|
-          → 2× gentler push → prevents ch_0 overshoot
-
-      The 2:1 ratio is the standard asymmetric loss design (same as
-      V10 used for the same purpose). Not a tunable hyperparameter.
+      T compensates 1/T dilution from mean() operator.
+      MSE gradient 2*gap is proportional, never saturates (unlike
+      V11's tanh, V15's Huber).
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -58,7 +68,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV16 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV17 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -83,15 +93,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ───
-        # No T factor (V14 proved T causes explosions: T*tanh/ac_scale
-        # bounds at 41/cell for ch_1, compounds to grad_max 2589-3706).
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
-
+        # ── AC scale ─────────────────────────────────────────────────
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
-        ac_scale_1d = ac_scale.squeeze()
+
+        # ── SHAPE: log_cosh on demeaned errors, DRO, per-series Hájek ─
+        e_mean = e.mean(dim=1, keepdim=True)
+        e_shape = e - e_mean
 
         shape_cell = self._log_cosh(e_shape / ac_scale)
 
@@ -105,35 +113,39 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = 1.0 + event_mask * (w_dro - 1.0)
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
-        if multivariate:
-            shape_w = gate * w_dro
-            loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
-        else:
-            shape_w = gate * w_dro
-            loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
+        shape_w = gate * w_dro  # (B, T) or (B, T, C)
 
-        # ── LEVEL: T × asymmetric MSE on mean gap ────────────────────
-        # V16: V13's MSE + 2:1 asymmetry (underprediction penalized 2×).
+        # V17: per-series Hájek (normalize over T only), then mean over
+        # event series. This gives each event country EQUAL total Shape
+        # gradient regardless of how many event cells it has.
         #
-        # V13 (symmetric MSE) had best calibration (0.84×) but:
-        #   - explosions from outlier gaps (grad max 1452)
-        #   - ch_0 overshoot 1.13× → 6.64× (MSE pushes equally both ways)
+        # V13 (global Hájek): sum_BT(w*cell) / sum_BT(w)
+        #   → countries with more events get more gradient
+        #   → rare-event countries get little gradient → templating
         #
-        # V15 (Huber) was stable but plateaued at 0.40× — gradient
-        # saturates at 1.0 for |gap| > ac_scale, can't push harder.
-        #
-        # V16 asymmetric MSE:
-        #   gap < 0 (underpredicting): weight 2.0 → grad 4*|gap| per cell
-        #     → 2× stronger push → breaks ch_1, ch_2 out of underprediction
-        #   gap > 0 (overpredicting): weight 1.0 → grad 2*|gap| per cell
-        #     → 2× gentler push → prevents ch_0 overshoot
-        #
-        # Still MSE (proportional gradient, no saturation) — just
-        # asymmetric. Explosions still possible from extreme outlier
-        # gaps, but asymmetry reduces overprediction-side explosions.
+        # V17 (per-series Hájek):
+        #   per_series = sum_T(w*cell) / sum_T(w)       # (B,) or (B, C)
+        #   loss = mean over event series of per_series  # scalar or (C,)
+        #   → each event country gets equal gradient → no templating
+        if multivariate:
+            # (B, T, C) → sum over T → (B, C)
+            shape_per_series = (shape_w * shape_cell).sum(dim=1) / shape_w.sum(dim=1).clamp_min(self._EPS)
+            # Event series mask: 1 if series has ANY event cell for that channel
+            ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B, C)
+            n_ev_series = ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
+            loss_shape = (shape_per_series * ev_series_mask).sum(dim=0) / n_ev_series  # (C,)
+        else:
+            # (B, T) → sum over T → (B,)
+            shape_per_series = (shape_w * shape_cell).sum(dim=1) / shape_w.sum(dim=1).clamp_min(self._EPS)
+            ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B,)
+            n_ev_series = ev_series_mask.sum().clamp_min(1.0)
+            loss_shape = (shape_per_series * ev_series_mask).sum() / n_ev_series
+
+        # ── LEVEL: T × symmetric MSE on mean gap (V13 style) ─────────
+        # V16's asymmetry caused 3.88× overprediction from epoch 0.
+        # Symmetric MSE is correct — V13 had best calibration (0.84×).
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
-        asym_w = torch.where(gap < 0, 2.0, 1.0)
-        level_cell = T * asym_w * gap ** 2
+        level_cell = T * gap ** 2
         w_level = gate.amax(dim=1)  # per-series event mass
 
         if multivariate:
@@ -180,25 +192,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                ac_scale_l = ac_scale_1d.tolist() if ac_scale_1d.dim() > 0 else [float(ac_scale_1d)]
+                ac_scale_l = ac_scale.squeeze().tolist() if ac_scale.squeeze().dim() > 0 else [float(ac_scale.squeeze())]
 
-                # ── V16 NEW: asymmetry diagnostics ──
-                # Fraction of event series that are UNDERPREDICTING (gap < 0).
-                # These get 2× weight. If this is high, most of the Level
-                # push is at 2× strength (strong calibration force).
-                _gap_neg = (gap < 0).float() * _ev_mask_s
-                underpredict_frac_l = (_gap_neg.sum(dim=0) / _n_ev_s).tolist()
-                # Mean |gap| for underpredicting vs overpredicting event series.
-                _gap_under = (_ga * _gap_neg).sum(dim=0) / _gap_neg.sum(dim=0).clamp_min(1.0)
-                _gap_over  = (_ga * (1 - _gap_neg) * _ev_mask_s).sum(dim=0) / ((1 - _gap_neg) * _ev_mask_s).sum(dim=0).clamp_min(1.0)
-                gap_under_mean_l = _gap_under.tolist()
-                gap_over_mean_l  = _gap_over.tolist()
-                # Mean effective Level gradient per cell (asym_w * 2 * |gap|)
-                # — directly shows the push strength. Underpredicting series
-                # get 2× this value.
-                _eff_grad = asym_w * 2.0 * _ga
-                eff_grad_mean_l = ((_eff_grad * _ev_mask_s).sum(dim=0)
-                                   / _n_ev_s).tolist()
+                # ── V17 NEW: per-series shape diagnostics ──
+                # These show whether the per-series Hájek is working:
+                # rare-event countries should now get more gradient.
+                # Event cells per series (for event series only):
+                _ev_per_series = event_mask.sum(dim=1)  # (B, C)
+                _ev_series_mask = (ev_series_mask > 0).float()  # (B, C)
+                _n_es = _ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
+                # Mean and std of event-cell count per event series
+                ev_per_series_mean_l = ((_ev_per_series * _ev_series_mask).sum(dim=0)
+                                        / _n_es).tolist()
+                _evps_var = ((_ev_per_series ** 2 * _ev_series_mask).sum(dim=0) / _n_es
+                             - torch.tensor(ev_per_series_mean_l) ** 2).clamp_min(0)
+                ev_per_series_std_l = _evps_var.sqrt().tolist()
+                # Per-series shape loss stats (how variable is shape loss across countries?)
+                _sps = shape_per_series * _ev_series_mask  # zero out peace series
+                shape_per_series_mean_l = (_sps.sum(dim=0) / _n_es).tolist()
+                _sps_var = ((_sps ** 2).sum(dim=0) / _n_es
+                            - torch.tensor(shape_per_series_mean_l) ** 2).clamp_min(0)
+                shape_per_series_std_l = _sps_var.sqrt().tolist()
+                # Fraction of event series with above-median shape loss
+                # (high value = shape loss concentrated in few countries = templating)
+                _sps_median = _sps.median(dim=0).values  # (C,) rough median
+                shape_hi_frac_l = ((_sps > _sps_median.unsqueeze(0)).float().sum(dim=0)
+                                   / _n_es).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -220,21 +239,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
-                ac_scale_l = [float(ac_scale_1d)]
-                _gap_neg = (gap < 0).float() * _ev_mask_s
-                underpredict_frac_l = [(_gap_neg.sum() / _n_ev_s).item()]
-                _gap_under = (_ga * _gap_neg).sum() / _gap_neg.sum().clamp_min(1.0)
-                _gap_over  = (_ga * (1 - _gap_neg) * _ev_mask_s).sum() / ((1 - _gap_neg) * _ev_mask_s).sum().clamp_min(1.0)
-                gap_under_mean_l = [float(_gap_under.item())]
-                gap_over_mean_l  = [float(_gap_over.item())]
-                _eff_grad = asym_w * 2.0 * _ga
-                eff_grad_mean_l = [((_eff_grad * _ev_mask_s).sum()
-                                    / _n_ev_s).item()]
+                ac_scale_l = [float(ac_scale.squeeze())]
+                _ev_per_series = event_mask.sum(dim=1)  # (B,)
+                _ev_series_mask = (ev_series_mask > 0).float()  # (B,)
+                _n_es = _ev_series_mask.sum().clamp_min(1.0)
+                ev_per_series_mean_l = [((_ev_per_series * _ev_series_mask).sum()
+                                         / _n_es).item()]
+                _evps_var = ((_ev_per_series ** 2 * _ev_series_mask).sum() / _n_es
+                             - ev_per_series_mean_l[0] ** 2).clamp_min(0)
+                ev_per_series_std_l = [_evps_var.sqrt().item()]
+                _sps = shape_per_series * _ev_series_mask
+                shape_per_series_mean_l = [(_sps.sum() / _n_es).item()]
+                _sps_var = ((_sps ** 2).sum() / _n_es
+                            - shape_per_series_mean_l[0] ** 2).clamp_min(0)
+                shape_per_series_std_l = [_sps_var.sqrt().item()]
+                _sps_median = _sps.median()
+                shape_hi_frac_l = [((_sps > _sps_median).float().sum()
+                                    / _n_es).item()]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV16: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV17: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -262,22 +288,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "shape_dc":       shape_dc_l,
             "ac_scale":         ac_scale_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V16 NEW: asymmetry diagnostics ──
-            "underpredict_frac":  underpredict_frac_l,  # frac of event series with gap < 0 (getting 2× push)
-                                                         # High → strong calibration force active
-                                                         # Low → most series overpredicting (gentle 1× push)
-            "gap_under_mean":     gap_under_mean_l,      # mean |gap| for underpredicting event series
-            "gap_over_mean":      gap_over_mean_l,       # mean |gap| for overpredicting event series
-            "eff_grad_mean":      eff_grad_mean_l,       # mean effective Level gradient (asym_w * 2 * |gap|)
-                                                         # V13 was 2*|gap| (symmetric)
-                                                         # V16 is 4*|gap| for underpredicting, 2*|gap| for overpredicting
+            # ── V17 NEW: per-series shape diagnostics ──
+            # Event cells per event series — shows the variability that
+            # per-series Hájek addresses. High std/mean ratio = high
+            # variability = per-series Hájek matters a lot.
+            "ev_per_series_mean": ev_per_series_mean_l,  # mean event cells per event series
+            "ev_per_series_std":  ev_per_series_std_l,   # std of event cells per event series
+            # Per-series shape loss — if std/mean is high, some countries
+            # have much worse patterns than others (templating signal).
+            # V13's global Hájek let these be dominated by frequent-event
+            # countries. V17 gives them equal weight.
+            "shape_per_series_mean": shape_per_series_mean_l,  # mean per-series shape loss
+            "shape_per_series_std":  shape_per_series_std_l,   # std of per-series shape loss
+            # Fraction of event series with above-median shape loss.
+            # Should be ~0.5 if shape loss is symmetrically distributed.
+            # If >0.7, shape loss is concentrated in few countries
+            # (those are the templating candidates).
+            "shape_hi_frac": shape_hi_frac_l,
         }
 
         logger.debug(
-            "SpotlightLossV16 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV17 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV16(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV17(non_zero_threshold={self.tau})"

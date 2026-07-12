@@ -72,14 +72,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = torch.sigmoid(10.0 * (abs_max - tau))
 
         # ── Shape: demeaned logcosh, |raw_error|-weighted, Hájek ────
-        # |raw_error| upweights cells where flatness hurts most
-        # (large events). No mean computation → no peace noise.
-        # Same signal as level → reinforces, doesn't conflict.
+        # DC-NEUTRALITY BY CONSTRUCTION (why shape cannot fight level):
+        #   pred_ac = y_pred − mean(y_pred) applies the projection
+        #   P = I − (1/T)·11ᵀ. P is symmetric & idempotent, so the gradient
+        #   of logcosh(pred_ac − true_ac) w.r.t. y_pred is Pᵀ·g = P·g — i.e.
+        #   ZERO-MEAN per series. The differentiable shape path therefore
+        #   contributes NO DC shift; level is the sole owner of the mean.
+        #
+        # The |raw_error| weight is DETACHED so it acts as a pure attention
+        # mask (steering *where* shape looks — large-event cells) WITHOUT
+        # leaking a live gradient through y_pred. If the weight were live,
+        # its unprojected path would inject DC and fight level (the exact
+        # under-prediction failure mode). Detaching makes any reweighting
+        # scheme — |raw_error|, DRO, quadratic — safe by construction.
         raw_error = y_pred - y_true
         pred_ac = y_pred - y_pred.mean(dim=1, keepdim=True)
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
-        shape_cell = raw_error.abs() * self._Logcosh((pred_ac - true_ac) / ac_scale)
+        shape_weight = raw_error.abs().detach()  # pure attention mask, no DC leak
+        shape_cell = shape_weight * self._Logcosh((pred_ac - true_ac) / ac_scale)
 
         # ── Level: per-cell gated logcosh, log-magnitude, /n_event ──
         mag_weight = torch.log1p(abs_max)

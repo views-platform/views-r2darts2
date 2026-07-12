@@ -12,32 +12,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     ── Design ─────────────────────────────────────────────────────────
 
-    Two terms with distinct roles:
-
     * **Shape (per‑cell pattern).** Demeaned logcosh residual, gated
-      and Hájek‑normalised. logcosh provides bounded, stable gradients
-      against noise and spikes. The demeaning ensures this term scores
-      temporal dynamics only — it cannot absorb a magnitude error.
+      and Hájek‑normalised. Scores temporal dynamics only.
 
-    * **Level (aggregate magnitude).** logcosh(mean(pred) − mean(true))
-      per series, filtered to exclude pure-peace series (both means < τ).
-      
-      Logcosh is symmetric: both over and under prediction contribute
-      equally to the loss. The gradient tanh(gap) is antisymmetric, so
-      it always pushes predictions toward the true mean (no sign flip).
-      
-      Why filter peace series? In zero-inflated data, most series have
-      mean ≈ 0. For these series, |gap| is small (usually < 0.5 asinh
-      units), yet logcosh(gap) can still be nonzero. This wastes capacity
-      on high-frequency noise. By ignoring series where BOTH y_true and
-      y_pred are entirely below τ (no events in either), the level loss
-      focuses gradient only on series with meaningful events — where
-      calibration and magnitude actually matter.
+    * **Level (batch magnitude).** Uses the BATCH-LEVEL gated mean gap
+      per channel: ``T × logcosh(gated_mean(pred) − gated_mean(true))``.
+
+      The batch-level gap has a SINGLE SIGN per channel — if the batch
+      underpredicts, ALL series get pushed up; if it overpredicts, ALL
+      get pushed down. This eliminates the per-series cancellation that
+      kept the Hájek level stuck at 8.3 while calibration dropped.
+
+      The gated mean uses the event gate as weights, so only event
+      cells contribute to the gap. The gradient per event cell is:
+        ``tanh(batch_gap) × gate / n_event ≈ 0.33`` per cell
+      (for typical gap≈2, n_event≈3), which matches the shape gradient
+      (~0.5) without dominating it.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
-    Used to define the event gate and to filter peace series.
     """
 
     _EPS = 1e-6
@@ -77,51 +71,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(tau)
         shape_cell = self._Logcosh((pred_ac - true_ac) / ac_scale)
 
-        # ── Level: logcosh(mean gap), symmetric, peace-filtered ──────
-        # Logcosh is symmetric: penalizes over and under equally.
-        # Gradient: tanh(gap) is antisymmetric, so it always pushes toward truth.
+        # ── Level: batch-level gated mean gap ────────────────────────
+        # ONE gap per channel (not per series). This ensures a single
+        # gradient direction: if the batch underpredicts, ALL series
+        # get pushed up. No per-series cancellation.
         #
-        # Filter: ignore series where BOTH y_true and y_pred are entirely
-        # below non_zero_threshold (pure peace series). These contribute only
-        # noise to the level signal; the shape term handles temporal dynamics.
-        #
-        # Peace mask: True where series should be ignored (both means < tau)
-        series_mean_true = y_true.mean(dim=1)  # (B,) or (B, C)
-        series_mean_pred = y_pred.mean(dim=1)
-        peace_mask = (series_mean_true.abs() < tau) & (series_mean_pred.abs() < tau)
-
-        gap = series_mean_pred - series_mean_true  # (B,) or (B, C)
-        level_cell = self._Logcosh(gap)
-
-        # ── Per-series event weight for level (zero out peace series) ──
-        w = gate.amax(dim=1)  # (B,) or (B, C)
-        w = w * (~peace_mask).float()  # Mask out peace series
-
-        # ── Combine ──────────────────────────────────────────────────
-        # Both terms use Hájek (sum/sum) aggregation: composition-robust,
-        # stable under masking, and ensures gradients scale with the actual
-        # number of active (gated/event) samples in the batch.
-        #
-        # Shape: Hájek over space and batch; gradient ~0.5-1.0 per cell
-        # Level: Hájek over batch, SCALED by sqrt(T) to compensate for mean dilution.
-        #   When gap = mean(y_pred) - mean(y_true), the gradient per cell is
-        #   d(loss)/d(y_pred_cell) = d(loss)/d(gap) / T.
-        #   Without scaling, this is ~0.007 per cell; shape is ~0.04-0.08.
-        #   Scaling by sqrt(T) ≈ 6 brings level to comparable magnitude.
-        #   With peace filtering, this ensures event series receive meaningful signal.
-        scaler = T ** 0.5
+        # Gated mean: only event cells contribute (weighted by gate).
+        # T scaling: compensates 1/T dilution from the mean operator.
+        # Gradient per event cell ≈ tanh(gap) × gate / n_event ≈ 0.33.
         if multivariate:
-            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
-            level = scaler * (w * level_cell).sum(dim=0) / w.sum(dim=0).clamp_min(self._EPS)  # Hájek, scaled
+            gate_sum = gate.sum(dim=(0, 1)).clamp_min(self._EPS)  # (C,)
+            batch_pred_mean = (y_pred * gate).sum(dim=(0, 1)) / gate_sum  # (C,)
+            batch_true_mean = (y_true * gate).sum(dim=(0, 1)) / gate_sum  # (C,)
+            batch_gap = batch_pred_mean - batch_true_mean  # (C,)
+            level = T * self._Logcosh(batch_gap)  # (C,)
 
+            shape = (gate * shape_cell).sum(dim=(0, 1)) / gate_sum
             per_channel = shape + level
             total_loss = per_channel.sum()  # SUM over channels
             shape_c = shape.detach().tolist()
             level_c = level.detach().tolist()
             comp = per_channel.detach().tolist()
         else:
-            shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
-            level = scaler * (w * level_cell).sum() / w.sum().clamp_min(self._EPS)  # Hájek, scaled
+            gate_sum = gate.sum().clamp_min(self._EPS)
+            batch_pred_mean = (y_pred * gate).sum() / gate_sum
+            batch_true_mean = (y_true * gate).sum() / gate_sum
+            batch_gap = batch_pred_mean - batch_true_mean
+            level = T * self._Logcosh(batch_gap)
+
+            shape = (gate * shape_cell).sum() / gate_sum
             total_loss = shape + level
             shape_c = [float(shape.detach())]
             level_c = [float(level.detach())]

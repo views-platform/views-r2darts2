@@ -245,6 +245,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 # What V13 MSE gradient would have been (for comparison)
                 mse_grad_mean_l = ((2.0 * _ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 mse_grad_max_l = (2.0 * _ga.amax(dim=0)).tolist()
+
+                # ── V19 NEW: series boost diagnostics ──
+                _ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B, C)
+                _n_es = _ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
+                _boost_per_series = series_boost.squeeze(-1) * _ev_series_mask  # (B, C)
+                boost_mean_l = (_boost_per_series.sum(dim=0) / _n_es).tolist()
+                _boost_var = ((_boost_per_series ** 2).sum(dim=0) / _n_es
+                              - torch.tensor(boost_mean_l) ** 2).clamp_min(0)
+                boost_std_l = _boost_var.sqrt().tolist()
+                boost_max_l = (_boost_per_series.amax(dim=0)).tolist()
+                boost_up_frac_l = (((series_boost.squeeze(-1) > 1.0).float() * _ev_series_mask).sum(dim=0)
+                                   / _n_es).tolist()
+
+                sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
                 _n_ev   = event_mask.sum().clamp_min(1.0)
                 _w_ev   = w_dro * event_mask
@@ -274,6 +288,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 eff_grad_max_l = [_eff_grad.max().item()]
                 mse_grad_mean_l = [(2.0 * _ga * _ev_mask_s).sum().item() / _n_ev_s.item()]
                 mse_grad_max_l = [(2.0 * _ga.max()).item()]
+                _ev_series_mask = (event_mask.sum(dim=1) > 0).float()
+                _n_es = _ev_series_mask.sum().clamp_min(1.0)
+                _bps = series_boost.squeeze(1) if series_boost.dim() > 1 and series_boost.size(1) == 1 else series_boost
+                _boost_per_series = _bps * _ev_series_mask
+                boost_mean_l = [(_boost_per_series.sum() / _n_es).item()]
+                _boost_var = ((_boost_per_series ** 2).sum() / _n_es - boost_mean_l[0] ** 2).clamp_min(0)
+                boost_std_l = [_boost_var.sqrt().item()]
+                boost_max_l = [_boost_per_series.max().item()]
+                boost_up_frac_l = [(((_bps > 1.0).float() * _ev_series_mask).sum() / _n_es).item()]
+                sl_ratio_l = [float((loss_shape.detach()
+                                     / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
             raise RuntimeError(f"NaN in SpotlightLossV19: per_channel={comp}")

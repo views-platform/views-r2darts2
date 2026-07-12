@@ -108,7 +108,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Uses per-series MEAN GAP (not per-cell raw_error).
         # Gradient = tanh(gap) per cell — UNIFORM → no shape conflict.
         # T compensates 1/T dilution from the mean operator.
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
+        gap = y_pred.sum(dim=1) - y_true.sum(dim=1)  # (B,) or (B, C)
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)  # per-series event mass
 

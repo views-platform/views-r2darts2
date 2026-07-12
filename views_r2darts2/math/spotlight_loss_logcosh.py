@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 class SpotlightLossLogcosh(torch.nn.Module):
     """
     3-term loss for zero-inflated conflict fatality forecasting.
-    Shape = log_cosh (prevents templating). Level = MSE (fixes underprediction).
-    Temporal = adaptive MSE on diffs (fixes persistence). No hyperparameters.
+    Shape = log_cosh (prevents templating).
+    Level = asymmetric Hájek MSE (fixes underprediction via heavy left-tail penalty).
+    Temporal = adaptive MSE on diffs (fixes persistence).
     """
 
     _EPS = 1e-6
@@ -22,7 +23,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
 
-        logger.info("SpotlightLossV3 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV4 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -43,12 +44,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = 0.01 + 0.99 * torch.sigmoid(5.0 * (abs_max - self.tau))
 
         # ── SHAPE: log_cosh on full-sequence demeaned errors ────────
-        # Demean the ERROR, not the raw signals. Cleaner and numerically stable.
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # Scale by the true signal's AC std, with a floor to prevent blowup
-        # on flat series. Use the true signal's std, not the error's.
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
         shape_cell = self._log_cosh(e_shape / ac_scale)
@@ -58,33 +56,41 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (gate * shape_cell).sum() / gate.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: MSE on raw errors (unbounded gradient) ───────────
-        mag_weight = torch.log1p(abs_max)          # bounded magnitude: Ukraine~2.3, small~1.1
-        level_raw = gate * mag_weight * (e ** 2)   # MSE, not log_cosh
+        # ── LEVEL: Asymmetric Hájek MSE ─────────────────────────────
+        # Asymmetric penalty: underprediction (e < 0, pred < true) is penalized
+        # more heavily. This directly corrects the systematic underprediction bias.
+        # 
+        # For e < 0 (underpredict): penalty = 2.0 * e^2  (2x weight)
+        # For e > 0 (overpredict):  penalty = 1.0 * e^2  (normal)
+        # 
+        # The asymmetry factor is applied BEFORE the Hájek normalization so it
+        # genuinely shifts the optimal prediction upward.
+        mag_weight = torch.log1p(abs_max)
+        
+        # Asymmetric squared error
+        asym_factor = torch.where(e < 0, 2.0, 1.0)  # 2x for underprediction
+        level_raw = gate * mag_weight * asym_factor * (e ** 2)
 
-        n_event = gate.sum(dim=1, keepdim=True).clamp_min(1.0)
-        level_cell = level_raw / n_event
-
-        # CRITICAL FIX: mean over batch+time so level is batch-size invariant
+        # Hájek normalization: sum over all event cells in batch, divide by total gate mass
+        # This is batch-size invariant and gives each event cell gradient proportional
+        # to its error, NOT diluted by n_event per series.
         if multivariate:
-            loss_level = level_cell.mean(dim=(0, 1))  # (C,)
+            loss_level = level_raw.sum(dim=(0, 1)) / gate.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
-            loss_level = level_cell.mean()
+            loss_level = level_raw.sum() / gate.sum().clamp_min(self._EPS)
 
-        # ── TEMPORAL: MSE on first differences (persistence fix) ──────
+        # ── TEMPORAL: MSE on first differences ──────────────────────
         pred_diff = y_pred[:, 1:] - y_pred[:, :-1]
         true_diff = y_true[:, 1:] - y_true[:, :-1]
         diff_error = (pred_diff - true_diff) ** 2
         gate_diff = gate[:, 1:]
 
         if multivariate:
-            loss_temporal = (gate_diff * diff_error).mean(dim=(0, 1))  # (C,)
+            loss_temporal = (gate_diff * diff_error).mean(dim=(0, 1))
         else:
             loss_temporal = (gate_diff * diff_error).mean()
 
-        # ── ADAPTIVE TEMPORAL WEIGHT (hyperparameter-free) ────────────
-        # Measure how bursty predictions are relative to targets.
-        # Detached so the model cannot game the weight.
+        # ── ADAPTIVE TEMPORAL WEIGHT ─────────────────────────────────
         with torch.no_grad():
             if multivariate:
                 pred_scale = (gate_diff * pred_diff.abs()).mean(dim=(0, 1))
@@ -97,7 +103,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             true_scale = torch.clamp(true_scale, min=scale_floor)
 
             burst_ratio = pred_scale / true_scale
-            # Soft activation: weak when matched, strong when bursty
             w_t = 0.1 + 0.9 * torch.sigmoid(5.0 * (burst_ratio - 1.2))
 
         # ── Combine ───────────────────────────────────────────────────
@@ -119,7 +124,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = [float(total_loss.detach())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV3: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV4: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -137,10 +142,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV3 | shape=%s level=%s temporal=%s w_t=%s total=%.6f",
+            "SpotlightLossV4 | shape=%s level=%s temporal=%s w_t=%s total=%.6f",
             shape_c, level_c, temp_c, w_t_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV3(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV4(non_zero_threshold={self.tau})"

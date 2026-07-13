@@ -212,6 +212,9 @@ class DartsForecaster:
 
         self.device = self.get_device()
         logger.info("Using device: %s", self.device)
+        if self.device == "cuda" and torch.cuda.is_available():
+            torch.set_float32_matmul_precision("high")
+            logger.info("Set torch float32 matmul precision to 'high' for CUDA.")
         if hasattr(self.model, "to_device"):
             self.model.to_device(self.device)
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):

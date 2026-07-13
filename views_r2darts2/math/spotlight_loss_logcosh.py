@@ -7,28 +7,23 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V44: V13 + per-series ac_scale + y_true-only event_mask.
-
-    Keeps V13's proven structure (gated Level, MSE, global Shape) and
-    fixes two real bugs:
-    1. ac_scale computed per-series (not per-batch) — prevents Ukraine
-       from diluting Shape penalty for peaceful countries.
-    2. event_mask from y_true only — prevents DRO gaming exploit where
-       model hallucinates spikes to dilute DRO at true events.
-
-    Reverts V42's w_level=1.0 (which diluted Level gradient 10×) back
-    to V13's gate.amax.
+    """V46: Series-level gate + per-series ac_scale + y_true-only event_mask.
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (AC pattern).** V13's log_cosh, but with per-series
-      ac_scale (dim=1). Each country scaled by its own variance.
+    * **Series-level gate.** Activates Shape and Level for the ENTIRE
+      series if ANY cell has activity (y_true or y_pred > tau). This:
+      - Ignores peaceful series with small predictions (no noise training)
+      - Catches hallucinated spikes on peaceful series (gate turns ON)
+      - Lets Shape see the full event/peace contrast within active series
 
-    * **Level (DC magnitude).** V13's MSE, gated (gate.amax). Proven
-      to calibrate to 0.84×.
+    * **Per-series ac_scale.** Each country scaled by its own variance.
+      Only matters for active series (gate=0 for inactive). No longer
+      destabilizes peaceful countries because they're gated off entirely.
 
-    * **Gate**: max(y_true, y_pred.detach()) — catches FPs and FNs.
-    * **Event Mask**: y_true only — protects DRO from gaming.
+    * **y_true-only event_mask.** Protects DRO from gaming exploit.
+
+    * **Level.** V13's MSE, gate.amax (series-level).
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -45,7 +40,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV44 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV46 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -66,13 +61,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         e = y_pred - y_true
 
-        # ── Gate (catches FPs and FNs) ───────────────────────────────
-        abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = torch.sigmoid(10.0 * (abs_max - self.tau))
+        # ── Series-level gate (V46) ──────────────────────────────────
+        # Activates for the ENTIRE series if ANY cell has activity.
+        # max(y_true, y_pred) per cell, then max over all cells.
+        abs_max = torch.max(y_true.abs(), y_pred.detach().abs())  # (B, T) or (B, T, C)
+        if multivariate:
+            series_max = abs_max.amax(dim=1, keepdim=True)  # (B, 1, C)
+            gate = torch.sigmoid(10.0 * (series_max - self.tau))  # (B, 1, C)
+            gate = gate.expand(B, T, -1)  # broadcast to all cells
+        else:
+            series_max = abs_max.amax(dim=1, keepdim=True)  # (B, 1)
+            gate = torch.sigmoid(10.0 * (series_max - self.tau))  # (B, 1)
+            gate = gate.expand(B, T)  # broadcast to all cells
 
-        # ── Event Mask (protects DRO math — y_true ONLY) ─────────────
-        # V43 fix: prevents model from gaming DRO by hallucinating spikes
-        # to inflate n_ev and dilute DRO at true events.
+        # ── Event Mask (y_true ONLY — prevents DRO gaming) ───────────
         event_mask = (y_true.abs() > self.tau).float()
 
         # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ───
@@ -80,9 +82,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_shape = e - e_mean
 
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        # V42 fix: per-series ac_scale (dim=1, not dim=(0,1))
-        # Prevents high-variance countries from diluting Shape penalty
-        # for peaceful countries.
+        # Per-series ac_scale (dim=1 only)
         ac_scale = true_ac.std(dim=1, keepdim=True).clamp_min(self.tau)
         shape_cell = self._log_cosh(e_shape / ac_scale)
 
@@ -103,10 +103,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
         # ── LEVEL: T × MSE(mean gap), gate-weighted, Hájek ───────────
-        # V13 structure — gate.amax (NOT w_level=1.0 which diluted 10×).
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
         level_cell = T * gap ** 2
-        w_level = gate.amax(dim=1)  # V13: per-series event mass
+        # Series-level gate.amax = the series gate value (same for all cells)
+        w_level = gate.amax(dim=1)  # (B,) or (B, C) — 0 for inactive, ~1 for active
 
         if multivariate:
             loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -152,6 +152,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
+                # V46: series-level gate diagnostics
+                _series_gate = gate[:, 0, :] if multivariate else gate[:, 0]  # (B, C) or (B,)
+                series_gate_mean_l = _series_gate.mean(dim=0).tolist()
+                series_active_frac_l = ((_series_gate > 0.5).float().sum(dim=0) / _series_gate.size(0)).tolist()
+                
                 # V42: per-series ac_scale diagnostics
                 _ac_scale_mean = ac_scale.mean(dim=0).squeeze(0) if ac_scale.dim() > 2 else ac_scale.mean()
                 ac_scale_mean_l = _ac_scale_mean.tolist() if _ac_scale_mean.dim() > 0 else [float(_ac_scale_mean)]
@@ -186,6 +191,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
+                _series_gate = gate[:, 0]
+                series_gate_mean_l = [_series_gate.mean().item()]
+                series_active_frac_l = [((_series_gate > 0.5).float().sum() / _series_gate.size(0)).item()]
                 _ac_scale_mean = ac_scale.mean()
                 ac_scale_mean_l = [float(_ac_scale_mean)]
                 _ac_scale_max = ac_scale.max()
@@ -200,7 +208,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV44: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV46: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -229,13 +237,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "ac_scale_max":   ac_scale_max_l,
             "ac_scale_min":   ac_scale_min_l,
             "gaming_ratio":   gaming_ratio_l,
+            # ── V46: series-level gate diagnostics ──
+            # Mean gate value (should be ~0.1-0.3 — only active series)
+            "series_gate_mean":     series_gate_mean_l,
+            # Fraction of series that are active (gate > 0.5)
+            # Should be ~10-20% (event fraction)
+            "series_active_frac":   series_active_frac_l,
         }
 
         logger.debug(
-            "SpotlightLossV44 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV46 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV44(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV46(non_zero_threshold={self.tau})"

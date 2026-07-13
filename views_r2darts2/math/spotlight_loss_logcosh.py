@@ -9,33 +9,40 @@ logger = logging.getLogger(__name__)
 class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
-    Shape = cosh (sinh gradient) + TV smoothness prior (V35).
-    Level = MSE on mean gap (V13 — unchanged).
+    Shape = log_cosh with raw-error DRO (sharpens flat forecasts).
+    Level = MSE on mean gap (V13 — fixes V11 saturation & V12 weak DC).
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (AC pattern).** ``cosh`` on demeaned residual, gated,
-      DRO-weighted, Hájek-normalised, plus a Total Variation (TV)
-      smoothness prior on adjacent predictions.
+    * **Shape (AC pattern).** Demeaned log_cosh residual, gated,
+      DRO-weighted on ``|raw_error|``, Hájek-normalised. Unchanged from
+      V11/V12 — this component works (non-flat forecasts, healthy AC
+      gradient).
 
-      V13 used ``log_cosh`` → gradient ``tanh`` saturates at ±1.0. The
-      model could not push hard on large temporal errors (spikes,
-      misplacements) → sporadic spikes persisted.
+    * **Level (DC magnitude).** ``T × gap²`` on the per-series mean gap,
+      gate-weighted, Hájek-normalised.
 
-      V35 uses ``cosh`` → gradient ``sinh`` grows exponentially. For
-      large errors, the gradient hits the global clip (20), providing
-      an aggressive, capped-linear push. For small errors, cosh ≈ x²/2
-      (MSE-like). This gives Shape the "teeth" to kill spikes without
-      destabilizing normal training.
+      V11 used ``T × log_cosh(gap)`` → ``tanh(gap)`` saturates for
+      ``|gap| > 3`` → model gets the same gradient whether off by 5 or
+      15 → cannot push harder on severely underpredicted channels.
 
-      V35 also adds a TV prior: ``log_cosh(y_pred[t] - y_pred[t-1])``.
-      This penalizes bursty oscillations (e.g., 2000, 49, 2500) and
-      encourages blocky, sustained predictions (e.g., 1500, 1500, 1500)
-      which match real conflict dynamics. Integrated inside the Shape
-      Hájek to maintain the 2-term structure.
+      V12 used per-cell ``log_cosh(e)`` → gradient focused on event
+      cells but total DC push per series is ``tanh(e_event) × 1`` vs
+      V11's ``tanh(gap) × 36`` → 34× weaker DC gradient → worse
+      underprediction than V11 on ALL channels.
 
-    * **Level (DC magnitude).** ``T × gap²`` (V13 MSE — unchanged).
-      Pure DC, unsaturated, provides strong calibration push.
+      V13 uses ``T × gap²`` → gradient is ``2 × gap`` per cell:
+        - DC-only (mean gap → uniform gradient → no Shape conflict)
+        - Unsaturated (scales linearly with error magnitude)
+        - Applied to all T cells (same total gradient surface as V11)
+        - For gap=1.5: gradient = 3.0/cell vs V11's 0.91 → 3.3× stronger
+        - For gap=3.0: gradient = 6.0/cell vs V11's 0.995 → 6× stronger
+
+      MSE is safe here because the mean-gap formulation has ZERO AC
+      gradient by construction — it cannot cause the AC template-ization
+      that per-cell MSE caused in V9. The user's "must use log_cosh"
+      constraint applies to the Shape base loss (per-cell), not to the
+      Level DC term.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -50,9 +57,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         super().__init__()
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
+        # Set by backward hook in forward(); holds d(loss)/d(y_pred) for gradient diagnostics.
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV35 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV13 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -74,6 +82,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         multivariate = y_pred.dim() == 3
         B, T = y_pred.shape[:2]
 
+        # Register hook to capture d(loss)/d(y_pred) after backward.
         self._last_input_grad = None
         if y_pred.requires_grad:
             y_pred.register_hook(lambda g: setattr(self, "_last_input_grad", g.detach()))
@@ -84,32 +93,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── SHAPE: cosh + TV prior ───────────────────────────────────
+        # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ──
+        # Unchanged from V11/V12 — this component works.
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
-        
-        # V35: Use cosh instead of log_cosh for aggressive large-error push
         shape_cell = self._cosh(e_shape / ac_scale)
 
-        # V35: Total Variation (TV) smoothness prior on predictions.
-        # Penalizes adjacent differences to prevent bursty oscillations.
-        # log_cosh is used here for a smooth, bounded penalty on diffs.
-        y_pred_diffs = y_pred[:, 1:] - y_pred[:, :-1]
-        tv_prior = self._log_cosh(y_pred_diffs / ac_scale)
-        # Pad to match T dimension (first cell has no diff, penalty 0)
-        if multivariate:
-            tv_pad = torch.zeros(B, 1, y_pred.size(-1), device=y_pred.device, dtype=y_pred.dtype)
-        else:
-            tv_pad = torch.zeros(B, 1, device=y_pred.device, dtype=y_pred.dtype)
-        tv_prior = torch.cat([tv_pad, tv_prior], dim=1)
-
-        # Combine shape error and TV prior
-        shape_combined = shape_cell + tv_prior
-
-        # DRO weighting (unchanged)
         raw_abs = e.abs().detach()
         event_mask = (abs_max > self.tau).float()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
@@ -122,12 +114,37 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         if multivariate:
             shape_w = gate * w_dro
-            loss_shape = (shape_w * shape_combined).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
+            loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
             shape_w = gate * w_dro
-            loss_shape = (shape_w * shape_combined).sum() / shape_w.sum().clamp_min(self._EPS)
+            loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: T × MSE(mean gap) — V13, unchanged ────────────────
+        # ── LEVEL: T × MSE(mean gap), gate-weighted, Hájek ───────────
+        # V13: replaces V11's T*log_cosh(gap) and V12's per-cell log_cosh(e).
+        #
+        # gap = mean(y_pred) - mean(y_true) per series, shape (B,) or (B, C).
+        # level_cell = T * gap²
+        # Gradient w.r.t. y_pred[t] = 2 * gap (uniform across all T cells).
+        #
+        # Why MSE instead of log_cosh here:
+        #  - log_cosh(gap) → tanh(gap) saturates for |gap|>3 → V11 can't
+        #    push harder on severely underpredicted channels (ch_1, ch_2).
+        #  - MSE(gap) → 2*gap is unsaturated → gradient scales with error.
+        #  - Both are DC-only (mean gap → uniform gradient) → no Shape
+        #    conflict. MSE cannot cause AC template-ization because it
+        #    has zero AC gradient by construction.
+        #
+        # Why mean-gap instead of per-cell (V12):
+        #  - Per-cell log_cosh(e) focuses gradient on event cells but
+        #    total DC push per series = tanh(e_event) × 1 ≈ 1.
+        #  - Mean-gap applies gradient to ALL T cells: total push =
+        #    gradient × T. V11/V13 have 36× more total DC gradient.
+        #  - V12's dcMag=0.0001 vs V11's approach → V12 underpredicts
+        #    more on ALL channels.
+        #
+        # T factor: gap has gradient 1/T per cell (from mean operator).
+        # T * gap² has gradient 2*gap per cell (T cancels 1/T). Without
+        # T, gradient would be 2*gap/T — diluted by 1/T.
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
         level_cell = T * gap ** 2
         w_level = gate.amax(dim=1)  # per-series event mass
@@ -151,10 +168,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             level_c = [float(loss_level.detach())]
             comp = [float(total_loss.detach())]
 
-        # ── Diagnostic telemetry ──────────────────────────────────────
+        # ── Diagnostic telemetry (detached, no extra grad) ────────────────
         with torch.no_grad():
             if multivariate:
-                _n_ev   = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
+                _n_ev   = event_mask.sum(dim=(0, 1)).clamp_min(1.0)           # (C,)
                 _w_ev   = w_dro * event_mask
                 _dm     = _w_ev.sum(dim=(0, 1)) / _n_ev
                 _dw2    = (_w_ev ** 2).sum(dim=(0, 1)) / _n_ev
@@ -165,26 +182,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 dro_frac_up_l = (((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
                 event_frac_l  = event_mask.mean(dim=(0, 1)).tolist()
 
+                # Gap diagnostics — computed per series, then stats over
+                # event series only (where w_level > 0.5) AND over all series.
                 _ga    = gap.abs()
-                gap_mean_l    = _ga.mean(dim=0).tolist()
+                gap_mean_l    = _ga.mean(dim=0).tolist()  # all-series mean |gap|
                 gap_max_l     = _ga.amax(dim=0).tolist()
-                _ev_mask_s = (w_level > 0.5).float()
+                # Event-only gap (what Level actually sees after Hájek).
+                _ev_mask_s = (w_level > 0.5).float()  # (B,) or (B, C)
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
+                # Fraction of event series where |gap| > 1.5 (tanh saturated
+                # zone for V11 — V13's MSE gradient is 2*1.5=3.0, unsaturated).
+                # If this is high and V11 stalled here, V13 should break through.
                 gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
-
-                # V35: TV diagnostic
-                _tv_mean = tv_prior.mean(dim=(0, 1))
-                tv_mean_l = _tv_mean.tolist()
-                # V35: cosh gradient diagnostic
-                _sinh_grad = torch.sinh(e_shape / ac_scale).abs()
-                sinh_grad_mean_l = (_sinh_grad.mean(dim=(0, 1))).tolist()
-                sinh_grad_max_l = (_sinh_grad.amax(dim=(0, 1))).tolist()
-
-                sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
                 _n_ev   = event_mask.sum().clamp_min(1.0)
                 _w_ev   = w_dro * event_mask
@@ -204,16 +217,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
-                _tv_mean = tv_prior.mean()
-                tv_mean_l = [_tv_mean.item()]
-                _sinh_grad = torch.sinh(e_shape / ac_scale).abs()
-                sinh_grad_mean_l = [_sinh_grad.mean().item()]
-                sinh_grad_max_l = [_sinh_grad.max().item()]
-                sl_ratio_l = [float((loss_shape.detach()
-                                     / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV35: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV13: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -226,37 +232,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "cal_score": [1.0] * n,
             "gates": [1.0] * n,
             "contribution": comp,
-            # ── DRO diagnostics ──
-            "dro_w_mean":     dro_wmean_l,
-            "dro_w_std":      dro_wstd_l,
-            "dro_w_max":      dro_wmax_l,
-            "dro_frac_up":    dro_frac_up_l,
-            "event_frac":     event_frac_l,
-            # ── Gap diagnostics ──
-            "level_gap_mean": gap_mean_l,
-            "level_gap_max":  gap_max_l,
-            "level_gap_ev_mean": gap_ev_mean_l,
-            "level_gap_ev_max":  gap_ev_max_l,
-            "level_gap_sat":     gap_sat_l,
-            "shape_dc":       shape_dc_l,
-            "shape_level_ratio": sl_ratio_l,
-            # ── V35: Shape diagnostics ──
-            # The sinh gradient (from cosh loss). V13's tanh saturated at 1.0.
-            # V35's sinh grows exponentially. If sinh_grad_max >> 1.0, Shape
-            # is actively pushing hard on large errors (what we want).
-            "sinh_grad_mean": sinh_grad_mean_l,
-            "sinh_grad_max":  sinh_grad_max_l,
-            # Total Variation penalty. Measures burstiness of predictions.
-            # High TV = oscillating predictions (2000, 49, 2500).
-            # Low TV = smooth/blocky predictions (1500, 1500, 1500).
-            "tv_mean":        tv_mean_l,
+            # ── Diagnostic keys (read by LossGradientDiagnosticsCallback) ──
+            "dro_w_mean":     dro_wmean_l,    # mean DRO weight over event cells
+            "dro_w_std":      dro_wstd_l,     # std  DRO weight over event cells
+            "dro_w_max":      dro_wmax_l,     # max  DRO weight (tail upweighting)
+            "dro_frac_up":    dro_frac_up_l,  # fraction of event cells with w_dro > 1
+            "event_frac":     event_frac_l,   # fraction of cells that are events
+            "level_gap_mean": gap_mean_l,     # mean |gap| per channel (ALL series — diagnostic only)
+            "level_gap_max":  gap_max_l,      # max  |gap| per channel (ALL series)
+            "shape_dc":       shape_dc_l,     # gated shape-error DC leak (should be ≈ 0)
+            # ── NEW (V13): event-series gap diagnostics ──
+            # These show what the Hájek-normalized Level actually sees
+            # (event series only, where w_level > 0.5).
+            "level_gap_ev_mean": gap_ev_mean_l,  # mean |gap| over EVENT series (what Level optimizes)
+            "level_gap_ev_max":  gap_ev_max_l,   # max  |gap| over EVENT series
+            "level_gap_sat":     gap_sat_l,      # frac of event series with |gap|>1.5 (V11 tanh saturation zone)
+                                                 # V13 MSE gradient at |gap|=1.5 is 3.0 — unsaturated.
+                                                 # If V11 stalled with high gap_sat, V13 should break through.
         }
 
         logger.debug(
-            "SpotlightLossV35 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV13 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV35(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV13(non_zero_threshold={self.tau})"

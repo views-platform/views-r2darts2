@@ -10,57 +10,44 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
     Shape = log_cosh with raw-error DRO (V13 — unchanged).
-    Level = T × MSE(mean gap) with series-level DRO (V32 — improves on V13).
+    Level = MSE on mean gap (V14 — fixes V13 sporadic spikes & calibration overpred).
+
+    ── V14 Changes ────────────────────────────────────────────────────
+
+    1. **Soft level weighting:** `w_level = gate_true.mean(dim=1)` instead of
+       `gate.amax(dim=1)`. Eliminates binary on/off that caused spikes when
+       a single cell crossed threshold.
+
+    2. **True-only gate for Level:** `gate_true` uses `y_true` only, not
+       `max(y_true, y_pred.detach())`. Removes prediction→gate feedback loop
+       that amplified oscillations.
+
+    3. **Peace series get weak Level signal:** With soft mean, a series with
+       1 event in 36 cells gets w_level≈0.03 (not 1.0). The model no longer
+       overcorrects on marginal event series. Pure-peace series (w_level≈0)
+       rely on Shape's DRO-weighted event cells for calibration — but since
+       gate_true is 0 for peace cells, Shape also gets 0 weight. So we add
+       a tiny peace anchor (see below).
+
+    ── Why V13 Spiked ─────────────────────────────────────────────────
+
+    V13's `w_level = gate.amax(dim=1)` was binary: 1.0 if ANY cell in the
+    series had max(|y_true|,|y_pred|) > τ. On calibration (sparse events),
+    this created hard transitions:
+
+    - Epoch N:   y_pred=0.5 everywhere → gate≈0 → w_level=0 → no Level loss
+    - Epoch N+1: weight update drifts y_pred to 0.95 on some cells
+                 → gate flips to 1 → w_level=1 → T×gap² suddenly active
+                 → gradient yanks mean hard → overshoot → spike
+
+    The gate also used y_pred.detach(), so the flip was based on stale
+    predictions, creating a feedback loop. Validation had dense events (gate
+    always 1), so no flip, no spikes.
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (AC pattern).** Demeaned log_cosh residual, gated,
-      DRO-weighted on ``|raw_error|``, Hájek-normalised. EXACTLY V13.
-
-    * **Level (DC magnitude).** V13's ``T × gap²`` with **series-level
-      DRO** that upweights poorly-calibrated series.
-
-      V13 used uniform Hájek weighting (w_level = gate.amax). All event
-      series got equal weight regardless of calibration error. Sparse
-      channels (ch_1, ch_2) with large gaps got the same gradient share
-      as well-calibrated channels (ch_0) with small gaps → ch_1/ch_2
-      stuck at 0.51×/0.36×.
-
-      V32 adds series-level DRO:
-        w_series = sqrt(|gap| / mean|gap|)  (detached, per-channel)
-        w_level = gate.amax × w_series
-
-      Series with 2× the mean gap get sqrt(2) ≈ 1.41× more weight.
-      Series with 0.5× the mean gap get 0.71× less weight. The sqrt
-      dampens extremes. The Hájek normalization preserves loss scale.
-
-      Why this is safe (preserves V13's strengths):
-        1. Still DC-only: gradient is uniform within each series (same
-           value at all T cells). No AC introduced. No Shape conflict.
-        2. No n_ev instability: no per-cell normalization. The DRO
-           operates on per-series |gap| (a scalar), not per-cell errors.
-        3. No location leakage: w_series is per-series, not per-cell.
-           The model can't learn WHERE events are from Level.
-        4. No new constants: DRO is fully adaptive (sqrt of ratio to
-           batch mean). No thresholds, no hyperparameters.
-        5. Loss scale preserved: Hájek normalization absorbs the DRO
-           weight. Shape:Level ratio unchanged from V13.
-
-      Why this helps ch_1/ch_2:
-        These channels have large gaps (0.51×, 0.36× calibration) but
-        few event series. V13's uniform weighting gives them the same
-        gradient share as ch_0 (which has more series but smaller gaps).
-        V32's DRO upweights the poorly-calibrated series → stronger
-        calibration push where it's needed most.
-
-      What this does NOT fix:
-        Mean obfuscation (DC-only = mean-only, mathematical necessity).
-        Eval overprediction (generalization problem, not a loss problem).
-        These require Shape or model-level changes, not Level changes.
-
-    ── Hyperparameters ────────────────────────────────────────────────
-
-    ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
+    * **Shape (AC pattern).** Unchanged from V13.
+    * **Level (DC magnitude).** `T × gap²` with soft, true-only gating.
     """
 
     _EPS = 1e-6
@@ -73,7 +60,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV32 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV14 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -94,12 +81,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         e = y_pred - y_true
 
-        # ── Event gate ───────────────────────────────────────────────
+        # ── Event gates ──────────────────────────────────────────────
+        # Shape gate: uses max(true, pred) — allows model to "discover" events
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = torch.sigmoid(10.0 * (abs_max - self.tau))
+        gate_shape = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ───
-        # EXACTLY V13 — unchanged.
+        # Level gate: uses true ONLY — deterministic, no feedback loop
+        gate_true = torch.sigmoid(10.0 * (y_true.abs() - self.tau))
+
+        # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ──
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
@@ -118,41 +108,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         if multivariate:
-            shape_w = gate * w_dro
+            shape_w = gate_shape * w_dro
             loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
-            shape_w = gate * w_dro
+            shape_w = gate_shape * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: T × MSE(mean gap) with series-level DRO (V32) ──────
-        # V13's pure DC Level + adaptive series-level weighting.
-        #
-        # gap = mean(y_pred) - mean(y_true) per series (scalar, DC-only)
-        # w_series = sqrt(|gap| / mean|gap|)  (detached, per-channel)
-        # w_level = gate.amax × w_series
-        # level_cell = T × gap²
-        # loss = (w_level × level_cell).sum / w_level.sum  (Hájek)
-        #
-        # Gradient: uniform within series (DC), reweighted across series.
-        # Series with large |gap| get more gradient → stronger calibration
-        # push on poorly-calibrated channels (ch_1, ch_2).
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
+        # ── LEVEL: T × MSE(mean gap), soft true-only gating ─────────
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
 
-        # Series-level DRO: upweight poorly-calibrated series
-        gap_abs = gap.abs().detach()  # (B,) or (B, C)
-        if multivariate:
-            gap_mu = gap_abs.mean(dim=0, keepdim=True).clamp_min(1e-8)  # (1, C)
-        else:
-            gap_mu = gap_abs.mean().clamp_min(1e-8)  # scalar
-        w_series = torch.sqrt(gap_abs / gap_mu)  # (B,) or (B, C)
-        # Normalize so mean weight = 1 (preserves loss scale)
-        if multivariate:
-            w_series = w_series / w_series.mean(dim=0, keepdim=True).clamp_min(1e-8)
-        else:
-            w_series = w_series / w_series.mean().clamp_min(1e-8)
+        # V14: soft mean instead of hard amax; true-only instead of max
+        w_level = gate_true.mean(dim=1)  # (B,) or (B, C) — proportional to event density
 
-        level_cell = T * gap ** 2
-        w_level = gate.amax(dim=1) * w_series  # event mass × series DRO
+        # Peace anchor: for series with no true events, weakly pull toward zero
+        # This prevents pure-peace series from drifting arbitrarily.
+        # Computed only where w_level is very small (no true events).
+        peace_mask = (w_level < 0.05).float()  # series with <5% event density
+        peace_anchor = peace_mask * (y_pred.mean(dim=1) ** 2)  # MSE to zero mean
+
+        level_cell = T * gap ** 2 + 0.5 * peace_anchor  # 0.5 is weak anchor weight
 
         if multivariate:
             loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -190,35 +164,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga    = gap.abs()
                 gap_mean_l    = _ga.mean(dim=0).tolist()
                 gap_max_l     = _ga.amax(dim=0).tolist()
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+
+                # V14: w_level is soft, so "event series" threshold is different
+                _ev_mask_s = (w_level > 0.05).float()  # soft threshold
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
                 gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
 
-                shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
+                # V14: peace anchor diagnostics
+                peace_frac_l = peace_mask.mean(dim=0).tolist()
+                peace_anchor_mean_l = (peace_anchor * peace_mask).sum(dim=0).clamp_min(0).tolist()
 
-                # ── V32: series-level DRO diagnostics ──
-                w_series_mean_l = w_series.mean(dim=0).tolist()  # should be ≈ 1.0
-                w_series_max_l = w_series.amax(dim=0).tolist()   # most upweighted series
-                # For event series only
-                _ws_ev = w_series * _ev_mask_s
-                w_series_ev_mean_l = (_ws_ev.sum(dim=0) / _n_ev_s).tolist()
-                w_series_ev_max_l = (_ws_ev.amax(dim=0)).tolist()
-                # Fraction of event series upweighted (w_series > 1)
-                dro_series_up_l = (((w_series > 1.0).float() * _ev_mask_s).sum(dim=0)
-                                   / _n_ev_s).tolist()
-                # Gap distribution: how variable are gaps across series?
-                # High std means some series are much worse → DRO matters more
-                _gap_ev = _ga * _ev_mask_s
-                _gap_ev_mean_t = _gap_ev.sum(dim=0) / _n_ev_s  # (C,)
-                _gap_ev_var = ((_gap_ev ** 2).sum(dim=0) / _n_ev_s
-                               - _gap_ev_mean_t ** 2).clamp_min(0)
-                gap_ev_std_l = _gap_ev_var.sqrt().tolist()
-                # Coefficient of variation (std/mean) — if high, DRO is doing work
-                gap_cv_l = (_gap_ev_var.sqrt() / _gap_ev_mean_t.clamp_min(1e-8)).tolist()
-
-                sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
+                shape_dc_l    = (gate_shape * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
             else:
                 _n_ev   = event_mask.sum().clamp_min(1.0)
                 _w_ev   = w_dro * event_mask
@@ -232,28 +190,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga    = gap.abs()
                 gap_mean_l    = [_ga.mean().item()]
                 gap_max_l     = [_ga.max().item()]
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+                _ev_mask_s = (w_level > 0.05).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
-                shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
-                w_series_mean_l = [w_series.mean().item()]
-                w_series_max_l = [w_series.max().item()]
-                _ws_ev = w_series * _ev_mask_s
-                w_series_ev_mean_l = [(_ws_ev.sum() / _n_ev_s).item()]
-                w_series_ev_max_l = [_ws_ev.max().item()]
-                dro_series_up_l = [(((w_series > 1.0).float() * _ev_mask_s).sum() / _n_ev_s).item()]
-                _gap_ev = _ga * _ev_mask_s
-                _gap_ev_mean_t = _gap_ev.sum() / _n_ev_s
-                _gap_ev_var = ((_gap_ev ** 2).sum() / _n_ev_s - _gap_ev_mean_t ** 2).clamp_min(0)
-                gap_ev_std_l = [_gap_ev_var.sqrt().item()]
-                gap_cv_l = [(_gap_ev_var.sqrt() / max(1e-8, _gap_ev_mean_t.item())).item()]
-                sl_ratio_l = [float((loss_shape.detach()
-                                     / loss_level.detach().clamp_min(self._EPS)).item())]
+                peace_frac_l = [peace_mask.mean().item()]
+                peace_anchor_mean_l = [(peace_anchor * peace_mask).sum().clamp_min(0).item()]
+                shape_dc_l    = [(gate_shape * e_shape).mean(dim=1).abs().mean().item()]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV32: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV14: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -266,41 +213,27 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "cal_score": [1.0] * n,
             "gates": [1.0] * n,
             "contribution": comp,
-            # ── DRO diagnostics (Shape) ──
             "dro_w_mean":     dro_wmean_l,
             "dro_w_std":      dro_wstd_l,
             "dro_w_max":      dro_wmax_l,
             "dro_frac_up":    dro_frac_up_l,
             "event_frac":     event_frac_l,
-            # ── Gap diagnostics (Level) ──
             "level_gap_mean": gap_mean_l,
             "level_gap_max":  gap_max_l,
             "level_gap_ev_mean": gap_ev_mean_l,
             "level_gap_ev_max":  gap_ev_max_l,
             "level_gap_sat":     gap_sat_l,
+            # V14 diagnostics
+            "peace_frac":        peace_frac_l,
+            "peace_anchor_mean": peace_anchor_mean_l,
             "shape_dc":       shape_dc_l,
-            "shape_level_ratio": sl_ratio_l,
-            # ── V32: series-level DRO diagnostics ──
-            # The series-level DRO weight. Mean should be ≈ 1.0 (normalized).
-            # Max shows the most upweighted series (should be 1.5-2.5).
-            # If max > 3, some series have extreme gaps (outliers).
-            "w_series_mean":       w_series_mean_l,       # mean DRO weight (should be ≈ 1.0)
-            "w_series_max":        w_series_max_l,        # max DRO weight (most upweighted)
-            "w_series_ev_mean":    w_series_ev_mean_l,    # mean over event series
-            "w_series_ev_max":     w_series_ev_max_l,     # max over event series
-            "dro_series_up":       dro_series_up_l,       # frac event series with w > 1 (upweighted)
-            # Gap variability — if high, DRO is doing important work
-            # (some series much worse than others)
-            "gap_ev_std":          gap_ev_std_l,          # std of |gap| over event series
-            "gap_cv":              gap_cv_l,              # coefficient of variation (std/mean)
-                                                          # >0.5 = high variability = DRO matters
         }
 
         logger.debug(
-            "SpotlightLossV32 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV14 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV32(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV14(non_zero_threshold={self.tau})"

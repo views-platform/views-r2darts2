@@ -5,18 +5,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class SpotlightLossLogcosh(torch.nn.Module):
-    """V53: Raw Shape + Global Level + Ungated.
+class SpotlightLossV54(torch.nn.Module):
+    """V54: Direct DRO + Global Level + Ungated.
     
-    Fixes V52's hedging and gradient crushing.
+    Fixes V53's ineffective DRO for single-spike series (Ukraine/Sudan).
     
-    1. Shape: Raw log_cosh(e_shape). No ac_scale! log_cosh already saturates,
-       so it provides a strong, bounded gradient for all errors without crushing
-       moderate spikes.
-    2. Level: Global AsinhPlus(gap). Not windowed! Prevents the model from
-       hedging (spreading predictions across a window).
-    3. Level Gate: Ungated. Ensures the model learns the baseline for peaceful
-       countries.
+    1. Shape: Raw log_cosh on demeaned errors. No ac_scale.
+    2. DRO: Direct upweighting of large errors (1 + raw_abs/tau).
+       Fixes V53's w_dro=1.0 for single-spike series.
+    3. Level: Global AsinhPlus(gap). Not windowed. Ungated.
     """
     _EPS = 1e-6
 
@@ -27,7 +24,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV53 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV54 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -59,20 +56,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         event_mask = (abs_max > self.tau).float()
 
         # ── SHAPE: Raw log_cosh on demeaned errors ───────────────────
-        # NO ac_scale! log_cosh already saturates, providing a strong,
-        # bounded gradient for all errors without crushing moderate spikes.
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
-        # DRO on |raw_error|
+        # ── DRO: Direct upweighting of large errors ──────────────────
+        # Fixes V53's w_dro=1.0 for single-spike series.
         raw_abs = e.abs().detach()
-        n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
-        w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
-        w_dro_mean = (w_dro * event_mask).sum(dim=1, keepdim=True) / n_ev
-        w_dro = w_dro / w_dro_mean.clamp_min(1e-8)
-        w_dro = 1.0 + event_mask * (w_dro - 1.0)
+        w_dro = 1.0 + (raw_abs / self.tau)
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         shape_w = gate * w_dro
@@ -82,11 +73,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
         # ── LEVEL: Global AsinhPlus ──────────────────────────────────
-        # NOT windowed! Prevents the model from hedging.
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = T * self._asinh_plus(gap)
 
-        # UNGATED! Ensures the model learns the baseline for peaceful countries.
         if multivariate:
             loss_level = level_cell.mean(dim=0)
         else:
@@ -110,26 +99,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
             gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
             
             if multivariate:
-                _n_ev   = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
-                _w_ev   = w_dro * event_mask
-                _dm     = _w_ev.sum(dim=(0, 1)) / _n_ev
-                _dw2    = (_w_ev ** 2).sum(dim=(0, 1)) / _n_ev
-                _dstd   = (_dw2 - _dm ** 2).clamp_min(0).sqrt()
-                dro_wmean_l   = _dm.tolist()
-                dro_wstd_l    = _dstd.tolist()
-                dro_wmax_l    = w_dro.amax(dim=(0, 1)).tolist()
+                _n_ev = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
+                _w_ev = w_dro * event_mask
+                _dm = _w_ev.sum(dim=(0, 1)) / _n_ev
+                _dw2 = (_w_ev ** 2).sum(dim=(0, 1)) / _n_ev
+                _dstd = (_dw2 - _dm ** 2).clamp_min(0).sqrt()
+                dro_wmean_l = _dm.tolist()
+                dro_wstd_l = _dstd.tolist()
+                dro_wmax_l = w_dro.amax(dim=(0, 1)).tolist()
                 dro_frac_up_l = (((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
-                event_frac_l  = event_mask.mean(dim=(0, 1)).tolist()
+                event_frac_l = event_mask.mean(dim=(0, 1)).tolist()
 
-                _ga    = gap_global.abs()
-                gap_mean_l    = _ga.mean(dim=0).tolist()
-                gap_max_l     = _ga.amax(dim=0).tolist()
+                _ga = gap_global.abs()
+                gap_mean_l = _ga.mean(dim=0).tolist()
+                gap_max_l = _ga.amax(dim=0).tolist()
                 _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
+                gap_ev_max_l = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
                 gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
+                shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
                 _asinh_grad = (torch.asinh(gap_global) + gap_global / torch.sqrt(1.0 + gap_global**2)).abs()
                 asinh_grad_mean_l = _asinh_grad.mean(dim=0).tolist()
@@ -137,33 +126,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
-                _n_ev   = event_mask.sum().clamp_min(1.0)
-                _w_ev   = w_dro * event_mask
-                _dm     = (_w_ev.sum() / _n_ev).item()
-                _dw2    = ((_w_ev ** 2).sum() / _n_ev).item()
-                dro_wmean_l   = [_dm]
-                dro_wstd_l    = [max(0.0, _dw2 - _dm ** 2) ** 0.5]
-                dro_wmax_l    = [w_dro.max().item()]
+                _n_ev = event_mask.sum().clamp_min(1.0)
+                _w_ev = w_dro * event_mask
+                _dm = (_w_ev.sum() / _n_ev).item()
+                _dw2 = ((_w_ev ** 2).sum() / _n_ev).item()
+                dro_wmean_l = [_dm]
+                dro_wstd_l = [max(0.0, _dw2 - _dm ** 2) ** 0.5]
+                dro_wmax_l = [w_dro.max().item()]
                 dro_frac_up_l = [((w_dro > 1.0) * event_mask).sum().item() / _n_ev.item()]
-                event_frac_l  = [event_mask.mean().item()]
-                _ga    = gap_global.abs()
-                gap_mean_l    = [_ga.mean().item()]
-                gap_max_l     = [_ga.max().item()]
+                event_frac_l = [event_mask.mean().item()]
+                _ga = gap_global.abs()
+                gap_mean_l = [_ga.mean().item()]
+                gap_max_l = [_ga.max().item()]
                 _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
-                gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
+                gap_ev_max_l = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
-                shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
+                shape_dc_l = [(gate * e_shape).mean(dim=1).abs().mean().item()]
                 
                 _asinh_grad = (torch.asinh(gap_global) + gap_global / torch.sqrt(1.0 + gap_global**2)).abs()
                 asinh_grad_mean_l = [_asinh_grad.mean().item()]
                 asinh_grad_max_l = [_asinh_grad.max().item()]
-                sl_ratio_l = [float((loss_shape.detach()
-                                     / loss_level.detach().clamp_min(self._EPS)).item())]
+                sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV53: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV54: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -176,27 +164,27 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "cal_score": [1.0] * n,
             "gates": [1.0] * n,
             "contribution": comp,
-            "dro_w_mean":     dro_wmean_l,
-            "dro_w_std":      dro_wstd_l,
-            "dro_w_max":      dro_wmax_l,
-            "dro_frac_up":    dro_frac_up_l,
-            "event_frac":     event_frac_l,
+            "dro_w_mean": dro_wmean_l,
+            "dro_w_std": dro_wstd_l,
+            "dro_w_max": dro_wmax_l,
+            "dro_frac_up": dro_frac_up_l,
+            "event_frac": event_frac_l,
             "level_gap_mean": gap_mean_l,
-            "level_gap_max":  gap_max_l,
+            "level_gap_max": gap_max_l,
             "level_gap_ev_mean": gap_ev_mean_l,
-            "level_gap_ev_max":  gap_ev_max_l,
-            "level_gap_sat":     gap_sat_l,
-            "shape_dc":       shape_dc_l,
+            "level_gap_ev_max": gap_ev_max_l,
+            "level_gap_sat": gap_sat_l,
+            "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
             "asinh_grad_mean": asinh_grad_mean_l,
-            "asinh_grad_max":  asinh_grad_max_l,
+            "asinh_grad_max": asinh_grad_max_l,
         }
 
         logger.debug(
-            "SpotlightLossV53 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV54 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV53(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV54(non_zero_threshold={self.tau})"

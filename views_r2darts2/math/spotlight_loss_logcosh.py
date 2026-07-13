@@ -9,40 +9,55 @@ logger = logging.getLogger(__name__)
 class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
-    Shape = T × per-series Hájek of log_cosh DRO (V30 — rebalanced).
-    Level = T × weighted dual-gap (V29 — unchanged).
+    Shape = T × per-series Hájek of log_cosh DRO (V30 — unchanged).
+    Level = T × unweighted dual-gap (V31 — fixes V29/V30 structural zero bias).
 
     ── Design ─────────────────────────────────────────────────────────
 
     * **Shape (AC pattern).** T-scaled per-series Hájek of demeaned
-      log_cosh residual, gated, DRO-weighted.
+      log_cosh residual, gated, DRO-weighted. Unchanged from V30.
 
-      V13/V29 used per-cell Hájek (normalize over B×T = ~6400 event
-      cells) with no T. Shape ≈ 1.0, gradient ≈ 0.006/cell.
-      V29's Level ≈ 88, gradient ≈ 0.4/cell.
-      Shape:Level = 1:88 → Shape completely starved → templating.
+    * **Level (DC magnitude, unweighted dual-gap).** ``T × (gap_event² + gap_peace²) / 2``
+      where masks are from ``y_true`` only (not gameable).
 
-      V30 uses per-series Hájek (normalize over B = ~100 event series)
-      WITH T factor. Shape ≈ T = 36, gradient ≈ T/N_series = 0.36/cell.
-      Shape:Level = 36:88 ≈ 1:2.4 → balanced.
+      V29/V30 used ``T × [(n_ev/T) × gap_ev² + (n_peace/T) × gap_peace²]``.
+      The n/T weighting gave peace cells 97% of the loss (n_peace >> n_ev).
+      This created a STRUCTURAL ZERO BIAS: the equilibrium prediction was
+      c ≈ 0.14 (near zero) instead of c ≈ 2.5 (midpoint between event
+      and peace means). The model was incentivized to predict near-zero
+      everywhere to minimize gap_peace², even though this made gap_event²
+      large. Underprediction was the optimal strategy.
 
-      Why per-series Hájek (not per-cell):
-        Per-cell Hájek: gradient = w[t] × tanh / sum_BT(w) ≈ 1/6400 per cell
-        Per-series Hájek: gradient = w[t] × tanh / (sum_T(w) × N_series) ≈ 1/500 per cell
-        With T: per-series becomes T/N_series ≈ 0.36 per cell — comparable to Level
+      V31 drops the n/T weighting:
+        level_cell = T × (gap_event² + gap_peace²) / 2
 
-      Why T is safe here (unlike V14):
-        V14's explosion: T × log_cosh(e_shape/ac_scale) per cell, gradient
-        T × tanh / ac_scale ≈ 24/cell, compounded through 8 layers.
-        V30: T × Hájek-normalized loss. Per-cell gradient = T × w[t] × tanh /
-        (sum_T(w) × N_series) = T/N_series × (w[t]/sum_T(w)) × tanh.
-        The (w[t]/sum_T(w)) term is ≤ 1 (Hájek-normalized within series),
-        so per-cell gradient ≤ T/N_series ≈ 0.36. Bounded, no explosion.
+      The /2 is the standard mean normalization (average of 2 terms),
+      not a hyperparameter.
 
-    * **Level (DC magnitude, dual-gap).** V29 unchanged.
-        T × [(n_ev/T) × gap_ev² + (n_peace/T) × gap_peace²]
-      Catches false alarms (gap_peace) and underprediction (gap_event)
-      without gaming (y_true-only masks). DC-dominant (76% in V29).
+      Why this eliminates the zero bias:
+        For uniform y_pred = c:
+          gap_event = c - μ_event, gap_peace = c - μ_peace
+          level = T × ((c-μ_event)² + (c-μ_peace)²) / 2
+          d/dc = T × ((c-μ_event) + (c-μ_peace)) = 0
+          → c = (μ_event + μ_peace) / 2  (midpoint, NOT zero)
+
+      Per-cell gradient comparison:
+        V29 weighted: event=2×gap_ev, peace=2×gap_peace (equal per cell)
+          → peace dominates by majority (32 cells vs 4) → zero bias
+        V31 unweighted: event=T×gap_ev/n_ev, peace=T×gap_peace/n_peace
+          → event cells get T/n_ev ≈ 9× more gradient per cell
+          → total event push : peace push = 9:1 (events drive calibration)
+
+      Why Shape and Level stop fighting:
+        At event cells: Shape (DRO) pushes UP, Level (gap_event < 0) pushes UP
+          → ALIGNED, not fighting
+        At peace cells: Shape may push up (false alarm), Level pushes DOWN
+          → Level correctly opposes false alarms (weak but right direction)
+
+      V30's tug-of-war was caused by the weighted dual-gap giving equal
+      per-cell gradients at events and peace. The model compromised to
+      flat-low. V31's unweighted version makes event push 72× stronger
+      per cell → Level dominates at events → no compromise needed.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -59,7 +74,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV30 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV31 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -80,11 +95,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         e = y_pred - y_true
 
-        # ── Event gate (for Shape — soft, uses both y_true and y_pred) ─
+        # ── Event gate (for Shape) ───────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── True event/peace masks (for Level — y_true only, not gameable) ─
+        # ── True event/peace masks (for Level — y_true only) ─────────
         mask_event = (y_true.abs() > self.tau).float()
         mask_peace = 1.0 - mask_event
         n_event = mask_event.sum(dim=1).clamp_min(1.0)
@@ -108,25 +123,27 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = 1.0 + event_mask * (w_dro - 1.0)
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
-        shape_w = gate * w_dro  # (B, T) or (B, T, C)
+        shape_w = gate * w_dro
 
-        # V30: per-series Hájek (normalize over T), then Hájek over series, then T-scale
         if multivariate:
-            # Per-series mean: (B, T, C) → sum over T → (B, C)
             shape_per_series = (shape_w * shape_cell).sum(dim=1) / shape_w.sum(dim=1).clamp_min(self._EPS)
-            # Event series mask: 1 if series has ANY event cell
-            ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B, C)
-            n_ev_series = ev_series_mask.sum(dim=0).clamp_min(1.0)  # (C,)
-            # Hájek over event series, then T-scale
+            ev_series_mask = (event_mask.sum(dim=1) > 0).float()
+            n_ev_series = ev_series_mask.sum(dim=0).clamp_min(1.0)
             loss_shape = T * (ev_series_mask * shape_per_series).sum(dim=0) / n_ev_series
         else:
-            # Per-series mean: (B, T) → sum over T → (B,)
             shape_per_series = (shape_w * shape_cell).sum(dim=1) / shape_w.sum(dim=1).clamp_min(self._EPS)
-            ev_series_mask = (event_mask.sum(dim=1) > 0).float()  # (B,)
+            ev_series_mask = (event_mask.sum(dim=1) > 0).float()
             n_ev_series = ev_series_mask.sum().clamp_min(1.0)
             loss_shape = T * (ev_series_mask * shape_per_series).sum() / n_ev_series
 
-        # ── LEVEL: T × weighted dual-gap (V29 — unchanged) ────────────
+        # ── LEVEL: T × unweighted dual-gap (V31) ──────────────────────
+        # V29/V30 used n/T weighting → structural zero bias (c ≈ 0.14).
+        # V31 drops the weighting → equilibrium at midpoint (c ≈ 2.5).
+        #
+        # Per-cell gradient:
+        #   event: T × gap_event / n_event (STRONG, few cells)
+        #   peace: T × gap_peace / n_peace (weak, many cells)
+        # Events drive calibration 9:1 over peace. No zero bias.
         mean_pred_ev = (mask_event * y_pred).sum(dim=1) / n_event
         mean_true_ev = (mask_event * y_true).sum(dim=1) / n_event
         gap_event = mean_pred_ev - mean_true_ev
@@ -135,12 +152,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         mean_true_peace = (mask_peace * y_true).sum(dim=1) / n_peace
         gap_peace = mean_pred_peace - mean_true_peace
 
-        w_ev = n_event / T
-        w_peace = n_peace / T
+        # Unweighted: (gap_event² + gap_peace²) / 2 — mean of 2 terms
+        level_cell = T * (gap_event ** 2 + gap_peace ** 2) / 2.0
 
-        level_cell = T * (w_ev * gap_event ** 2 + w_peace * gap_peace ** 2)
-
-        w_level = gate.amax(dim=1)  # per-series event mass
+        w_level = gate.amax(dim=1)
 
         if multivariate:
             loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -175,7 +190,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 dro_frac_up_l = (((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
                 event_frac_l  = event_mask.mean(dim=(0, 1)).tolist()
 
-                # V13 gap (for comparison)
                 gap_v13 = y_pred.mean(dim=1) - y_true.mean(dim=1)
                 _ga_v13 = gap_v13.abs()
                 gap_v13_mean_l = _ga_v13.mean(dim=0).tolist()
@@ -186,7 +200,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # Dual-gap diagnostics
                 _gae = gap_event.abs()
                 _gap = gap_peace.abs()
                 gap_event_mean_l = _gae.mean(dim=0).tolist()
@@ -204,6 +217,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 false_alarm_frac_l = (_gap_peace_pos.sum(dim=0) / _n_ev_s).tolist()
                 _gap_ev_neg = (gap_event < 0).float() * _ev_mask_s
                 underpred_ev_frac_l = (_gap_ev_neg.sum(dim=0) / _n_ev_s).tolist()
+
+                # V31: per-cell gradient magnitude comparison
+                # event: T * |gap_event| / n_event
+                # peace: T * |gap_peace| / n_peace
+                _ev_grad_per_cell = T * _gae / n_event
+                _peace_grad_per_cell = T * _gap / n_peace
+                ev_grad_per_cell_l = (_ev_grad_per_cell.mean(dim=0)).tolist()
+                peace_grad_per_cell_l = (_peace_grad_per_cell.mean(dim=0)).tolist()
+                # Ratio: how much stronger is event push vs peace push per cell?
+                # Should be >> 1 (events dominate)
+                grad_ratio_l = (_ev_grad_per_cell.mean(dim=0)
+                                / _peace_grad_per_cell.mean(dim=0).clamp_min(1e-8)).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -237,11 +262,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 false_alarm_frac_l = [(_gap_peace_pos.sum() / _n_ev_s).item()]
                 _gap_ev_neg = (gap_event < 0).float() * _ev_mask_s
                 underpred_ev_frac_l = [(_gap_ev_neg.sum() / _n_ev_s).item()]
+                _ev_grad_per_cell = T * _gae / n_event
+                _peace_grad_per_cell = T * _gap / n_peace
+                ev_grad_per_cell_l = [_ev_grad_per_cell.mean().item()]
+                peace_grad_per_cell_l = [_peace_grad_per_cell.mean().item()]
+                grad_ratio_l = [(_ev_grad_per_cell.mean()
+                                 / max(1e-8, _peace_grad_per_cell.mean())).item()]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV30: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV31: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -265,7 +296,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_ev_mean": gap_ev_v13_mean_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V29 dual-gap diagnostics ──
+            # ── V31 dual-gap diagnostics ──
             "gap_event_mean":   gap_event_mean_l,
             "gap_peace_mean":   gap_peace_mean_l,
             "ev_frac":          ev_frac_l,
@@ -276,13 +307,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "mean_true_peace":  mean_true_peace_l,
             "false_alarm_frac": false_alarm_frac_l,
             "underpred_ev_frac": underpred_ev_frac_l,
+            # ── V31: per-cell gradient comparison ──
+            # The KEY diagnostic: event push should >> peace push per cell.
+            # V29/V30 had these equal (→ zero bias).
+            # V31 should have ev_grad >> peace_grad (→ no zero bias).
+            "ev_grad_per_cell":     ev_grad_per_cell_l,
+            "peace_grad_per_cell":  peace_grad_per_cell_l,
+            "grad_ratio":           grad_ratio_l,  # ev/peace per-cell ratio (should be >> 1)
         }
 
         logger.debug(
-            "SpotlightLossV30 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV31 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV30(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV31(non_zero_threshold={self.tau})"

@@ -7,25 +7,21 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V49: V42 + windowed Level (6-month) + gated Level weight.
+    """V50: V13 + windowed Level (K=6) + batch ac_scale.
 
-    V42 base (per-series ac_scale, ungated Level) + windowed Level
-    with 6-month blocks and w_level = gate.amax.
+    V49 structure (6-month windows, MSE, gate.amax) but with BATCH
+    ac_scale (dim=(0,1)) instead of per-series ac_scale.
+
+    Per-series ac_scale caused flat collapse (acMag 30× stronger than
+    V13 → tug-of-war → std=0.028). Batch ac_scale is proven stable.
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (AC pattern).** V42's per-series ac_scale, global
-      demeaning, log_cosh, DRO, Hájek. Each country scaled by its
-      own variance.
+    * **Shape (AC pattern).** V13 EXACTLY — batch ac_scale, global
+      demeaning, log_cosh, DRO (max(y_true,y_pred) event_mask), Hájek.
 
     * **Level (DC magnitude, windowed).** ``T_w × Σ_k gap_k²`` (MSE).
-      K=6 blocks of 6 months. Localizes calibration to half-year
-      windows.
-
-      w_level = gate.amax (NOT 1.0). V42's w_level=1.0 caused 10×
-      Level gradient dilution (Hájek denominator from 0.1B to B).
-      gate.amax focuses Level on active series where calibration
-      matters. This is the same as V13/V36/V44.
+      K=6 blocks of 6 months. Localizes calibration. gate.amax weight.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -44,7 +40,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV49 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV50 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -75,21 +71,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
+        # ── Event mask (V13 — max(y_true, y_pred) > tau) ────────────
+        event_mask = (abs_max > self.tau).float()
+
         # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ───
-        # V42 structure: per-series ac_scale.
+        # V13 EXACTLY — batch ac_scale (dim=(0,1)).
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        # V42 FIX: per-series ac_scale (dim=1 only, not dim=(0,1))
-        if multivariate:
-            ac_scale = true_ac.std(dim=1, keepdim=True).clamp_min(self.tau)  # (B, 1, C)
-        else:
-            ac_scale = true_ac.std(dim=1, keepdim=True).clamp_min(self.tau)  # (B, 1)
+        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
         shape_cell = self._log_cosh(e_shape / ac_scale)
 
         raw_abs = e.abs().detach()
-        event_mask = (abs_max > self.tau).float()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
@@ -105,8 +99,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: windowed MSE, gate-weighted, Hájek ────────────────
-        # V49: 6-month windows. w_level = gate.amax (not 1.0).
+        # ── LEVEL: windowed MSE (K=6, 6-month blocks) ────────────────
         if K > 1:
             if multivariate:
                 C = y_pred.size(-1)
@@ -124,7 +117,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
             level_cell = T * gap ** 2
 
-        w_level = gate.amax(dim=1)  # V13/V36: per-series event mass
+        w_level = gate.amax(dim=1)  # V13: per-series event mass
 
         if multivariate:
             loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -172,23 +165,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # V42: per-series ac_scale diagnostics
-                _ac_scale_mean = ac_scale.mean(dim=0).squeeze(0) if ac_scale.dim() > 2 else ac_scale.mean()
-                ac_scale_mean_l = _ac_scale_mean.tolist() if _ac_scale_mean.dim() > 0 else [float(_ac_scale_mean)]
-                _ac_scale_max = ac_scale.max(dim=0).values.squeeze(0) if ac_scale.dim() > 2 else ac_scale.max()
-                ac_scale_max_l = _ac_scale_max.tolist() if _ac_scale_max.dim() > 0 else [float(_ac_scale_max)]
-                _ac_scale_min = ac_scale.min(dim=0).values.squeeze(0) if ac_scale.dim() > 2 else ac_scale.min()
-                ac_scale_min_l = _ac_scale_min.tolist() if _ac_scale_min.dim() > 0 else [float(_ac_scale_min)]
-
-                # V42: peaceful country diagnostics
-                _peace_mask = (gate.amax(dim=1) < 0.1).float()
-                _n_peace = _peace_mask.sum(dim=0).clamp_min(1.0)
-                _gap_peace = (_ga * _peace_mask).sum(dim=0) / _n_peace
-                gap_peace_mean_l = _gap_peace.tolist()
-                _yp_peace = (y_pred.abs() * _peace_mask.unsqueeze(1)).sum(dim=(0,1)) / (_n_peace * T)
-                y_pred_peace_l = _yp_peace.tolist()
-
-                # V49: windowed gap diagnostics
                 if K > 1 and gap_w is not None:
                     gap_w_abs = gap_w.abs()
                     gap_w_mean_l = gap_w_abs.mean(dim=(0, 1)).tolist()
@@ -223,18 +199,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
-                _ac_scale_mean = ac_scale.mean()
-                ac_scale_mean_l = [float(_ac_scale_mean)]
-                _ac_scale_max = ac_scale.max()
-                ac_scale_max_l = [float(_ac_scale_max)]
-                _ac_scale_min = ac_scale.min()
-                ac_scale_min_l = [float(_ac_scale_min)]
-                _peace_mask = (gate.amax(dim=1) < 0.1).float()
-                _n_peace = _peace_mask.sum().clamp_min(1.0)
-                _gap_peace = (_ga * _peace_mask).sum() / _n_peace
-                gap_peace_mean_l = [_gap_peace.item()]
-                _yp_peace = (y_pred.abs() * _peace_mask.unsqueeze(1)).sum() / (_n_peace * T)
-                y_pred_peace_l = [_yp_peace.item()]
                 if K > 1 and gap_w is not None:
                     gap_w_abs = gap_w.abs()
                     gap_w_mean_l = [gap_w_abs.mean().item()]
@@ -252,7 +216,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV49: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV50: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -277,11 +241,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            "ac_scale_mean":  ac_scale_mean_l,
-            "ac_scale_max":   ac_scale_max_l,
-            "ac_scale_min":   ac_scale_min_l,
-            "gap_peace_mean":  gap_peace_mean_l,
-            "y_pred_peace":    y_pred_peace_l,
             "gap_w_mean":     gap_w_mean_l,
             "gap_w_max":      gap_w_max_l,
             "gap_w_cv":       gap_w_cv,
@@ -289,10 +248,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV49 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV50 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV49(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV50(non_zero_threshold={self.tau})"

@@ -7,36 +7,26 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """2-term loss with exact orthogonal projections (V37).
+    """2-term loss with exact orthogonal projections + AsinhIntegral (V38).
 
     Shape = log_cosh on block-demeaned errors (AC within blocks).
-    Level = MSE on block-mean gaps (DC within blocks).
+    Level = AsinhIntegral on block-mean gaps (DC within blocks).
 
     ── Design ─────────────────────────────────────────────────────────
 
-    Uses the orthogonal projection framework:
-      P_L = block-mean projection (rank K)
-      P_S = I - P_L (orthogonal complement)
-      Level = g(P_L · e)  →  ∇Level ∈ Range(P_L)
-      Shape = h(P_S · e)  →  ∇Shape ∈ Range(P_S)
-      Range(P_L) ⊥ Range(P_S)  →  EXACT orthogonality, any g, h.
+    Fixes V37's three fatal flaws:
+    1. ac_scale: Computed from block-demeaned truth (matches e_shape).
+    2. Gradient explosions: Replaces MSE with AsinhIntegral (log-bounded).
+    3. Shape suppression: Fixed ac_scale restores healthy Shape gradient.
 
     * **Shape (AC within blocks).** Block-demeaned log_cosh residual,
-      gated, DRO-weighted, Hájek-normalised.
+      gated, DRO-weighted, Hájek-normalised. Exact orthogonality with
+      Level maintained via rank-K block projection.
 
-      V13 used global demeaning (rank-1 removal). V36 used block Level
-      but kept global Shape demeaning → Shape leaked block-mean AC →
-      tug-of-war persisted.
-
-      V37 uses block demeaning for BOTH terms. Shape removes the full
-      rank-K block-mean subspace → exact orthogonality with Level.
-
-    * **Level (DC within blocks).** ``T_w × Σ_k gap_k²`` where gap_k is
-      the per-block mean gap. K=4 blocks of 9 months each.
-
-      V13 used a single global gap (K=1) → couldn't localize spikes.
-      V37 uses K=4 → a spike in block 2 inflates gap_2 → pushes only
-      block 2's cells down. Catches obfuscation V13 misses.
+    * **Level (DC within blocks).** ``T_w × Σ_k AsinhIntegral(gap_k)``.
+      AsinhIntegral gradient = asinh(x). For typical block gaps (~0.5),
+      gradient ≈ 0.48 (strong enough to calibrate). For extreme block
+      gaps (~10), gradient ≈ 3.0 (log-bounded, no explosion).
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -55,12 +45,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV37 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV38 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
         a = x.abs()
         return a + F.softplus(-2.0 * a) - math.log(2.0)
+
+    @staticmethod
+    def _asinh_integral(x: torch.Tensor) -> torch.Tensor:
+        """
+        Integral of asinh(x): x * asinh(x) - sqrt(1 + x^2) + 1
+        Gradient is asinh(x), which grows logarithmically.
+        Convex, smooth, unbounded but stable.
+        """
+        return x * torch.asinh(x) - torch.sqrt(1.0 + x**2) + 1.0
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
@@ -87,47 +86,49 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
         # ── Block projection: P_L · e = block-mean broadcast ─────────
-        # This is the key operation. P_L e replaces each cell with its
-        # block's mean. P_S e = e - P_L e = block-demeaned residual.
         if K > 1:
             if multivariate:
                 C = y_pred.size(-1)
-                # Compute block means: (B, T, C) → (B, K, T_w, C) → (B, K, C)
                 e_blocks = e.reshape(B, K, T_w, C)
                 block_means = e_blocks.mean(dim=2)  # (B, K, C)
-                # Broadcast back: (B, K, C) → (B, K, T_w, C) → (B, T, C)
                 e_dc = block_means.unsqueeze(2).expand(B, K, T_w, C).reshape(B, T, C)
-                # Also for y_true (for computing block gaps)
+                
                 y_true_blocks = y_true.reshape(B, K, T_w, C)
-                y_true_block_means = y_true_blocks.mean(dim=2)  # (B, K, C)
+                y_true_block_means = y_true_blocks.mean(dim=2)
                 y_pred_blocks = y_pred.reshape(B, K, T_w, C)
-                y_pred_block_means = y_pred_blocks.mean(dim=2)  # (B, K, C)
+                y_pred_block_means = y_pred_blocks.mean(dim=2)
                 gap_blocks = y_pred_block_means - y_true_block_means  # (B, K, C)
+                
+                # V38 FIX: Compute ac_scale from BLOCK-DEMEANED truth
+                true_block_means = y_true_block_means.unsqueeze(2).expand(B, K, T_w, C).reshape(B, T, C)
+                true_ac = y_true - true_block_means
             else:
                 e_blocks = e.reshape(B, K, T_w)
                 block_means = e_blocks.mean(dim=2)  # (B, K)
                 e_dc = block_means.unsqueeze(2).expand(B, K, T_w).reshape(B, T)
+                
                 y_true_blocks = y_true.reshape(B, K, T_w)
                 y_true_block_means = y_true_blocks.mean(dim=2)
                 y_pred_blocks = y_pred.reshape(B, K, T_w)
                 y_pred_block_means = y_pred_blocks.mean(dim=2)
                 gap_blocks = y_pred_block_means - y_true_block_means  # (B, K)
+                
+                # V38 FIX: Compute ac_scale from BLOCK-DEMEANED truth
+                true_block_means = y_true_block_means.unsqueeze(2).expand(B, K, T_w).reshape(B, T)
+                true_ac = y_true - true_block_means
         else:
-            # Fallback to V13 (K=1)
             if multivariate:
                 e_dc = e.mean(dim=1, keepdim=True).expand_as(e)
-                gap_blocks = (y_pred.mean(dim=1) - y_true.mean(dim=1)).unsqueeze(1)  # (B, 1, C)
+                gap_blocks = (y_pred.mean(dim=1) - y_true.mean(dim=1)).unsqueeze(1)
+                true_ac = y_true - y_true.mean(dim=1, keepdim=True)
             else:
                 e_dc = e.mean(dim=1, keepdim=True).expand_as(e)
-                gap_blocks = (y_pred.mean(dim=1) - y_true.mean(dim=1)).unsqueeze(1)  # (B, 1)
+                gap_blocks = (y_pred.mean(dim=1) - y_true.mean(dim=1)).unsqueeze(1)
+                true_ac = y_true - y_true.mean(dim=1, keepdim=True)
 
         # ── SHAPE: log_cosh on BLOCK-DEMEANED errors (P_S · e) ───────
-        # This is the critical fix over V36. Shape removes the FULL
-        # block-mean subspace (rank K), not just the global mean (rank 1).
-        # This ensures ∇Shape ∈ Range(P_S) ⊥ Range(P_L) ∋ ∇Level.
-        e_shape = e - e_dc  # block-demeaned residual
+        e_shape = e - e_dc
 
-        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
         shape_cell = self._log_cosh(e_shape / ac_scale)
 
@@ -148,14 +149,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: T_w × Σ_k gap_k² (DC within blocks) ───────────────
-        # Per-block MSE, summed across K blocks.
-        # Gradient: 2 × gap_k per cell in block k (uniform within block).
-        # Total Level gradient ∈ Range(P_L) by construction.
+        # ── LEVEL: T_w × Σ_k AsinhIntegral(gap_k) ────────────────────
+        # V38: Replaces MSE with AsinhIntegral to bound gradient explosions.
+        # Gradient = asinh(gap_k), bounded logarithmically.
         if multivariate:
-            level_cell = T_w * (gap_blocks ** 2).sum(dim=1)  # (B, C)
+            level_cell = T_w * self._asinh_integral(gap_blocks).sum(dim=1)  # (B, C)
         else:
-            level_cell = T_w * (gap_blocks ** 2).sum(dim=1)  # (B,)
+            level_cell = T_w * self._asinh_integral(gap_blocks).sum(dim=1)  # (B,)
 
         w_level = gate.amax(dim=1)  # per-series event mass
 
@@ -180,7 +180,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Diagnostic telemetry ──────────────────────────────────────
         with torch.no_grad():
-            # Global gap (for comparison with V13)
             gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
 
             if multivariate:
@@ -204,28 +203,31 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
                 gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
 
-                # Verify orthogonality: Shape DC leak should be ~0
-                # (block-demeaned errors should have zero block means)
                 shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # V37: block gap diagnostics
                 if K > 1:
-                    gap_blocks_abs = gap_blocks.abs()  # (B, K, C)
+                    gap_blocks_abs = gap_blocks.abs()
                     gap_w_mean_l = gap_blocks_abs.mean(dim=(0, 1)).tolist()
                     gap_w_max_l = gap_blocks_abs.amax(dim=(0, 1)).tolist()
-                    # Localization factor: max block gap / global gap
                     loc_factor_l = (gap_blocks_abs.amax(dim=1).mean(dim=0)
                                     / _ga.mean(dim=0).clamp_min(1e-8)).tolist()
-                    # Orthogonality check: block means of e_shape should be ~0
-                    if multivariate:
-                        _e_shape_blocks = e_shape.reshape(B, K, T_w, C)
-                        _e_shape_block_means = _e_shape_blocks.mean(dim=2)  # (B, K, C)
-                        _orth_error = _e_shape_block_means.abs().mean(dim=(0, 1))
+                    
+                    # V38: AsinhIntegral gradient diagnostics
+                    _asinh_grad = torch.asinh(gap_blocks).abs()
+                    asinh_grad_mean_l = _asinh_grad.mean(dim=(0, 1)).tolist()
+                    asinh_grad_max_l = _asinh_grad.amax(dim=(0, 1)).tolist()
+                    
+                    _e_shape_blocks = e_shape.reshape(B, K, T_w, C)
+                    _e_shape_block_means = _e_shape_blocks.mean(dim=2)
+                    _orth_error = _e_shape_block_means.abs().mean(dim=(0, 1))
                     orth_error_l = _orth_error.tolist()
                 else:
                     gap_w_mean_l = gap_mean_l
                     gap_w_max_l = gap_max_l
                     loc_factor_l = [1.0] * len(gap_mean_l)
+                    _asinh_grad = torch.asinh(gap_blocks).abs()
+                    asinh_grad_mean_l = _asinh_grad.mean(dim=(0, 1)).tolist()
+                    asinh_grad_max_l = _asinh_grad.amax(dim=(0, 1)).tolist()
                     orth_error_l = [0.0] * len(gap_mean_l)
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
@@ -254,6 +256,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
                     gap_w_max_l = [gap_blocks_abs.max().item()]
                     loc_factor_l = [(gap_blocks_abs.amax(dim=1).mean().item()
                                      / max(1e-8, _ga.mean().item())).item()]
+                    _asinh_grad = torch.asinh(gap_blocks).abs()
+                    asinh_grad_mean_l = [_asinh_grad.mean().item()]
+                    asinh_grad_max_l = [_asinh_grad.max().item()]
                     _e_shape_blocks = e_shape.reshape(B, K, T_w)
                     _e_shape_block_means = _e_shape_blocks.mean(dim=2)
                     _orth_error = _e_shape_block_means.abs().mean()
@@ -262,12 +267,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
                     gap_w_mean_l = gap_mean_l
                     gap_w_max_l = gap_max_l
                     loc_factor_l = [1.0]
+                    _asinh_grad = torch.asinh(gap_blocks).abs()
+                    asinh_grad_mean_l = [_asinh_grad.mean().item()]
+                    asinh_grad_max_l = [_asinh_grad.max().item()]
                     orth_error_l = [0.0]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV37: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV38: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -294,22 +302,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V37: block diagnostics ──
-            "gap_w_mean":     gap_w_mean_l,     # mean |gap| across all blocks
-            "gap_w_max":      gap_w_max_l,      # max |gap| in any block
-            "loc_factor":     loc_factor_l,     # max_block_gap / global_gap (should be >1)
-            # ── V37: orthogonality verification ──
-            # Block means of e_shape (should be ≈0 if orthogonality holds).
-            # This is the mathematical proof that Shape and Level don't conflict.
-            # If orth_error > 0.01, there's a bug in the block-demeaning.
-            "orth_error":     orth_error_l,     # should be ≈0 (exact orthogonality)
+            # ── V38: block diagnostics ──
+            "gap_w_mean":     gap_w_mean_l,
+            "gap_w_max":      gap_w_max_l,
+            "loc_factor":     loc_factor_l,
+            # ── V38: AsinhIntegral gradient diagnostics ──
+            # Bounded logarithmically. Should not explode.
+            "asinh_grad_mean": asinh_grad_mean_l,
+            "asinh_grad_max":  asinh_grad_max_l,
+            # ── V38: orthogonality verification ──
+            "orth_error":     orth_error_l,
         }
 
         logger.debug(
-            "SpotlightLossV37 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV38 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV37(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV38(non_zero_threshold={self.tau})"

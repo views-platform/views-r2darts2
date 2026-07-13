@@ -6,12 +6,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V55: Per-Series AC Scale + AsinhIntegral Level + Ungated Level.
+    """V56: V55 Foundation + DRO Error Magnitude Fix + AsinhPlus Level Fix.
     
-    Fixes V54's underprediction by:
-    1. Using per-series std for ac_scale (prevents global outliers from crushing moderate events).
-    2. Using AsinhIntegral for Level loss (prevents gradient explosions on large gaps).
-    3. Ungated Level loss (prevents peaceful countries from drifting).
+    Fixes V55's flat forecasts by:
+    1. Correcting DRO to weight by |error| instead of |value| (abs_max -> raw_abs).
+    2. Upgrading Level loss from AsinhIntegral to AsinhPlus for stronger calibration.
     """
     _EPS = 1e-6
     _K = 4  # 4 blocks of 9 months
@@ -21,7 +20,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV55 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV56 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -29,8 +28,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return a + F.softplus(-2.0 * a) - math.log(2.0)
 
     @staticmethod
-    def _asinh_integral(x: torch.Tensor) -> torch.Tensor:
-        return x * torch.asinh(x) - torch.sqrt(1.0 + x**2) + 1.0
+    def _asinh_plus(x: torch.Tensor) -> torch.Tensor:
+        """Loss: x * asinh(x)
+        Gradient: asinh(x) + x / sqrt(1 + x^2)
+        Matches MSE curvature (2.0) at origin, bends to log(x) for large x.
+        """
+        return x * torch.asinh(x)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
@@ -61,9 +64,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # DRO weighting
         event_mask = (abs_max > self.tau).float()
+        raw_abs = e.abs().detach()  # FIX: Use |error|, not |value|
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        dro_mu = (abs_max * event_mask).sum(dim=1, keepdim=True) / n_ev
-        w_dro = torch.sqrt(abs_max / dro_mu.clamp_min(1e-6))
+        dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
+        w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
         w_dro_mean = (w_dro * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = w_dro / w_dro_mean.clamp_min(1e-8)
         w_dro = 1.0 + event_mask * (w_dro - 1.0)
@@ -75,11 +79,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhIntegral on global gap ───────────────────────
+        # ── LEVEL: AsinhPlus on global gap ───────────────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         
-        # FIX 2: Use AsinhIntegral instead of gap**2
-        level_cell = T * self._asinh_integral(gap)
+        # FIX 2: Use AsinhPlus instead of AsinhIntegral
+        level_cell = T * self._asinh_plus(gap)
         
         # FIX 3: Ungated Level loss
         w_level = torch.ones_like(gap)
@@ -153,7 +157,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV55: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV56: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -181,10 +185,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV55 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV56 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV55(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV56(non_zero_threshold={self.tau})"

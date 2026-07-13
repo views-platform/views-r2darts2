@@ -7,30 +7,28 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V40: Global Shape + Block Level + AsinhIntegral.
+    """V41: Global Shape + Block Level + arctan loss.
 
-    Combines V36's localized block-level calibration with V38's bounded
-    AsinhIntegral to prevent gradient explosions on volatile block gaps.
+    Fixes V40's underprediction by replacing AsinhIntegral (too weak)
+    with x·arctan(x) — strong for small gaps, perfectly bounded.
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (AC pattern).** V13's global log_cosh, unchanged. This
-      prevents the block-smearing exploit seen in V37/V38.
+    * **Shape (AC pattern).** V13's global log_cosh, unchanged.
 
-    * **Level (DC magnitude, windowed).** Splits the T-step horizon into
-      K non-overlapping windows. For each window w:
-        gap_w = mean(y_pred[w]) - mean(y_true[w])
-        level_w = T_w × AsinhIntegral(gap_w)
-      Total Level = Σ_w level_w.
+    * **Level (DC magnitude, windowed).** ``T_w × Σ_k arctan_loss(gap_k)``
+      where ``arctan_loss(x) = x · arctan(x)``.
 
-      V36 used MSE (gap_w²) which exploded on volatile block gaps.
-      V40 uses AsinhIntegral (gradient: asinh(gap_w)) which grows
-      logarithmically — strong enough to calibrate, bounded enough to
-      prevent explosions.
+      V40 used AsinhIntegral → gradient asinh(0.3)=0.295 → too weak →
+      underprediction (stuck at 0.37×) and flat forecasts.
 
-      Gradient comparison (gap_w=3.0, T_w=9):
-        V36 (MSE): 2×3.0 = 6.0 per cell (explosive on volatile blocks)
-        V40 (Asinh): asinh(3.0) = 1.82 per cell (bounded, stable)
+      V41 uses x·arctan(x) → gradient arctan(x) + x/(1+x²):
+        gap=0.3: 0.566 (≈MSE's 0.6, strong enough to calibrate)
+        gap=3.0: 1.549 (bounded, no explosion)
+        gap=15:  1.570 (perfectly bounded at π/2)
+
+      This is the Goldilocks loss: strong where MSE is needed (small
+      gaps), bounded where MSE explodes (large gaps). No hyperparameters.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -49,7 +47,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV40 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV41 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -57,12 +55,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return a + F.softplus(-2.0 * a) - math.log(2.0)
 
     @staticmethod
-    def _asinh_integral(x: torch.Tensor) -> torch.Tensor:
-        """Integral of asinh(x): x * asinh(x) - sqrt(1 + x^2) + 1
-        Gradient is asinh(x), which grows logarithmically.
-        Convex, smooth, unbounded but stable.
+    def _arctan_loss(x: torch.Tensor) -> torch.Tensor:
+        """x * arctan(x).
+        Gradient: arctan(x) + x/(1+x²).
+        - For small x: ≈ x² (MSE-like, strong push)
+        - For large x: ≈ (π/2)·x (linear, bounded gradient)
+        No hyperparameters, smooth, convex.
         """
-        return x * torch.asinh(x) - torch.sqrt(1.0 + x**2) + 1.0
+        return x * torch.atan(x)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
@@ -75,7 +75,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T_w = T // K
 
         if T % K != 0:
-            # Fallback to V13 if T doesn't divide evenly
             K = 1
             T_w = T
 
@@ -115,34 +114,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: windowed AsinhIntegral on per-window mean gaps ────
-        # V40: Replaces V36's MSE with AsinhIntegral to bound gradient explosions.
-        # Gradient: asinh(gap_w), bounded logarithmically.
+        # ── LEVEL: windowed arctan loss on per-window mean gaps ──────
+        # V41: Replaces V40's AsinhIntegral with x·arctan(x).
+        # Gradient: arctan(gap_w) + gap_w/(1+gap_w²)
+        #   - Strong for small gaps (0.566 at gap=0.3, ≈MSE's 0.6)
+        #   - Bounded for large gaps (1.57 at gap=15, vs MSE's 30)
         if K > 1:
             if multivariate:
                 C = y_pred.size(-1)
-                # Reshape: (B, T, C) → (B, K, T_w, C)
                 y_pred_win = y_pred.reshape(B, K, T_w, C)
                 y_true_win = y_true.reshape(B, K, T_w, C)
-                # Per-window means: (B, K, C)
                 gap_w = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
-                # Per-window level: T_w × AsinhIntegral(gap_w), sum across windows
-                level_cell = T_w * self._asinh_integral(gap_w).sum(dim=1)  # (B, C)
+                level_cell = T_w * self._arctan_loss(gap_w).sum(dim=1)  # (B, C)
             else:
-                # Reshape: (B, T) → (B, K, T_w)
                 y_pred_win = y_pred.reshape(B, K, T_w)
                 y_true_win = y_true.reshape(B, K, T_w)
-                # Per-window means: (B, K)
                 gap_w = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
-                # Per-window level: T_w × AsinhIntegral(gap_w), sum across windows
-                level_cell = T_w * self._asinh_integral(gap_w).sum(dim=1)  # (B,)
+                level_cell = T_w * self._arctan_loss(gap_w).sum(dim=1)  # (B,)
         else:
-            # Fallback to V13 with AsinhIntegral
             gap_w = None
             gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-            level_cell = T * self._asinh_integral(gap)
+            level_cell = T * self._arctan_loss(gap)
 
-        w_level = gate.amax(dim=1)  # per-series event mass (same as V13)
+        w_level = gate.amax(dim=1)
 
         if multivariate:
             loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -165,7 +159,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Diagnostic telemetry ──────────────────────────────────────
         with torch.no_grad():
-            # Global gap (for comparison with V13)
             gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
 
             if multivariate:
@@ -191,28 +184,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # V40: windowed gap diagnostics
                 if K > 1 and gap_w is not None:
-                    gap_w_abs = gap_w.abs()  # (B, K, C)
+                    gap_w_abs = gap_w.abs()
                     gap_w_mean_l = gap_w_abs.mean(dim=(0, 1)).tolist()
                     gap_w_max_l = gap_w_abs.amax(dim=(0, 1)).tolist()
-                    gap_w_std = gap_w_abs.std(dim=1)  # (B, C)
+                    gap_w_std = gap_w_abs.std(dim=1)
                     gap_w_cv = (gap_w_std.mean(dim=0) / gap_w_abs.mean(dim=(0, 1)).clamp_min(1e-8)).tolist()
                     loc_factor_l = (gap_w_abs.amax(dim=1).mean(dim=0)
                                     / _ga.mean(dim=0).clamp_min(1e-8)).tolist()
-                    
-                    # V40: AsinhIntegral gradient diagnostics
-                    _asinh_grad = torch.asinh(gap_w).abs()
-                    asinh_grad_mean_l = _asinh_grad.mean(dim=(0, 1)).tolist()
-                    asinh_grad_max_l = _asinh_grad.amax(dim=(0, 1)).tolist()
+                    # V41: arctan gradient diagnostics
+                    _arctan_grad = (torch.atan(gap_w) + gap_w / (1.0 + gap_w ** 2)).abs()
+                    arctan_grad_mean_l = _arctan_grad.mean(dim=(0, 1)).tolist()
+                    arctan_grad_max_l = _arctan_grad.amax(dim=(0, 1)).tolist()
                 else:
                     gap_w_mean_l = gap_mean_l
                     gap_w_max_l = gap_max_l
                     gap_w_cv = [0.0] * len(gap_mean_l)
                     loc_factor_l = [1.0] * len(gap_mean_l)
-                    _asinh_grad = torch.asinh(gap_global).abs()
-                    asinh_grad_mean_l = _asinh_grad.mean(dim=0).tolist()
-                    asinh_grad_max_l = _asinh_grad.amax(dim=0).tolist()
+                    _arctan_grad = (torch.atan(gap_global) + gap_global / (1.0 + gap_global ** 2)).abs()
+                    arctan_grad_mean_l = _arctan_grad.mean(dim=0).tolist()
+                    arctan_grad_max_l = _arctan_grad.amax(dim=0).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -242,22 +233,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
                     gap_w_cv = [(gap_w_std.mean() / max(1e-8, gap_w_abs.mean().item())).item()]
                     loc_factor_l = [(gap_w_abs.amax(dim=1).mean().item()
                                      / max(1e-8, _ga.mean().item())).item()]
-                    _asinh_grad = torch.asinh(gap_w).abs()
-                    asinh_grad_mean_l = [_asinh_grad.mean().item()]
-                    asinh_grad_max_l = [_asinh_grad.max().item()]
+                    _arctan_grad = (torch.atan(gap_w) + gap_w / (1.0 + gap_w ** 2)).abs()
+                    arctan_grad_mean_l = [_arctan_grad.mean().item()]
+                    arctan_grad_max_l = [_arctan_grad.max().item()]
                 else:
                     gap_w_mean_l = gap_mean_l
                     gap_w_max_l = gap_max_l
                     gap_w_cv = [0.0]
                     loc_factor_l = [1.0]
-                    _asinh_grad = torch.asinh(gap_global).abs()
-                    asinh_grad_mean_l = [_asinh_grad.mean().item()]
-                    asinh_grad_max_l = [_asinh_grad.max().item()]
+                    _arctan_grad = (torch.atan(gap_global) + gap_global / (1.0 + gap_global ** 2)).abs()
+                    arctan_grad_mean_l = [_arctan_grad.mean().item()]
+                    arctan_grad_max_l = [_arctan_grad.max().item()]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV40: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV41: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -270,13 +261,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "cal_score": [1.0] * n,
             "gates": [1.0] * n,
             "contribution": comp,
-            # ── DRO diagnostics ──
             "dro_w_mean":     dro_wmean_l,
             "dro_w_std":      dro_wstd_l,
             "dro_w_max":      dro_wmax_l,
             "dro_frac_up":    dro_frac_up_l,
             "event_frac":     event_frac_l,
-            # ── Gap diagnostics ──
             "level_gap_mean": gap_mean_l,
             "level_gap_max":  gap_max_l,
             "level_gap_ev_mean": gap_ev_mean_l,
@@ -284,21 +273,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V40: windowed gap diagnostics ──
             "gap_w_mean":     gap_w_mean_l,
             "gap_w_max":      gap_w_max_l,
             "gap_w_cv":       gap_w_cv,
             "loc_factor":     loc_factor_l,
-            # ── V40: AsinhIntegral gradient diagnostics ──
-            "asinh_grad_mean": asinh_grad_mean_l,
-            "asinh_grad_max":  asinh_grad_max_l,
+            "arctan_grad_mean": arctan_grad_mean_l,
+            "arctan_grad_max":  arctan_grad_max_l,
         }
 
         logger.debug(
-            "SpotlightLossV40 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV41 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV40(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV41(non_zero_threshold={self.tau})"

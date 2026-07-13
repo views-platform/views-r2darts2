@@ -134,7 +134,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Split into K windows, compute per-window gap, sum T_w × gap_w².
         #
         # Gradient per cell in window w: 2 × gap_w (uniform within window)
-        → DC within window, blocky AC across windows.
+        # → DC within window, blocky AC across windows.
         # Compare V13: 2 × gap (uniform across ALL cells) → pure DC.
         #
         # If K=1 (fallback): identical to V13.

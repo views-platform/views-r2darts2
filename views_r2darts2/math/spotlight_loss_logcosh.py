@@ -5,7 +5,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class SpotlightLossV54(torch.nn.Module):
+class SpotlightLossLogcosh(torch.nn.Module):
     """V54: Direct DRO + Global Level + Ungated.
     
     Fixes V53's ineffective DRO for single-spike series (Ukraine/Sudan).

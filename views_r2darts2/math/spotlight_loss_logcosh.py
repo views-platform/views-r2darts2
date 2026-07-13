@@ -52,6 +52,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         a = x.abs()
         return a + F.softplus(-2.0 * a) - math.log(2.0)
 
+    @staticmethod
+    def _asinh_plus(x: torch.Tensor) -> torch.Tensor:
+        """x * asinh(x). Gradient: asinh(x) + x/sqrt(1+x^2)."""
+        return x * torch.asinh(x)
+
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
@@ -107,7 +112,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # This ensures peaceful countries get the same Level push as
         # event countries. The gate stays only for Shape.
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
-        level_cell = T * gap ** 2
+        level_cell = T * self._asinh_plus(gap)
         w_level = torch.ones_like(gap)  # V42: constant 1.0, not gate.amax
 
         if multivariate:

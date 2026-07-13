@@ -6,12 +6,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V57: V56 + gated Level (gate.amax instead of ones_like).
+    """V58: V57 + Remove ac_scale entirely.
     
-    Fixes V56's stuck calibration (0.36× for 20 epochs) by restoring
-    V13's gate.amax Hájek weight. The ungated w_level=1.0 diluted the
-    Level gradient 10× (denominator 128 vs 13). Shape's per-series
-    ac_scale already anchors peaceful countries — Level doesn't need to.
+    Per-series ac_scale gave peaceful countries 5.6× stronger Shape
+    gradient than spike countries (1/0.88 vs 1/5.0). This inverted
+    priorities — the model was incentivized to ignore spikes.
+    
+    Removing ac_scale lets tanh(e) naturally prioritize large errors:
+    - Spike (e=5): tanh(5)=1.0 (full push)
+    - Peace (e=0.3): tanh(0.3)=0.29 (gentle push)
+    
+    Division of labor:
+    - Shape (no ac_scale): aggressively learns spikes
+    - Level (AsinhPlus, gate.amax): calibrates mean for active series
     """
     _EPS = 1e-6
     _K = 4  # 4 blocks of 9 months
@@ -21,7 +28,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV57 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV58 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -54,14 +61,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── SHAPE: log_cosh on demeaned errors ───────────────────────
+        # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # Per-series std for ac_scale
-        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        ac_scale = true_ac.std(dim=1, keepdim=True).clamp_min(self.tau)
-        shape_cell = self._log_cosh(e_shape / ac_scale)
+        # V58: Remove ac_scale entirely.
+        # tanh(e) naturally prioritizes large errors (saturates at 1.0).
+        # No normalization needed — the function is self-normalizing.
+        shape_cell = self._log_cosh(e_shape)
 
         # DRO weighting (V56 fix: use error magnitude, not value magnitude)
         event_mask = (abs_max > self.tau).float()
@@ -80,13 +87,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhPlus on global gap, GATED (V57 fix) ─────────
+        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = T * self._asinh_plus(gap)
-        
-        # V57 FIX: gate.amax instead of ones_like
-        # Shape's per-series ac_scale already anchors peaceful countries.
-        # Level's job is to calibrate event series. gate.amax focuses it.
         w_level = gate.amax(dim=1)
 
         if multivariate:
@@ -158,7 +161,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV57: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV58: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -186,10 +189,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV57 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV58 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV57(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV58(non_zero_threshold={self.tau})"

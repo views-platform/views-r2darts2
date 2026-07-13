@@ -7,61 +7,45 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """2-term loss for zero-inflated conflict fatality forecasting.
+    """2-term loss with exact orthogonal projections (V37).
 
-    Shape = log_cosh with raw-error DRO (V13 — unchanged, global).
-    Level = windowed MSE on per-window mean gaps (V36 — localizes spikes).
+    Shape = log_cosh on block-demeaned errors (AC within blocks).
+    Level = MSE on block-mean gaps (DC within blocks).
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (AC pattern).** Demeaned log_cosh residual, gated,
-      DRO-weighted on ``|raw_error|``, Hájek-normalised. EXACTLY V13.
-      Shape operates on the FULL series (global demeaning) to learn
-      long-term temporal patterns. Unchanged.
+    Uses the orthogonal projection framework:
+      P_L = block-mean projection (rank K)
+      P_S = I - P_L (orthogonal complement)
+      Level = g(P_L · e)  →  ∇Level ∈ Range(P_L)
+      Shape = h(P_S · e)  →  ∇Shape ∈ Range(P_S)
+      Range(P_L) ⊥ Range(P_S)  →  EXACT orthogonality, any g, h.
 
-    * **Level (DC magnitude, windowed).** Splits the T-step horizon into
-      K non-overlapping windows. For each window w:
-        gap_w = mean(y_pred[w]) - mean(y_true[w])
-        level_w = T_w × gap_w²
-      Total Level = Σ_w level_w.
+    * **Shape (AC within blocks).** Block-demeaned log_cosh residual,
+      gated, DRO-weighted, Hájek-normalised.
 
-      V13 used a single global gap → uniform gradient on all T cells →
-      couldn't localize corrections. A spike in month 5 was invisible
-      if months 10-36 compensated.
+      V13 used global demeaning (rank-1 removal). V36 used block Level
+      but kept global Shape demeaning → Shape leaked block-mean AC →
+      tug-of-war persisted.
 
-      V36 uses K=4 windows (9 months each for T=36). Each window's gap
-      is independent. A spike in window 2 inflates gap_2 → pushes ONLY
-      window 2's cells down. Localization without per-cell AC.
+      V37 uses block demeaning for BOTH terms. Shape removes the full
+      rank-K block-mean subspace → exact orthogonality with Level.
 
-      Orthogonality analysis:
-        - Within each window: Level is DC (uniform gradient), Shape is
-          AC (demeaned). Perfectly orthogonal within window.
-        - Across windows: Level has low-frequency AC at K-1=3 boundaries.
-          This is NOT the per-cell AC (35 boundaries) that caused V25's
-          tug-of-war. The AC is block-level, much coarser than Shape's
-          cell-level AC. Minimal interaction.
+    * **Level (DC within blocks).** ``T_w × Σ_k gap_k²`` where gap_k is
+      the per-block mean gap. K=4 blocks of 9 months each.
 
-      Gradient comparison (gap=0.3, T=36, K=4, T_w=9):
-        V13: 2×0.3 = 0.60 per cell (all 36 cells, uniform)
-        V36: 2×gap_w per cell in window w (9 cells per window)
-          If gap_w ≈ gap: 0.60 per cell (same as V13)
-          If gap_2 = 0.6 (spike): 1.20 per cell in window 2 (2× stronger)
-          If gap_1 = 0.0 (correct): 0.00 per cell in window 1 (no push)
-        → Localized push where needed, no push where correct.
-
-      Why K=4 (not adaptive):
-        K=4 for T=36 gives 9-month windows. This is a structural choice
-        (like T=36 itself), not a tunable hyperparameter. 9 months is
-        long enough to capture conflict episodes, short enough to
-        localize spikes. K must divide T evenly.
+      V13 used a single global gap (K=1) → couldn't localize spikes.
+      V37 uses K=4 → a spike in block 2 inflates gap_2 → pushes only
+      block 2's cells down. Catches obfuscation V13 misses.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
     ``non_zero_threshold`` — the only tunable, ≈ 0.88 (asinh(1)).
+    ``K`` — structural (like T=36), not tunable. K=4 for 9-month blocks.
     """
 
     _EPS = 1e-6
-    _K = 4  # Number of windows (structural, like T=36)
+    _K = 4  # Number of blocks (structural, like T=36)
 
     def __init__(self, non_zero_threshold: float = 0.88):
         if non_zero_threshold <= 0.0:
@@ -71,8 +55,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        # Verify T is divisible by K (checked at runtime in forward)
-        logger.info("SpotlightLossV36 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV37 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -90,7 +73,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         T_w = T // K
 
         if T % K != 0:
-            # Fallback to V13 if T doesn't divide evenly
             K = 1
             T_w = T
 
@@ -104,10 +86,46 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ───
-        # EXACTLY V13 — global, unchanged.
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
+        # ── Block projection: P_L · e = block-mean broadcast ─────────
+        # This is the key operation. P_L e replaces each cell with its
+        # block's mean. P_S e = e - P_L e = block-demeaned residual.
+        if K > 1:
+            if multivariate:
+                C = y_pred.size(-1)
+                # Compute block means: (B, T, C) → (B, K, T_w, C) → (B, K, C)
+                e_blocks = e.reshape(B, K, T_w, C)
+                block_means = e_blocks.mean(dim=2)  # (B, K, C)
+                # Broadcast back: (B, K, C) → (B, K, T_w, C) → (B, T, C)
+                e_dc = block_means.unsqueeze(2).expand(B, K, T_w, C).reshape(B, T, C)
+                # Also for y_true (for computing block gaps)
+                y_true_blocks = y_true.reshape(B, K, T_w, C)
+                y_true_block_means = y_true_blocks.mean(dim=2)  # (B, K, C)
+                y_pred_blocks = y_pred.reshape(B, K, T_w, C)
+                y_pred_block_means = y_pred_blocks.mean(dim=2)  # (B, K, C)
+                gap_blocks = y_pred_block_means - y_true_block_means  # (B, K, C)
+            else:
+                e_blocks = e.reshape(B, K, T_w)
+                block_means = e_blocks.mean(dim=2)  # (B, K)
+                e_dc = block_means.unsqueeze(2).expand(B, K, T_w).reshape(B, T)
+                y_true_blocks = y_true.reshape(B, K, T_w)
+                y_true_block_means = y_true_blocks.mean(dim=2)
+                y_pred_blocks = y_pred.reshape(B, K, T_w)
+                y_pred_block_means = y_pred_blocks.mean(dim=2)
+                gap_blocks = y_pred_block_means - y_true_block_means  # (B, K)
+        else:
+            # Fallback to V13 (K=1)
+            if multivariate:
+                e_dc = e.mean(dim=1, keepdim=True).expand_as(e)
+                gap_blocks = (y_pred.mean(dim=1) - y_true.mean(dim=1)).unsqueeze(1)  # (B, 1, C)
+            else:
+                e_dc = e.mean(dim=1, keepdim=True).expand_as(e)
+                gap_blocks = (y_pred.mean(dim=1) - y_true.mean(dim=1)).unsqueeze(1)  # (B, 1)
+
+        # ── SHAPE: log_cosh on BLOCK-DEMEANED errors (P_S · e) ───────
+        # This is the critical fix over V36. Shape removes the FULL
+        # block-mean subspace (rank K), not just the global mean (rank 1).
+        # This ensures ∇Shape ∈ Range(P_S) ⊥ Range(P_L) ∋ ∇Level.
+        e_shape = e - e_dc  # block-demeaned residual
 
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
         ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
@@ -130,39 +148,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: windowed MSE on per-window mean gaps (V36) ────────
-        # Split into K windows, compute per-window gap, sum T_w × gap_w².
-        #
-        # Gradient per cell in window w: 2 × gap_w (uniform within window)
-        # → DC within window, blocky AC across windows.
-        # Compare V13: 2 × gap (uniform across ALL cells) → pure DC.
-        #
-        # If K=1 (fallback): identical to V13.
-        if K > 1:
-            if multivariate:
-                C = y_pred.size(-1)
-                # Reshape: (B, T, C) → (B, K, T_w, C)
-                y_pred_win = y_pred.reshape(B, K, T_w, C)
-                y_true_win = y_true.reshape(B, K, T_w, C)
-                # Per-window means: (B, K, C)
-                gap_w = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
-                # Per-window level: T_w × gap_w², sum across windows
-                level_cell = T_w * (gap_w ** 2).sum(dim=1)  # (B, C)
-            else:
-                # Reshape: (B, T) → (B, K, T_w)
-                y_pred_win = y_pred.reshape(B, K, T_w)
-                y_true_win = y_true.reshape(B, K, T_w)
-                # Per-window means: (B, K)
-                gap_w = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
-                # Per-window level: T_w × gap_w², sum across windows
-                level_cell = T_w * (gap_w ** 2).sum(dim=1)  # (B,)
+        # ── LEVEL: T_w × Σ_k gap_k² (DC within blocks) ───────────────
+        # Per-block MSE, summed across K blocks.
+        # Gradient: 2 × gap_k per cell in block k (uniform within block).
+        # Total Level gradient ∈ Range(P_L) by construction.
+        if multivariate:
+            level_cell = T_w * (gap_blocks ** 2).sum(dim=1)  # (B, C)
         else:
-            # Fallback to V13
-            gap_w = None
-            gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-            level_cell = T * gap ** 2
+            level_cell = T_w * (gap_blocks ** 2).sum(dim=1)  # (B,)
 
-        w_level = gate.amax(dim=1)  # per-series event mass (same as V13)
+        w_level = gate.amax(dim=1)  # per-series event mass
 
         if multivariate:
             loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -209,27 +204,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
                 gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
 
-                shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
+                # Verify orthogonality: Shape DC leak should be ~0
+                # (block-demeaned errors should have zero block means)
+                shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # V36: windowed gap diagnostics
-                if K > 1 and gap_w is not None:
-                    # Per-window gap stats
-                    gap_w_abs = gap_w.abs()  # (B, K, C)
-                    gap_w_mean_l = gap_w_abs.mean(dim=(0, 1)).tolist()  # mean across batch and windows
-                    gap_w_max_l = gap_w_abs.amax(dim=(0, 1)).tolist()
-                    # Gap variation across windows (AC indicator)
-                    # If std across windows is high, windows have different gaps → localized
-                    gap_w_std = gap_w_abs.std(dim=1)  # (B, C) — std across windows per series
-                    gap_w_cv = (gap_w_std.mean(dim=0) / gap_w_abs.mean(dim=(0, 1)).clamp_min(1e-8)).tolist()
-                    # Max window gap / global gap (localization factor)
-                    # If >1, some window has worse gap than global → V36 catches what V13 missed
-                    loc_factor_l = (gap_w_abs.amax(dim=1).mean(dim=0)
+                # V37: block gap diagnostics
+                if K > 1:
+                    gap_blocks_abs = gap_blocks.abs()  # (B, K, C)
+                    gap_w_mean_l = gap_blocks_abs.mean(dim=(0, 1)).tolist()
+                    gap_w_max_l = gap_blocks_abs.amax(dim=(0, 1)).tolist()
+                    # Localization factor: max block gap / global gap
+                    loc_factor_l = (gap_blocks_abs.amax(dim=1).mean(dim=0)
                                     / _ga.mean(dim=0).clamp_min(1e-8)).tolist()
+                    # Orthogonality check: block means of e_shape should be ~0
+                    if multivariate:
+                        _e_shape_blocks = e_shape.reshape(B, K, T_w, C)
+                        _e_shape_block_means = _e_shape_blocks.mean(dim=2)  # (B, K, C)
+                        _orth_error = _e_shape_block_means.abs().mean(dim=(0, 1))
+                    orth_error_l = _orth_error.tolist()
                 else:
                     gap_w_mean_l = gap_mean_l
                     gap_w_max_l = gap_max_l
-                    gap_w_cv = [0.0] * len(gap_mean_l)
                     loc_factor_l = [1.0] * len(gap_mean_l)
+                    orth_error_l = [0.0] * len(gap_mean_l)
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -251,24 +248,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
-                if K > 1 and gap_w is not None:
-                    gap_w_abs = gap_w.abs()
-                    gap_w_mean_l = [gap_w_abs.mean().item()]
-                    gap_w_max_l = [gap_w_abs.max().item()]
-                    gap_w_std = gap_w_abs.std(dim=1)
-                    gap_w_cv = [(gap_w_std.mean() / max(1e-8, gap_w_abs.mean().item())).item()]
-                    loc_factor_l = [(gap_w_abs.amax(dim=1).mean().item()
+                if K > 1:
+                    gap_blocks_abs = gap_blocks.abs()
+                    gap_w_mean_l = [gap_blocks_abs.mean().item()]
+                    gap_w_max_l = [gap_blocks_abs.max().item()]
+                    loc_factor_l = [(gap_blocks_abs.amax(dim=1).mean().item()
                                      / max(1e-8, _ga.mean().item())).item()]
+                    _e_shape_blocks = e_shape.reshape(B, K, T_w)
+                    _e_shape_block_means = _e_shape_blocks.mean(dim=2)
+                    _orth_error = _e_shape_block_means.abs().mean()
+                    orth_error_l = [_orth_error.item()]
                 else:
                     gap_w_mean_l = gap_mean_l
                     gap_w_max_l = gap_max_l
-                    gap_w_cv = [0.0]
                     loc_factor_l = [1.0]
+                    orth_error_l = [0.0]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV36: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV37: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -287,7 +286,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "dro_w_max":      dro_wmax_l,
             "dro_frac_up":    dro_frac_up_l,
             "event_frac":     event_frac_l,
-            # ── Gap diagnostics (global, for comparison with V13) ──
+            # ── Gap diagnostics ──
             "level_gap_mean": gap_mean_l,
             "level_gap_max":  gap_max_l,
             "level_gap_ev_mean": gap_ev_mean_l,
@@ -295,28 +294,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V36: windowed gap diagnostics ──
-            # Per-window gap stats. Compare gap_w_mean to gap_mean:
-            # If gap_w_mean > gap_mean, some windows have worse gaps
-            # than the global average → V36 catches what V13 missed.
-            "gap_w_mean":     gap_w_mean_l,     # mean |gap| across all windows
-            "gap_w_max":      gap_w_max_l,      # max |gap| in any window
-            # Coefficient of variation of gaps across windows.
-            # If >0.3, windows have significantly different gaps →
-            # localization is doing work. If ≈0, all windows similar →
-            # V36 ≈ V13 (no benefit from windowing).
-            "gap_w_cv":       gap_w_cv,         # std/mean of per-window gaps
-            # Localization factor: max window gap / global gap.
-            # If >1.5, some window has 1.5× worse gap than global →
-            # V13 was hiding that error. V36 catches it.
-            "loc_factor":     loc_factor_l,     # max_window_gap / global_gap
+            # ── V37: block diagnostics ──
+            "gap_w_mean":     gap_w_mean_l,     # mean |gap| across all blocks
+            "gap_w_max":      gap_w_max_l,      # max |gap| in any block
+            "loc_factor":     loc_factor_l,     # max_block_gap / global_gap (should be >1)
+            # ── V37: orthogonality verification ──
+            # Block means of e_shape (should be ≈0 if orthogonality holds).
+            # This is the mathematical proof that Shape and Level don't conflict.
+            # If orth_error > 0.01, there's a bug in the block-demeaning.
+            "orth_error":     orth_error_l,     # should be ≈0 (exact orthogonality)
         }
 
         logger.debug(
-            "SpotlightLossV36 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV37 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV36(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV37(non_zero_threshold={self.tau})"

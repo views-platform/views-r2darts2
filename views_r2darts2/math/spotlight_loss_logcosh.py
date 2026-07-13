@@ -6,19 +6,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V52: The Golden Trio (Batch ac_scale + Gated Level + Windowed AsinhPlus).
+    """V53: Raw Shape + Global Level + Ungated.
     
-    Fixes V51's AC starvation and flat-line collapse.
+    Fixes V52's hedging and gradient crushing.
     
-    1. Shape: Batch-wide ac_scale (V13). Ensures event countries don't have 
-       their Shape gradient attenuated by their own massive variance.
-    2. Level: Gated by gate.amax (V13). Prevents Level loss from dominating 
-       peaceful countries and starving the Shape loss.
-    3. Level: Windowed AsinhPlus (V51). Prevents MSE hedging (V50) and 
-       gradient explosions (V13).
+    1. Shape: Raw log_cosh(e_shape). No ac_scale! log_cosh already saturates,
+       so it provides a strong, bounded gradient for all errors without crushing
+       moderate spikes.
+    2. Level: Global AsinhPlus(gap). Not windowed! Prevents the model from
+       hedging (spreading predictions across a window).
+    3. Level Gate: Ungated. Ensures the model learns the baseline for peaceful
+       countries.
     """
     _EPS = 1e-6
-    _K = 6  # 6-month blocks
 
     def __init__(self, non_zero_threshold: float = 0.88):
         if non_zero_threshold <= 0.0:
@@ -27,7 +27,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV52 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV53 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -46,12 +46,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         multivariate = y_pred.dim() == 3
         B, T = y_pred.shape[:2]
-        K = self._K
-        T_w = T // K
-
-        if T % K != 0:
-            K = 1
-            T_w = T
 
         self._last_input_grad = None
         if y_pred.requires_grad:
@@ -64,16 +58,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
         event_mask = (abs_max > self.tau).float()
 
-        # ── SHAPE: log_cosh on demeaned errors ───────────────────────
+        # ── SHAPE: Raw log_cosh on demeaned errors ───────────────────
+        # NO ac_scale! log_cosh already saturates, providing a strong,
+        # bounded gradient for all errors without crushing moderate spikes.
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
-        
-        # V52 FIX 1: Revert to BATCH-WIDE ac_scale (V13).
-        # Per-series ac_scale attenuated the Shape gradient for high-variance 
-        # event countries, killing the AC signal.
-        true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        ac_scale = true_ac.std(dim=(0, 1), keepdim=True).clamp_min(self.tau)
-        shape_cell = self._log_cosh(e_shape / ac_scale)
+        shape_cell = self._log_cosh(e_shape)
 
         # DRO on |raw_error|
         raw_abs = e.abs().detach()
@@ -91,31 +81,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: Windowed AsinhPlus ────────────────────────────────
-        if K > 1:
-            if multivariate:
-                C = y_pred.size(-1)
-                y_pred_win = y_pred.reshape(B, K, T_w, C)
-                y_true_win = y_true.reshape(B, K, T_w, C)
-                gap_w = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
-                level_cell = T_w * self._asinh_plus(gap_w).sum(dim=1)
-            else:
-                y_pred_win = y_pred.reshape(B, K, T_w)
-                y_true_win = y_true.reshape(B, K, T_w)
-                gap_w = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
-                level_cell = T_w * self._asinh_plus(gap_w).sum(dim=1)
-        else:
-            gap_w = None
-            gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-            level_cell = T * self._asinh_plus(gap)
+        # ── LEVEL: Global AsinhPlus ──────────────────────────────────
+        # NOT windowed! Prevents the model from hedging.
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
+        level_cell = T * self._asinh_plus(gap)
 
-        # V52 FIX 2: Revert to GATED Level loss (V13).
-        # Ungated Level loss dominated peaceful countries and starved AC.
-        w_level = gate.amax(dim=1)
+        # UNGATED! Ensures the model learns the baseline for peaceful countries.
         if multivariate:
-            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = level_cell.mean(dim=0)
         else:
-            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = level_cell.mean()
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
@@ -149,38 +124,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga    = gap_global.abs()
                 gap_mean_l    = _ga.mean(dim=0).tolist()
                 gap_max_l     = _ga.amax(dim=0).tolist()
-                _ev_mask_s = (w_level > 0.5).float()
+                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
                 gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # Batch-wide ac_scale telemetry
-                _ac_scale_val = ac_scale.squeeze()
-                ac_scale_mean_l = _ac_scale_val.tolist() if _ac_scale_val.dim() > 0 else [float(_ac_scale_val)]
-                ac_scale_max_l = ac_scale_mean_l
-                ac_scale_min_l = ac_scale_mean_l
-
-                if K > 1 and gap_w is not None:
-                    gap_w_abs = gap_w.abs()
-                    gap_w_mean_l = gap_w_abs.mean(dim=(0, 1)).tolist()
-                    gap_w_max_l = gap_w_abs.amax(dim=(0, 1)).tolist()
-                    gap_w_std = gap_w_abs.std(dim=1)
-                    gap_w_cv = (gap_w_std.mean(dim=0) / gap_w_abs.mean(dim=(0, 1)).clamp_min(1e-8)).tolist()
-                    loc_factor_l = (gap_w_abs.amax(dim=1).mean(dim=0)
-                                    / _ga.mean(dim=0).clamp_min(1e-8)).tolist()
-                    _asinh_grad = (torch.asinh(gap_w) + gap_w / torch.sqrt(1.0 + gap_w**2)).abs()
-                    asinh_grad_mean_l = _asinh_grad.mean(dim=(0, 1)).tolist()
-                    asinh_grad_max_l = _asinh_grad.amax(dim=(0, 1)).tolist()
-                else:
-                    gap_w_mean_l = gap_mean_l
-                    gap_w_max_l = gap_max_l
-                    gap_w_cv = [0.0] * len(gap_mean_l)
-                    loc_factor_l = [1.0] * len(gap_mean_l)
-                    _asinh_grad = (torch.asinh(gap_global) + gap_global / torch.sqrt(1.0 + gap_global**2)).abs()
-                    asinh_grad_mean_l = _asinh_grad.mean(dim=0).tolist()
-                    asinh_grad_max_l = _asinh_grad.amax(dim=0).tolist()
+                _asinh_grad = (torch.asinh(gap_global) + gap_global / torch.sqrt(1.0 + gap_global**2)).abs()
+                asinh_grad_mean_l = _asinh_grad.mean(dim=0).tolist()
+                asinh_grad_max_l = _asinh_grad.amax(dim=0).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -196,42 +149,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga    = gap_global.abs()
                 gap_mean_l    = [_ga.mean().item()]
                 gap_max_l     = [_ga.max().item()]
-                _ev_mask_s = (w_level > 0.5).float()
+                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
                 
-                _ac_scale_val = ac_scale.squeeze()
-                ac_scale_mean_l = [float(_ac_scale_val)]
-                ac_scale_max_l = ac_scale_mean_l
-                ac_scale_min_l = ac_scale_mean_l
-
-                if K > 1 and gap_w is not None:
-                    gap_w_abs = gap_w.abs()
-                    gap_w_mean_l = [gap_w_abs.mean().item()]
-                    gap_w_max_l = [gap_w_abs.max().item()]
-                    gap_w_std = gap_w_abs.std(dim=1)
-                    gap_w_cv = [(gap_w_std.mean() / max(1e-8, gap_w_abs.mean().item())).item()]
-                    loc_factor_l = [(gap_w_abs.amax(dim=1).mean().item()
-                                     / max(1e-8, _ga.mean().item())).item()]
-                    _asinh_grad = (torch.asinh(gap_w) + gap_w / torch.sqrt(1.0 + gap_w**2)).abs()
-                    asinh_grad_mean_l = [_asinh_grad.mean().item()]
-                    asinh_grad_max_l = [_asinh_grad.max().item()]
-                else:
-                    gap_w_mean_l = gap_mean_l
-                    gap_w_max_l = gap_max_l
-                    gap_w_cv = [0.0]
-                    loc_factor_l = [1.0]
-                    _asinh_grad = (torch.asinh(gap_global) + gap_global / torch.sqrt(1.0 + gap_global**2)).abs()
-                    asinh_grad_mean_l = [_asinh_grad.mean().item()]
-                    asinh_grad_max_l = [_asinh_grad.max().item()]
+                _asinh_grad = (torch.asinh(gap_global) + gap_global / torch.sqrt(1.0 + gap_global**2)).abs()
+                asinh_grad_mean_l = [_asinh_grad.mean().item()]
+                asinh_grad_max_l = [_asinh_grad.max().item()]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV52: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV53: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -256,22 +188,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            "ac_scale_mean":  ac_scale_mean_l,
-            "ac_scale_max":   ac_scale_max_l,
-            "ac_scale_min":   ac_scale_min_l,
-            "gap_w_mean":     gap_w_mean_l,
-            "gap_w_max":      gap_w_max_l,
-            "gap_w_cv":       gap_w_cv,
-            "loc_factor":     loc_factor_l,
             "asinh_grad_mean": asinh_grad_mean_l,
             "asinh_grad_max":  asinh_grad_max_l,
         }
 
         logger.debug(
-            "SpotlightLossV52 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV53 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV52(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV53(non_zero_threshold={self.tau})"

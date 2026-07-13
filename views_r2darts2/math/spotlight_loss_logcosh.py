@@ -7,28 +7,28 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V42: V13 + per-series ac_scale + ungated Level.
+    """V44: V13 + per-series ac_scale + y_true-only event_mask.
 
-    Fixes two overlooked blind spots in V13:
-    1. ac_scale computed per-batch → high-variance countries diluted
-       Shape penalty for peaceful countries → enabled sporadic spikes.
-    2. w_level = gate.amax → peaceful countries got 100× less Level
-       gradient → model had no incentive to push peaceful predictions
-       to zero → aggregate overprediction.
+    Keeps V13's proven structure (gated Level, MSE, global Shape) and
+    fixes two real bugs:
+    1. ac_scale computed per-series (not per-batch) — prevents Ukraine
+       from diluting Shape penalty for peaceful countries.
+    2. event_mask from y_true only — prevents DRO gaming exploit where
+       model hallucinates spikes to dilute DRO at true events.
+
+    Reverts V42's w_level=1.0 (which diluted Level gradient 10×) back
+    to V13's gate.amax.
 
     ── Design ─────────────────────────────────────────────────────────
 
-    * **Shape (AC pattern).** V13's log_cosh, but with **per-series
-      ac_scale** (dim=1 instead of dim=(0,1)). Each country's Shape
-      loss is scaled by its OWN variance, not contaminated by other
-      countries in the batch. A spike on a peaceful country now gets
-      the full Shape penalty.
+    * **Shape (AC pattern).** V13's log_cosh, but with per-series
+      ac_scale (dim=1). Each country scaled by its own variance.
 
-    * **Level (DC magnitude).** V13's MSE on mean gap, but with
-      **w_level = 1.0** (constant, not gate-dependent). All series
-      get equal Level weight. Peaceful countries now get the same
-      calibration push as event countries. The gate remains only for
-      Shape (where it's needed to focus on events).
+    * **Level (DC magnitude).** V13's MSE, gated (gate.amax). Proven
+      to calibrate to 0.84×.
+
+    * **Gate**: max(y_true, y_pred.detach()) — catches FPs and FNs.
+    * **Event Mask**: y_true only — protects DRO from gaming.
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV42 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV44 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -66,27 +66,27 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         e = y_pred - y_true
 
-        # ── Event gate ───────────────────────────────────────────────
+        # ── Gate (catches FPs and FNs) ───────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
+        # ── Event Mask (protects DRO math — y_true ONLY) ─────────────
+        # V43 fix: prevents model from gaming DRO by hallucinating spikes
+        # to inflate n_ev and dilute DRO at true events.
+        event_mask = (y_true.abs() > self.tau).float()
+
         # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ───
-        # V13 structure, but with PER-SERIES ac_scale (V42 fix).
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
         true_ac = y_true - y_true.mean(dim=1, keepdim=True)
-        # V42 FIX: per-series ac_scale (dim=1 only, not dim=(0,1))
-        # This prevents high-variance countries from diluting the Shape
-        # penalty for peaceful countries.
-        if multivariate:
-            ac_scale = true_ac.std(dim=1, keepdim=True).clamp_min(self.tau)  # (B, 1, C)
-        else:
-            ac_scale = true_ac.std(dim=1, keepdim=True).clamp_min(self.tau)  # (B, 1)
+        # V42 fix: per-series ac_scale (dim=1, not dim=(0,1))
+        # Prevents high-variance countries from diluting Shape penalty
+        # for peaceful countries.
+        ac_scale = true_ac.std(dim=1, keepdim=True).clamp_min(self.tau)
         shape_cell = self._log_cosh(e_shape / ac_scale)
 
         raw_abs = e.abs().detach()
-        event_mask = (abs_max > self.tau).float()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
@@ -102,13 +102,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: T × MSE(mean gap), UNGATED (V42 fix) ──────────────
-        # V42 FIX: w_level = 1.0 (constant, not gate-dependent).
-        # This ensures peaceful countries get the same Level push as
-        # event countries. The gate stays only for Shape.
+        # ── LEVEL: T × MSE(mean gap), gate-weighted, Hájek ───────────
+        # V13 structure — gate.amax (NOT w_level=1.0 which diluted 10×).
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
         level_cell = T * gap ** 2
-        w_level = torch.ones_like(gap)  # V42: constant 1.0, not gate.amax
+        w_level = gate.amax(dim=1)  # V13: per-series event mass
 
         if multivariate:
             loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -146,8 +144,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga    = gap.abs()
                 gap_mean_l    = _ga.mean(dim=0).tolist()
                 gap_max_l     = _ga.amax(dim=0).tolist()
-                # Event-only gap
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()  # use gate for diagnostics
+                _ev_mask_s = (w_level > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
@@ -163,14 +160,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ac_scale_min = ac_scale.min(dim=0).values.squeeze(0) if ac_scale.dim() > 2 else ac_scale.min()
                 ac_scale_min_l = _ac_scale_min.tolist() if _ac_scale_min.dim() > 0 else [float(_ac_scale_min)]
 
-                # V42: peaceful country diagnostics
-                _peace_mask = (gate.amax(dim=1) < 0.1).float()  # peaceful series
-                _n_peace = _peace_mask.sum(dim=0).clamp_min(1.0)
-                _gap_peace = (_ga * _peace_mask).sum(dim=0) / _n_peace
-                gap_peace_mean_l = _gap_peace.tolist()
-                # Mean y_pred for peaceful countries (should be →0)
-                _yp_peace = (y_pred.abs() * _peace_mask.unsqueeze(1)).sum(dim=(0,1)) / (_n_peace * T)
-                y_pred_peace_l = _yp_peace.tolist()
+                # V43: gaming exploit diagnostics
+                _gate_active = (gate > 0.5).float()
+                _gate_active_count = _gate_active.sum(dim=(0, 1))
+                _true_event_count = event_mask.sum(dim=(0, 1))
+                gaming_ratio_l = (_gate_active_count / _true_event_count.clamp_min(1.0)).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -186,7 +180,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga    = gap.abs()
                 gap_mean_l    = [_ga.mean().item()]
                 gap_max_l     = [_ga.max().item()]
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+                _ev_mask_s = (w_level > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
                 gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
@@ -198,17 +192,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 ac_scale_max_l = [float(_ac_scale_max)]
                 _ac_scale_min = ac_scale.min()
                 ac_scale_min_l = [float(_ac_scale_min)]
-                _peace_mask = (gate.amax(dim=1) < 0.1).float()
-                _n_peace = _peace_mask.sum().clamp_min(1.0)
-                _gap_peace = (_ga * _peace_mask).sum() / _n_peace
-                gap_peace_mean_l = [_gap_peace.item()]
-                _yp_peace = (y_pred.abs() * _peace_mask.unsqueeze(1)).sum() / (_n_peace * T)
-                y_pred_peace_l = [_yp_peace.item()]
+                _gate_active = (gate > 0.5).float()
+                _gate_active_count = _gate_active.sum()
+                _true_event_count = event_mask.sum()
+                gaming_ratio_l = [(_gate_active_count / _true_event_count.clamp_min(1.0)).item()]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV42: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV44: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -233,27 +225,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V42: per-series ac_scale diagnostics ──
-            # Should now vary significantly across series (not a single
-            # batch-wide value). Min should be ≈ tau (peaceful countries),
-            # max should be >> tau (high-variance countries).
             "ac_scale_mean":  ac_scale_mean_l,
             "ac_scale_max":   ac_scale_max_l,
             "ac_scale_min":   ac_scale_min_l,
-            # ── V42: peaceful country diagnostics ──
-            # These show whether the blind spot is fixed. If gap_peace_mean
-            # decreases over training, Level is now pushing peaceful
-            # predictions toward zero. If y_pred_peace → 0, the blind
-            # spot is closed.
-            "gap_peace_mean":  gap_peace_mean_l,  # mean |gap| for peaceful countries (should →0)
-            "y_pred_peace":    y_pred_peace_l,    # mean |y_pred| for peaceful countries (should →0)
+            "gaming_ratio":   gaming_ratio_l,
         }
 
         logger.debug(
-            "SpotlightLossV42 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV44 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV42(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV44(non_zero_threshold={self.tau})"

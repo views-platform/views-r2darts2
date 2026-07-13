@@ -63,6 +63,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         No hyperparameters, smooth, convex.
         """
         return x * torch.atan(x)
+    
+    @staticmethod
+    def _asinh_plus(x: torch.Tensor) -> torch.Tensor:
+        """
+        Loss: x * asinh(x)
+        Gradient: asinh(x) + x / sqrt(1 + x^2)
+        Matches MSE curvature (2.0) at origin, bends to log(x) for large x.
+        Strictly convex, parameter-free, zero hyperparameters.
+        """
+        return x * torch.asinh(x)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
@@ -125,16 +135,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 y_pred_win = y_pred.reshape(B, K, T_w, C)
                 y_true_win = y_true.reshape(B, K, T_w, C)
                 gap_w = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
-                level_cell = T_w * self._arctan_loss(gap_w).sum(dim=1)  # (B, C)
+                level_cell = T_w * self._asinh_plus(gap_w).sum(dim=1)  # (B, C)
             else:
                 y_pred_win = y_pred.reshape(B, K, T_w)
                 y_true_win = y_true.reshape(B, K, T_w)
                 gap_w = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
-                level_cell = T_w * self._arctan_loss(gap_w).sum(dim=1)  # (B,)
+                level_cell = T_w * self._asinh_plus(gap_w).sum(dim=1)  # (B,)
         else:
             gap_w = None
             gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-            level_cell = T * self._arctan_loss(gap)
+            level_cell = T * self._asinh_plus(gap)
 
         w_level = gate.amax(dim=1)
 

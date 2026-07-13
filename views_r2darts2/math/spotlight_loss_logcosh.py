@@ -10,46 +10,52 @@ class SpotlightLossLogcosh(torch.nn.Module):
     """2-term loss for zero-inflated conflict fatality forecasting.
 
     Shape = log_cosh with raw-error DRO (V13 — unchanged).
-    Level = V13 mean-gap MSE + V27 peace guard (least invasive).
+    Level = T × weighted dual-gap on event/peace partition (V29).
 
     ── Design ─────────────────────────────────────────────────────────
 
     * **Shape (AC pattern).** Demeaned log_cosh residual, gated,
       DRO-weighted on ``|raw_error|``, Hájek-normalised. Unchanged.
 
-    * **Level (DC magnitude + peace guard).** V13's ``T × gap²`` plus
-      a peace-cell guard ``T × peace_mean²``.
+    * **Level (DC magnitude, two-distribution match).** ``T × [(n_ev/T) × gap_ev² + (n_peace/T) × gap_peace²]``
+      where the masks are from ``y_true`` only (not gameable).
 
-      V13's gap is DC-only but gameable by spiking at peace cells —
-      the model satisfies mean(y_pred) ≈ mean(y_true) with zeros+
-      spikes. On training, spikes align with events. On eval, spikes
-      misalign at peace cells → overprediction (V20 eval: sb 1.96×).
+      V13 used ``T × mean(e)²`` — a single scalar gap over all cells.
+      This is mathematically DC-only, but DC-only ⟹ L = φ(Σy_t), so
+      any two trajectories with the same mean are indistinguishable.
+      The model satisfies V13 by spiking at event cells on training
+      (gap ≈ 0) but spikes misalign on eval → overprediction.
 
-      V27 adds a peace guard:
-        peace_mean = mean(y_pred at cells where y_true < tau)
-        peace_cell = T × peace_mean²
+      V29 separates the gap into event and peace components:
+        gap_event = mean(y_pred at true events) - mean(y_true at true events)
+        gap_peace = mean(y_pred at true peace) - mean(y_true at true peace)
+        L = T × [(n_event/T) × gap_event² + (n_peace/T) × gap_peace²]
 
-      The peace mask depends ONLY on y_true (not y_pred) → fixed
-      target, not gameable (fixes V23's flaw). The guard catches
-      false alarms — a spike at a peace cell raises peace_mean →
-      gradient pushes it DOWN (fixes V24's blindness).
+      This matches the two-point distribution (event mean, peace mean)
+      without sorting — no temporal blindness. The event/peace partition
+      is the natural structure for zero-inflated data.
 
-      Least-invasive design choices:
-        1. peace_cell gradient is ZERO at event cells → does NOT
-           disturb V13's DC calibration at events. Only pushes peace
-           cells down.
-        2. peace_cell is inert when peace_mean ≈ 0 (no false alarms).
-           Doesn't interfere when the model is behaving well.
-        3. Combined with level_cell via simple ADDITION (not Hájek
-           reweighting) — keeps level_cell's scale exactly as V13.
-           The peace term is a small additive penalty, not a
-           replacement. This preserves V13's Shape:Level balance.
-        4. No new constants — uses existing tau for the peace mask.
+      Why this escapes mean obfuscation:
+        pred = [5, 0, 0, 0]  true = [0, 0, 0, 0]  (false alarm)
+        V13: gap = 1.25 (looks like calibration)
+        V29: gap_peace = 1.67 (isolates the false alarm) → penalized
 
-      The peace guard is essentially a regularizer on peace-cell
-      predictions, not a separate loss term. It nudges the model
-      toward predicting low at peace cells without changing the
-      magnitude calibration at event cells.
+      Why the gradient is DC-dominant:
+        grad at event cell: 2 × gap_event (uniform across event cells)
+        grad at peace cell: 2 × gap_peace (uniform across peace cells)
+        The only AC is the single event/peace partition — one bit of
+        structure, not noisy per-cell AC. This is the minimum AC needed
+        to escape the DC-only = mean-only limitation.
+
+      Why no conflict (unlike V27):
+        V27's level_cell pushed ALL cells up (including peace), while
+        peace_cell pushed peace cells down → conflict.
+        V29's gap_event only pushes event cells, gap_peace only pushes
+        peace cells → no overlap, no conflict.
+
+      Masks from y_true only → not gameable (fixes V23).
+      gap_peace catches false alarms → not blind to overpred (fixes V24).
+      Gradient uniform within each group → DC-dominant (fixes V22/V25).
 
     ── Hyperparameters ────────────────────────────────────────────────
 
@@ -66,7 +72,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
 
-        logger.info("SpotlightLossV27 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV29 | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -87,9 +93,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         e = y_pred - y_true
 
-        # ── Event gate ───────────────────────────────────────────────
+        # ── Event gate (for Shape — soft, uses both y_true and y_pred) ─
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
+
+        # ── True event/peace masks (for Level — y_true only, not gameable) ─
+        mask_event = (y_true.abs() > self.tau).float()
+        mask_peace = 1.0 - mask_event
+        n_event = mask_event.sum(dim=1).clamp_min(1.0)   # (B,) or (B, C)
+        n_peace = mask_peace.sum(dim=1).clamp_min(1.0)   # (B,) or (B, C)
 
         # ── SHAPE: log_cosh on demeaned errors, DRO on |raw_error| ───
         # Unchanged from V13.
@@ -117,31 +129,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
             shape_w = gate * w_dro
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: V13 mean-gap MSE + V27 peace guard ────────────────
+        # ── LEVEL: T × weighted dual-gap (V29) ────────────────────────
+        # Event gap: mean(y_pred at true events) - mean(y_true at true events)
+        # Peace gap: mean(y_pred at true peace) - mean(y_true at true peace)
+        # Weighted by cell fraction (n_event/T, n_peace/T).
         #
-        # Part 1 (V13, unchanged): T × gap² on all-cell mean.
-        # Pure DC, calibrates magnitude. Gradient = 2*gap at ALL cells.
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)  # (B,) or (B, C)
-        level_cell = T * gap ** 2
+        # Gradient at event cell: 2 × gap_event (uniform across events)
+        # Gradient at peace cell: 2 × gap_peace (uniform across peace)
+        # DC-dominant within each group; only AC is the event/peace split.
+        mean_pred_ev = (mask_event * y_pred).sum(dim=1) / n_event
+        mean_true_ev = (mask_event * y_true).sum(dim=1) / n_event
+        gap_event = mean_pred_ev - mean_true_ev                       # (B,) or (B, C)
 
-        # Part 2 (V27 peace guard): T × peace_mean².
-        # Peace mask from y_true ONLY (not gameable). Catches false
-        # alarms — spikes at peace cells raise peace_mean → pushed DOWN.
-        # Gradient is ZERO at event cells → doesn't disturb V13 calibration.
-        # Inert when peace_mean ≈ 0 (no false alarms).
-        gate_true = torch.sigmoid(10.0 * (y_true.abs() - self.tau))  # (B, T) or (B, T, C)
-        mask_peace = 1.0 - gate_true
-        n_peace = mask_peace.sum(dim=1).clamp_min(1e-6)
-        peace_mean = (y_pred * mask_peace).sum(dim=1) / n_peace  # (B,) or (B, C)
-        peace_cell = T * peace_mean ** 2
+        mean_pred_peace = (mask_peace * y_pred).sum(dim=1) / n_peace
+        mean_true_peace = (mask_peace * y_true).sum(dim=1) / n_peace
+        gap_peace = mean_pred_peace - mean_true_peace                 # (B,) or (B, C)
 
-        # Hájek combination (same structure as V13, weight = event mass)
-        w_level = gate.amax(dim=1)  # per-series event mass (same as V13)
+        # Weights: cell fractions (n_event/T, n_peace/T)
+        w_ev = n_event / T
+        w_peace = n_peace / T
+
+        level_cell = T * (w_ev * gap_event ** 2 + w_peace * gap_peace ** 2)
+
+        # Hájek normalization (same structure as V13)
+        w_level = gate.amax(dim=1)  # per-series event mass
 
         if multivariate:
-            loss_level = (w_level * (level_cell + peace_cell)).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = (w_level * (level_cell + peace_cell)).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
@@ -171,37 +187,56 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 dro_frac_up_l = (((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
                 event_frac_l  = event_mask.mean(dim=(0, 1)).tolist()
 
-                _ga    = gap.abs()
-                gap_mean_l    = _ga.mean(dim=0).tolist()
-                gap_max_l     = _ga.amax(dim=0).tolist()
+                # V13's all-cell gap (for comparison)
+                gap_v13 = y_pred.mean(dim=1) - y_true.mean(dim=1)
+                _ga_v13 = gap_v13.abs()
+                gap_v13_mean_l = _ga_v13.mean(dim=0).tolist()
+                gap_v13_max_l  = _ga_v13.amax(dim=0).tolist()
+
                 _ev_mask_s = (w_level > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
-                gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                gap_ev_max_l  = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
-                gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
+                gap_ev_v13_mean_l = ((_ga_v13 * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
+                gap_ev_v13_max_l  = ((_ga_v13 * _ev_mask_s).amax(dim=0)).tolist()
+                gap_sat_l = (((_ga_v13 > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
 
                 shape_dc_l    = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
-                # ── V27 peace guard diagnostics ──
-                _pm = peace_mean.abs()
-                peace_mean_l  = _pm.mean(dim=0).tolist()
-                peace_max_l   = _pm.amax(dim=0).tolist()
-                # Peace cell fraction (how many cells are "peace")
-                peace_frac_l  = mask_peace.mean(dim=(0, 1)).tolist()
-                # Fraction of event series with significant false alarms (peace_mean > 0.1)
-                _pm_ev = _pm * _ev_mask_s
-                false_alarm_frac_l = (((_pm > 0.1).float() * _ev_mask_s).sum(dim=0)
-                                      / _n_ev_s).tolist()
-                # Mean y_pred at peace cells (what peace_cell is pushing down)
-                _yp_peace = (y_pred.abs() * mask_peace).sum(dim=(0, 1)) / mask_peace.sum(dim=(0, 1)).clamp_min(1.0)
-                y_pred_peace_l = _yp_peace.tolist()
-                # Level sub-component magnitudes (for monitoring)
-                level_cell_mean_l = ((level_cell * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                peace_cell_mean_l = ((peace_cell * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                # Ratio: how much of Level loss is the peace guard?
-                # Should be small (<0.5) — if >1, peace guard is dominating
-                peace_level_ratio_l = ((peace_cell * _ev_mask_s).sum(dim=0)
-                                       / (level_cell * _ev_mask_s).sum(dim=0).clamp_min(1e-8)).tolist()
+                # ── V29: dual-gap diagnostics ──
+                _gae = gap_event.abs()
+                _gap = gap_peace.abs()
+                gap_event_mean_l = _gae.mean(dim=0).tolist()
+                gap_event_max_l  = _gae.amax(dim=0).tolist()
+                gap_peace_mean_l = _gap.mean(dim=0).tolist()
+                gap_peace_max_l  = _gap.amax(dim=0).tolist()
+
+                # Event/peace fractions
+                ev_frac_l = (n_event.mean(dim=0) / T).tolist()
+                peace_frac_l = (n_peace.mean(dim=0) / T).tolist()
+
+                # Mean pred/true at event and peace cells
+                mean_pred_ev_l = mean_pred_ev.mean(dim=0).tolist()
+                mean_true_ev_l = mean_true_ev.mean(dim=0).tolist()
+                mean_pred_peace_l = mean_pred_peace.mean(dim=0).tolist()
+                mean_true_peace_l = mean_true_peace.mean(dim=0).tolist()
+
+                # Sign analysis: how many event series are under/overpredicting?
+                _gap_ev_neg = (gap_event < 0).float() * _ev_mask_s
+                _gap_ev_pos = (gap_event > 0).float() * _ev_mask_s
+                underpred_ev_frac_l = (_gap_ev_neg.sum(dim=0) / _n_ev_s).tolist()
+                overpred_ev_frac_l = (_gap_ev_pos.sum(dim=0) / _n_ev_s).tolist()
+
+                # Same for peace
+                _gap_peace_pos = (gap_peace > 0).float() * _ev_mask_s  # overpred at peace = false alarms
+                _gap_peace_neg = (gap_peace < 0).float() * _ev_mask_s
+                false_alarm_frac_l = (_gap_peace_pos.sum(dim=0) / _n_ev_s).tolist()
+                underpred_peace_frac_l = (_gap_peace_neg.sum(dim=0) / _n_ev_s).tolist()
+
+                # Obfuscation detection: V13 gap vs V29 gaps
+                # If |gap_v13| << |gap_event| or |gap_peace|, V13 was hiding error
+                _obf_ev = _gae / _ga_v13.clamp_min(1e-8)
+                _obf_peace = _gap / _ga_v13.clamp_min(1e-8)
+                obf_ev_mean_l = (_obf_ev * _ev_mask_s).sum(dim=0).div(_n_ev_s).tolist()
+                obf_peace_mean_l = (_obf_peace * _ev_mask_s).sum(dim=0).div(_n_ev_s).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
@@ -214,32 +249,45 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 dro_wmax_l    = [w_dro.max().item()]
                 dro_frac_up_l = [((w_dro > 1.0) * event_mask).sum().item() / _n_ev.item()]
                 event_frac_l  = [event_mask.mean().item()]
-                _ga    = gap.abs()
-                gap_mean_l    = [_ga.mean().item()]
-                gap_max_l     = [_ga.max().item()]
+                gap_v13 = y_pred.mean(dim=1) - y_true.mean(dim=1)
+                _ga_v13 = gap_v13.abs()
+                gap_v13_mean_l = [_ga_v13.mean().item()]
+                gap_v13_max_l  = [_ga_v13.max().item()]
                 _ev_mask_s = (w_level > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
-                gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
-                gap_ev_max_l  = [((_ga * _ev_mask_s).amax()).item()]
-                gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
+                gap_ev_v13_mean_l = [((_ga_v13 * _ev_mask_s).sum() / _n_ev_s).item()]
+                gap_ev_v13_max_l  = [((_ga_v13 * _ev_mask_s).amax()).item()]
+                gap_sat_l = [(((_ga_v13 > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l    = [(gate * e_shape).mean(dim=1).abs().mean().item()]
-                _pm = peace_mean.abs()
-                peace_mean_l  = [_pm.mean().item()]
-                peace_max_l   = [_pm.max().item()]
-                peace_frac_l  = [mask_peace.mean().item()]
-                _pm_ev = _pm * _ev_mask_s
-                false_alarm_frac_l = [(((_pm > 0.1).float() * _ev_mask_s).sum() / _n_ev_s).item()]
-                _yp_peace = (y_pred.abs() * mask_peace).sum() / mask_peace.sum().clamp_min(1.0)
-                y_pred_peace_l = [_yp_peace.item()]
-                level_cell_mean_l = [((level_cell * _ev_mask_s).sum() / _n_ev_s).item()]
-                peace_cell_mean_l = [((peace_cell * _ev_mask_s).sum() / _n_ev_s).item()]
-                peace_level_ratio_l = [((peace_cell * _ev_mask_s).sum()
-                                        / max(1e-8, (level_cell * _ev_mask_s).sum())).item()]
+                _gae = gap_event.abs()
+                _gap = gap_peace.abs()
+                gap_event_mean_l = [_gae.mean().item()]
+                gap_event_max_l  = [_gae.max().item()]
+                gap_peace_mean_l = [_gap.mean().item()]
+                gap_peace_max_l  = [_gap.max().item()]
+                ev_frac_l = [(n_event.mean() / T).item()]
+                peace_frac_l = [(n_peace.mean() / T).item()]
+                mean_pred_ev_l = [mean_pred_ev.mean().item()]
+                mean_true_ev_l = [mean_true_ev.mean().item()]
+                mean_pred_peace_l = [mean_pred_peace.mean().item()]
+                mean_true_peace_l = [mean_true_peace.mean().item()]
+                _gap_ev_neg = (gap_event < 0).float() * _ev_mask_s
+                _gap_ev_pos = (gap_event > 0).float() * _ev_mask_s
+                underpred_ev_frac_l = [(_gap_ev_neg.sum() / _n_ev_s).item()]
+                overpred_ev_frac_l = [(_gap_ev_pos.sum() / _n_ev_s).item()]
+                _gap_peace_pos = (gap_peace > 0).float() * _ev_mask_s
+                _gap_peace_neg = (gap_peace < 0).float() * _ev_mask_s
+                false_alarm_frac_l = [(_gap_peace_pos.sum() / _n_ev_s).item()]
+                underpred_peace_frac_l = [(_gap_peace_neg.sum() / _n_ev_s).item()]
+                _obf_ev = _gae / _ga_v13.clamp_min(1e-8)
+                _obf_peace = _gap / _ga_v13.clamp_min(1e-8)
+                obf_ev_mean_l = [((_obf_ev * _ev_mask_s).sum() / _n_ev_s).item()]
+                obf_peace_mean_l = [((_obf_peace * _ev_mask_s).sum() / _n_ev_s).item()]
                 sl_ratio_l = [float((loss_shape.detach()
                                      / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV27: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV29: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -259,39 +307,44 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "dro_frac_up":    dro_frac_up_l,
             "event_frac":     event_frac_l,
             # ── Gap diagnostics ──
-            "level_gap_mean": gap_mean_l,
-            "level_gap_max":  gap_max_l,
-            "level_gap_ev_mean": gap_ev_mean_l,
-            "level_gap_ev_max":  gap_ev_max_l,
+            "level_gap_mean": gap_v13_mean_l,        # V13's all-cell gap (for comparison)
+            "level_gap_max":  gap_v13_max_l,
+            "level_gap_ev_mean": gap_ev_v13_mean_l,
+            "level_gap_ev_max":  gap_ev_v13_max_l,
             "level_gap_sat":     gap_sat_l,
             "shape_dc":       shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # ── V27 peace guard diagnostics ──
-            # The mean y_pred at peace cells. This is what the peace guard
-            # is pushing toward 0. Should DECREASE over training.
-            # If high at start and decreases, the guard is working.
-            "peace_mean":           peace_mean_l,        # mean |peace_mean| per channel
-            "peace_max":            peace_max_l,         # max |peace_mean| (worst false alarmer)
-            "peace_frac":           peace_frac_l,        # fraction of cells that are peace
-            # Fraction of event series with significant false alarms.
-            # If >50%, most series are spiking at peace cells.
-            "false_alarm_frac":     false_alarm_frac_l,  # frac event series with peace_mean > 0.1
-            # Mean |y_pred| at peace cells — direct measure of false alarm magnitude.
-            "y_pred_peace":         y_pred_peace_l,      # mean |y_pred| at peace cells
-            # Level sub-component magnitudes (for monitoring balance).
-            # level_cell = V13's gap² term. peace_cell = V27's guard.
-            # If peace_cell_mean >> level_cell_mean, the guard is dominating
-            # (may be too strong). If <<, it's a minor regularizer (ideal).
-            "level_cell_mean":      level_cell_mean_l,   # V13's gap² term (calibration)
-            "peace_cell_mean":      peace_cell_mean_l,   # V27's peace guard
-            "peace_level_ratio":    peace_level_ratio_l, # peace/level ratio (should be < 0.5)
+            # ── V29: dual-gap diagnostics ──
+            # The two gaps V29 actually optimizes. Compare to V13's gap:
+            # If gap_event >> gap_v13, V13 was hiding event underprediction.
+            # If gap_peace >> gap_v13, V13 was hiding peace overprediction (false alarms).
+            "gap_event_mean":   gap_event_mean_l,     # mean |gap| at true event cells
+            "gap_event_max":    gap_event_max_l,
+            "gap_peace_mean":   gap_peace_mean_l,     # mean |gap| at true peace cells
+            "gap_peace_max":    gap_peace_max_l,
+            # Event/peace fractions
+            "ev_frac":          ev_frac_l,            # fraction of cells that are true events
+            "peace_frac":       peace_frac_l,
+            # Mean pred/true at each partition — should converge
+            "mean_pred_ev":     mean_pred_ev_l,       # mean y_pred at true events
+            "mean_true_ev":     mean_true_ev_l,       # mean y_true at true events
+            "mean_pred_peace":  mean_pred_peace_l,    # mean y_pred at true peace (should → 0)
+            "mean_true_peace":  mean_true_peace_l,    # mean y_true at true peace (≈ 0)
+            # Sign analysis — calibration direction
+            "underpred_ev_frac":   underpred_ev_frac_l,   # frac event series underpredicting events
+            "overpred_ev_frac":    overpred_ev_frac_l,    # frac event series overpredicting events
+            "false_alarm_frac":    false_alarm_frac_l,    # frac event series overpredicting at peace (FALSE ALARMS)
+            "underpred_peace_frac": underpred_peace_frac_l,
+            # Obfuscation: V29 gap / V13 gap. If >1, V13 was hiding this error.
+            "obf_ev_mean":         obf_ev_mean_l,        # event obfuscation (V29 sees more than V13)
+            "obf_peace_mean":      obf_peace_mean_l,     # peace obfuscation (V29 sees more than V13)
         }
 
         logger.debug(
-            "SpotlightLossV27 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV29 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV27(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV29(non_zero_threshold={self.tau})"

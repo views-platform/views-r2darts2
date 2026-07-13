@@ -6,16 +6,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V54: Direct DRO + Global Level + Ungated.
+    """V55: Windowed Level (K=6) + Global Shape + Direct DRO.
     
-    Fixes V53's ineffective DRO for single-spike series (Ukraine/Sudan).
+    Fixes V54's global level loss by applying 6-month windows to the Level loss.
+    Shape loss remains globally demeaned (not windowed) to preserve AC gradients.
     
-    1. Shape: Raw log_cosh on demeaned errors. No ac_scale.
+    1. Shape: Raw log_cosh on globally demeaned errors. No ac_scale.
     2. DRO: Direct upweighting of large errors (1 + raw_abs/tau).
-       Fixes V53's w_dro=1.0 for single-spike series.
-    3. Level: Global AsinhPlus(gap). Not windowed. Ungated.
+    3. Level: Windowed AsinhPlus(gap). K=6 windows. Ungated.
     """
     _EPS = 1e-6
+    _K = 6  # 6-month windows
 
     def __init__(self, non_zero_threshold: float = 0.88):
         if non_zero_threshold <= 0.0:
@@ -24,7 +25,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV54 | threshold=%.4f", non_zero_threshold)
+        logger.info("SpotlightLossV55 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -55,13 +56,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
         event_mask = (abs_max > self.tau).float()
 
-        # ── SHAPE: Raw log_cosh on demeaned errors ───────────────────
+        # ── SHAPE: Raw log_cosh on globally demeaned errors ──────────
+        # NOT windowed. Preserves AC gradients across the full horizon.
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
         # ── DRO: Direct upweighting of large errors ──────────────────
-        # Fixes V53's w_dro=1.0 for single-spike series.
         raw_abs = e.abs().detach()
         w_dro = 1.0 + (raw_abs / self.tau)
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
@@ -72,14 +73,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: Global AsinhPlus ──────────────────────────────────
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = T * self._asinh_plus(gap)
+        # ── LEVEL: Windowed AsinhPlus (K=6) ──────────────────────────
+        K = self._K
+        if T % K != 0:
+            K_eff = 1
+            T_w = T
+        else:
+            K_eff = K
+            T_w = T // K
 
         if multivariate:
-            loss_level = level_cell.mean(dim=0)
+            C = y_pred.size(-1)
+            y_pred_win = y_pred.reshape(B, K_eff, T_w, C)
+            y_true_win = y_true.reshape(B, K_eff, T_w, C)
         else:
-            loss_level = level_cell.mean()
+            y_pred_win = y_pred.reshape(B, K_eff, T_w)
+            y_true_win = y_true.reshape(B, K_eff, T_w)
+
+        gap_win = y_pred_win.mean(dim=2) - y_true_win.mean(dim=2)
+        level_cell = T_w * self._asinh_plus(gap_win)
+
+        if multivariate:
+            # Sum over K windows -> (B, C), then mean over B -> (C,)
+            loss_level = level_cell.sum(dim=1).mean(dim=0)
+        else:
+            # Sum over K windows -> (B,), then mean over B -> scalar
+            loss_level = level_cell.sum(dim=1).mean()
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
@@ -151,7 +170,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV54: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV55: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -181,10 +200,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV54 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV55 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV54(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV55(non_zero_threshold={self.tau})"

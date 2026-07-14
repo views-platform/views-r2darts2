@@ -274,7 +274,16 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         """
         active_config = self.configs
         time_id = active_config.get("time_id", "month_id")
-        entity_id = active_config.get("entity_id", "country_id")
+        
+        # Determine entity_id based on configured level (level-aware defaults).
+        level = active_config.get("level")
+        if level == "pgm":
+            entity_id ="priogrid_id"
+        elif level == "cm":
+            entity_id = "country_id"
+        else:
+            raise ValueError(f"Unsupported level for entity_id resolution: {level}")
+        
         return prediction_frames_to_dataframe(
             predictions=predictions,
             time_id=time_id,

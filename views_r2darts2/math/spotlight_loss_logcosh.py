@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V58: V57 + Remove ac_scale entirely.
+    """V59: V58 + Windowed level loss.
     
     Per-series ac_scale gave peaceful countries 5.6× stronger Shape
     gradient than spike countries (1/0.88 vs 1/5.0). This inverted
@@ -18,17 +18,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
     
     Division of labor:
     - Shape (no ac_scale): aggressively learns spikes
-    - Level (AsinhPlus, gate.amax): calibrates mean for active series
+    - Level (windowed MSE, window gate max): calibrates local region means
     """
     _EPS = 1e-6
-    _K = 4  # 4 blocks of 9 months
 
-    def __init__(self, non_zero_threshold: float = 0.88):
+    def __init__(self, non_zero_threshold: float = 0.88, level_window: int = 9):
         super().__init__()
+        if level_window not in (6, 9):
+            raise ValueError(f"level_window must be 6 or 9, got {level_window}")
         self.tau = non_zero_threshold
+        self.level_window = level_window
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV58 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info(
+            "SpotlightLossV59 | threshold=%.4f level_window=%d",
+            non_zero_threshold,
+            level_window,
+        )
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -46,6 +52,46 @@ class SpotlightLossLogcosh(torch.nn.Module):
     @staticmethod
     def _mse(x: torch.Tensor) -> torch.Tensor:
         return x.pow(2)
+
+    @staticmethod
+    def _window_mean(x: torch.Tensor, window: int) -> torch.Tensor:
+        if x.dim() == 2:
+            pooled = F.avg_pool1d(
+                x.unsqueeze(1),
+                kernel_size=window,
+                stride=window,
+                ceil_mode=True,
+                count_include_pad=False,
+            )
+            return pooled.squeeze(1)
+
+        pooled = F.avg_pool1d(
+            x.transpose(1, 2),
+            kernel_size=window,
+            stride=window,
+            ceil_mode=True,
+            count_include_pad=False,
+        )
+        return pooled.transpose(1, 2)
+
+    @staticmethod
+    def _window_max(x: torch.Tensor, window: int) -> torch.Tensor:
+        if x.dim() == 2:
+            pooled = F.max_pool1d(
+                x.unsqueeze(1),
+                kernel_size=window,
+                stride=window,
+                ceil_mode=True,
+            )
+            return pooled.squeeze(1)
+
+        pooled = F.max_pool1d(
+            x.transpose(1, 2),
+            kernel_size=window,
+            stride=window,
+            ceil_mode=True,
+        )
+        return pooled.transpose(1, 2)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
@@ -91,13 +137,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: MSE on global gap, GATED ─────────────────────────
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = T * self._mse(gap)
-        w_level = gate.amax(dim=1)
+        # ── LEVEL: windowed MSE on local gaps, window-gated ─────────
+        pred_win = self._window_mean(y_pred, self.level_window)
+        true_win = self._window_mean(y_true, self.level_window)
+        gap_win = pred_win - true_win
+        level_cell = T * self._mse(gap_win)
+        w_level = self._window_max(gate, self.level_window)
 
         if multivariate:
-            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum(dim=(0, 1)) / w_level.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
             loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
@@ -193,11 +241,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV58 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV59 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV58(non_zero_threshold={self.tau})"
+        return (
+            "SpotlightLossV59("
+            f"non_zero_threshold={self.tau}, level_window={self.level_window}"
+            ")"
+        )
 

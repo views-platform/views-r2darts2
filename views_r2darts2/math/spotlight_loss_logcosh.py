@@ -68,7 +68,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # V58: Remove ac_scale entirely.
         # tanh(e) naturally prioritizes large errors (saturates at 1.0).
         # No normalization needed — the function is self-normalizing.
-        shape_cell = self._asinh_plus(e_shape)
+        shape_cell = self._log_cosh(e_shape)
 
         # DRO weighting (V56 fix: use error magnitude, not value magnitude)
         event_mask = (abs_max > self.tau).float()
@@ -89,7 +89,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = T * self._asinh_plus(gap)
+        level_cell = T * self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 
         if multivariate:

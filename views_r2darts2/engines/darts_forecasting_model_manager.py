@@ -278,7 +278,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         # Determine entity_id based on configured level (level-aware defaults).
         level = active_config.get("level")
         if level == "pgm":
-            entity_id ="priogrid_id"
+            entity_id ="priogrid_gid"
         elif level == "cm":
             entity_id = "country_id"
         else:

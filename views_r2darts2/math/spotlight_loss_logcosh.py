@@ -141,7 +141,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         pred_win = self._window_mean(y_pred, self.level_window)
         true_win = self._window_mean(y_true, self.level_window)
         gap_win = pred_win - true_win
-        level_cell = T * self._log_cosh(gap_win)
+        level_cell = T * self._asinh_plus(gap_win)
         w_level = self._window_max(gate, self.level_window)
 
         if multivariate:

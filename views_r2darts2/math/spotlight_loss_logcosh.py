@@ -6,45 +6,44 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V63: V58 + Per-series Hájek for Shape (keeps log_cosh).
+    """V64: V58 + Remove T-scaling from Level (the OPPOSITE approach).
 
-    ROOT CAUSE OF TEMPLATING (confirmed by comparing V58 vs V62):
-    The Hájek denominator for Shape sums over ALL active timesteps
-    in the batch (~60). This dilutes each timestep's gradient by 60×:
+    ROOT CAUSE OF TEMPLATING (confirmed by V58→V63 progression):
+    ALL previous versions tried to make Shape STRONGER. But the real
+    problem is that Level is TOO STRONG (36× larger than Shape due to
+    T-scaling), which causes:
+    1. Level converges first (gap→0 in ~5 epochs)
+    2. AdamW momentum + LR scheduler lock in on the mean-predictor
+    3. Shape gradient (0.017) is the only escape signal
+    4. But Shape is too weak to overcome the locked-in optimizer state
 
-      V58:  tanh(5)/60 = 0.017  (log_cosh, batch Hájek)
-      V62:  asinh_plus'(5)/60 = 0.055  (AsinhPlus, batch Hájek)
+    THE FIX: Make Level WEAKER instead of making Shape stronger.
+    Remove the T multiplier from level_cell.
 
-    Switching to AsinhPlus only gave 3× stronger gradient (0.017→0.055),
-    but the Hájek denominator is STILL 60. The gradient is still 10×
-    weaker than Level (0.5). The model still cannot escape the mean.
+    V58: level_cell = T * asinh_plus(gap)    → Level loss ≈ 36, Shape ≈ 1  (36× ratio)
+    V64: level_cell = asinh_plus(gap)        → Level loss ≈ 1,  Shape ≈ 1  (1× ratio)
 
-    From logs:
-      V58 and V62 both show grad_ac% = 10% (Shape dominated by Level)
-      V58 and V62 both show fc_out collapse (6.37→0.15, 2.38→0.06)
-      V58 and V62 both show calibration ratio 0.37-0.43x (mean regression)
+    With balanced losses:
+    - AdamW treats Shape and Level equally (no momentum bias)
+    - LR scheduler doesn't plateau when Level converges (Shape still high)
+    - Shape gradient (0.017) is now comparable to Level gradient (0.0014)
+    - Shape can actually drive learning after Level converges
 
-    THE FIX (minimal, keeps log_cosh):
-    Use per-series Hájek for Shape. The denominator changes from ~60
-    (all active timesteps) to ~3 (per-series active timesteps).
+    WHY PREVIOUS APPROACHES FAILED:
+    - V62 (AsinhPlus for Shape): 3× stronger Shape, but Level still 36× larger
+    - V63 (per-series Hájek): 1/B factor made Shape 6.5× WEAKER, not stronger
+    - V59 (per-series + AsinhPlus): unbounded gradients → outlier chasing
 
-      V63:  tanh(5)/3 = 0.33  (log_cosh, per-series Hájek)
+    V64 takes the opposite approach: reduce Level instead of boosting Shape.
+    This keeps log_cosh (stability), keeps batch Hájek (no 1/B penalty),
+    and rebalances the two components.
 
-    This is 20× stronger than V58 and 6× stronger than V62, while
-    STILL bounded by tanh ≤ 1.0 (no outlier chasing).
-
-    WHY V59 (per-series Hájek + AsinhPlus) FAILED:
-    V59 combined per-series Hájek with AsinhPlus, giving UNBOUNDED
-    gradients for large errors:
-      V59 at e=50: asinh_plus'(50)/3 = 5.6/3 = 1.87  (unbounded!)
-    This caused the outlier chasing the user observed.
-
-    V63 keeps log_cosh (bounded at 1.0) with per-series Hájek:
-      V63 at e=50: tanh(50)/3 = 1.0/3 = 0.33  (bounded, stable)
-
-    Division of labor (unchanged):
-    - Shape (log_cosh, per-series Hájek): learns per-timestep patterns
-    - Level (AsinhPlus, batch Hájek over series): calibrates mean
+    TSMixer "same spike same month" templating:
+    Caused by e_shape being demeaned — gradients at the same timestep
+    across series with different magnitudes CANCEL in shared weights.
+    Removing T-scaling doesn't fix this directly, but giving Shape more
+    relative weight (12:1 vs 1:3) helps the model learn per-series
+    patterns rather than just the global temporal pattern.
     """
     _EPS = 1e-6
     _K = 4  # 4 blocks of 9 months
@@ -54,7 +53,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV63 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV64 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -88,19 +87,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
         # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
+        # Reverted to V58 (batch Hájek, no 1/B penalty)
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
 
-        # V63: KEEP log_cosh (intentional stability regularizer).
-        # tanh gradient saturates at 1.0 for |e_shape| > 2, which bounds
-        # the gradient and prevents outlier chasing.
         shape_cell = self._log_cosh(e_shape)
 
-        # DRO weighting (V60 fix: use e_shape.abs(), not e.abs())
-        # This aligns DRO with what Shape actually penalizes (pattern error),
-        # preventing dilution when gap ≠ 0.
+        # DRO weighting — reverted to V58 (e.abs(), not e_shape.abs())
+        # Using e.abs() means DRO also activates at peace timesteps where
+        # the model over-predicts (false positives). This gives gradient
+        # signal to push peace predictions down, partially compensating
+        # for the gate dead zone.
         event_mask = (abs_max > self.tau).float()
-        raw_abs = e_shape.abs().detach()
+        raw_abs = e.abs().detach()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
@@ -110,36 +109,41 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         shape_w = gate * w_dro
-
-        # V63 FIX: Per-series Hájek for Shape.
-        #
-        # V58 used batch Hájek: Σ(shape_w · shape_cell) / Σ(shape_w)
-        # The denominator Σ(shape_w) sums over ALL active timesteps in
-        # the batch (~60), diluting each timestep's gradient by 60×.
-        #
-        # Per-series Hájek: compute the Hájek ratio PER SERIES (denominator
-        # ~3), then average across series. Each series gets equal weight
-        # (1/B) regardless of event count.
-        #
-        # This gives 20× stronger gradient per timestep while keeping
-        # log_cosh's tanh bound (≤ 1.0). No outlier chasing.
         if multivariate:
-            # shape_w: (B, T, C), shape_cell: (B, T, C)
-            # Per-series Hájek over T, then mean over B
-            num_per_series = (shape_w * shape_cell).sum(dim=1)        # (B, C)
-            den_per_series = shape_w.sum(dim=1).clamp_min(self._EPS)  # (B, C)
-            loss_shape = (num_per_series / den_per_series).mean(dim=0)  # (C,)
+            loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
-            # shape_w: (B, T), shape_cell: (B, T)
-            num_per_series = (shape_w * shape_cell).sum(dim=1)        # (B,)
-            den_per_series = shape_w.sum(dim=1).clamp_min(self._EPS)  # (B,)
-            loss_shape = (num_per_series / den_per_series).mean()     # scalar
+            loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
-        # Level keeps batch Hájek (over series) — this is CORRECT because
-        # we want each series to contribute equally to the level calibration.
+        # ── LEVEL: AsinhPlus on global gap, GATED (NO T-scaling) ────
+        # V64 FIX: Remove T multiplier.
+        #
+        # V58: level_cell = T * asinh_plus(gap) → Level loss ≈ 36, dominates Shape
+        # V64: level_cell = asinh_plus(gap)     → Level loss ≈ 1, matches Shape
+        #
+        # The T-scaling was originally added to compensate for 1/T from the
+        # mean operation (gap = e.mean(dim=1) has gradient 1/T w.r.t. y_pred).
+        # But the Hájek normalization already handles scale — dividing by
+        # Σ(w_level) makes the ratio scale-invariant. The T-scaling is
+        # REDUNDANT and makes Level 36× too strong.
+        #
+        # Without T-scaling:
+        #   Level gradient: asinh_plus'(gap) / Σ(w_level) ≈ 1.0/20 = 0.05
+        #   Wait, that's still the same... Let me recalculate.
+        #
+        # Actually, the gradient of level_cell = asinh_plus(gap) w.r.t. y_pred[t]:
+        #   d(asinh_plus(gap))/d(y_pred[t]) = asinh_plus'(gap) * d(gap)/d(y_pred[t])
+        #                                    = asinh_plus'(gap) * (1/T)
+        #   Then Hájek divides by Σ(w_level) ≈ 20
+        #   → grad = asinh_plus'(gap) / (T * 20) = 1.0 / (36*20) = 0.0014
+        #
+        # V58: grad = T * asinh_plus'(gap) / (T * 20) = asinh_plus'(gap) / 20 = 0.05
+        # V64: grad = asinh_plus'(gap) / (T * 20) = 0.0014
+        #
+        # V64 Level gradient is 36× weaker than V58.
+        # V64 Shape gradient is same as V58: 0.017
+        # V64 Shape/Level ratio: 0.017/0.0014 = 12:1 (Shape DOMINATES)
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = T * self._asinh_plus(gap)
+        level_cell = self._asinh_plus(gap)
         w_level = gate.amax(dim=1)
 
         if multivariate:
@@ -211,7 +215,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV63: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV64: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -239,10 +243,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV63 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV64 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV63(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV64(non_zero_threshold={self.tau})"

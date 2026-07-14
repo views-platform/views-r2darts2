@@ -6,19 +6,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V58: V57 + Remove ac_scale entirely.
+    """V59: V58 + Per-Series Hájek for Shape (anti-templating).
     
-    Per-series ac_scale gave peaceful countries 5.6× stronger Shape
-    gradient than spike countries (1/0.88 vs 1/5.0). This inverted
-    priorities — the model was incentivized to ignore spikes.
+    V58's batch Hájek normalized Shape over all active cells across the
+    batch. A series with 1 large error was diluted by series with 10
+    small errors → the model learned a single "average shape" (template).
     
-    Removing ac_scale lets tanh(e) naturally prioritize large errors:
-    - Spike (e=5): tanh(5)=1.0 (full push)
-    - Peace (e=0.3): tanh(0.3)=0.29 (gentle push)
-    
-    Division of labor:
-    - Shape (no ac_scale): aggressively learns spikes
-    - Level (AsinhPlus, gate.amax): calibrates mean for active series
+    V59 normalizes Shape per-series (over T only), then averages across
+    series. Each country gets its own Shape loss → no template.
     """
     _EPS = 1e-6
     _K = 4  # 4 blocks of 9 months
@@ -28,7 +23,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV58 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV59 | threshold=%.4f K=%d", non_zero_threshold, self._K)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -64,13 +59,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean
-
-        # V58: Remove ac_scale entirely.
-        # tanh(e) naturally prioritizes large errors (saturates at 1.0).
-        # No normalization needed — the function is self-normalizing.
         shape_cell = self._log_cosh(e_shape)
 
-        # DRO weighting (V56 fix: use error magnitude, not value magnitude)
+        # DRO weighting (use error magnitude, not value magnitude)
         event_mask = (abs_max > self.tau).float()
         raw_abs = e.abs().detach()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
@@ -82,14 +73,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
 
         shape_w = gate * w_dro
+
+        # V59: Per-series Hájek (normalize over T only, then mean over B)
         if multivariate:
-            loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
+            shape_per_series = (shape_w * shape_cell).sum(dim=1) / shape_w.sum(dim=1).clamp_min(self._EPS)
+            loss_shape = shape_per_series.mean(dim=0)  # (C,)
         else:
-            loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
+            shape_per_series = (shape_w * shape_cell).sum(dim=1) / shape_w.sum(dim=1).clamp_min(self._EPS)
+            loss_shape = shape_per_series.mean()  # scalar
 
         # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = T * self._log_cosh(gap)
+        level_cell = T * self._asinh_plus(gap)
         w_level = gate.amax(dim=1)
 
         if multivariate:
@@ -135,6 +130,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
+                # V59: per-series shape diagnostics
+                _sps = shape_per_series  # (B, C)
+                shape_per_series_mean_l = _sps.mean(dim=0).tolist()
+                _sps_var = ((_sps ** 2).sum(dim=0) / B - _sps.mean(dim=0) ** 2).clamp_min(0)
+                shape_per_series_std_l = _sps_var.sqrt().tolist()
+                shape_cv_l = (_sps_var.sqrt() / _sps.mean(dim=0).clamp_min(1e-8)).tolist()
+
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
             else:
                 _n_ev = event_mask.sum().clamp_min(1.0)
@@ -158,10 +160,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l = [(gate * e_shape).mean(dim=1).abs().mean().item()]
 
+                _sps = shape_per_series  # (B,)
+                shape_per_series_mean_l = [_sps.mean().item()]
+                _sps_var = ((_sps ** 2).sum() / B - _sps.mean() ** 2).clamp_min(0)
+                shape_per_series_std_l = [_sps_var.sqrt().item()]
+                shape_cv_l = [_sps_var.sqrt().item() / max(1e-8, _sps.mean().item())]
+
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV58: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossV59: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -186,13 +194,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
+            "shape_per_series_mean": shape_per_series_mean_l,
+            "shape_per_series_std": shape_per_series_std_l,
+            "shape_cv": shape_cv_l,
         }
 
         logger.debug(
-            "SpotlightLossV58 | shape=%s level=%s total=%.6f",
+            "SpotlightLossV59 | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV58(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV59(non_zero_threshold={self.tau})"

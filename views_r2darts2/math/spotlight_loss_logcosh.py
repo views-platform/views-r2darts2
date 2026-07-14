@@ -43,6 +43,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """
         return x * torch.asinh(x)
 
+    @staticmethod
+    def _mse(x: torch.Tensor) -> torch.Tensor:
+        return x.pow(2)
+
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
@@ -87,9 +91,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
+        # ── LEVEL: MSE on global gap, GATED ─────────────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = T * self._asinh_plus(gap)
+        level_cell = T * self._mse(gap)
         w_level = gate.amax(dim=1)
 
         if multivariate:

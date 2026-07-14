@@ -68,7 +68,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # V58: Remove ac_scale entirely.
         # tanh(e) naturally prioritizes large errors (saturates at 1.0).
         # No normalization needed — the function is self-normalizing.
-        shape_cell = self._log_cosh(e_shape)
+        shape_cell = self._asinh_plus(e_shape)
 
         # DRO weighting (V56 fix: use error magnitude, not value magnitude)
         event_mask = (abs_max > self.tau).float()

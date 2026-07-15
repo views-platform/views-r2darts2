@@ -107,9 +107,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
+        # ── SHAPE: log_cosh on window-demeaned errors (NO ac_scale) ──
+        # To guarantee true Windowed Shape/Level Orthogonality:
+        # Subtract the window mean error from the error tensor to get e_shape.
+        e_win_mean = self._window_mean(e, self.level_window)
+        e_shape_mean = torch.repeat_interleave(e_win_mean, repeats=self.level_window, dim=1)
+        # Ensure it matches T exactly in case T is not a perfect multiple of level_window
+        e_shape_mean = e_shape_mean[:, :T] if not multivariate else e_shape_mean[:, :T, :]
+        e_shape = e - e_shape_mean
 
         # V58: Remove ac_scale entirely.
         # tanh(e) naturally prioritizes large errors (saturates at 1.0).

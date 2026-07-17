@@ -91,15 +91,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._asinh_plus(gap)
         w_level = gate.amax(dim=1)
-        # Define "active" from the same event threshold (abs_max > tau).
-        active_frac = event_mask.amax(dim=1).mean(dim=0).clamp_min(self._EPS)
-        # Softer adaptation than inverse-active; normalize to mean 1 in multivariate
-        # so this redistributes level pressure across channels without global blow-up.
-        level_multiplier_raw = active_frac.rsqrt()
+        # ── Adaptive de-dilution boost from batch temporal sparsity ──
+        # The gap is a mean over T timesteps. When events occupy only a few
+        # timesteps per active series (PGM spikes), that mean is diluted by the
+        # temporal density d = active_cells / (active_series * T), which lies in
+        # (0, 1] and equals 1 only when active series are active at every step.
+        # Boosting level by 1/sqrt(d) cancels this dilution adaptively: it is ~1
+        # for temporally dense batches (CM stays put) and grows as sparsity
+        # increases (PGM), with no magic constants or extra hyperparameters.
         if multivariate:
-            level_multiplier = level_multiplier_raw / level_multiplier_raw.mean().clamp_min(self._EPS)
+            n_active_cells = event_mask.sum(dim=(0, 1))
+            n_active_series = event_mask.amax(dim=1).sum(dim=0)
         else:
-            level_multiplier = level_multiplier_raw
+            n_active_cells = event_mask.sum()
+            n_active_series = event_mask.amax(dim=1).sum()
+        temporal_density = (
+            n_active_cells / (n_active_series * T).clamp_min(self._EPS)
+        ).clamp(min=self._EPS, max=1.0)
+        level_multiplier = temporal_density.rsqrt()
 
         if multivariate:
             loss_level = level_multiplier * (
@@ -199,7 +208,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            "level_active_frac": active_frac.detach().tolist() if multivariate else [float(active_frac.detach().item())],
+            "level_active_frac": temporal_density.detach().tolist() if multivariate else [float(temporal_density.detach().item())],
             "level_multiplier": level_multiplier.detach().tolist() if multivariate else [float(level_multiplier.detach().item())],
         }
 

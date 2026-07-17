@@ -99,16 +99,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Boosting level by 1/sqrt(d) cancels this dilution adaptively: it is ~1
         # for temporally dense batches (CM stays put) and grows as sparsity
         # increases (PGM), with no magic constants or extra hyperparameters.
-        if multivariate:
-            n_active_cells = event_mask.sum(dim=(0, 1))
-            n_active_series = event_mask.amax(dim=1).sum(dim=0)
-        else:
-            n_active_cells = event_mask.sum()
-            n_active_series = event_mask.amax(dim=1).sum()
+        # Compute batch-level temporal density (not per-channel) so all channels
+        # receive the same adaptive boost based on overall batch sparsity.
+        n_active_cells = event_mask.sum()  # Total events across all B, T, C
+        n_active_series = event_mask.amax(dim=1).sum()  # Count of (b,c) with >=1 event
         temporal_density = (
             n_active_cells / (n_active_series * T).clamp_min(self._EPS)
         ).clamp(min=self._EPS, max=1.0)
-        level_multiplier = temporal_density.rsqrt()
+        # Try linear inverse (1/d) instead of sqrt if rsqrt is too weak.
+        # rsqrt: ~1.4× boost for d=0.5 (CM), ~6× for d=0.03 (PGM).
+        # 1/d:   ~2.0× boost for d=0.5 (CM), ~24× for d=0.03 (PGM).
+        level_multiplier = 1.0 / temporal_density  # Scalar, linear inverse
 
         if multivariate:
             loss_level = level_multiplier * (
@@ -208,8 +209,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            "level_active_frac": temporal_density.detach().tolist() if multivariate else [float(temporal_density.detach().item())],
-            "level_multiplier": level_multiplier.detach().tolist() if multivariate else [float(level_multiplier.detach().item())],
+            "level_active_frac": [float(temporal_density.detach().item())],
+            "level_multiplier": [float(level_multiplier.detach().item())],
         }
 
         logger.debug(

@@ -91,11 +91,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._asinh_plus(gap)
         w_level = gate.amax(dim=1)
+        # Define "active" from the same event threshold (abs_max > tau),
+        # avoiding any extra hard-coded gate cutoffs.
+        active_frac = event_mask.amax(dim=1).mean(dim=0).clamp_min(self._EPS)
+        level_multiplier = 1.0 / active_frac
 
         if multivariate:
-            loss_level = T + T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = level_multiplier * (
+                T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            )
         else:
-            loss_level = T + T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = level_multiplier * (
+                T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            )
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
@@ -186,6 +194,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
+            "level_active_frac": active_frac.detach().tolist() if multivariate else [float(active_frac.detach().item())],
+            "level_multiplier": level_multiplier.detach().tolist() if multivariate else [float(level_multiplier.detach().item())],
         }
 
         logger.debug(

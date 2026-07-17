@@ -91,10 +91,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._asinh_plus(gap)
         w_level = gate.amax(dim=1)
-        # Define "active" from the same event threshold (abs_max > tau),
-
+        # Define "active" from the same event threshold (abs_max > tau).
         active_frac = event_mask.amax(dim=1).mean(dim=0).clamp_min(self._EPS)
-        level_multiplier = 1.0 / active_frac
+        # Softer adaptation than inverse-active; normalize to mean 1 in multivariate
+        # so this redistributes level pressure across channels without global blow-up.
+        level_multiplier_raw = active_frac.rsqrt()
+        if multivariate:
+            level_multiplier = level_multiplier_raw / level_multiplier_raw.mean().clamp_min(self._EPS)
+        else:
+            level_multiplier = level_multiplier_raw
 
         if multivariate:
             loss_level = level_multiplier * (
@@ -136,7 +141,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga = gap_global.abs()
                 gap_mean_l = _ga.mean(dim=0).tolist()
                 gap_max_l = _ga.amax(dim=0).tolist()
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+                _ev_mask_s = event_mask.amax(dim=1)
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
@@ -159,7 +164,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga = gap_global.abs()
                 gap_mean_l = [_ga.mean().item()]
                 gap_max_l = [_ga.max().item()]
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+                _ev_mask_s = event_mask.amax(dim=1)
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
                 gap_ev_max_l = [((_ga * _ev_mask_s).amax()).item()]

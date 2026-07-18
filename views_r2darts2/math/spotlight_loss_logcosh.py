@@ -87,23 +87,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhPlus on event-series gap only (not global mean) ─
-        # The global mean is dominated by peaceful series (w_level≈0.0125),
-        # pulling predictions toward peace-series levels. Instead, target the
-        # event-series mean (where w_level > tau), so conflict events are
-        # calibrated to their own true mean, not the global mean.
+        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._asinh_plus(gap)
         w_level = gate.amax(dim=1)
-        # Mask: only event series (where w_level > tau) contribute to level loss.
-        mask_ev = (w_level > self.tau).float()
 
         if multivariate:
-            n_ev = mask_ev.sum(dim=0).clamp_min(1)  # Count of event series per channel
-            loss_level = T * (mask_ev * level_cell).sum(dim=0) / n_ev
+            loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            n_ev = mask_ev.sum().clamp_min(1)  # Count of event series (scalar)
-            loss_level = T * (mask_ev * level_cell).sum() / n_ev
+            loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

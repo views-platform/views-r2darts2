@@ -87,38 +87,23 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
+        # ── LEVEL: AsinhPlus on event-series gap only (not global mean) ─
+        # The global mean is dominated by peaceful series (w_level≈0.0125),
+        # pulling predictions toward peace-series levels. Instead, target the
+        # event-series mean (where w_level > tau), so conflict events are
+        # calibrated to their own true mean, not the global mean.
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._asinh_plus(gap)
         w_level = gate.amax(dim=1)
-        # ── Adaptive de-dilution boost from batch temporal sparsity ──
-        # The gap is a mean over T timesteps. When events occupy only a few
-        # timesteps per active series (PGM spikes), that mean is diluted by the
-        # temporal density d = active_cells / (active_series * T), which lies in
-        # (0, 1] and equals 1 only when active series are active at every step.
-        # Boosting level by 1/sqrt(d) cancels this dilution adaptively: it is ~1
-        # for temporally dense batches (CM stays put) and grows as sparsity
-        # increases (PGM), with no magic constants or extra hyperparameters.
-        # Compute batch-level temporal density (not per-channel) so all channels
-        # receive the same adaptive boost based on overall batch sparsity.
-        n_active_cells = event_mask.sum()  # Total events across all B, T, C
-        n_active_series = event_mask.amax(dim=1).sum()  # Count of (b,c) with >=1 event
-        temporal_density = (
-            n_active_cells / (n_active_series * T).clamp_min(self._EPS)
-        ).clamp(min=self._EPS, max=1.0)
-        # Try linear inverse (1/d) instead of sqrt if rsqrt is too weak.
-        # rsqrt: ~1.4× boost for d=0.5 (CM), ~6× for d=0.03 (PGM).
-        # 1/d:   ~2.0× boost for d=0.5 (CM), ~24× for d=0.03 (PGM).
-        level_multiplier = 1.0 / temporal_density  # Scalar, linear inverse
+        # Mask: only event series (where w_level > tau) contribute to level loss.
+        mask_ev = (w_level > self.tau).float()
 
         if multivariate:
-            loss_level = level_multiplier * (
-                T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
-            )
+            n_ev = mask_ev.sum(dim=0).clamp_min(1)  # Count of event series per channel
+            loss_level = T * (mask_ev * level_cell).sum(dim=0) / n_ev
         else:
-            loss_level = level_multiplier * (
-                T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
-            )
+            n_ev = mask_ev.sum().clamp_min(1)  # Count of event series (scalar)
+            loss_level = T * (mask_ev * level_cell).sum() / n_ev
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
@@ -151,7 +136,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga = gap_global.abs()
                 gap_mean_l = _ga.mean(dim=0).tolist()
                 gap_max_l = _ga.amax(dim=0).tolist()
-                _ev_mask_s = event_mask.amax(dim=1)
+                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
@@ -174,7 +159,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga = gap_global.abs()
                 gap_mean_l = [_ga.mean().item()]
                 gap_max_l = [_ga.max().item()]
-                _ev_mask_s = event_mask.amax(dim=1)
+                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
                 gap_ev_max_l = [((_ga * _ev_mask_s).amax()).item()]
@@ -209,8 +194,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            "level_active_frac": [float(temporal_density.detach().item())],
-            "level_multiplier": [float(level_multiplier.detach().item())],
         }
 
         logger.debug(

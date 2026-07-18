@@ -87,10 +87,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhPlus on global gap, event-series only ───────
+        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._asinh_plus(gap)
-        w_level = (event_mask.sum(dim=1) > 0).float()
+        w_level = gate.amax(dim=1)
 
         if multivariate:
             loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -128,7 +128,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga = gap_global.abs()
                 gap_mean_l = _ga.mean(dim=0).tolist()
                 gap_max_l = _ga.amax(dim=0).tolist()
-                _ev_mask_s = (event_mask.sum(dim=1) > 0).float()
+                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
@@ -151,7 +151,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _ga = gap_global.abs()
                 gap_mean_l = [_ga.mean().item()]
                 gap_max_l = [_ga.max().item()]
-                _ev_mask_s = (event_mask.sum(dim=1) > 0).float()
+                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
                 gap_ev_max_l = [((_ga * _ev_mask_s).amax()).item()]

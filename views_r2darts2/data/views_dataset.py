@@ -417,6 +417,8 @@ def _resolve_features_from_config(
 
     The legacy contract is:
         * ``config["features"]`` (explicit list) — use as-is.
+        * ``config["feature_scaler_map"]`` present — derive features from the
+          union of all column lists in the map values (order-preserving).
         * ``config["broadcast_features"] == True`` and no explicit features —
           load all non-target value columns from the parquet.
         * Otherwise — empty feature list (targets only).
@@ -424,6 +426,14 @@ def _resolve_features_from_config(
     explicit = config.get("features")
     if explicit:
         return list(explicit)
+    feature_scaler_map = config.get("feature_scaler_map")
+    if feature_scaler_map:
+        seen: dict[str, None] = {}
+        for cols in feature_scaler_map.values():
+            for col in cols:
+                seen[col] = None
+        if seen:
+            return list(seen)
     if config.get("broadcast_features"):
         # Load the parquet schema to enumerate non-target columns.
         path_raw = config.get("path_raw")

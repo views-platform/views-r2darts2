@@ -439,6 +439,8 @@ def _resolve_features_from_config(
     """Resolve the feature column list from the experiment manifest.
 
     The legacy contract is:
+                * ``config["force_target_only"] == True``) — return an empty feature
+                    list and run in target-only mode.
         * ``config["feature_scaler_map"]`` present — STRICT allowlist mode;
           derive features from the union of all column lists in the map values
           (order-preserving) and ignore all other potential input features.
@@ -447,6 +449,14 @@ def _resolve_features_from_config(
           load all non-target value columns from the parquet.
         * Otherwise — empty feature list (targets only).
     """
+    if bool(config.get("force_target_only")):
+        logger.info(
+            "Target-only mode enabled via config flag "
+            "(force_target_only/disable_features). No features will be passed "
+            "to the model."
+        )
+        return []
+
     feature_scaler_map = config.get("feature_scaler_map")
     if feature_scaler_map:
         seen: dict[str, None] = {}

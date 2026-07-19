@@ -149,6 +149,23 @@ class ViewsDatasetDarts:
         targets = list(config.get("targets") or [])
         features = _resolve_features_from_config(config, targets)
 
+        # Strict allowlist mode: when feature_scaler_map is provided, only the
+        # listed features are eligible as model covariates. Any extra value
+        # columns present in parquet are intentionally ignored.
+        if config.get("feature_scaler_map"):
+            ignored_features = _enumerate_ignored_input_features(
+                file_path=file_path,
+                targets=targets,
+                allowed_features=features,
+            )
+            if ignored_features:
+                logger.info(
+                    "Ignoring %d input feature columns not present in "
+                    "feature_scaler_map: %s",
+                    len(ignored_features),
+                    ignored_features,
+                )
+
         time_id = config.get("time_id", "month_id")
         declared_entity_id = config.get("entity_id", "country_id")
 
@@ -416,24 +433,37 @@ def _resolve_features_from_config(
     """Resolve the feature column list from the experiment manifest.
 
     The legacy contract is:
-        * ``config["features"]`` (explicit list) — use as-is.
-        * ``config["feature_scaler_map"]`` present — derive features from the
-          union of all column lists in the map values (order-preserving).
+        * ``config["feature_scaler_map"]`` present — STRICT allowlist mode;
+          derive features from the union of all column lists in the map values
+          (order-preserving) and ignore all other potential input features.
+        * ``config["features"]`` (explicit list) and no scaler map — use as-is.
         * ``config["broadcast_features"] == True`` and no explicit features —
           load all non-target value columns from the parquet.
         * Otherwise — empty feature list (targets only).
     """
-    explicit = config.get("features")
-    if explicit:
-        return list(explicit)
     feature_scaler_map = config.get("feature_scaler_map")
     if feature_scaler_map:
         seen: dict[str, None] = {}
         for cols in feature_scaler_map.values():
             for col in cols:
                 seen[col] = None
-        if seen:
-            return list(seen)
+        features_from_map = list(seen)
+        explicit = config.get("features")
+        if explicit:
+            explicit_not_in_map = [f for f in explicit if f not in seen]
+            if explicit_not_in_map:
+                logger.info(
+                    "Ignoring %d config['features'] entries not present in "
+                    "feature_scaler_map: %s",
+                    len(explicit_not_in_map),
+                    explicit_not_in_map,
+                )
+        return features_from_map
+
+    explicit = config.get("features")
+    if explicit:
+        return list(explicit)
+
     if config.get("broadcast_features"):
         # Load the parquet schema to enumerate non-target columns.
         path_raw = config.get("path_raw")
@@ -460,6 +490,46 @@ def _resolve_features_from_config(
             logger.warning("Could not enumerate features from %s: %s", file_path, exc)
             return []
     return []
+
+
+def _enumerate_ignored_input_features(
+    *,
+    file_path: Path,
+    targets: Sequence[str],
+    allowed_features: Sequence[str],
+) -> list[str]:
+    """Return non-target parquet value columns that are excluded by allowlist.
+
+    This is used only for observability in strict ``feature_scaler_map`` mode.
+    If schema introspection fails, we silently skip logging rather than fail
+    dataset construction.
+    """
+    try:
+        import pyarrow.parquet as pq
+
+        schema = pq.read_schema(str(file_path))
+    except Exception as exc:  # pragma: no cover - defensive observability
+        logger.warning(
+            "Could not enumerate input features from %s for ignore logging: %s",
+            file_path,
+            exc,
+        )
+        return []
+
+    targets_set = set(targets)
+    allowed_set = set(allowed_features)
+    reserved = {
+        "month_id",
+        "country_id",
+        "priogrid_id",
+        "priogrid_gid",
+    }
+    input_value_features = [
+        name
+        for name in schema.names
+        if name not in targets_set and name not in reserved
+    ]
+    return sorted(name for name in input_value_features if name not in allowed_set)
 
 
 def _entity_boundaries(entity_sorted: NDArray[np.int64]) -> NDArray[np.intp]:

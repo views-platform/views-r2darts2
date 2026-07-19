@@ -93,10 +93,12 @@ class ViewsDatasetDarts:
             raise ValueError(
                 f"FeatureFrame is missing feature columns: {sorted(missing_features)}."
             )
-        overlap = set(targets).intersection(features)
+        overlap = sorted(set(targets).intersection(features))
         if overlap:
-            raise ValueError(
-                f"Columns cannot be both target and feature: {sorted(overlap)}."
+            logger.info(
+                "Using %d target columns as features as requested: %s",
+                len(overlap),
+                overlap,
             )
 
         self._frame = feature_frame
@@ -319,7 +321,11 @@ class ViewsDatasetDarts:
         if time_subset.shape[0] == 0:
             return []
 
-        value_columns = [*self._features, *self._targets]
+        # Keep features first; append only targets not already present.
+        value_columns = list(self._features)
+        for target in self._targets:
+            if target not in value_columns:
+                value_columns.append(target)
         # Sanity: the frame's column order must match what we promise to Darts.
         if value_columns != self._frame.feature_names:
             # The frame may carry extra columns; align to the declared order.

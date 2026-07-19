@@ -197,10 +197,12 @@ def load_views_parquet(
         raise ParquetLoadError("`targets` must be a non-empty list.")
 
     features = list(features) if features else []
-    overlap = set(targets).intersection(features)
+    overlap = sorted(set(targets).intersection(features))
     if overlap:
-        raise ParquetLoadError(
-            f"Columns cannot be both target and feature: {sorted(overlap)}."
+        logger.info(
+            "Using %d target columns as features as requested: %s",
+            len(overlap),
+            overlap,
         )
 
     path = Path(path)
@@ -243,10 +245,13 @@ def load_views_parquet(
             f"Parquet file {path} is missing required columns: {sorted(missing)}."
         )
 
-    # Value-axis order: features first, then targets. This matches the Darts
-    # ``value_cols`` order used downstream so the TimeSeries components line up
-    # with the feature_names list one-to-one.
-    value_columns = [*features, *targets]
+    # Value-axis order: features first, then targets not already present.
+    # This allows targets to also be listed as features without duplicate
+    # parquet projections or duplicated component names.
+    value_columns = list(features)
+    for target in targets:
+        if target not in value_columns:
+            value_columns.append(target)
     column_order = [time_id, entity_id, *value_columns]
     raw = _read_parquet_columns(path, column_order)
     time_arr = np.ascontiguousarray(raw[time_id]).astype(np.int64, copy=False)

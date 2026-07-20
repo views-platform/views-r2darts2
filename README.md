@@ -398,7 +398,7 @@ def get_hp_config():
         "target_scaler": "AsinhTransform",
         "feature_scaler": None,
         "feature_scaler_map": {
-            "AsinhTransform->MaxAbsScaler": [
+            "AsinhTransform": [
                 # All conflict counts, macro indicators, and lagged features
             ],
         },

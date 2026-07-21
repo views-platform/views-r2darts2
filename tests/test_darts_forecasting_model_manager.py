@@ -256,7 +256,7 @@ class TestPredictionFormat:
 
     def test_get_prediction_format_dataframe(self) -> None:
         """Explicit ``"dataframe"`` is returned."""
-        mgr = self._make_manager({"prediction_format": "dataframe"})
+        mgr = self._make_manager({"prediction_format": "dataframe", "level": "cm"})
         assert mgr._get_prediction_format() == "dataframe"
 
     def test_get_prediction_format_prediction_frame(self) -> None:
@@ -306,7 +306,7 @@ class TestPredictionFormat:
         )
         import numpy as np
 
-        mgr = self._make_manager({"prediction_format": "dataframe"})
+        mgr = self._make_manager({"prediction_format": "dataframe", "level": "cm"})
         time = np.array([100, 101], dtype=np.int64)
         entity = np.array([1, 1], dtype=np.int64)
         index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
@@ -349,7 +349,7 @@ class TestPredictionFormat:
         )
         import numpy as np
 
-        mgr = self._make_manager({"prediction_format": "dataframe"})
+        mgr = self._make_manager({"prediction_format": "dataframe", "level": "cm"})
         time = np.array([100], dtype=np.int64)
         entity = np.array([1], dtype=np.int64)
         index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
@@ -374,3 +374,21 @@ class TestPredictionFormat:
         preds = {"lr_ged_sb": frame}
         result = mgr._format_forecast_predictions(preds)
         assert result is preds  # identity — no conversion
+
+    def test_dataframe_mode_missing_level_raises(self) -> None:
+        """Dataframe mode requires config['level'] for entity-id resolution."""
+        from views_frames import (
+            PredictionFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+        )
+        import numpy as np
+
+        mgr = self._make_manager({"prediction_format": "dataframe"})
+        time = np.array([100], dtype=np.int64)
+        entity = np.array([1], dtype=np.int64)
+        index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
+        frame = PredictionFrame(np.array([[0.5]], dtype=np.float32), index=index)
+
+        with pytest.raises(ValueError, match=r"config\['level'\]"):
+            mgr._format_forecast_predictions({"lr_ged_sb": frame})

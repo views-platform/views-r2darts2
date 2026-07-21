@@ -275,28 +275,21 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         active_config = self.configs
         time_id = active_config.get("time_id", "month_id")
 
-        # Determine entity_id from explicit config first, then level, then
-        # the PredictionFrame index as a final fallback.
-        entity_id = active_config.get("entity_id")
-        if entity_id is None:
-            level = active_config.get("level")
-            if isinstance(level, str):
-                level_norm = level.lower()
-                if level_norm == "pgm":
-                    entity_id = "priogrid_id"
-                elif level_norm == "cm":
-                    entity_id = "country_id"
-
-        if entity_id is None:
-            first_frame = next(iter(predictions.values()), None)
-            if first_frame is not None:
-                entity_id = first_frame.index.level.entity_column
-
-        if entity_id is None:
+        # Entity-id resolution is level-driven by config.
+        level = active_config.get("level")
+        if not isinstance(level, str):
             raise ValueError(
-                "Unable to resolve entity_id for dataframe conversion. "
-                "Set config['entity_id'] or config['level']."
+                "Missing required config['level'] for dataframe conversion. "
+                "Expected 'cm' or 'pgm'."
             )
+
+        level_norm = level.lower()
+        if level_norm == "pgm":
+            entity_id = "priogrid_id"
+        elif level_norm == "cm":
+            entity_id = "country_id"
+        else:
+            raise ValueError(f"Unsupported level for entity_id resolution: {level}")
         
         return prediction_frames_to_dataframe(
             predictions=predictions,

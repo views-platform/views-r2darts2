@@ -398,7 +398,7 @@ def get_hp_config():
         "target_scaler": "AsinhTransform",
         "feature_scaler": None,
         "feature_scaler_map": {
-            "AsinhTransform->MaxAbsScaler": [
+            "AsinhTransform": [
                 # All conflict counts, macro indicators, and lagged features
             ],
         },
@@ -436,7 +436,7 @@ def get_hp_config():
 
         # Normalization
         "use_reversible_instance_norm": True,
-        "use_cyclic_encoders": True,
+        "use_cyclic_encoders": False,
         "use_static_covariates": True,  # Set False for N-BEATS, N-HiTS, Transformer
 
         # Reproducibility

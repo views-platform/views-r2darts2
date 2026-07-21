@@ -95,10 +95,9 @@ class ViewsDatasetDarts:
             )
         overlap = sorted(set(targets).intersection(features))
         if overlap:
-            logger.info(
-                "Using %d target columns as features as requested: %s",
-                len(overlap),
-                overlap,
+            raise ValueError(
+                "A column cannot be both target and feature. "
+                f"Overlapping columns: {overlap}."
             )
 
         self._frame = feature_frame

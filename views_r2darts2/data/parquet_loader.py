@@ -87,6 +87,11 @@ _ENTITY_ALIASES: dict[str, str] = {
 }
 
 
+def _canonical_entity_column(name: str) -> str:
+    """Return canonical entity column name (normalizes known aliases)."""
+    return _ENTITY_ALIASES.get(name, name)
+
+
 def _resolve_entity_column(declared: str, available: set[str]) -> str:
     """Resolve the actual entity column name against the parquet schema.
 
@@ -196,13 +201,16 @@ def load_views_parquet(
     if not targets:
         raise ParquetLoadError("`targets` must be a non-empty list.")
 
+    # Normalize caller-provided aliases so downstream semantics always use
+    # canonical VIEWS column names.
+    entity_id = _canonical_entity_column(entity_id)
+
     features = list(features) if features else []
     overlap = sorted(set(targets).intersection(features))
     if overlap:
-        logger.info(
-            "Using %d target columns as features as requested: %s",
-            len(overlap),
-            overlap,
+        raise ParquetLoadError(
+            "A column cannot be both target and feature. "
+            f"Overlapping columns: {overlap}."
         )
 
     path = Path(path)
@@ -236,9 +244,10 @@ def load_views_parquet(
     # callers don't need to know the level upfront — they can pass the default
     # ``country_id`` and the loader will fall back to ``priogrid_id`` (or the
     # ``priogrid_gid`` alias) when the parquet is pgm-level.
-    entity_id = _resolve_entity_column(entity_id, available)
+    entity_column = _resolve_entity_column(entity_id, available)
+    entity_id = _canonical_entity_column(entity_column)
 
-    required = {time_id, entity_id, *targets, *features}
+    required = {time_id, entity_column, *targets, *features}
     missing = required - available
     if missing:
         raise ParquetLoadError(
@@ -252,10 +261,10 @@ def load_views_parquet(
     for target in targets:
         if target not in value_columns:
             value_columns.append(target)
-    column_order = [time_id, entity_id, *value_columns]
+    column_order = [time_id, entity_column, *value_columns]
     raw = _read_parquet_columns(path, column_order)
     time_arr = np.ascontiguousarray(raw[time_id]).astype(np.int64, copy=False)
-    entity_arr = np.ascontiguousarray(raw[entity_id]).astype(np.int64, copy=False)
+    entity_arr = np.ascontiguousarray(raw[entity_column]).astype(np.int64, copy=False)
 
     # Cast every value column to float32 at the airlock boundary (ADR-010).
     if value_columns:

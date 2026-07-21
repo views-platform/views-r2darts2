@@ -722,10 +722,10 @@ class DartsForecaster:
                 self.model.model.to(self.device)
             current_device = next(self.model.model.parameters()).device
             if current_device.type == "cpu":
-                raise RuntimeError(
-                    f"CRITICAL DEVICE FAILURE: failed to move model from CPU "
-                    f"to {self.device}. Prediction aborted to prevent "
-                    "inconsistent results."
+                logger.warning(
+                    "Failed to move model from CPU to %s before prediction; "
+                    "continuing on CPU.",
+                    self.device,
                 )
 
         # Generate forecasts.

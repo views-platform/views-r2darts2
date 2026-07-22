@@ -19,9 +19,9 @@ class OptimizerCatalog:
         self._all_potential_args = {
             "lr": opt_overrides.get("lr", self.config.get("lr")),
             "weight_decay": opt_overrides.get("weight_decay", self.config.get("weight_decay")),
-            "momentum": opt_overrides.get("momentum", self.config.get("momentum")),
-            "alpha": opt_overrides.get("alpha", self.config.get("alpha")),
-            "betas": opt_overrides.get("betas", self.config.get("betas")),
+            "momentum": opt_overrides.get("momentum"),
+            "alpha": opt_overrides.get("alpha"),
+            "betas": opt_overrides.get("betas"),
         }
 
     def get_optimizer_cls(self) -> Type[torch.optim.Optimizer]:

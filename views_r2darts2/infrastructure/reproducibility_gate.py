@@ -277,11 +277,20 @@ class ReproducibilityGate:
 
         # Optimizer-specific genes
         OPTIMIZER_GENOMES = {
-            "Adam": ["lr", "weight_decay", "betas"],
-            "AdamW": ["lr", "weight_decay", "betas"],
-            "RAdam": ["lr", "weight_decay", "betas"],
+            "Adam": ["lr", "weight_decay"],
+            "AdamW": ["lr", "weight_decay"],
+            "RAdam": ["lr", "weight_decay"],
             "SGD": ["lr", "weight_decay", "momentum"],
             "RMSprop": ["lr", "weight_decay", "momentum", "alpha"],
+        }
+
+        # Optional optimizer genes that are allowed when present but not mandatory.
+        OPTIMIZER_OPTIONAL_GENES = {
+            "Adam": ["betas"],
+            "AdamW": ["betas"],
+            "RAdam": ["betas"],
+            "SGD": [],
+            "RMSprop": [],
         }
 
         # Scheduler-specific genes

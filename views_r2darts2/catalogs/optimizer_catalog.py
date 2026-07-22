@@ -49,7 +49,13 @@ class OptimizerCatalog:
             raise ValueError(error_msg)
         
         opt_genome = ReproducibilityGate.Config.OPTIMIZER_GENOMES[self.opt_name]
-        valid_kwargs = {k: v for k, v in self._all_potential_args.items() if k in opt_genome}
+        optional_genes = ReproducibilityGate.Config.OPTIMIZER_OPTIONAL_GENES.get(self.opt_name, [])
+        allowed_genes = set(opt_genome) | set(optional_genes)
+        valid_kwargs = {
+            k: v
+            for k, v in self._all_potential_args.items()
+            if (k in allowed_genes and v is not None)
+        }
         
         missing = [k for k in opt_genome if valid_kwargs.get(k) is None]
         if missing:

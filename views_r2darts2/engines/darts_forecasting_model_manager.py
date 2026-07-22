@@ -24,6 +24,7 @@ Key cleanup vs. the legacy implementation:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Mapping
 
 import torch  # noqa: F401 — kept alive for the monkey-patches in apply_all_patches
@@ -356,6 +357,27 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
             return predictions
         return self._predictions_to_dataframe(predictions)
 
+    @staticmethod
+    def _materialize_prediction_frames_to_memmap(
+        predictions: dict[str, PredictionFrame],
+        cache_root: Path,
+        sequence_number: int,
+    ) -> dict[str, PredictionFrame]:
+        """Persist per-target frames to disk and reload as mmap-backed frames.
+
+        This guarantees that prediction-frame mode does not keep dense prediction
+        arrays resident in RAM across rolling-origin sequences.
+        """
+        sequence_dir = cache_root / f"sequence_{sequence_number:04d}"
+        sequence_dir.mkdir(parents=True, exist_ok=True)
+
+        memmap_predictions: dict[str, PredictionFrame] = {}
+        for target, frame in predictions.items():
+            target_dir = sequence_dir / target
+            frame.save(target_dir)
+            memmap_predictions[target] = PredictionFrame.load(target_dir, mmap=True)
+        return memmap_predictions
+
     def _train_model_artifact(self) -> DartsForecaster:
         """Train a forecasting model and (optionally) save the artifact.
 
@@ -405,7 +427,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
     def _evaluate_model_artifact(
         self, eval_type: str, artifact_name: str | None = None
-    ) -> list[dict[str, PredictionFrame]]:
+    ) -> Any:
         """Evaluate a model artifact over all rolling-origin sequences.
 
         Args:
@@ -415,8 +437,11 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
                 the latest artifact for the current run type is used.
 
         Returns:
-            A list of ``{target_name: PredictionFrame}`` dicts, one per
-            rolling-origin sequence.
+                        Formatted predictions by configured output mode:
+                                * ``prediction_format='dataframe'``:
+                                    ``list[pd.DataFrame]``
+                                * ``prediction_format='prediction_frame'``:
+                                    ``dict[str, list[PredictionFrame]]`` (disk-backed memmap)
         """
         import concurrent.futures
 
@@ -474,6 +499,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         )
 
         predict_kwargs = self._get_predict_kwargs(active_config)
+        prediction_format = self._get_prediction_format()
 
         def predict_sequence(sequence_number: int):
             """Predict a single rolling-origin sequence."""
@@ -494,7 +520,14 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
         # FORCE SEQUENTIAL FOR GPU: Darts moves models to CPU in teardown(),
         # causing race conditions in multi-threaded GPU inference.
-        if forecaster.device == "cpu":
+        if prediction_format == "prediction_frame":
+            logger.info(
+                "prediction_format='prediction_frame': forcing sequential "
+                "evaluation and memmap materialization to avoid in-memory "
+                "accumulation across sequences."
+            )
+            max_workers = 1
+        elif forecaster.device == "cpu":
             max_workers = active_config.get("parallel_workers", 1)
         else:
             logger.info(
@@ -508,6 +541,40 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
             max_workers,
             total_sequence_number,
         )
+
+        if prediction_format == "prediction_frame":
+            cache_root = (
+                path_artifacts
+                / f"_prediction_frames_memmap_{timestamp}_{eval_type}"
+            )
+            cache_root.mkdir(parents=True, exist_ok=True)
+
+            per_target_predictions: dict[str, list[PredictionFrame]] = {}
+            for seq_num in range(total_sequence_number):
+                try:
+                    sequence_predictions = predict_sequence(seq_num)
+                    sequence_predictions = self._materialize_prediction_frames_to_memmap(
+                        sequence_predictions,
+                        cache_root,
+                        sequence_number=seq_num,
+                    )
+                    for target, frame in sequence_predictions.items():
+                        per_target_predictions.setdefault(target, []).append(frame)
+                    logger.info(
+                        "Progress: %d/%d sequences completed",
+                        seq_num + 1,
+                        total_sequence_number,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Sequence %d failed with error: %s", seq_num + 1, exc
+                    )
+                    raise
+
+            logger.info(
+                "All %d predictions completed successfully", total_sequence_number
+            )
+            return per_target_predictions
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -537,9 +604,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         logger.info(
             "All %d predictions completed successfully", total_sequence_number
         )
-        # Format per the configured prediction_format:
-        #   "dataframe"       → list[pd.DataFrame]
-        #   "prediction_frame" → dict[str, list[PredictionFrame]]
+        # Dataframe mode only reaches this branch.
         return self._format_eval_predictions(df_predictions)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------ forecast
@@ -597,6 +662,14 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
         predict_kwargs = self._get_predict_kwargs(active_config)
         predictions = forecaster.predict(0, max(active_config["steps"]), **predict_kwargs)
+        if self._get_prediction_format() == "prediction_frame":
+            cache_root = path_artifacts / f"_prediction_frames_memmap_{timestamp}_forecast"
+            cache_root.mkdir(parents=True, exist_ok=True)
+            predictions = self._materialize_prediction_frames_to_memmap(
+                predictions,
+                cache_root,
+                sequence_number=0,
+            )
         return self._format_forecast_predictions(predictions)
 
     # ------------------------------------------------------------------ sweep

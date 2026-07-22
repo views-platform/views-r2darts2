@@ -392,3 +392,28 @@ class TestPredictionFormat:
 
         with pytest.raises(ValueError, match=r"config\['level'\]"):
             mgr._format_forecast_predictions({"lr_ged_sb": frame})
+
+    def test_materialize_prediction_frames_to_memmap(self, tmp_path) -> None:
+        """PredictionFrame mode persists to disk and reloads as memmap-backed arrays."""
+        from views_frames import (
+            PredictionFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+        )
+        import numpy as np
+
+        time = np.array([100, 101], dtype=np.int64)
+        entity = np.array([1, 1], dtype=np.int64)
+        index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
+        frame = PredictionFrame(np.array([[0.5], [1.5]], dtype=np.float32), index=index)
+
+        memmap_preds = DartsForecastingModelManager._materialize_prediction_frames_to_memmap(
+            {"lr_ged_sb": frame},
+            tmp_path,
+            sequence_number=0,
+        )
+
+        assert "lr_ged_sb" in memmap_preds
+        loaded = memmap_preds["lr_ged_sb"]
+        assert isinstance(loaded.values, np.memmap)
+        assert np.array_equal(loaded.values, frame.values)

@@ -414,7 +414,8 @@ def get_hp_config():
         "lr": 0.0005,
         "weight_decay": 0.0002,
         "gradient_clip_val": 3,
-        "optimizer_kwargs": {"lr": 0.0005, "weight_decay": 0.0002},
+        "optimizer_kwargs": {
+            "betas": (0.9, 0.95), "lr": 0.0005, "weight_decay": 0.0002},
 
         # Scheduler
         "lr_scheduler_cls": "ReduceLROnPlateau",

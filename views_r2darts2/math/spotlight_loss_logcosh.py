@@ -92,7 +92,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         n_events = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._log_cosh(gap)
-        w_level = gate.amax(dim=1)
+        # w_level = gate.amax(dim=1)
+        w_level = torch.sigmoid(15.0 * (y_pred.detach().abs().amax(dim=1) - self.tau))
 
         amplifier = max(math.log10(T / n_events) + 1.0, 1.0)  # Amplify level loss when events are sparse
         # amplifier = 1.0

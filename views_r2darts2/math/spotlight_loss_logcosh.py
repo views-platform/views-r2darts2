@@ -88,16 +88,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
         # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        n_eff = gate.sum(dim=1).clamp_min(1.0)  # effective number of active series
-        boost = torch.sqrt(T / n_eff)
+        n_eff = gate.sum(dim=1).clamp_min(1.0)
+        gap = (gate * (y_pred - y_true)).sum(dim=1) / n_eff   # event-only mean error
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
+        boost = (T / n_eff).sqrt()
 
         if multivariate:
-            loss_level = T * (boost * w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = (boost * w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = T * (boost * w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = (boost * w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

@@ -90,13 +90,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         n_eff = gate.sum(dim=1).clamp_min(1.0)
+        level_scale = (T / n_eff)
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 
         if multivariate:
-            loss_level = T * (T/n_eff) * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            # Apply per-series scaling before batch reduction so output stays (C,).
+            weighted_level = level_scale * w_level
+            loss_level = T * (weighted_level * level_cell).sum(dim=0) / weighted_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = T * (T/n_eff) *(w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            weighted_level = (level_scale.squeeze(-1) * w_level)
+            loss_level = T * (weighted_level * level_cell).sum() / weighted_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

@@ -73,11 +73,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # DRO weighting (V56 fix: use error magnitude, not value magnitude)
         raw_abs = e_shape.abs().detach()
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
-        w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
+        valid_dro = (raw_abs > 1e-6).float()
+        w_dro = torch.sqrt((raw_abs * valid_dro) / dro_mu.clamp_min(1e-6))
         w_dro_mean = (w_dro * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = w_dro / w_dro_mean.clamp_min(1e-8)
-        w_dro = 1.0 + event_mask * (w_dro - 1.0)
+        
+        # Where raw_abs was 0, w_dro is nan. We safely set it to 1.0 (neutral weight).
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+        w_dro = 1.0 + event_mask * (w_dro - 1.0)
 
         shape_w = gate * w_dro
         if multivariate:

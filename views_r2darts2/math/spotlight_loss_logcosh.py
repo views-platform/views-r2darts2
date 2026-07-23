@@ -61,19 +61,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(15.0 * (abs_max - self.tau))
 
+        event_mask = (abs_max > self.tau).float()
+        n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
         # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
-        e_mean = e.mean(dim=1, keepdim=True)
+        e_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
         e_shape = e - e_mean
 
-        # V58: Remove ac_scale entirely.
-        # tanh(e) naturally prioritizes large errors (saturates at 1.0).
-        # No normalization needed — the function is self-normalizing.
         shape_cell = self._log_cosh(e_shape)
 
         # DRO weighting (V56 fix: use error magnitude, not value magnitude)
-        event_mask = (abs_max > self.tau).float()
         raw_abs = e_shape.abs().detach()
-        n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
         w_dro_mean = (w_dro * event_mask).sum(dim=1, keepdim=True) / n_ev
@@ -93,8 +91,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 
-        amplifier = max(math.asinh(T / n_events), 1.0)  # Amplify level loss when events are sparse
-        
+        # amplifier = max(math.asinh(T / n_events), 1.0)  # Amplify level loss when events are sparse
+        amplifier = 1.0
         logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
 
         if multivariate:

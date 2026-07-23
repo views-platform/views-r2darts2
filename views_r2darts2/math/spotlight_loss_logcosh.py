@@ -59,7 +59,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Event gate ───────────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = torch.sigmoid(10.0 * (abs_max - self.tau))
+        gate = torch.sigmoid(15.0 * (abs_max - self.tau))
 
         # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
         e_mean = e.mean(dim=1, keepdim=True)

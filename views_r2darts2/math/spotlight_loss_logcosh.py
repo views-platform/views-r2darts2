@@ -83,15 +83,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         shape_w = gate * w_dro
         if multivariate:
-            sw_sum = shape_w.sum(dim=(0, 1))
-            sw_sq_sum = (shape_w ** 2).sum(dim=(0, 1))
-            ess_shape = (sw_sum ** 2) / sw_sq_sum.clamp_min(self._EPS)
-            loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / ess_shape.sqrt().clamp_min(self._EPS)
+            loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
-            sw_sum = shape_w.sum()
-            sw_sq_sum = (shape_w ** 2).sum()
-            ess_shape = (sw_sum ** 2) / sw_sq_sum.clamp_min(self._EPS)
-            loss_shape = (shape_w * shape_cell).sum() / ess_shape.sqrt().clamp_min(self._EPS)
+            loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
         # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
@@ -99,15 +93,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_level = gate.amax(dim=1)
 
         if multivariate:
-            wl_sum = w_level.sum(dim=0)
-            wl_sq_sum = (w_level ** 2).sum(dim=0)
-            ess_level = (wl_sum ** 2) / wl_sq_sum.clamp_min(self._EPS)
-            loss_level = T * (w_level * level_cell).sum(dim=0) / ess_level.sqrt().clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            wl_sum = w_level.sum()
-            wl_sq_sum = (w_level ** 2).sum()
-            ess_level = (wl_sum ** 2) / wl_sq_sum.clamp_min(self._EPS)
-            loss_level = T * (w_level * level_cell).sum() / ess_level.sqrt().clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

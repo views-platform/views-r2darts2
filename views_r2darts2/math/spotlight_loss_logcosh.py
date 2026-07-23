@@ -93,7 +93,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 
-        amplifier = math.sqrt(T / n_events)
+        amplifier = math.asinh(T / n_events)
         
         logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
 

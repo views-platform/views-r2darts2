@@ -94,8 +94,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 
-        # amplifier = max(math.asinh(T / n_events), 1.0)  # Amplify level loss when events are sparse
-        amplifier = 1.0
+        amplifier = max(math.log10(T / n_events) + 1.0, 1.0)  # Amplify level loss when events are sparse
+        # amplifier = 1.0
         # logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
 
         if multivariate:

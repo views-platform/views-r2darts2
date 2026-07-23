@@ -94,7 +94,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # amplifier = max(math.asinh(T / n_events), 1.0)  # Amplify level loss when events are sparse
         amplifier = 1.0
-        logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
+        # logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
 
         if multivariate:
             loss_level = T * amplifier * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)

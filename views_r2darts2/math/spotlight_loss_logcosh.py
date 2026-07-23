@@ -89,7 +89,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        n_eff = gate.sum(dim=1).clamp_min(1.0)
+        n_eff = gate.sum(dim=1).clamp_min(1.0).mean().item()
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 

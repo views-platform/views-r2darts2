@@ -87,19 +87,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         n_events = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
-        # gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        gap = e_mean.squeeze(1)
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 
-        # amplifier = max(math.asinh(T / n_events), 1.0)  # Amplify level loss when events are sparse
-        amplifier = 1.0
-        # logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
+        amplifier = max(math.asinh(T / n_events), 1.0)  # Amplify level loss when events are sparse
+        # amplifier = 1.0
+        logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
 
         if multivariate:
-            loss_level = (n_ev.squeeze(1) * amplifier * (w_level * level_cell)).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = T * amplifier * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = (n_ev.squeeze(1) * amplifier * (w_level * level_cell)).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * amplifier * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

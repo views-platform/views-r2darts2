@@ -95,9 +95,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         boost = (T / n_eff).sqrt()
 
         if multivariate:
-            loss_level = (boost * w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = T * (boost * w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = (boost * w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * (boost * w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

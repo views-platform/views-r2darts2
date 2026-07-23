@@ -87,9 +87,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: gate-weighted gap ────────────────────────────────────
-        n_eff = gate.sum(dim=1).clamp_min(1.0)
-        gap = (gate * (y_pred - y_true)).sum(dim=1) / n_eff
+        # ── LEVEL: active-cell mean gap ─────────────────────────────────
+        n_eff = event_mask.sum(dim=1).clamp_min(1.0)
+        gap = (event_mask * (y_pred - y_true)).sum(dim=1) / n_eff
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 
@@ -97,7 +97,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
             loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
-
+        
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
             per_channel = loss_shape + loss_level

@@ -240,7 +240,7 @@ def apply_rinorm_compression_patch():
             torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
-        self.stdev = torch.clamp(self.stdev, min=0.1)
+        self.stdev = torch.clamp(self.stdev, min=1.0)
 
         # Normalize by centered-raw std, compress back via asinh
         x = torch.asinh(x_centered_raw / self.stdev)

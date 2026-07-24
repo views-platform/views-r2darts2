@@ -88,20 +88,29 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
-        n_events = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
+        # ── LEVEL: log_cosh on the UNCONDITIONAL per-series window gap ──
+        # Root cause of the 98%-zero collapse: the target unconditional mean
+        # (~0.218 in asinh space) sits BELOW tau (0.88), i.e. inside the
+        # gate's zero-gradient blind spot. Any event-conditional signal —
+        # whether via an event-masked gap OR via `w_level = gate.amax()`
+        # weighting — down-weights the ~98% peaceful series (true mean 0) to
+        # near zero, leaving the global bias free to drift past y_bar to 0.
+        #
+        # Weighting every series equally makes each series defend its OWN
+        # per-series mean: a peaceful series (mean 0) is held at 0 (not
+        # driven negative), an active series is held at its true mean. This
+        # restores gradient support at the base rate, is batch-invariant
+        # (each series reduces over its own T steps, no event-count term),
+        # and preserves Shape's exact zero-DC orthogonality. `T` rescales
+        # the per-cell gradient to O(tanh(gap)) — a structural constant, not
+        # a sparsity-driven amplifier.
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._log_cosh(gap)
-        w_level = gate.amax(dim=1)
-
-        # amplifier = max(math.log10(T / n_events) + 1.0, 1.0)  # Amplify level loss when events are sparse
-        amplifier = 1.0
-        # logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
 
         if multivariate:
-            loss_level = T * amplifier * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = T * level_cell.mean(dim=0)
         else:
-            loss_level = T * amplifier * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * level_cell.mean()
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

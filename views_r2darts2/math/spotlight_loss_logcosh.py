@@ -88,26 +88,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: log_cosh on the EVENT-CELL mean gap, GATED ───────
-        # gap == e_mean, the mean error over event cells (already computed
-        # above and subtracted by Shape). This is the crux of the sparse-data
-        # fix. The old temporal-mean gap [y_pred.mean(1) - y_true.mean(1)]
-        # diluted each spike by 1/T, so at 98% zeros the model could zero the
-        # gap by smearing spike mass uniformly across time -> flatline-at-mean.
-        #
-        # Because Shape penalises (e - e_mean) and Level penalises e_mean, the
-        # two terms now reconstruct the FULL per-event error e with no null
-        # space: a uniform under-prediction of spikes yields e_mean ~ -Δ (not
-        # 0) and a strong, non-vanishing upward gradient on the event cells.
-        # The dilution is gone, so the T * amplifier compensation is dropped.
-        gap = e_mean.squeeze(1)
+        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
+        n_events = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
+        # gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
+        gap = ((event_mask * y_pred).sum(dim=1, keepdim=True) / n_ev - (event_mask * y_true).sum(dim=1, keepdim=True) / n_ev)
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 
+        amplifier = max(math.log10(T / n_events) + 1.0, 1.0)  # Amplify level loss when events are sparse
+        # amplifier = 1.0
+        # logger.info("SpotlightLossV58 | n_events=%.2f amplifier=%.4f total=%.4f", n_events, amplifier, T*amplifier)
+
         if multivariate:
-            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = T * amplifier * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * amplifier * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

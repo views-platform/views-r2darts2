@@ -199,18 +199,17 @@ def apply_torch_load_patch():
 
 def apply_rinorm_compression_patch():
     """
-    Patches Darts RINorm with hybrid-space normalization (v3).
+    Patches Darts RINorm with MEAN-ONLY centering (v4).
 
-    Centers in asinh-space (zero mean bias), normalizes variance in
-    raw-space (bounded gradients). Eliminates both the gradient
-    explosion of standard RevIN AND the systematic positive bias of
-    pure raw-space RevIN.
+    Centers in asinh-space only. No variance normalization.
+    Gradient of inverse = 1 (perfectly symmetric), eliminating the
+    sigma amplification that crushed prediction std on non-event cells.
 
-    Forward:  z = asinh(sinh(x − μ_asinh) / σ_c)
-    Inverse:  ŷ = asinh(sinh(ẑ) · σ_c) + μ_asinh
+    Forward:  z = x - mu_asinh
+    Inverse:  y = z + mu_asinh
 
-    At ẑ=0: ŷ = μ_asinh exactly. No Jensen bias.
-    Gradient: bounded ∈ [1, σ_c], no exponential explosion.
+    At ẑ=0: ŷ = mu_asinh exactly. No Jensen bias.
+    Gradient: 1 everywhere. No sigma amplification.
     Round-trip: exact (forward ∘ inverse = identity).
     Zero learnable parameters. Backwards-compatible state_dict.
     """
@@ -219,38 +218,25 @@ def apply_rinorm_compression_patch():
     if getattr(RINorm, '_raw_space_patched', False):
         return  # Already patched
 
-    def _raw_space_forward(self, x: torch.Tensor):
+    def _mean_only_forward(self, x: torch.Tensor):
         # x is in asinh-space: (batch, input_chunk_length, n_targets)
         calc_dims = tuple(range(1, x.ndim - 1))
-
-        # Guard against any upstream numeric accident before sinh.
-        x = torch.clamp(x, -88.0, 88.0)
 
         # Compute asinh-space mean (bias-free centering point)
         self.mean = torch.mean(x, dim=calc_dims, keepdim=True).detach()
 
-        # Center in asinh space, convert to raw
-        x_centered_raw = torch.sinh(x - self.mean)
+        # Center only — NO variance normalization
+        x = x - self.mean
 
-        # Compute variance of the centered-raw signal
-        # NOTE: this is std(sinh(x - μ_asinh)), NOT std(sinh(x)).
-        # These differ enormously — std(sinh(x)) is inflated by the
-        # raw-space mean offset; std(sinh(x-μ)) reflects actual variability.
-        self.stdev = torch.sqrt(
-            torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
-            + self.eps
-        ).detach()
-        self.stdev = torch.clamp(self.stdev, min=1.0)
-
-        # Normalize by centered-raw std, compress back via asinh
-        x = torch.asinh(x_centered_raw / self.stdev)
+        # stdev is kept at 1.0 for backwards compatibility (some code may reference it)
+        self.stdev = torch.ones_like(self.mean)
 
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    def _raw_space_inverse(self, x: torch.Tensor):
+    def _mean_only_inverse(self, x: torch.Tensor):
         # x shape: (batch, output_chunk_length, n_targets, nr_params)
         if self.affine:
             x = x - self.affine_bias.view(self.affine_bias.shape + (1,))
@@ -259,49 +245,26 @@ def apply_rinorm_compression_patch():
                 + self.eps * self.eps
             )
 
-        sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
 
-        # Clamp before sinh to prevent float32 overflow.
-        # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
-        # (Syria peak centered-raw std), sinh(50)*1000≈2.6e24 << 3.4e38.
-        x = torch.clamp(x, -50.0, 50.0)
-
-        # Expand and denormalize.
-        # When using a likelihood (e.g. Gaussian/Laplace), Darts passes the raw
-        # parameter tensor of shape (..., nr_params) through this inverse BEFORE
-        # loss computation.  Only the LOCATION parameter (index 0) should receive
-        # the full nonlinear inverse (asinh(sinh(x)×σ) + μ).
-        #
-        # SCALE parameters (index 1+) must NOT go through asinh(sinh(·)×σ).
-        # Reason: σ_raw for high-conflict series can be 100+.  The transform
-        # asinh(sinh(1.0)×100) ≈ 5.5, producing a Laplace b ≈ 5.5 in asinh-space.
-        # The 5% tail samples then land at μ±16.5 in asinh-space → sinh(16.5) ≈
-        # 7.3 million deaths.  But the ENTIRE target range in asinh-space is
-        # only ~7 (asinh(500)≈6.9).  The natural uncertainty scale is O(1-3).
-        #
-        # Fix: scale parameters pass through as IDENTITY.  The model learns the
-        # absolute scale of uncertainty directly in target (asinh) space.  The
-        # NLL gradient naturally calibrates scale to the empirical residual
-        # magnitude (~0.3 for peace, ~1-3 for conflict).  No σ amplification.
+        # Mean-only inverse: y = z + mu
+        # Gradient = 1 everywhere (perfectly symmetric, no sigma amplification)
+        # Handle scale parameters as identity (same as before)
         if x.dim() == 4 and x.shape[-1] > 1:
-            # x[..., 0]: location parameter — full nonlinear inverse
-            loc = torch.asinh(torch.sinh(x[..., :1]) * sigma) + mu
-            # x[..., 1+]: scale/dispersion — identity (model learns in target space)
+            loc = x[..., :1] + mu
             sca = x[..., 1:]
             x = torch.cat([loc, sca], dim=-1)
         else:
-            # Point forecasting (nr_params == 1) — full inverse as before
-            x = torch.asinh(torch.sinh(x) * sigma) + mu
+            x = x + mu
 
         return x
 
-    RINorm.forward = _raw_space_forward
-    RINorm.inverse = _raw_space_inverse
+    RINorm.forward = _mean_only_forward
+    RINorm.inverse = _mean_only_inverse
     RINorm._raw_space_patched = True
     logger.info(
-        "🐨 Patched RINorm: hybrid-space normalization v3 "
-        "(asinh centering + raw-space σ, zero mean bias)."
+        "🐨 Patched RINorm: mean-only centering v4 "
+        "(asinh centering, gradient=1, no sigma amplification)."
     )
 
 

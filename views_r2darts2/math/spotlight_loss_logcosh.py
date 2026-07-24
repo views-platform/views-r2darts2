@@ -47,6 +47,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
+            
+        y_pred = torch.clamp(y_pred, min=0.0)
 
         multivariate = y_pred.dim() == 3
         B, T = y_pred.shape[:2]

@@ -43,17 +43,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         """
         return x * torch.asinh(x)
 
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    def forward(self, y_pred, y_true):
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
         multivariate = y_pred.dim() == 3
         B, T = y_pred.shape[:2]
-
-        self._last_input_grad = None
-        if y_pred.requires_grad:
-            y_pred.register_hook(lambda g: setattr(self, "_last_input_grad", g.detach()))
 
         e = y_pred - y_true
 
@@ -63,22 +59,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gate = (abs_max > self.tau).float()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
-        # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
-        e_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
+        # ── SHAPE: background-referenced demeaning ──
+        bg_mask = 1.0 - event_mask
+        n_bg = bg_mask.sum(dim=1, keepdim=True)
+        has_bg = (n_bg > 0).float()
+        e_bg_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_bg.clamp_min(1e-6)
+        e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
+        e_mean = has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean
         e_shape = e - e_mean
-        # e_shape = torch.where(n_ev <= 1.0, e, e - e_mean) # try without
 
         shape_cell = self._log_cosh(e_shape)
 
-        # DRO weighting
+        # DRO weighting (unchanged)
         raw_abs = e_shape.abs().detach()
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         valid_dro = (raw_abs > 1e-6).float()
         w_dro = torch.sqrt((raw_abs * valid_dro) / dro_mu.clamp_min(1e-6))
         w_dro_mean = (w_dro * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = w_dro / w_dro_mean.clamp_min(1e-8)
-        
-        # Where raw_abs was 0, w_dro is nan. We safely set it to 1.0 (neutral weight).
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
         w_dro = 1.0 + event_mask * (w_dro - 1.0)
 
@@ -88,28 +86,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
-        n_events = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
+        # ── LEVEL: gap_event + gap_non_event (decomposed) ──
         n_non_ev = (T - event_mask.sum(dim=1, keepdim=True)).clamp_min(1.0)
         e_non_event_mean = ((1.0 - event_mask) * e).sum(dim=1, keepdim=True) / n_non_ev
-
-        gap_event = e_mean.squeeze(1)              # (B,) or (B, C); already computed for shape
-        gap_non_event = e_non_event_mean.squeeze(1)    # (B,) or (B, C)
-
+        gap_event = e_ev_mean.squeeze(1)
+        gap_non_event = e_non_event_mean.squeeze(1)
         level_cell = self._log_cosh(gap_event) + self._log_cosh(gap_non_event)
-
-        # Uniform w_level: the non-event gap must apply to ALL series, including
-        # no-event series (where gap_event = 0 but gap_non_event = y_pred.mean
-        # provides the push toward 0). The original gate.amax zeroed-out no-event
-        # series, leaving them unconstrained.
         w_level = torch.ones_like(gap_event)
 
-        amplifier = 1.0  # unchanged
-
         if multivariate:
-            loss_level = T * amplifier * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = T * amplifier * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

@@ -66,7 +66,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
         e_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
-        e_shape = e - e_mean
+        # e_shape = e - e_mean
+        e_shape = torch.where(n_ev <= 1.0, e, e - e_mean)
 
         shape_cell = self._log_cosh(e_shape)
 
@@ -90,9 +91,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── LEVEL: AsinhPlus on global gap, GATED ───────────────────
         n_events = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
-        # gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         # gap = (event_mask * y_pred).sum(dim=1) / T - y_true.mean(dim=1)
-        gap = ((event_mask * y_pred).sum(dim=1) - T * y_true.mean(dim=1)) / n_ev.squeeze(1)
+        # gap = ((event_mask * y_pred).sum(dim=1) - T * y_true.mean(dim=1)) / n_ev.squeeze(1)
         level_cell = self._log_cosh(gap)
         w_level = gate.amax(dim=1)
 

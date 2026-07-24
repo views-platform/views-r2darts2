@@ -21,11 +21,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
       sqrt(huge) intermediates in the autograd graph.
     - Decomposed level loss: gap_event + gap_non_event. The gap_non_event
       term is essential to prevent non-event predictions from drifting
-      upward (mean overshoot). The event-only level loss causes overshoot
-      because non-events are unconstrained.
+      upward (mean overshoot).
     - Series-level normalization for shape loss: each series contributes
-      equally regardless of how many gated cells it has. Batch-composition
-      invariant, no batch-size dependence.
+      equally regardless of how many gated cells it has.
     """
     _EPS = 1e-6
 
@@ -40,6 +38,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
         a = x.abs()
         return a + F.softplus(-2.0 * a) - math.log(2.0)
+
+    @staticmethod
+    def _tolist(x):
+        """Normalize tensor .tolist() to always return a list.
+        0-d tensor .tolist() returns a float; 1-d returns a list."""
+        val = x.tolist()
+        return val if isinstance(val, list) else [val]
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
@@ -97,14 +102,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         shape_w = gate * w_dro                                   # (B, T) or (B, T, C)
 
         # ── Shape loss: series-level normalization ───────────────────
-        # Each series contributes equally regardless of gated cell count.
-        # Batch-composition invariant, no batch-size dependence.
         if multivariate:
+            # shape_w: (B, T, C), shape_cell: (B, T, C)
             num = (shape_w * shape_cell).sum(dim=(0, 1))        # (C,)
             den = shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)  # (C,)
+            per_series = num / den                              # (C,)
             has_gated = (shape_w.sum(dim=(0, 1)) > self._EPS).float()  # (C,)
-            per_channel_shape = (num / den) * has_gated
-            loss_shape = per_channel_shape.sum() / has_gated.sum().clamp_min(1.0)
+            loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
         else:
             num = (shape_w * shape_cell).sum(dim=1)             # (B,)
             den = shape_w.sum(dim=1).clamp_min(self._EPS)       # (B,)
@@ -113,10 +117,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
         # ── LEVEL: gap_event + gap_non_event (decomposed) ────────────
-        # gap_event: calibrates event predictions toward true event mean
-        # gap_non_event: calibrates non-event predictions toward 0 (prevents overshoot)
-        # Both are essential — event-only level loss causes mean overshoot
-        # because non-event predictions are unconstrained.
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
@@ -124,7 +124,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gap_non_event = e_non_event_mean.squeeze(1)                     # always defined
         level_cell = self._log_cosh(gap_event) + self._log_cosh(gap_non_event)
 
-        # Series-level normalization (each series contributes equally)
+        # Series-level normalization
         if multivariate:
             loss_level = T * level_cell.mean(dim=0).sum()  # mean over B, sum over C
         else:
@@ -134,9 +134,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if multivariate:
             per_channel = loss_shape + loss_level
             total_loss = per_channel.sum()
-            shape_c = loss_shape.detach().tolist()
-            level_c = loss_level.detach().tolist()
-            comp = per_channel.detach().tolist()
+            shape_c = self._tolist(loss_shape.detach())
+            level_c = self._tolist(loss_level.detach())
+            comp = self._tolist(per_channel.detach())
         else:
             total_loss = loss_shape + loss_level
             shape_c = [float(loss_shape.detach())]

@@ -54,29 +54,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e = y_pred - y_true
 
         # ── Event gate (binary, y_true-based mask + abs_max binary gate) ──
-        event_mask = (y_true.abs() > self.tau).float()
-        abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = (abs_max > self.tau).float()
-        n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        # event_mask = (y_true.abs() > self.tau).float()
+        # abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
+        # gate = (abs_max > self.tau).float()
+        # n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
         # Alternative block
-        # abs_max = torch.max(y_true.abs(), y_pred.detach().abs())        
-        # gate = torch.sigmoid(15.0 * (abs_max - self.tau))         
-        # event_mask = (abs_max > self.tau).float()
-        # n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        abs_max = torch.max(y_true.abs(), y_pred.detach().abs())        
+        gate = torch.sigmoid(15.0 * (abs_max - self.tau))         
+        event_mask = (abs_max > self.tau).float()
+        n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
 
         # ── SHAPE: background-referenced demeaning ──
         bg_mask = 1.0 - event_mask
         n_bg = bg_mask.sum(dim=1, keepdim=True)
-        has_event = (n_ev > 0.5).float()  # 1 if series has ≥1 event, 0 otherwise
         has_bg = (n_bg > 0).float()
-
         e_bg_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_bg.clamp_min(1e-6)
         e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
-
-        # Series with events: background-referenced demeaning
-        # Series without events: e_mean = 0 (absolute error, preserves 0 reference)
-        e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
+        e_mean = has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean
         e_shape = e - e_mean
 
         shape_cell = self._log_cosh(e_shape)

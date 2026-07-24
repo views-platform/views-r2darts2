@@ -48,7 +48,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
             
-        y_pred = torch.clamp(y_pred, min=0.0)
 
         multivariate = y_pred.dim() == 3
         B, T = y_pred.shape[:2]
@@ -85,7 +84,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
         w_dro = 1.0 + event_mask * (w_dro - 1.0)
 
-        shape_w = gate * w_dro
+        # shape_w = gate * w_dro
+        shape_w = gate * w_dro * event_mask
         if multivariate:
             loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:

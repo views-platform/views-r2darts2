@@ -147,17 +147,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 # gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
                 # _ga = gap_global.abs()
-                # gap_mean_l = _ga.mean(dim=0).tolist()
-                # gap_max_l = _ga.amax(dim=0).tolist()
-                gap_event = event_pred_mean - event_true_mean  # (B,) or (B, C)
-                _ge = gap_event.abs()
-                gap_ev_mean_l = _ge.mean(dim=0).tolist() if multivariate else [_ge.mean().item()]
-                gap_ev_max_l = _ge.amax(dim=0).tolist() if multivariate else [_ge.amax().item()]
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+                gap_event_tel = event_pred_mean - event_true_mean  # (B,) or (B, C)
+                _ga = gap_event_tel.abs()
+                gap_mean_l = _ga.mean(dim=0).tolist()
+                gap_max_l = _ga.amax(dim=0).tolist()
+                _ev_mask_s = (gate.amax(dim=1) > 0.88).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
-                gap_ev_mean_l = ((_ge * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                gap_ev_max_l = ((_ge * _ev_mask_s).amax(dim=0)).tolist()
-                gap_sat_l = (((_ge > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
+                gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
+                gap_ev_max_l = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
+                gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
@@ -174,17 +172,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
                 # gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
                 # _ga = gap_global.abs()
-                # gap_mean_l = [_ga.mean().item()]
-                # gap_max_l = [_ga.max().item()]
-                gap_event = event_pred_mean - event_true_mean  # (B,) or (B, C)
-                _ge = gap_event.abs()
-                gap_ev_mean_l = _ge.mean(dim=0).tolist() if multivariate else [_ge.mean().item()]
-                gap_ev_max_l = _ge.amax(dim=0).tolist() if multivariate else [_ge.amax().item()]
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+                gap_event_tel = event_pred_mean - event_true_mean  # (B,) or (B, C)
+                _ga = gap_event_tel.abs()
+                gap_mean_l = [_ga.mean().item()]
+                gap_max_l = [_ga.max().item()]
+                _ev_mask_s = (gate.amax(dim=1) > 0.88).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
-                gap_ev_mean_l = [((_ge * _ev_mask_s).sum() / _n_ev_s).item()]
-                gap_ev_max_l = [((_ge * _ev_mask_s).amax()).item()]
-                gap_sat_l = [(((_ge > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
+                gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
+                gap_ev_max_l = [((_ga * _ev_mask_s).amax()).item()]
+                gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
                 shape_dc_l = [(gate * e_shape).mean(dim=1).abs().mean().item()]
 
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]

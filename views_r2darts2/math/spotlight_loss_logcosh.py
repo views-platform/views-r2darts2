@@ -47,7 +47,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
-            
 
         multivariate = y_pred.dim() == 3
         B, T = y_pred.shape[:2]
@@ -68,7 +67,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── SHAPE: log_cosh on demeaned errors (NO ac_scale) ────────
         e_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
         # e_shape = e - e_mean
-        e_shape = torch.where(n_ev <= 1.0, e, e - e_mean)
+        e_shape = torch.where(n_ev <= 1.0, e, e - e_mean) # try without later
 
         shape_cell = self._log_cosh(e_shape)
 
@@ -84,8 +83,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
         w_dro = 1.0 + event_mask * (w_dro - 1.0)
 
-        # shape_w = gate * w_dro
-        shape_w = gate * w_dro * event_mask
+        shape_w = gate * w_dro
         if multivariate:
             loss_shape = (shape_w * shape_cell).sum(dim=(0, 1)) / shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
         else:
@@ -97,7 +95,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # gap = (event_mask * y_pred).sum(dim=1) / T - y_true.mean(dim=1)
         # gap = ((event_mask * y_pred).sum(dim=1) - T * y_true.mean(dim=1)) / n_ev.squeeze(1)
         level_cell = self._log_cosh(gap)
-        w_level = gate.amax(dim=1)
+        # w_level = gate.amax(dim=1)
+        w_level = torch.ones_like(gate.amax(dim=1))
 
         # amplifier = max(math.log10(T / n_events) + 1.0, 1.0)  # Amplify level loss when events are sparse
         amplifier = 1.0

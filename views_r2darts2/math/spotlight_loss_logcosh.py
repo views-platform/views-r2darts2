@@ -11,19 +11,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     Design:
     - Two-mask gate: event_mask (y_true-based) for structure, gate (abs_max-based)
-      for shape weighting. True events get shape gradient toward y_true; false
-      alarms get shape gradient toward 0; true negatives get no gradient.
-    - Background-referenced demeaning: e_mean = e_bg_mean (mean error on
-      non-event cells). Fixes the structural cancellation where n_ev=1 series
-      had e_shape[event] = 0 identically. Guarded by has_event so no-event
-      series use absolute error (e_mean = 0) instead.
-    - Guarded DRO: w_dro = 1.0 for no-event series, preventing NaN from
-      sqrt(huge) intermediates in the autograd graph.
-    - Decomposed level loss: gap_event + gap_non_event. The gap_non_event
-      term is essential to prevent non-event predictions from drifting
-      upward (mean overshoot).
-    - Series-level normalization for shape loss: each series contributes
-      equally regardless of how many gated cells it has.
+      for shape weighting.
+    - Background-referenced demeaning (guarded by has_event).
+    - Guarded DRO (no NaN for no-event series).
+    - Decomposed level loss: gap_event + gap_non_event (prevents mean overshoot).
+    - Series-level normalization for shape loss.
     """
     _EPS = 1e-6
 
@@ -43,7 +35,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _tolist(x):
         """Normalize tensor .tolist() to always return a list.
         0-d tensor .tolist() returns a float; 1-d returns a list."""
-        val = x.tolist()
+        val = x.tolist() if isinstance(x, torch.Tensor) else x
         return val if isinstance(val, list) else [val]
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -61,74 +53,65 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e = y_pred - y_true
 
         # ── Two-mask gate ────────────────────────────────────────────
-        # event_mask: TRUE events only (y_true-based) — for structural computations
-        # gate: true events + false alarms (abs_max-based) — for shape weighting
         event_mask = (y_true.abs() > self.tau).float()
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = (abs_max > self.tau).float()
 
-        n_ev_raw = event_mask.sum(dim=1, keepdim=True)          # (B, 1) or (B, 1, C)
-        has_event = (n_ev_raw > 0.5).float()                    # 1 if series has >=1 event
-        n_ev = n_ev_raw.clamp_min(1.0)                          # avoid div by 0
+        n_ev_raw = event_mask.sum(dim=1, keepdim=True)
+        has_event = (n_ev_raw > 0.5).float()
+        n_ev = n_ev_raw.clamp_min(1.0)
 
         # ── SHAPE: background-referenced demeaning (guarded) ─────────
         bg_mask = 1.0 - event_mask
-        n_bg = bg_mask.sum(dim=1, keepdim=True)                 # can be 0 if all cells are events
+        n_bg = bg_mask.sum(dim=1, keepdim=True)
         has_bg = (n_bg > 0.5).float()
         n_bg_safe = n_bg.clamp_min(1.0)
 
         e_bg_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_bg_safe
         e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
 
-        # Guarded demeaning:
-        # - Series with events AND background: demean by background mean (fixes n_ev=1 cancellation)
-        # - Series with events but no background (all-events): demean by event mean (fallback)
-        # - Series with no events: e_mean = 0 (absolute error, preserves 0 reference for non-events)
         e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
-        # ── DRO weighting (guarded — no NaN for no-event series) ─────
+        # ── DRO weighting (guarded) ──────────────────────────────────
         raw_abs = e_shape.abs().detach()
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
-        valid_dro = (raw_abs > 1e-6).float() * event_mask       # only count event cells
+        valid_dro = (raw_abs > 1e-6).float() * event_mask
         w_dro_raw = torch.sqrt((raw_abs * valid_dro) / dro_mu.clamp_min(self._EPS))
         w_dro_mean = (w_dro_raw * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = w_dro_raw / w_dro_mean.clamp_min(self._EPS)
         w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
-        # Guard: w_dro = 1.0 for no-event series (skip DRO entirely)
         w_dro = has_event * (1.0 + event_mask * (w_dro - 1.0)) + (1.0 - has_event) * 1.0
 
-        shape_w = gate * w_dro                                   # (B, T) or (B, T, C)
+        shape_w = gate * w_dro
 
         # ── Shape loss: series-level normalization ───────────────────
         if multivariate:
-            # shape_w: (B, T, C), shape_cell: (B, T, C)
-            num = (shape_w * shape_cell).sum(dim=(0, 1))        # (C,)
-            den = shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)  # (C,)
-            per_series = num / den                              # (C,)
-            has_gated = (shape_w.sum(dim=(0, 1)) > self._EPS).float()  # (C,)
+            num = (shape_w * shape_cell).sum(dim=(0, 1))
+            den = shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
+            per_series = num / den
+            has_gated = (shape_w.sum(dim=(0, 1)) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
         else:
-            num = (shape_w * shape_cell).sum(dim=1)             # (B,)
-            den = shape_w.sum(dim=1).clamp_min(self._EPS)       # (B,)
-            per_series = num / den                              # (B,)
-            has_gated = (shape_w.sum(dim=1) > self._EPS).float()  # (B,)
+            num = (shape_w * shape_cell).sum(dim=1)
+            den = shape_w.sum(dim=1).clamp_min(self._EPS)
+            per_series = num / den
+            has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
         # ── LEVEL: gap_event + gap_non_event (decomposed) ────────────
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
-        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)         # 0 for no-event series
-        gap_non_event = e_non_event_mean.squeeze(1)                     # always defined
+        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
+        gap_non_event = e_non_event_mean.squeeze(1)
         level_cell = self._log_cosh(gap_event) + self._log_cosh(gap_non_event)
 
-        # Series-level normalization
         if multivariate:
-            loss_level = T * level_cell.mean(dim=0).sum()  # mean over B, sum over C
+            loss_level = T * level_cell.mean(dim=0).sum()
         else:
-            loss_level = T * level_cell.mean()             # mean over B
+            loss_level = T * level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
@@ -151,24 +134,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 _dm = _w_ev.sum(dim=(0, 1)) / _n_ev
                 _dw2 = (_w_ev ** 2).sum(dim=(0, 1)) / _n_ev
                 _dstd = (_dw2 - _dm ** 2).clamp_min(0).sqrt()
-                dro_wmean_l = _dm.tolist()
-                dro_wstd_l = _dstd.tolist()
-                dro_wmax_l = w_dro.amax(dim=(0, 1)).tolist()
-                dro_frac_up_l = (((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
-                event_frac_l = event_mask.mean(dim=(0, 1)).tolist()
+                dro_wmean_l = self._tolist(_dm)
+                dro_wstd_l = self._tolist(_dstd)
+                dro_wmax_l = self._tolist(w_dro.amax(dim=(0, 1)))
+                dro_frac_up_l = self._tolist(((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev)
+                event_frac_l = self._tolist(event_mask.mean(dim=(0, 1)))
 
                 gap_event_tel = has_event.squeeze(1) * e_ev_mean.squeeze(1)
                 _ga = gap_event_tel.abs()
-                gap_mean_l = _ga.mean(dim=0).tolist()
-                gap_max_l = _ga.amax(dim=0).tolist()
+                gap_mean_l = self._tolist(_ga.mean(dim=0))
+                gap_max_l = self._tolist(_ga.amax(dim=0))
                 _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
-                gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                gap_ev_max_l = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
-                gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
+                gap_ev_mean_l = self._tolist((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s)
+                gap_ev_max_l = self._tolist((_ga * _ev_mask_s).amax(dim=0))
+                gap_sat_l = self._tolist(((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s)
+                shape_dc_l = self._tolist((gate * e_shape).mean(dim=1).abs().mean(dim=0))
 
-                sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
+                sl_ratio_l = self._tolist(loss_shape.detach() / loss_level.detach().clamp_min(self._EPS))
             else:
                 _n_ev = event_mask.sum().clamp_min(1.0)
                 _w_ev = w_dro * event_mask

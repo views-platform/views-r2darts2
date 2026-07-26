@@ -112,9 +112,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(gap_event) + self._log_cosh(gap_non_event)
 
         if multivariate:
-            loss_level = T * level_cell.mean(dim=0).sum()
+            loss_level = level_cell.mean(dim=0).sum()
         else:
-            loss_level = T * level_cell.mean()
+            loss_level = level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

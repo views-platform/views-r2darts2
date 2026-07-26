@@ -288,13 +288,13 @@ def apply_rinorm_compression_patch():
             # x[..., 0]: location parameter — full nonlinear inverse
             loc = torch.asinh(torch.sinh(x[..., :1]) * sigma) + mu
             # x[..., 1+]: scale/dispersion — identity (model learns in target space)
-            loc = F.relu(loc)
+            # loc = F.relu(loc)
             sca = x[..., 1:]
             x = torch.cat([loc, sca], dim=-1)
         else:
             # Point forecasting (nr_params == 1) — full inverse as before
             x = torch.asinh(torch.sinh(x) * sigma) + mu
-            x = F.relu(x) # fatalities cannot be negative
+            # x = F.relu(x) # fatalities cannot be negative
 
         return x
 

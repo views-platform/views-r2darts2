@@ -39,6 +39,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return x * torch.asinh(x)
 
     @staticmethod
+    def _log1p_loss(x: torch.Tensor) -> torch.Tensor:
+        """L = |x| * log(1 + |x|). Gradient: sign(x) * [log1p(|x|) + |x|/(1+|x|)].
+        Grows as log(|x|) + 1 for large |x|. ~80% of asinh_plus's gradient."""
+        ax = x.abs()
+        return ax * torch.log1p(ax)
+
+    @staticmethod
     def _tolist(x):
         """Normalize tensor .tolist() to always return a list.
         0-d tensor .tolist() returns a float; 1-d returns a list."""
@@ -113,7 +120,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
         gap_non_event = e_non_event_mean.squeeze(1)
-        level_cell = self._asinh_plus(gap_event) + self._asinh_plus(gap_non_event)
+        level_cell = self._log1p_loss(gap_event) + self._log1p_loss(gap_non_event)
 
         if multivariate:
             loss_level = T * level_cell.mean(dim=0).sum()

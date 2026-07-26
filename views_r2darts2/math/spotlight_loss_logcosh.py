@@ -7,14 +7,14 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """SpotlightLossLogcosh — PGM/CM robust loss with guarded background demeaning.
+    """SpotlightLossLogcosh — PGM/CM robust loss.
 
-    Design:
-    - Two-mask gate: event_mask (y_true-based) for structure, gate (abs_max-based)
-      for shape weighting.
-    - Background-referenced demeaning (guarded by has_event).
-    - Guarded DRO (no NaN for no-event series).
-    - Decomposed level loss: gap_event + gap_non_event (prevents mean overshoot).
+    Key fixes:
+    - F.relu(y_pred): fatality counts cannot be negative. Prevents the sinh()
+      explosion where negative asinh predictions map to huge negative raw values.
+    - Background-referenced demeaning (guarded): fixes n_ev=1 cancellation.
+    - Guarded DRO: no NaN for no-event series.
+    - Decomposed level: gap_event + gap_non_event (prevents mean overshoot).
     - Series-level normalization for shape loss.
     """
     _EPS = 1e-6
@@ -33,8 +33,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _tolist(x):
-        """Normalize tensor .tolist() to always return a list.
-        0-d tensor .tolist() returns a float; 1-d returns a list."""
         val = x.tolist() if isinstance(x, torch.Tensor) else x
         return val if isinstance(val, list) else [val]
 
@@ -42,6 +40,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
+
+        # ── PHYSICAL CONSTRAINT: fatality counts cannot be negative ──
+        # asinh(deaths) >= 0 for deaths >= 0. This prevents the sinh() explosion
+        # where negative asinh predictions map to huge negative raw values.
+        y_pred = F.relu(y_pred)
 
         multivariate = y_pred.dim() == 3
         B, T = y_pred.shape[:2]
@@ -100,7 +103,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: gap_event + gap_non_event (decomposed) ────────────
+        # ── LEVEL: gap_event + gap_non_event (decomposed) ──
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 

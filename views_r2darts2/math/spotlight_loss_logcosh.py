@@ -51,6 +51,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
         Saturates very slowly — at x=5, gradient=0.385 (vs log_cosh's 1.0).
         Grows as 2/x for large x. Barely stronger than log_cosh near origin."""
         return torch.log1p(x * x)
+    
+    @staticmethod
+    def _log1p_half(x: torch.Tensor) -> torch.Tensor:
+        """L = 0.5 * |x| * log(1 + |x|).
+        Gradient: 0.5 * sign(x) * [log1p(|x|) + |x|/(1+|x|)].
+        Grows as 0.5 * log(|x|) + 0.5 for large |x|. Unsaturated, gentle.
+        Between log_cosh (saturates) and log1p_abs (grows too fast)."""
+        ax = x.abs()
+        return 0.5 * ax * torch.log1p(ax)
 
     @staticmethod
     def _tolist(x):
@@ -127,7 +136,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
         gap_non_event = e_non_event_mean.squeeze(1)
-        level_cell = self._log1p_sq_loss(gap_event) + self._log1p_sq_loss(gap_non_event)
+        level_cell = self._log1p_half(gap_event) + self._log1p_half(gap_non_event)
 
         if multivariate:
             loss_level = T * level_cell.mean(dim=0).sum()

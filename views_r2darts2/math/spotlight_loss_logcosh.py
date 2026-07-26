@@ -130,16 +130,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: gap_event + gap_non_event (MIXED functions) ──
+        # ── LEVEL: per-cell log_cosh (works for both CM and PGM) ──
+        # Per-cell formulation: each cell gets its own gradient, no averaging dilution.
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
+        n_ev_squeezed = n_ev.squeeze(1).clamp_min(1.0)
 
-        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
-        gap_non_event = e_non_event_mean.squeeze(1)
+        # Non-event level: per-cell log_cosh(y_pred), targets 0
+        level_non_event = (bg_mask * self._log_cosh(y_pred)).sum(dim=1) / n_non_ev.squeeze(1)
 
-        # Non-event: log_cosh (gentle, works for CM, vanishes at 0 — correct)
-        # Event: log1p_half (unsaturated)
-        level_cell = self._log1p_half(gap_event) + self._log_cosh(gap_non_event)
+        # Event level: per-cell log_cosh(y_pred - y_true), targets true event value
+        level_event = has_event.squeeze(1) * (
+            (event_mask * self._log_cosh(e)).sum(dim=1) / n_ev_squeezed
+        )
+
+        loss_level = T * (level_non_event + level_event).mean()
 
         if multivariate:
             loss_level = T * level_cell.mean(dim=0).sum()

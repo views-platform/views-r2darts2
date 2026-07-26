@@ -130,8 +130,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: per-cell log_cosh (works for both CM and PGM) ──
-        # Per-cell formulation: each cell gets its own gradient, no averaging dilution.
+        # ── LEVEL: per-cell log_cosh (works for both CM and PGM) ─────
+        # Per-cell formulation: each cell gets its own gradient.
+        # Prevents PGM collapse (false alarms get strong per-cell push) while
+        # preserving CM behavior (mean(log_cosh) ≈ log_cosh(mean) for low-variance CM).
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         n_ev_squeezed = n_ev.squeeze(1).clamp_min(1.0)
 
@@ -143,12 +145,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             (event_mask * self._log_cosh(e)).sum(dim=1) / n_ev_squeezed
         )
 
-        loss_level = T * (level_non_event + level_event).mean()
-
         if multivariate:
-            loss_level = T * level_cell.mean(dim=0).sum()
+            loss_level = T * (level_non_event + level_event).mean(dim=0).sum()
         else:
-            loss_level = T * level_cell.mean()
+            loss_level = T * (level_non_event + level_event).mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

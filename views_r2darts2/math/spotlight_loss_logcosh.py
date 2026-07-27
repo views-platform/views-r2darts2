@@ -107,18 +107,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: gap_event + gap_non_event (decomposed, NO T multiplier) ──
+        # ── LEVEL: gap_event + gap_non_event (asinh_plus, NO T multiplier) ──
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
         gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
         gap_non_event = e_non_event_mean.squeeze(1)
-        level_cell = self._log_cosh(gap_event) + self._log_cosh(gap_non_event)
+        level_cell = self._asinh_plus(gap_event) + self._asinh_plus(gap_non_event)
 
         if multivariate:
-            loss_level = level_cell.mean(dim=0).sum()
+            loss_level = math.sqrt(T) * level_cell.mean(dim=0).sum()
         else:
-            loss_level = level_cell.mean()
+            loss_level = math.sqrt(T) * level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

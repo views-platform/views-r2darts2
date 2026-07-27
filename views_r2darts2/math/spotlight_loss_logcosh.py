@@ -14,7 +14,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
       for shape weighting.
     - Background-referenced demeaning (guarded by has_event).
     - Guarded DRO (no NaN for no-event series).
-    - Decomposed level loss: gap_event + gap_non_event.
+    - Decomposed level loss: gap_event + gap_non_event (prevents mean overshoot).
     - Series-level normalization for shape loss.
     """
     _EPS = 1e-6
@@ -30,13 +30,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
         a = x.abs()
         return a + F.softplus(-2.0 * a) - math.log(2.0)
-    
-    @staticmethod
-    def _asinh_plus(x: torch.Tensor) -> torch.Tensor:
-        """Loss: x * asinh(x). Gradient: asinh(x) + x / sqrt(1 + x^2).
-        Matches MSE curvature (2.0) at origin, bends to log(x) for large x.
-        Does NOT saturate like log_cosh (whose gradient tanh(x) → 1.0)."""
-        return x * torch.asinh(x)
 
     @staticmethod
     def _tolist(x):
@@ -77,8 +70,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_bg_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_bg_safe
         e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
 
-        # e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
-        e_mean = has_event * (has_bg * e_bg_mean.detach() + (1.0 - has_bg) * e_ev_mean.detach())
+        e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean.detach())
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
@@ -108,7 +100,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: gap_event + gap_non_event (asinh_plus, NO T multiplier) ──
+        # ── LEVEL: gap_event + gap_non_event (decomposed) ────────────
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 

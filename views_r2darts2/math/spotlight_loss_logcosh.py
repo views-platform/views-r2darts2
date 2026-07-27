@@ -100,31 +100,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: gap_event + gap_non_event (decomposed) ────────────
+        # ── LEVEL: background term (population-wide) + event term
+        #           (normalized by event-bearing series only, mirroring Shape) ──
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
-        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
-        gap_non_event = e_non_event_mean.squeeze(1)
-        level_cell = self._log_cosh(gap_event) + self._log_cosh(gap_non_event)
+        gap_non_event = e_non_event_mean.squeeze(1)              # (B, C) or (B,)
+        gap_event_raw = e_ev_mean.squeeze(1)
+        has_event_flat = has_event.squeeze(1)                    # (B, C) or (B,)
+
+        level_bg_cell = self._log_cosh(gap_non_event)
+        level_ev_cell = self._log_cosh(gap_event_raw) * has_event_flat
 
         if multivariate:
-            loss_level = T * level_cell.mean(dim=0).sum()
+            loss_level_bg = level_bg_cell.mean(dim=0)
+            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)
+            loss_level_ev = level_ev_cell.sum(dim=0) / n_event_series
+            loss_level = T * (loss_level_bg + loss_level_ev).sum()
         else:
-            loss_level = T * level_cell.mean()
-
-        # ── Combine ──────────────────────────────────────────────────
-        if multivariate:
-            per_channel = loss_shape + loss_level
-            total_loss = per_channel.sum()
-            shape_c = self._tolist(loss_shape.detach())
-            level_c = self._tolist(loss_level.detach())
-            comp = self._tolist(per_channel.detach())
-        else:
-            total_loss = loss_shape + loss_level
-            shape_c = [float(loss_shape.detach())]
-            level_c = [float(loss_level.detach())]
-            comp = [float(total_loss.detach())]
+            loss_level_bg = level_bg_cell.mean()
+            n_event_series = has_event_flat.sum().clamp_min(1.0)
+            loss_level_ev = level_ev_cell.sum() / n_event_series
+            loss_level = T * (loss_level_bg + loss_level_ev)
 
         # ── Diagnostic telemetry ─────────────────────────────────────
         with torch.no_grad():

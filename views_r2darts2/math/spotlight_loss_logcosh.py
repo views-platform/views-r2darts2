@@ -120,12 +120,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
             n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)   # (C,)
             loss_level_bg = level_bg_cell.mean(dim=0)                   # (C,)
             loss_level_ev = level_ev_cell.sum(dim=0) / n_event_series   # (C,)
-            loss_level = (T // 2) * (loss_level_bg + loss_level_ev).sum()      # scalar
+            loss_level = math.sqrt(T) * (loss_level_bg + loss_level_ev).sum()      # scalar
         else:
             n_event_series = has_event_flat.sum().clamp_min(1.0)
             loss_level_bg = level_bg_cell.mean()
             loss_level_ev = level_ev_cell.sum() / n_event_series
-            loss_level = (T // 2) * (loss_level_bg + loss_level_ev)
+            loss_level = math.sqrt(T) * (loss_level_bg + loss_level_ev)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

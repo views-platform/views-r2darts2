@@ -39,29 +39,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return x * torch.asinh(x)
 
     @staticmethod
-    def _log1p_loss(x: torch.Tensor) -> torch.Tensor:
-        """L = |x| * log(1 + |x|). Gradient: sign(x) * [log1p(|x|) + |x|/(1+|x|)].
-        Grows as log(|x|) + 1 for large |x|. ~80% of asinh_plus's gradient."""
-        ax = x.abs()
-        return ax * torch.log1p(ax)
-    
-    @staticmethod
-    def _log1p_sq_loss(x: torch.Tensor) -> torch.Tensor:
-        """L = log(1 + x²). Gradient: 2x / (1 + x²).
-        Saturates very slowly — at x=5, gradient=0.385 (vs log_cosh's 1.0).
-        Grows as 2/x for large x. Barely stronger than log_cosh near origin."""
-        return torch.log1p(x * x)
-    
-    @staticmethod
-    def _log1p_half(x: torch.Tensor) -> torch.Tensor:
-        """L = 0.5 * |x| * log(1 + |x|).
-        Gradient: 0.5 * sign(x) * [log1p(|x|) + |x|/(1+|x|)].
-        Grows as 0.5 * log(|x|) + 0.5 for large |x|. Unsaturated, gentle.
-        Between log_cosh (saturates) and log1p_abs (grows too fast)."""
-        ax = x.abs()
-        return 0.5 * ax * torch.log1p(ax)
-
-    @staticmethod
     def _tolist(x):
         """Normalize tensor .tolist() to always return a list.
         0-d tensor .tolist() returns a float; 1-d returns a list."""
@@ -130,25 +107,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: per-cell log_cosh (works for both CM and PGM) ─────
-        # Per-cell formulation: each cell gets its own gradient.
-        # Prevents PGM collapse (false alarms get strong per-cell push) while
-        # preserving CM behavior (mean(log_cosh) ≈ log_cosh(mean) for low-variance CM).
+        # ── LEVEL: gap_event + gap_non_event (decomposed, NO T multiplier) ──
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        n_ev_squeezed = n_ev.squeeze(1).clamp_min(1.0)
+        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
-        # Non-event level: per-cell log_cosh(y_pred), targets 0
-        level_non_event = (bg_mask * self._log_cosh(y_pred)).sum(dim=1) / n_non_ev.squeeze(1)
-
-        # Event level: per-cell log_cosh(y_pred - y_true), targets true event value
-        level_event = has_event.squeeze(1) * (
-            (event_mask * self._log_cosh(e)).sum(dim=1) / n_ev_squeezed
-        )
+        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
+        gap_non_event = e_non_event_mean.squeeze(1)
+        level_cell = self._log_cosh(gap_event) + self._log_cosh(gap_non_event)
 
         if multivariate:
-            loss_level = T * (level_non_event + level_event).mean(dim=0).sum()
+            loss_level = level_cell.mean(dim=0).sum()
         else:
-            loss_level = T * (level_non_event + level_event).mean()
+            loss_level = level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

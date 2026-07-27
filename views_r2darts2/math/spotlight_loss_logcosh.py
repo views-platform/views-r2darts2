@@ -109,7 +109,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         #           count, mirroring Shape's has_gated normalization) ─
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
-
+        scaler = T
         gap_non_event = e_non_event_mean.squeeze(1)      # (B,) or (B, C)
         gap_event_raw = e_ev_mean.squeeze(1)             # (B,) or (B, C)
         has_event_flat = has_event.squeeze(1)            # (B,) or (B, C)
@@ -130,13 +130,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
-            per_channel = loss_shape + loss_level
+            per_channel = loss_shape + scaler *loss_level
             total_loss = per_channel.sum()
             shape_c = self._tolist(loss_shape.detach())
             level_c = self._tolist(loss_level.detach())
             comp = self._tolist(per_channel.detach())
         else:
-            total_loss = loss_shape + loss_level
+            total_loss = loss_shape + scaler * loss_level
             shape_c = [float(loss_shape.detach())]
             level_c = [float(loss_level.detach())]
             comp = [float(total_loss.detach())]

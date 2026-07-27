@@ -130,13 +130,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
-            per_channel = loss_shape + scaler *loss_level
+            per_channel = loss_shape + (scaler * loss_level)
             total_loss = per_channel.sum()
             shape_c = self._tolist(loss_shape.detach())
             level_c = self._tolist(loss_level.detach())
             comp = self._tolist(per_channel.detach())
         else:
-            total_loss = loss_shape + scaler * loss_level
+            total_loss = loss_shape + (scaler * loss_level)
             shape_c = [float(loss_shape.detach())]
             level_c = [float(loss_level.detach())]
             comp = [float(total_loss.detach())]

@@ -103,29 +103,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: background term (full-batch mean, unchanged) +
-        #           event term (normalized by event-bearing series
-        #           count, mirroring Shape's has_gated normalization) ─
+        # ── LEVEL: cell-count-weighted bg/ev mean-gap penalties ─────
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
-        gap_non_event = e_non_event_mean.squeeze(1)      # (B,) or (B, C)
-        gap_event_raw = e_ev_mean.squeeze(1)             # (B,) or (B, C)
-        has_event_flat = has_event.squeeze(1)            # (B,) or (B, C)
+        gap_non_event = e_non_event_mean.squeeze(1)   # (B,) or (B, C)
+        gap_event_raw = e_ev_mean.squeeze(1)          # (B,) or (B, C)
+        has_event_flat = has_event.squeeze(1)         # (B,) or (B, C)
 
-        level_bg_cell = T * self._log_cosh(gap_non_event)
-        level_ev_cell = T * self._log_cosh(gap_event_raw) * has_event_flat
+        level_bg_cell = self._log_cosh(gap_non_event)
+        level_ev_cell = self._log_cosh(gap_event_raw) * has_event_flat
 
         if multivariate:
-            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)   # (C,)
-            loss_level_bg = level_bg_cell.mean(dim=0)                   # (C,)
-            loss_level_ev = level_ev_cell.sum(dim=0) / n_event_series   # (C,)
-            loss_level = (loss_level_bg + loss_level_ev).sum()      # scalar
+            total_bg_cells = bg_mask.sum(dim=(0, 1)).clamp_min(1.0)    # (C,)
+            total_ev_cells = event_mask.sum(dim=(0, 1)).clamp_min(1.0) # (C,)
+            total_cells = total_bg_cells + total_ev_cells
+            w_bg = total_bg_cells / total_cells
+            w_ev = total_ev_cells / total_cells
+            loss_level_bg = level_bg_cell.mean(dim=0)                  # (C,)
+            loss_level_ev = level_ev_cell.mean(dim=0)                  # (C,)
+            loss_level = (T * (w_bg * loss_level_bg + w_ev * loss_level_ev)).sum()
         else:
-            n_event_series = has_event_flat.sum().clamp_min(1.0)
+            total_bg_cells = bg_mask.sum().clamp_min(1.0)
+            total_ev_cells = event_mask.sum().clamp_min(1.0)
+            total_cells = total_bg_cells + total_ev_cells
+            w_bg = total_bg_cells / total_cells
+            w_ev = total_ev_cells / total_cells
             loss_level_bg = level_bg_cell.mean()
-            loss_level_ev = level_ev_cell.sum() / n_event_series
-            loss_level = (loss_level_bg + loss_level_ev)
+            loss_level_ev = level_ev_cell.mean()
+            loss_level = T * (w_bg * loss_level_bg + w_ev * loss_level_ev)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

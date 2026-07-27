@@ -33,6 +33,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
         a = x.abs()
         return a + F.softplus(-2.0 * a) - math.log(2.0)
+    
+    @staticmethod
+    def _asinh_plus(x: torch.Tensor) -> torch.Tensor:
+        """Loss: x * asinh(x). Gradient: asinh(x) + x / sqrt(1 + x^2).
+        Matches MSE curvature (2.0) at origin, bends to log(x) for large x.
+        Does NOT saturate like log_cosh (whose gradient tanh(x) → 1.0)."""
+        return x * torch.asinh(x)
 
     @staticmethod
     def _tolist(x):
@@ -113,8 +120,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         gap_event_raw = e_ev_mean.squeeze(1)             # (B,) or (B, C)
         has_event_flat = has_event.squeeze(1)            # (B,) or (B, C)
 
-        level_bg_cell = self._log_cosh(gap_non_event)
-        level_ev_cell = self._log_cosh(gap_event_raw) * has_event_flat
+        level_bg_cell = self._asinh_plus(gap_non_event)
+        level_ev_cell = self._asinh_plus(gap_event_raw) * has_event_flat
 
         if multivariate:
             n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)   # (C,)

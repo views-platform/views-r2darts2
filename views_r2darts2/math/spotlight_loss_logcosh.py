@@ -14,7 +14,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
       for shape weighting.
     - Background-referenced demeaning (guarded by has_event).
     - Guarded DRO (no NaN for no-event series).
-    - Decomposed level loss: gap_event + gap_non_event (prevents mean overshoot).
+    - Decomposed level loss: gap_event + gap_non_event.
     - Series-level normalization for shape loss.
     """
     _EPS = 1e-6
@@ -77,7 +77,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_bg_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_bg_safe
         e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
 
-        e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
+        # e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
+        e_mean = has_event * (has_bg * e_bg_mean.detach() + (1.0 - has_bg) * e_ev_mean.detach())
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
@@ -113,12 +114,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
         gap_non_event = e_non_event_mean.squeeze(1)
-        level_cell = self._asinh_plus(gap_event) + self._asinh_plus(gap_non_event)
+        level_cell = self._log_cosh(gap_event) + self._log_cosh(gap_non_event)
 
         if multivariate:
-            loss_level = math.sqrt(T) * level_cell.mean(dim=0).sum()
+            loss_level = T * level_cell.mean(dim=0).sum()
         else:
-            loss_level = math.sqrt(T) * level_cell.mean()
+            loss_level = T * level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

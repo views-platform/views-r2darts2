@@ -100,21 +100,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: single population-mean gap, T multiplier ──────────
-        # Automatically population-proportional, no weight to tune.
-        # Jointly satisfied by the correct solution: if background sits
-        # near 0 and event cell sits near its true magnitude M, then
-        # y_pred.mean(dim=1) ~= M/T ~= y_true.mean(dim=1) automatically.
-        # Level is satisfied BECAUSE the spike was learned correctly,
-        # not in competition with it. Shape independently supplies a
-        # real, undiluted gradient at every event cell.
+        # ── LEVEL: single population-mean gap, matched normalization ──
+        # Normalized by has_gated (same as Shape) — only series with
+        # gated cells contribute, preventing dilution by no-event series
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._log_cosh(gap)
 
         if multivariate:
-            loss_level = T * level_cell.mean(dim=0).sum()
+            loss_level = T * (level_cell * has_gated).sum(dim=0) / has_gated.sum(dim=0).clamp_min(1.0)
+            loss_level = loss_level.sum()
         else:
-            loss_level = T * level_cell.mean()
+            loss_level = T * (level_cell * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

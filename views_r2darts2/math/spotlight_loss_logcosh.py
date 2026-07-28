@@ -1,81 +1,3 @@
-"""
-SpotlightLossLogcosh — PGM/CM robust loss.
-
-Changelog (from the V58 baseline):
-
-  1. Background-referenced demeaning in Shape (guarded by has_event /
-     has_bg). Fixes: exact zero-cancellation of the Shape gradient
-     whenever a series has exactly one event cell (n_ev == 1) — the
-     modal case at PriGrid-Month (98-99% zero) resolution. Demeaning
-     against the event-only mean made e_shape identically zero at
-     isolated spikes, killing Shape's gradient and DRO weight for
-     exactly the population it exists to serve. Demeaning against the
-     series' non-event background instead gives a real, model-
-     dependent residual at every event cell, while remaining invariant
-     to any uniform shift of the whole series — so Shape never fights
-     Level over the global bias, and Shape alone now robustly teaches
-     spike shape/magnitude regardless of batch composition or how rare
-     events are within a series.
-
-  2. Level reverted to a single population-mean gap — no bg/ev split.
-     History: an earlier revision (already present before this file was
-     touched) split Level into separately-pooled background and event
-     components, then combined them by addition. Two different
-     recombination schemes were tried on top of that split:
-       (a) event term normalized by raw batch size B — diluted at PGM
-           (98-99% zero), where most series have zero events, so the
-           "raise the spike" signal shrank toward nothing and
-           predictions collapsed toward y_bar (undercorrection).
-       (b) event term normalized by count of EVENT-BEARING SERIES
-           (undiluted across batch composition), but then recombined
-           with the background term using population-CELL-COUNT
-           weights (w_bg, w_ev = fraction of cells that are
-           background/event). This fixed CM's overshoot (events are
-           ~13-15% of CM cells, so w_ev was still meaningful) but
-           caused PGM to collapse catastrophically toward zero
-           (ratio -> 0.06x and flatlined): PGM's event_frac is under
-           0.5% of cells, so w_ev rounds to numerically negligible,
-           and Level's event anchor -- the ONLY mechanism that can set
-           the ABSOLUTE magnitude of a correctly-sized spike (Shape is
-           deliberately shift-invariant and only teaches relative
-           contrast, never absolute level) -- vanished exactly where
-           it was needed most. Weighting an absolute-calibration
-           anchor by rarity is backwards: rarer events need MORE
-           explicit anchoring per occurrence, not less.
-
-     Root fix: there is no single bg/ev recombination weight that is
-     correct at both extreme sparsity and moderate sparsity, because
-     the two failure modes (background gets dragged up vs. event
-     anchor evaporates) trade off against each other under any such
-     scheme. The split itself is the unnecessary complexity, not the
-     weighting constant. A single whole-window mean gap,
-       gap = y_pred.mean(dim=1) - y_true.mean(dim=1),
-     is automatically population-representative with no weight to
-     tune, and — critically — is jointly satisfied by the CORRECT
-     solution: if background sits near 0 and the event cell sits near
-     its true magnitude M, then y_pred.mean(dim=1) ~= M/T ~=
-     y_true.mean(dim=1) automatically. Level is satisfied BECAUSE the
-     spike was learned correctly, not in competition with it. This
-     works now (and did not before fix 1) because Shape independently
-     supplies a real, undiluted gradient at every event cell; Level no
-     longer needs to do double duty as an event-teacher, only its
-     original job of keeping the aggregate mean calibrated.
-
-Design (unchanged):
-  - Two-mask gate: event_mask (y_true-based) for structure, gate
-    (abs_max-based) for shape weighting.
-  - Guarded DRO (no NaN for no-event series).
-  - Series-level (has_gated-weighted) pooling for Shape loss.
-  - loss_shape and loss_level are each pooled to a SCALAR in the
-    multivariate case (matching the pre-existing pooling design);
-    per-channel diagnostics live in the telemetry dict, not in the
-    optimized loss terms themselves.
-
-NOTE for callers: the "level_w_bg" / "level_w_ev" diagnostic keys from
-the previous revision are removed along with the mechanism they
-described. If external logging code (e.g. callbacks.py) reads those
-keys, update it to stop expecting them.
-"""
 import math
 import torch
 import torch.nn.functional as F
@@ -85,6 +7,18 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
+    """SpotlightLossLogcosh — PGM/CM robust loss.
+
+    Design:
+    - Two-mask gate: event_mask (y_true-based) for structure, gate (abs_max-based)
+      for shape weighting.
+    - Background-referenced demeaning (guarded by has_event).
+    - Guarded DRO (no NaN for no-event series).
+    - Single whole-window mean gap for Level (automatically population-
+      proportional, no weight to tune, jointly satisfied by correct solution).
+    - T multiplier on level loss (provides corrective pressure).
+    - Series-level (has_gated-weighted) pooling for Shape loss.
+    """
     _EPS = 1e-6
 
     def __init__(self, non_zero_threshold: float = 0.88):
@@ -98,18 +32,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
         a = x.abs()
         return a + F.softplus(-2.0 * a) - math.log(2.0)
-    
-    @staticmethod
-    def _asinh_plus(x: torch.Tensor) -> torch.Tensor:
-        """Loss: x * asinh(x). Gradient: asinh(x) + x / sqrt(1 + x^2).
-        Matches MSE curvature (2.0) at origin, bends to log(x) for large x.
-        Does not saturate like log_cosh (whose gradient tanh(x) → 1.0)."""
-        return x * torch.asinh(x)
 
     @staticmethod
     def _tolist(x):
-        """Normalize tensor .tolist() to always return a list.
-        0-d tensor .tolist() returns a float; 1-d returns a list."""
         val = x.tolist() if isinstance(x, torch.Tensor) else x
         return val if isinstance(val, list) else [val]
 
@@ -175,28 +100,21 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: decomposed, matched normalization, T multiplier ───
-        # gap_non_event targets 0 (never vanishes at PGM).
-        # gap_event targets true event mean (provides strong, saturated push).
-        # Event term normalized by n_event_series (matches Shape's has_gated).
-        # Background term normalized by B (all series have background).
-        n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
-
-        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
-        gap_non_event = e_non_event_mean.squeeze(1)
-        has_event_flat = has_event.squeeze(1)
+        # ── LEVEL: single population-mean gap, T multiplier ──────────
+        # Automatically population-proportional, no weight to tune.
+        # Jointly satisfied by the correct solution: if background sits
+        # near 0 and event cell sits near its true magnitude M, then
+        # y_pred.mean(dim=1) ~= M/T ~= y_true.mean(dim=1) automatically.
+        # Level is satisfied BECAUSE the spike was learned correctly,
+        # not in competition with it. Shape independently supplies a
+        # real, undiluted gradient at every event cell.
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
+        level_cell = self._log_cosh(gap)
 
         if multivariate:
-            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)   # (C,)
-            level_ev = (self._asinh_plus(gap_event) * has_event_flat).sum(dim=0) / n_event_series
-            level_bg = self._asinh_plus(gap_non_event).mean(dim=0)
-            loss_level = T * (level_ev + level_bg).sum()
+            loss_level = T * level_cell.mean(dim=0).sum()
         else:
-            n_event_series = has_event_flat.sum().clamp_min(1.0)
-            level_ev = (self._asinh_plus(gap_event) * has_event_flat).sum() / n_event_series
-            level_bg = self._asinh_plus(gap_non_event).mean()
-            loss_level = T *(level_ev + level_bg)
+            loss_level = T * level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
@@ -213,6 +131,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Diagnostic telemetry ─────────────────────────────────────
         with torch.no_grad():
+            has_event_flat = has_event.squeeze(1)
             if multivariate:
                 _n_ev = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
                 _w_ev = w_dro * event_mask

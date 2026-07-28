@@ -3,64 +3,63 @@ SpotlightLossLogcosh — PGM/CM robust loss.
 
 Changelog (from the V58 baseline):
 
-  1. Background-referenced demeaning (guarded by has_event / has_bg).
-     Fixes: exact zero-cancellation of the Shape gradient whenever a
-     series has exactly one event cell (n_ev == 1) — the modal case at
-     PriGrid-Month (98-99% zero) resolution. Demeaning against the
-     event-only mean made e_shape identically zero at isolated spikes,
-     killing Shape's gradient and DRO weight for exactly the
-     population it exists to serve. Demeaning against the series'
-     non-event background instead gives a real, model-dependent
-     residual at every event cell, while remaining invariant to any
-     uniform shift of the whole series — so Shape still never fights
-     Level over the global bias.
+  1. Background-referenced demeaning in Shape (guarded by has_event /
+     has_bg). Fixes: exact zero-cancellation of the Shape gradient
+     whenever a series has exactly one event cell (n_ev == 1) — the
+     modal case at PriGrid-Month (98-99% zero) resolution. Demeaning
+     against the event-only mean made e_shape identically zero at
+     isolated spikes, killing Shape's gradient and DRO weight for
+     exactly the population it exists to serve. Demeaning against the
+     series' non-event background instead gives a real, model-
+     dependent residual at every event cell, while remaining invariant
+     to any uniform shift of the whole series — so Shape never fights
+     Level over the global bias, and Shape alone now robustly teaches
+     spike shape/magnitude regardless of batch composition or how rare
+     events are within a series.
 
-  2. Event-count-normalized Level loss.
-     Symptom: even after fix (1), PGM training no longer flatlined but
-     instead monotonically over-corrected past y_bar with no floor
-     (ratio 5.76x -> 3.17x -> ... -> 0.15x by epoch 14, event bias
-     drifting from +9.73 to -3.29 and still falling every epoch).
+  2. Level reverted to a single population-mean gap — no bg/ev split.
+     History: an earlier revision (already present before this file was
+     touched) split Level into separately-pooled background and event
+     components, then combined them by addition. Two different
+     recombination schemes were tried on top of that split:
+       (a) event term normalized by raw batch size B — diluted at PGM
+           (98-99% zero), where most series have zero events, so the
+           "raise the spike" signal shrank toward nothing and
+           predictions collapsed toward y_bar (undercorrection).
+       (b) event term normalized by count of EVENT-BEARING SERIES
+           (undiluted across batch composition), but then recombined
+           with the background term using population-CELL-COUNT
+           weights (w_bg, w_ev = fraction of cells that are
+           background/event). This fixed CM's overshoot (events are
+           ~13-15% of CM cells, so w_ev was still meaningful) but
+           caused PGM to collapse catastrophically toward zero
+           (ratio -> 0.06x and flatlined): PGM's event_frac is under
+           0.5% of cells, so w_ev rounds to numerically negligible,
+           and Level's event anchor -- the ONLY mechanism that can set
+           the ABSOLUTE magnitude of a correctly-sized spike (Shape is
+           deliberately shift-invariant and only teaches relative
+           contrast, never absolute level) -- vanished exactly where
+           it was needed most. Weighting an absolute-calibration
+           anchor by rarity is backwards: rarer events need MORE
+           explicit anchoring per occurrence, not less.
 
-     Root cause: the Level loss's event-raising term was pooled with a
-     plain `.mean(dim=0)` over the WHOLE BATCH, including every series
-     with zero events in its window. At CM (85% zero), most windows
-     contain several event months, so this dilution is mild. At PGM
-     (98-99% zero), the overwhelming majority of windows have zero
-     events, so the "pull the true spike up" signal was diluted by
-     roughly the same 10-20x factor as the batch's event sparsity —
-     while the "pull everything to background" signal was not diluted
-     at all (it legitimately applies to every series). The
-     population-wide "predict near zero" pressure was winning by sheer
-     denominator size, not by being a better fit.
-
-     Fix: keep the background term's plain full-batch mean (correct —
-     every series' background should count), but normalize the event
-     term by the COUNT OF EVENT-BEARING SERIES actually present in the
-     batch, mirroring the has_gated normalization the Shape loss
-     already used. This makes the "raise real spikes" gradient
-     magnitude independent of how many event-free series happen to
-     share the batch, without introducing any hardcoded amplifier —
-     n_event_series is a data-derived count, not a tunable constant.
-
-  3. Population-proportional Level weighting (this revision).
-     The background and event Level terms were previously summed 1:1,
-     implicitly asserting that calibrating the mean non-event error is
-     exactly as important as calibrating the mean event error,
-     regardless of how many cells each population actually contains.
-     At CM (~15% event cells) this is roughly defensible; at PGM
-     (~2% event cells) it gives the event term ~50x more influence
-     per cell than the background term, distorting the gradient
-     balance.
-
-     Fix: weight each term by its share of actual cells in the batch.
-     w_bg = total_bg_cells / total_cells, w_ev = total_ev_cells /
-     total_cells. These are pure data-derived counts — no tunable
-     constant enters. The Level loss now reflects the true population
-     structure: at PGM the background term dominates (as it should,
-     since 98% of predictions are background), while the event term
-     still receives its fair 2% share rather than being either
-     drowned out (fix 2's original bug) or over-amplified (the 1:1
-     sum). At CM the split is ~85/15, matching the data.
+     Root fix: there is no single bg/ev recombination weight that is
+     correct at both extreme sparsity and moderate sparsity, because
+     the two failure modes (background gets dragged up vs. event
+     anchor evaporates) trade off against each other under any such
+     scheme. The split itself is the unnecessary complexity, not the
+     weighting constant. A single whole-window mean gap,
+       gap = y_pred.mean(dim=1) - y_true.mean(dim=1),
+     is automatically population-representative with no weight to
+     tune, and — critically — is jointly satisfied by the CORRECT
+     solution: if background sits near 0 and the event cell sits near
+     its true magnitude M, then y_pred.mean(dim=1) ~= M/T ~=
+     y_true.mean(dim=1) automatically. Level is satisfied BECAUSE the
+     spike was learned correctly, not in competition with it. This
+     works now (and did not before fix 1) because Shape independently
+     supplies a real, undiluted gradient at every event cell; Level no
+     longer needs to do double duty as an event-teacher, only its
+     original job of keeping the aggregate mean calibrated.
 
 Design (unchanged):
   - Two-mask gate: event_mask (y_true-based) for structure, gate
@@ -71,6 +70,11 @@ Design (unchanged):
     multivariate case (matching the pre-existing pooling design);
     per-channel diagnostics live in the telemetry dict, not in the
     optimized loss terms themselves.
+
+NOTE for callers: the "level_w_bg" / "level_w_ev" diagnostic keys from
+the previous revision are removed along with the mechanism they
+described. If external logging code (e.g. callbacks.py) reads those
+keys, update it to stop expecting them.
 """
 import math
 import torch
@@ -164,59 +168,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: population-proportional weighting ─────────────────
-        #
-        # Each term is pooled to a per-channel (or scalar) quantity:
-        #   loss_level_bg — mean over ALL series (every series has
-        #                   background cells; this is the correct
-        #                   denominator for "calibrate the zeros").
-        #   loss_level_ev — mean over EVENT-BEARING series only
-        #                   (fix 2: prevents dilution by event-free
-        #                   series that would zero out the signal).
-        #
-        # The two terms are then combined with weights proportional to
-        # the actual cell counts each population represents in the
-        # batch.  bg_mask + event_mask == 1 for every cell, so
-        # total_bg + total_ev == B*T (per channel).  The weights are
-        # therefore pure data-derived fractions — no tunable constant.
-        #
-        # At PGM (~2% events):  w_bg ≈ 0.98, w_ev ≈ 0.02
-        # At CM  (~15% events): w_bg ≈ 0.85, w_ev ≈ 0.15
-        n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
+        # ── LEVEL: single population-mean gap (no bg/ev split) ────────
+        # Automatically population-proportional, no weight to tune, and
+        # jointly satisfied by the correct solution (background ~ 0,
+        # event cell ~ true magnitude) — see docstring for why the
+        # bg/ev split was removed rather than reweighted again.
+        has_event_flat = has_event.squeeze(1)            # (B,) or (B, C) -- diagnostics only
 
-        gap_non_event = e_non_event_mean.squeeze(1)      # (B,) or (B, C)
-        gap_event_raw = e_ev_mean.squeeze(1)             # (B,) or (B, C)
-        has_event_flat = has_event.squeeze(1)            # (B,) or (B, C)
-
-        level_bg_cell = self._log_cosh(gap_non_event)
-        level_ev_cell = self._log_cosh(gap_event_raw) * has_event_flat
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)     # (B,) or (B, C)
+        level_cell = self._log_cosh(gap)
 
         if multivariate:
-            # Per-channel cell counts → per-channel weights
-            total_bg_cells = bg_mask.sum(dim=(0, 1))                    # (C,)
-            total_ev_cells = event_mask.sum(dim=(0, 1))                 # (C,)
-            total_cells = (total_bg_cells + total_ev_cells).clamp_min(1.0)
-            w_bg = total_bg_cells / total_cells                         # (C,)
-            w_ev = total_ev_cells / total_cells                         # (C,)
-
-            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)   # (C,)
-            loss_level_bg = level_bg_cell.mean(dim=0)                   # (C,)
-            loss_level_ev = level_ev_cell.sum(dim=0) / n_event_series   # (C,)
-            loss_level = T * (w_bg * loss_level_bg
-                              + w_ev * loss_level_ev).sum()             # scalar
+            loss_level = T * level_cell.mean(dim=0).sum()   # scalar
         else:
-            total_bg_cells = bg_mask.sum()
-            total_ev_cells = event_mask.sum()
-            total_cells = (total_bg_cells + total_ev_cells).clamp_min(1.0)
-            w_bg = total_bg_cells / total_cells                         # scalar
-            w_ev = total_ev_cells / total_cells                         # scalar
-
-            n_event_series = has_event_flat.sum().clamp_min(1.0)
-            loss_level_bg = level_bg_cell.mean()
-            loss_level_ev = level_ev_cell.sum() / n_event_series
-            loss_level = T * (w_bg * loss_level_bg
-                              + w_ev * loss_level_ev)
+            loss_level = T * level_cell.mean()              # scalar
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
@@ -245,7 +210,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 dro_frac_up_l = self._tolist(((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev)
                 event_frac_l = self._tolist(event_mask.mean(dim=(0, 1)))
 
-                gap_event_tel = has_event_flat * gap_event_raw
+                gap_event_tel = has_event_flat * e_ev_mean.squeeze(1)
                 _ga = gap_event_tel.abs()
                 gap_mean_l = self._tolist(_ga.mean(dim=0))
                 gap_max_l = self._tolist(_ga.amax(dim=0))
@@ -257,8 +222,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 shape_dc_l = self._tolist((gate * e_shape).mean(dim=1).abs().mean(dim=0))
 
                 sl_ratio_l = self._tolist(loss_shape.detach() / loss_level.detach().clamp_min(self._EPS))
-                level_w_bg_l = self._tolist(w_bg)
-                level_w_ev_l = self._tolist(w_ev)
             else:
                 _n_ev = event_mask.sum().clamp_min(1.0)
                 _w_ev = w_dro * event_mask
@@ -270,7 +233,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 dro_frac_up_l = [((w_dro > 1.0) * event_mask).sum().item() / _n_ev.item()]
                 event_frac_l = [event_mask.mean().item()]
 
-                gap_event_tel = has_event_flat * gap_event_raw
+                gap_event_tel = has_event_flat * e_ev_mean.squeeze(1)
                 _ga = gap_event_tel.abs()
                 gap_mean_l = [_ga.mean().item()]
                 gap_max_l = [_ga.max().item()]
@@ -282,8 +245,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 shape_dc_l = [(gate * e_shape).mean(dim=1).abs().mean().item()]
 
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
-                level_w_bg_l = [float(w_bg)]
-                level_w_ev_l = [float(w_ev)]
 
         if torch.isnan(total_loss):
             raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
@@ -309,15 +270,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_ev_mean": gap_ev_mean_l,
             "level_gap_ev_max": gap_ev_max_l,
             "level_gap_sat": gap_sat_l,
-            "level_w_bg": level_w_bg_l,
-            "level_w_ev": level_w_ev_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
         }
 
         logger.debug(
-            "SpotlightLossLogcosh | shape=%s level=%s total=%.6f w_bg=%s w_ev=%s",
-            shape_c, level_c, total_loss.item(), level_w_bg_l, level_w_ev_l,
+            "SpotlightLossLogcosh | shape=%s level=%s total=%.6f",
+            shape_c, level_c, total_loss.item(),
         )
         return total_loss
 

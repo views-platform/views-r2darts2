@@ -13,10 +13,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
     - Two-mask gate: event_mask (y_true-based) for structure, gate (abs_max-based)
       for shape weighting.
     - Background-referenced demeaning (guarded by has_event).
-    - Guarded DRO (no NaN for no-event series).
+    - Scale-aware DRO: importance derived from max(|y_true|, |y_pred|) combined
+      with error magnitude. Cells that are both high-value AND high-error receive
+      the strongest upweighting.
     - Single whole-window mean gap for Level (automatically population-
       proportional, no weight to tune, jointly satisfied by correct solution).
-    - T multiplier on level loss (provides corrective pressure).
     - Series-level (has_gated-weighted) pooling for Shape loss.
     """
     _EPS = 1e-6
@@ -74,8 +75,25 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
-        # ── DRO weighting (guarded) ──────────────────────────────────
-        raw_abs = e_shape.abs().detach()
+        # ── DRO weighting: scale-aware (y_true + y_pred informed) ────
+        #
+        # Importance signal: max(|y_true|, |y_pred|) captures how much
+        # a cell matters regardless of whether the model or the ground
+        # truth is driving the magnitude.  A high-fatality event
+        # (y_true large) is important; a large false alarm (y_pred
+        # large, y_true small) is also important.
+        #
+        # Error signal: |e_shape| captures how wrong the model is
+        # after removing the series-level bias.
+        #
+        # Combined: importance * error gives a joint signal that
+        # upweights cells that are BOTH high-value AND high-error.
+        # The sqrt compression prevents any single cell from
+        # dominating the batch gradient.
+        importance = abs_max.detach()                          # (B, T) or (B, T, C)
+        error_mag = e_shape.abs().detach()
+        raw_abs = (importance * error_mag) * event_mask
+
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         valid_dro = (raw_abs > 1e-6).float() * event_mask
         w_dro_raw = torch.sqrt((raw_abs * valid_dro) / dro_mu.clamp_min(self._EPS))
@@ -105,7 +123,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(gap)
 
         if multivariate:
-            loss_level =  (level_cell * has_gated).sum(dim=0) / has_gated.sum(dim=0).clamp_min(1.0)
+            loss_level = (level_cell * has_gated).sum(dim=0) / has_gated.sum(dim=0).clamp_min(1.0)
             loss_level = loss_level.sum()
         else:
             loss_level = (level_cell * has_gated).sum() / has_gated.sum().clamp_min(1.0)

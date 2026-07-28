@@ -168,20 +168,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: single population-mean gap (no bg/ev split) ────────
-        # Automatically population-proportional, no weight to tune, and
-        # jointly satisfied by the correct solution (background ~ 0,
-        # event cell ~ true magnitude) — see docstring for why the
-        # bg/ev split was removed rather than reweighted again.
-        has_event_flat = has_event.squeeze(1)            # (B,) or (B, C) -- diagnostics only
+        # ── LEVEL: decomposed, matched normalization, T multiplier ───
+        # gap_non_event targets 0 (never vanishes at PGM).
+        # gap_event targets true event mean (provides strong, saturated push).
+        # Event term normalized by n_event_series (matches Shape's has_gated).
+        # Background term normalized by B (all series have background).
+        n_non_ev = (T - n_ev_raw).clamp_min(1.0)
+        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)     # (B,) or (B, C)
-        level_cell = self._log_cosh(gap)
+        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
+        gap_non_event = e_non_event_mean.squeeze(1)
+        has_event_flat = has_event.squeeze(1)
 
         if multivariate:
-            loss_level = T * level_cell.mean(dim=0).sum()   # scalar
+            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)   # (C,)
+            level_ev = (self._log_cosh(gap_event) * has_event_flat).sum(dim=0) / n_event_series
+            level_bg = self._log_cosh(gap_non_event).mean(dim=0)
+            loss_level = T * (level_ev + level_bg).sum()
         else:
-            loss_level = T * level_cell.mean()              # scalar
+            n_event_series = has_event_flat.sum().clamp_min(1.0)
+            level_ev = (self._log_cosh(gap_event) * has_event_flat).sum() / n_event_series
+            level_bg = self._log_cosh(gap_non_event).mean()
+            loss_level = T * (level_ev + level_bg)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

@@ -62,8 +62,8 @@ Changelog (from the V58 baseline):
      original job of keeping the aggregate mean calibrated.
 
 Design (unchanged):
-  - Two-mask gate: event_mask (y_true-based) for structure, gate
-    (abs_max-based) for shape weighting.
+    - Two-mask gate: event_mask (y_true/y_pred union) for structure,
+        gate (abs_max-based) for shape weighting.
   - Guarded DRO (no NaN for no-event series).
   - Series-level (has_gated-weighted) pooling for Shape loss.
   - loss_shape and loss_level are each pooled to a SCALAR in the
@@ -128,7 +128,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e = y_pred - y_true
 
         # ── Two-mask gate ────────────────────────────────────────────
-        event_mask = (y_true.abs() > self.tau).float()
+        event_true = (y_true.abs() > self.tau).float()
+        event_pred = (y_pred.detach().abs() > self.tau).float()
+        event_mask = torch.maximum(event_true, event_pred)
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = (abs_max > self.tau).float()
 
@@ -191,12 +193,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
             n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)   # (C,)
             level_ev = (self._asinh_plus(gap_event) * has_event_flat).sum(dim=0) / n_event_series
             level_bg = self._asinh_plus(gap_non_event).mean(dim=0)
-            loss_level = T * (level_ev + level_bg).sum()
+            loss_level = (level_ev + level_bg).sum()
         else:
             n_event_series = has_event_flat.sum().clamp_min(1.0)
             level_ev = (self._asinh_plus(gap_event) * has_event_flat).sum() / n_event_series
             level_bg = self._asinh_plus(gap_non_event).mean()
-            loss_level = T * (level_ev + level_bg)
+            loss_level = (level_ev + level_bg)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

@@ -118,30 +118,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: decomposed, matched normalization, sqrt(T) ────────
-        n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
+        # ── LEVEL
+        event_frac = event_mask.mean().clamp_min(self._EPS)
+        level_weight = has_gated + (1.0 - has_gated) * event_frac
 
-        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
-        gap_non_event = e_non_event_mean.squeeze(1)
-        has_event_flat = has_event.squeeze(1)
-
-        amplifier = math.sqrt(float(T))
-        level_ev_cell = self._log_cosh(gap_event)
-        level_bg_cell = self._log_cosh(gap_non_event)
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
+        level_cell = self._log_cosh(gap)
 
         if multivariate:
-            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)
-            n_no_event_series = (1.0 - has_gated).sum(dim=0).clamp_min(1.0)
-            loss_level_ev = (level_ev_cell * has_gated).sum(dim=0) / n_event_series
-            loss_level_bg = (level_bg_cell * (1.0 - has_gated)).sum(dim=0) / n_no_event_series
-            loss_level = amplifier * (loss_level_ev + loss_level_bg).sum()
+            loss_level = T * (level_cell * level_weight).sum(dim=0) / level_weight.sum(dim=0).clamp_min(1.0)
+            loss_level = loss_level.sum()
         else:
-            n_event_series = has_gated.sum().clamp_min(1.0)
-            n_no_event_series = (1.0 - has_gated).sum().clamp_min(1.0)
-            loss_level_ev = (level_ev_cell * has_gated).sum() / n_event_series
-            loss_level_bg = (level_bg_cell * (1.0 - has_gated)).sum() / n_no_event_series
-            loss_level = amplifier * (loss_level_ev + loss_level_bg)
+            loss_level = T * (level_cell * level_weight).sum() / level_weight.sum().clamp_min(1.0)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

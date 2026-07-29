@@ -53,7 +53,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         e = y_pred - y_true
 
-        # ── Two‑mask gate ────────────────────────────────────────────
+        # ── Two-mask gate ────────────────────────────────────────────
         event_mask = (y_true.abs() > self.tau).float()
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = (abs_max > self.tau).float()
@@ -62,13 +62,35 @@ class SpotlightLossLogcosh(torch.nn.Module):
         has_event = (n_ev_raw > 0.5).float()
         n_ev = n_ev_raw.clamp_min(1.0)
 
-        # ── SHAPE: per‑series mean demean (orthogonal to Level) ──────
-        e_mean = e.mean(dim=1, keepdim=True)          # simple, no background coupling
+        # ── SHAPE: background-referenced demeaning (guarded) ─────────
+        bg_mask = 1.0 - event_mask
+        n_bg = bg_mask.sum(dim=1, keepdim=True)
+        has_bg = (n_bg > 0.5).float()
+        n_bg_safe = n_bg.clamp_min(1.0)
+
+        e_bg_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_bg_safe
+        e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
+
+        e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
-        # ── DRO weighting (scale‑aware, as before) ───────────────────
-        importance = abs_max.detach()
+        # ── DRO weighting: scale-aware (y_true + y_pred informed) ────
+        #
+        # Importance signal: max(|y_true|, |y_pred|) captures how much
+        # a cell matters regardless of whether the model or the ground
+        # truth is driving the magnitude.  A high-fatality event
+        # (y_true large) is important; a large false alarm (y_pred
+        # large, y_true small) is also important.
+        #
+        # Error signal: |e_shape| captures how wrong the model is
+        # after removing the series-level bias.
+        #
+        # Combined: importance * error gives a joint signal that
+        # upweights cells that are BOTH high-value AND high-error.
+        # The sqrt compression prevents any single cell from
+        # dominating the batch gradient.
+        importance = abs_max.detach()                          # (B, T) or (B, T, C)
         error_mag = e_shape.abs().detach()
         raw_abs = (importance * error_mag) * event_mask
 
@@ -82,7 +104,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         shape_w = gate * w_dro
 
-        # ── Shape loss: series‑level pooling ─────────────────────────
+        # ── Shape loss: series-level (has_gated-weighted) pooling ────
         if multivariate:
             num = (shape_w * shape_cell).sum(dim=(0, 1))
             den = shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
@@ -96,43 +118,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: three‑component orthogonal anchor ─────────────────
-        has_event_flat = has_event.squeeze(1)          # (B,) or (B, C)
-        no_event_mask = 1.0 - has_event_flat
-
-        # 1. Event gap (strong, sparsity‑amplified) – only on event‑bearing series
+        # Lvl
         n_events_avg = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
         amplifier = max(math.log10(T / n_events_avg) + 1.0, 1.0)
-        e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
-        gap_event = e_ev_mean.squeeze(1)               # (B,) or (B, C)
-        level_ev = amplifier * self._log_cosh(gap_event) * has_event_flat
 
-        # 2. Background gap – only on series with no events
-        n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        e_non_event_mean = ((1 - event_mask) * e).sum(dim=1, keepdim=True) / n_non_ev
-        gap_bg = e_non_event_mean.squeeze(1)           # (B,) or (B, C)
-        level_bg = self._log_cosh(gap_bg) * no_event_mask
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)         
+        level_cell = self._log_cosh(gap)
 
-        # 3. Weak global anchor – prevents overall mean drift
-        gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)   # per‑series
-        w_global = 1.0 / T                                      # tiny, automatic
-        level_global = w_global * self._log_cosh(gap_global)
-
-        # Pooling
         if multivariate:
-            n_ev_series = has_event_flat.sum(dim=0).clamp_min(1.0)
-            n_no_ev_series = no_event_mask.sum(dim=0).clamp_min(1.0)
-            loss_level_ev = level_ev.sum(dim=0) / n_ev_series
-            loss_level_bg = level_bg.sum(dim=0) / n_no_ev_series
-            loss_level_global = level_global.mean(dim=0)
-            loss_level = (loss_level_ev + loss_level_bg + loss_level_global).sum()
+            loss_level = amplifier * T * level_cell.mean(dim=0).sum()
         else:
-            n_ev_series = has_event_flat.sum().clamp_min(1.0)
-            n_no_ev_series = no_event_mask.sum().clamp_min(1.0)
-            loss_level_ev = level_ev.sum() / n_ev_series
-            loss_level_bg = level_bg.sum() / n_no_ev_series
-            loss_level_global = level_global.mean()
-            loss_level = loss_level_ev + loss_level_bg + loss_level_global
+            loss_level = amplifier * T * level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
@@ -233,4 +229,4 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossLogcosh(non_zero_threshold={self.tau})" 
+        return f"SpotlightLossLogcosh(non_zero_threshold={self.tau})"

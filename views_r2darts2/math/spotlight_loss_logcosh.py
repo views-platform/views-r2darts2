@@ -118,15 +118,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: single mean gap, matched normalization ────────────
+        # ── LEVEL: single mean gap, RMS-normalized, T multiplier ────
+        # Level sees ALL series (no has_gated) — background series need
+        # their anchor at 0 to counteract Shape's de-escalation pressure.
+        # Gap normalized by batch-level RMS of y_true — RMS is dominated
+        # by rare events, not zero-inflation rate, so it doesn't collapse
+        # with sparsity. This keeps Level's gradient meaningful at any density.
+        rms = torch.sqrt((y_true ** 2).mean()).clamp_min(self._EPS)
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = self._log_cosh(gap)
+        level_cell = self._log_cosh(gap / rms)
 
         if multivariate:
-            loss_level = (level_cell * has_gated).sum(dim=0) / has_gated.sum(dim=0).clamp_min(1.0)
-            loss_level = loss_level.sum()
+            loss_level = T * level_cell.mean(dim=0).sum()
         else:
-            loss_level = (level_cell * has_gated).sum() / has_gated.sum().clamp_min(1.0)
+            loss_level = T * level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

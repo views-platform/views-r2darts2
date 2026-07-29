@@ -108,13 +108,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: per-cell log_cosh on gated cells only ────────────
-        # Per-cell log_cosh(e) fixes the average-before-nonlinearity bug.
-        # Gate restricts to cells where abs_max > tau — same mask Shape
-        # uses. This prevents 85% non-event cells (CM) or 98% (PGM)
-        # from dominating the Level gradient with their large residuals.
-        # Non-event cells below tau get zero Level gradient (Shape handles
-        # them via false-alarm suppression when they exceed tau).
+        # ── LEVEL ────────
+        has_event_flat = has_event.squeeze(1)   # (B,) or (B, C) -- diagnostics only
+
         level_cell = self._log_cosh(e) * gate
 
         if multivariate:

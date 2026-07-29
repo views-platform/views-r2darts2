@@ -118,17 +118,27 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # Lvl
-        n_events_avg = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
-        amplifier = max(math.log10(T / n_events_avg) + 1.0, 1.0)
+        # ── LEVEL: per‑series mean gap with importance weighting ─────
+        # Event‑bearing series get a weight proportional to the sparsity
+        # of events in the batch.  This automatically makes the level
+        # loss strong enough to overcome shape de‑escalation on PGM,
+        # but stays near 1.0 on CM where events are frequent.
+        n_events_avg = event_mask.sum(dim=1).clamp_min(1.0).mean().item()   # average events per series
+        amplifier = T / n_events_avg                                        # ~36 on PGM, ~6‑7 on CM
 
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)         
-        level_cell = self._log_cosh(gap)
+        # Per‑series weight: event‑bearing series get amplifier, others get 1.0
+        has_event_flat = has_event.squeeze(1)                               # (B,) or (B,C)
+        w_level = 1.0 + (amplifier - 1.0) * has_event_flat                  # (B,) or (B,C)
+
+        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)                       # unchanged global gap
+        level_cell = self._log_cosh(gap)                                    # per‑series scalar
 
         if multivariate:
-            loss_level = amplifier * T * level_cell.mean(dim=0).sum()
+            # weighted mean over series
+            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = loss_level.sum()                                   # scalar
         else:
-            loss_level = amplifier * T * level_cell.mean()
+            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

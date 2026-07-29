@@ -109,6 +109,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
         # ── LEVEL: single mean gap, NO T multiplier ─────────────────
+        has_event_flat = has_event.squeeze(1)   # (B,) or (B, C) -- diagnostics only
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._log_cosh(gap)
 

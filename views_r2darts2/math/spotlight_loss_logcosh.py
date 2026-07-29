@@ -118,20 +118,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: per‑series gap, summed with sparsity weighting ───────
-        n_events_avg = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
-        amplifier = max(math.log10(T / n_events_avg) + 1.0, 1.0)      # ~4.2 on PGM, ~3.5 on CM
+        # ── LEVEL: decomposed, matched normalization, sqrt(T) ────────
+        n_non_ev = (T - n_ev_raw).clamp_min(1.0)
+        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
-        has_event_flat = has_event.squeeze(1)                          # (B,) or (B,C)
-        weight = 1.0 + (amplifier - 1.0) * has_event_flat              # 1 for peaceful, amplifier for event
+        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
+        gap_non_event = e_non_event_mean.squeeze(1)
+        has_event_flat = has_event.squeeze(1)
 
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = self._log_cosh(gap)
+        amplifier = math.sqrt(float(T))
+        level_ev_cell = self._log_cosh(gap_event)
+        level_bg_cell = self._log_cosh(gap_non_event)
 
         if multivariate:
-            loss_level = (weight * level_cell).sum(dim=0).sum()    # sum over series and channels
+            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)
+            n_no_event_series = (1.0 - has_gated).sum(dim=0).clamp_min(1.0)
+            loss_level_ev = (level_ev_cell * has_gated).sum(dim=0) / n_event_series
+            loss_level_bg = (level_bg_cell * (1.0 - has_gated)).sum(dim=0) / n_no_event_series
+            loss_level = amplifier * (loss_level_ev + loss_level_bg).sum()
         else:
-            loss_level = (weight * level_cell).sum()                # sum over series
+            n_event_series = has_gated.sum().clamp_min(1.0)
+            n_no_event_series = (1.0 - has_gated).sum().clamp_min(1.0)
+            loss_level_ev = (level_ev_cell * has_gated).sum() / n_event_series
+            loss_level_bg = (level_bg_cell * (1.0 - has_gated)).sum() / n_no_event_series
+            loss_level = amplifier * (loss_level_ev + loss_level_bg)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

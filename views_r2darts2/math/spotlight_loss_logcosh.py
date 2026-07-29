@@ -137,8 +137,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
             # weighted mean over series
             loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
             loss_level = loss_level.sum()                                   # scalar
+            loss_level = T * loss_level
         else:
             loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * loss_level
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

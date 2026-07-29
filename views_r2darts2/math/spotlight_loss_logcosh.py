@@ -103,20 +103,26 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: single mean gap, RMS-normalized, T multiplier ────
-        # Level sees ALL series (no has_gated) — background series need
-        # their anchor at 0 to counteract Shape's de-escalation pressure.
-        # Gap normalized by batch-level RMS of y_true — RMS is dominated
-        # by rare events, not zero-inflation rate, so it doesn't collapse
-        # with sparsity. This keeps Level's gradient meaningful at any density.
-        rms = torch.sqrt((y_true ** 2).mean()).clamp_min(self._EPS)
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = self._log_cosh(gap / rms)
+        # ── LEVEL: decomposed, matched normalization, T multiplier ───
+        n_non_ev = (T - n_ev_raw).clamp_min(1.0)
+        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
+
+        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
+        gap_non_event = e_non_event_mean.squeeze(1)
+
+        level_ev_cell = self._log_cosh(gap_event)
+        level_bg_cell = self._log_cosh(gap_non_event)
 
         if multivariate:
-            loss_level = T * level_cell.mean(dim=0).sum()
+            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)
+            loss_level_ev = (level_ev_cell * has_event_flat).sum(dim=0) / n_event_series
+            loss_level_bg = (level_bg_cell * has_gated).sum(dim=0) / has_gated.sum(dim=0).clamp_min(1.0)
+            loss_level = T * (loss_level_ev + loss_level_bg).sum()
         else:
-            loss_level = T * level_cell.mean()
+            n_event_series = has_event_flat.sum().clamp_min(1.0)
+            loss_level_ev = (level_ev_cell * has_event_flat).sum() / n_event_series
+            loss_level_bg = (level_bg_cell * has_gated).sum() / has_gated.sum().clamp_min(1.0)
+            loss_level = T * (loss_level_ev + loss_level_bg)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

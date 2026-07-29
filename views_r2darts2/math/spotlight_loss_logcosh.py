@@ -113,11 +113,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         rms = torch.sqrt((y_true ** 2).mean()).clamp_min(self._EPS)
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._log_cosh(gap / rms)
+        sqrt_T = math.sqrt(float(T))
 
         if multivariate:
-            loss_level = level_cell.mean(dim=0).sum()
+            loss_level = sqrt_T * level_cell.mean(dim=0).sum()
         else:
-            loss_level = level_cell.mean()
+            loss_level = sqrt_T * level_cell.mean()
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

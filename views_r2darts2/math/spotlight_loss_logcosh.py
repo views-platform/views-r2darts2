@@ -54,7 +54,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         e = y_pred - y_true
 
-        # ── Two-mask gate ────────────────────────────────────────────
+        # ── Two‑mask gate ────────────────────────────────────────────
         event_mask = (y_true.abs() > self.tau).float()
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = (abs_max > self.tau).float()
@@ -63,7 +63,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         has_event = (n_ev_raw > 0.5).float()
         n_ev = n_ev_raw.clamp_min(1.0)
 
-        # ── SHAPE: background-referenced demeaning (guarded) ─────────
+        # ── SHAPE: background‑referenced demeaning (guarded) ─────────
         bg_mask = 1.0 - event_mask
         n_bg = bg_mask.sum(dim=1, keepdim=True)
         has_bg = (n_bg > 0.5).float()
@@ -76,7 +76,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
-        # ── DRO weighting: error-only (guarded) ──────────────────────
+        # ── DRO weighting (guarded) ──────────────────────────────────
         raw_abs = e_shape.abs().detach()
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         valid_dro = (raw_abs > 1e-6).float() * event_mask
@@ -88,7 +88,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         shape_w = gate * w_dro
 
-        # ── Shape loss: series-level (has_gated-weighted) pooling ────
+        # ── Shape loss: series‑level pooling ─────────────────────────
         if multivariate:
             num = (shape_w * shape_cell).sum(dim=(0, 1))
             den = shape_w.sum(dim=(0, 1)).clamp_min(self._EPS)
@@ -102,37 +102,43 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: event‑only + background‑only (no conflict) ────────
-        # Amplifier grows with sparsity.
+        # ── LEVEL: three‑component anchor ────────────────────────────
         n_events_avg = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
         amplifier = max(math.log10(T / n_events_avg) + 1.0, 1.0)
 
-        has_event_flat = has_event.squeeze(1)          # (B,) or (B, C)
-        no_event_mask = 1.0 - has_event_flat           # (B,) or (B, C)
+        has_event_flat = has_event.squeeze(1)          # (B,) or (B,C)
+        no_event_mask = 1.0 - has_event_flat
 
-        # Event gap (only for series with events)
-        gap_event_raw = e_ev_mean.squeeze(1)           # (B,) or (B, C)
-        level_ev_cell = amplifier * self._log_cosh(gap_event_raw) * has_event_flat
+        # 1. Event gap (strong, sparsity‑amplified) — only event‑bearing series
+        gap_event_raw = e_ev_mean.squeeze(1)           # (B,) or (B,C)
+        level_ev = amplifier * self._log_cosh(gap_event_raw) * has_event_flat
 
-        # Background gap (only for series without events)
+        # 2. Background gap (only no‑event series)
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        e_non_event_mean = ((1 - event_mask) * e).sum(dim=1, keepdim=True) / n_non_ev
-        gap_non_event = e_non_event_mean.squeeze(1)    # (B,) or (B, C)
-        level_bg_cell = self._log_cosh(gap_non_event) * no_event_mask
+        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
+        gap_non_event = e_non_event_mean.squeeze(1)
+        level_bg = self._log_cosh(gap_non_event) * no_event_mask
 
+        # 3. Weak global anchor (prevents overall mean drift)
+        gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)      # per‑series
+        weight_global = 1.0 / math.sqrt(T)                        # small, automatic
+        level_global = weight_global * self._log_cosh(gap_global)
+
+        # Pooling
         if multivariate:
-            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)     # (C,)
-            n_no_event_series = no_event_mask.sum(dim=0).clamp_min(1.0)  # (C,)
-            loss_level_ev = level_ev_cell.sum(dim=0) / n_event_series
-            loss_level_bg = level_bg_cell.sum(dim=0) / n_no_event_series
-            loss_level = (loss_level_ev + loss_level_bg).sum()
+            n_ev_series = has_event_flat.sum(dim=0).clamp_min(1.0)
+            n_no_ev_series = no_event_mask.sum(dim=0).clamp_min(1.0)
+            loss_level_ev = level_ev.sum(dim=0) / n_ev_series
+            loss_level_bg = level_bg.sum(dim=0) / n_no_ev_series
+            loss_level_global = level_global.mean(dim=0)          # average over all series
+            loss_level = (loss_level_ev + loss_level_bg + loss_level_global).sum()
         else:
-            n_event_series = has_event_flat.sum().clamp_min(1.0)
-            n_no_event_series = no_event_mask.sum().clamp_min(1.0)
-            loss_level_ev = level_ev_cell.sum() / n_event_series
-            loss_level_bg = level_bg_cell.sum() / n_no_event_series
-            loss_level = (loss_level_ev + loss_level_bg)
-
+            n_ev_series = has_event_flat.sum().clamp_min(1.0)
+            n_no_ev_series = no_event_mask.sum().clamp_min(1.0)
+            loss_level_ev = level_ev.sum() / n_ev_series
+            loss_level_bg = level_bg.sum() / n_no_ev_series
+            loss_level_global = level_global.mean()
+            loss_level = loss_level_ev + loss_level_bg + loss_level_global
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

@@ -102,30 +102,37 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: background term only for no-event series ─────────
+        # ── LEVEL: event‑only + background‑only (no conflict) ────────
+        # Amplifier grows with sparsity.
+        n_events_avg = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
+        amplifier = max(math.log10(T / n_events_avg) + 1.0, 1.0)
+
+        has_event_flat = has_event.squeeze(1)          # (B,) or (B, C)
+        no_event_mask = 1.0 - has_event_flat           # (B,) or (B, C)
+
+        # Event gap (only for series with events)
+        gap_event_raw = e_ev_mean.squeeze(1)           # (B,) or (B, C)
+        level_ev_cell = amplifier * self._log_cosh(gap_event_raw) * has_event_flat
+
+        # Background gap (only for series without events)
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
-
-        gap_non_event = e_non_event_mean.squeeze(1)          # (B,) or (B, C)
-        gap_event_raw = e_ev_mean.squeeze(1)                 # (B,) or (B, C)
-        has_event_flat = has_event.squeeze(1)                # (B,) or (B, C)
-
-        # Background loss only where there are no events
-        level_bg_cell = self._log_cosh(gap_non_event) * (1.0 - has_event_flat)
-        level_ev_cell = self._log_cosh(gap_event_raw) * has_event_flat
+        e_non_event_mean = ((1 - event_mask) * e).sum(dim=1, keepdim=True) / n_non_ev
+        gap_non_event = e_non_event_mean.squeeze(1)    # (B,) or (B, C)
+        level_bg_cell = self._log_cosh(gap_non_event) * no_event_mask
 
         if multivariate:
-            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)
-            n_no_event_series = (1.0 - has_event_flat).sum(dim=0).clamp_min(1.0)
-            loss_level_bg = level_bg_cell.sum(dim=0) / n_no_event_series   # average over no-event series
-            loss_level_ev = level_ev_cell.sum(dim=0) / n_event_series      # average over event series
-            loss_level = math.asinh(T) * (loss_level_bg + loss_level_ev).sum()
+            n_event_series = has_event_flat.sum(dim=0).clamp_min(1.0)     # (C,)
+            n_no_event_series = no_event_mask.sum(dim=0).clamp_min(1.0)  # (C,)
+            loss_level_ev = level_ev_cell.sum(dim=0) / n_event_series
+            loss_level_bg = level_bg_cell.sum(dim=0) / n_no_event_series
+            loss_level = (loss_level_ev + loss_level_bg).sum()
         else:
             n_event_series = has_event_flat.sum().clamp_min(1.0)
-            n_no_event_series = (1.0 - has_event_flat).sum().clamp_min(1.0)
-            loss_level_bg = level_bg_cell.sum() / n_no_event_series
+            n_no_event_series = no_event_mask.sum().clamp_min(1.0)
             loss_level_ev = level_ev_cell.sum() / n_event_series
-            loss_level = math.asinh(T) * (loss_level_bg + loss_level_ev)
+            loss_level_bg = level_bg_cell.sum() / n_no_event_series
+            loss_level = (loss_level_ev + loss_level_bg)
+
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

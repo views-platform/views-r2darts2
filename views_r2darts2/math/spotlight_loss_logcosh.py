@@ -118,9 +118,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(e)           # (B, T) or (B, T, C), NOT averaged first
 
         if multivariate:
-            loss_level = level_cell.mean(dim=(0, 1)).sum()   # scalar
+            loss_level = T * level_cell.mean(dim=(0, 1)).sum()   # scalar
         else:
-            loss_level = level_cell.mean()                    # scalar
+            loss_level = T * level_cell.mean()                    # scalar
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

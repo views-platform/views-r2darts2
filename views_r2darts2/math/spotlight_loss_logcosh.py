@@ -71,7 +71,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_bg_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_bg_safe
         e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
 
-        e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
+        # e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
+        e_mean = has_event * (has_bg * e_bg_mean.detach() + (1.0 - has_bg) * e_ev_mean.detach())
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 

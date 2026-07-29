@@ -118,20 +118,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: active series only, T‑scaled, sparsity‑normalised ─────
-        active = gate.amax(dim=1)                # 1 if any cell in the series is active
-        n_active = active.sum().clamp_min(1.0)   # number of active series in the batch
+        # ── LEVEL: per‑series gap, summed with sparsity weighting ───────
+        n_events_avg = event_mask.sum(dim=1).clamp_min(1.0).mean().item()
+        amplifier = max(math.log10(T / n_events_avg) + 1.0, 1.0)      # ~4.2 on PGM, ~3.5 on CM
+
+        has_event_flat = has_event.squeeze(1)                          # (B,) or (B,C)
+        weight = 1.0 + (amplifier - 1.0) * has_event_flat              # 1 for peaceful, amplifier for event
 
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = self._log_cosh(gap)         # per‑series loss
+        level_cell = self._log_cosh(gap)
 
-        # Mean over active series, scaled by T – each active series gets a
-        # gradient proportional to T, undiluted by the silent majority.
         if multivariate:
-            loss_level = T * (active * level_cell).sum(dim=0) / n_active
-            loss_level = loss_level.sum()
+            loss_level = T * (weight * level_cell).sum(dim=0).sum()    # sum over series and channels
         else:
-            loss_level = T * (active * level_cell).sum() / n_active
+            loss_level = T * (weight * level_cell).sum()                # sum over series
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

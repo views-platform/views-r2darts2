@@ -13,11 +13,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
     - Two-mask gate: event_mask (y_true-based) for structure, gate (abs_max-based)
       for shape weighting.
     - Background-referenced demeaning (guarded by has_event).
-    - Scale-aware DRO: importance derived from max(|y_true|, |y_pred|) combined
-      with error magnitude. Cells that are both high-value AND high-error receive
-      the strongest upweighting.
-    - Single whole-window mean gap for Level (automatically population-
-      proportional, no weight to tune, jointly satisfied by correct solution).
+    - Error-only DRO (guarded, no NaN for no-event series).
+    - Decomposed level loss: gap_event + gap_non_event.
+      gap_non_event targets 0 (never vanishes at PGM).
+      gap_event targets true event mean (strong, saturated push).
+      Both normalized by has_gated / n_event_series (matches Shape).
+    - T multiplier on level loss.
     - Series-level (has_gated-weighted) pooling for Shape loss.
     """
     _EPS = 1e-6
@@ -72,13 +73,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_ev_mean = (event_mask * e).sum(dim=1, keepdim=True) / n_ev
 
         e_mean = has_event * (has_bg * e_bg_mean + (1.0 - has_bg) * e_ev_mean)
-        # e_mean = has_event * (has_bg * e_bg_mean.detach() + (1.0 - has_bg) * e_ev_mean.detach())
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
         # ── DRO weighting: error-only (guarded) ──────────────────────
         raw_abs = e_shape.abs().detach()
-
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         valid_dro = (raw_abs > 1e-6).float() * event_mask
         w_dro_raw = torch.sqrt((raw_abs * valid_dro) / dro_mu.clamp_min(self._EPS))
@@ -104,11 +103,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
         # ── LEVEL: decomposed, matched normalization, T multiplier ───
+        # gap_non_event targets 0 (never vanishes at PGM).
+        # gap_event targets true event mean (strong, saturated push).
+        # Both normalized by has_gated / n_event_series (matches Shape).
         n_non_ev = (T - n_ev_raw).clamp_min(1.0)
         e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
 
         gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
         gap_non_event = e_non_event_mean.squeeze(1)
+        has_event_flat = has_event.squeeze(1)
 
         level_ev_cell = self._log_cosh(gap_event)
         level_bg_cell = self._log_cosh(gap_non_event)
@@ -139,7 +142,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Diagnostic telemetry ─────────────────────────────────────
         with torch.no_grad():
-            has_event_flat = has_event.squeeze(1)
             if multivariate:
                 _n_ev = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
                 _w_ev = w_dro * event_mask

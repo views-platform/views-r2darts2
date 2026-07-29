@@ -76,24 +76,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
-        # ── DRO weighting: scale-aware (y_true + y_pred informed) ────
-        #
-        # Importance signal: max(|y_true|, |y_pred|) captures how much
-        # a cell matters regardless of whether the model or the ground
-        # truth is driving the magnitude.  A high-fatality event
-        # (y_true large) is important; a large false alarm (y_pred
-        # large, y_true small) is also important.
-        #
-        # Error signal: |e_shape| captures how wrong the model is
-        # after removing the series-level bias.
-        #
-        # Combined: importance * error gives a joint signal that
-        # upweights cells that are BOTH high-value AND high-error.
-        # The sqrt compression prevents any single cell from
-        # dominating the batch gradient.
-        importance = abs_max.detach()                          # (B, T) or (B, T, C)
-        error_mag = e_shape.abs().detach()
-        raw_abs = (importance * error_mag) * event_mask
+        # ── DRO weighting: error-only (guarded) ──────────────────────
+        raw_abs = e_shape.abs().detach()
 
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         valid_dro = (raw_abs > 1e-6).float() * event_mask

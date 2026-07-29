@@ -1,3 +1,21 @@
+"""
+SpotlightLossLogcosh
+
+Design:
+  - Two-mask gate: event_mask (y_true-based) for structure, gate
+    (abs_max-based) for shape weighting.
+  - Guarded DRO (no NaN for no-event series).
+  - Series-level (has_gated-weighted) pooling for Shape loss.
+  - loss_shape and loss_level are each pooled to a scalar in the
+    multivariate case (matching the pre-existing pooling design);
+    per-channel diagnostics live in the telemetry dict, not in the
+    optimized loss terms themselves.
+
+NOTE for callers: the "level_w_bg" / "level_w_ev" diagnostic keys from
+an earlier revision remain removed. If external logging code (e.g.
+callbacks.py) reads those keys, it should already have been updated to
+stop expecting them.
+"""
 import math
 import torch
 import torch.nn.functional as F
@@ -7,19 +25,6 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """SpotlightLossLogcosh — PGM/CM robust loss.
-
-    Design:
-    - Two-mask gate: event_mask (y_true-based) for structure, gate (abs_max-based)
-      for shape weighting.
-    - Background-referenced demeaning (guarded by has_event).
-    - Scale-aware DRO: importance derived from max(|y_true|, |y_pred|) combined
-      with error magnitude. Cells that are both high-value AND high-error receive
-      the strongest upweighting.
-    - Single whole-window mean gap for Level (automatically population-
-      proportional, no weight to tune, jointly satisfied by correct solution).
-    - Series-level (has_gated-weighted) pooling for Shape loss.
-    """
     _EPS = 1e-6
 
     def __init__(self, non_zero_threshold: float = 0.88):
@@ -36,6 +41,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _tolist(x):
+        """Normalize tensor .tolist() to always return a list.
+        0-d tensor .tolist() returns a float; 1-d returns a list."""
         val = x.tolist() if isinstance(x, torch.Tensor) else x
         return val if isinstance(val, list) else [val]
 
@@ -75,25 +82,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_shape = e - e_mean
         shape_cell = self._log_cosh(e_shape)
 
-        # ── DRO weighting: scale-aware (y_true + y_pred informed) ────
-        #
-        # Importance signal: max(|y_true|, |y_pred|) captures how much
-        # a cell matters regardless of whether the model or the ground
-        # truth is driving the magnitude.  A high-fatality event
-        # (y_true large) is important; a large false alarm (y_pred
-        # large, y_true small) is also important.
-        #
-        # Error signal: |e_shape| captures how wrong the model is
-        # after removing the series-level bias.
-        #
-        # Combined: importance * error gives a joint signal that
-        # upweights cells that are BOTH high-value AND high-error.
-        # The sqrt compression prevents any single cell from
-        # dominating the batch gradient.
-        importance = abs_max.detach()                          # (B, T) or (B, T, C)
-        error_mag = e_shape.abs().detach()
-        raw_abs = (importance * error_mag) * event_mask
-
+        # ── DRO weighting (guarded) ──────────────────────────────────
+        raw_abs = e_shape.abs().detach()
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         valid_dro = (raw_abs > 1e-6).float() * event_mask
         w_dro_raw = torch.sqrt((raw_abs * valid_dro) / dro_mu.clamp_min(self._EPS))
@@ -118,23 +108,19 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: decomposed, has_gated normalization, T ───────────
-        n_non_ev = (T - n_ev_raw).clamp_min(1.0)
-        e_non_event_mean = (bg_mask * e).sum(dim=1, keepdim=True) / n_non_ev
+        # ── LEVEL: per-cell log_cosh, applied BEFORE averaging ────────
+        # Applying log_cosh directly
+        # to each cell's own residual e gives every event its full,
+        # undiluted correction automatically. Shape keeps the demeaned,
+        # relative-contrast job.
+        has_event_flat = has_event.squeeze(1)   # (B,) or (B, C) -- diagnostics only
 
-        gap_event = has_event.squeeze(1) * e_ev_mean.squeeze(1)
-        gap_non_event = e_non_event_mean.squeeze(1)
-
-        level_ev_cell = self._log_cosh(gap_event)
-        level_bg_cell = self._log_cosh(gap_non_event)
+        level_cell = self._log_cosh(e)           # (B, T) or (B, T, C), NOT averaged first
 
         if multivariate:
-            n_gated = has_gated.sum(dim=0).clamp_min(1.0)
-            loss_level = ((level_ev_cell + level_bg_cell) * has_gated).sum(dim=0) / n_gated
-            loss_level = loss_level.sum()
+            loss_level = level_cell.mean(dim=(0, 1)).sum()   # scalar
         else:
-            n_gated = has_gated.sum().clamp_min(1.0)
-            loss_level = ((level_ev_cell + level_bg_cell) * has_gated).sum() / n_gated
+            loss_level = level_cell.mean()                    # scalar
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:
@@ -151,7 +137,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Diagnostic telemetry ─────────────────────────────────────
         with torch.no_grad():
-            has_event_flat = has_event.squeeze(1)
             if multivariate:
                 _n_ev = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
                 _w_ev = w_dro * event_mask

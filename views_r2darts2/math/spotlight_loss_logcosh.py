@@ -119,13 +119,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             n_no_event_series = (1.0 - has_event_flat).sum(dim=0).clamp_min(1.0)
             loss_level_bg = level_bg_cell.sum(dim=0) / n_no_event_series   # average over no-event series
             loss_level_ev = level_ev_cell.sum(dim=0) / n_event_series      # average over event series
-            loss_level = T * (loss_level_bg + loss_level_ev).sum()
+            loss_level = math.asinh(T) * (loss_level_bg + loss_level_ev).sum()
         else:
             n_event_series = has_event_flat.sum().clamp_min(1.0)
             n_no_event_series = (1.0 - has_event_flat).sum().clamp_min(1.0)
             loss_level_bg = level_bg_cell.sum() / n_no_event_series
             loss_level_ev = level_ev_cell.sum() / n_event_series
-            loss_level = T *(loss_level_bg + loss_level_ev)
+            loss_level = math.asinh(T) * (loss_level_bg + loss_level_ev)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

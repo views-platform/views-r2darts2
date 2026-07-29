@@ -130,11 +130,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         if multivariate:
             n_gated = has_gated.sum(dim=0).clamp_min(1.0)
-            loss_level = T * ((level_ev_cell + level_bg_cell) * has_gated).sum(dim=0) / n_gated
+            loss_level = ((level_ev_cell + level_bg_cell) * has_gated).sum(dim=0) / n_gated
             loss_level = loss_level.sum()
         else:
             n_gated = has_gated.sum().clamp_min(1.0)
-            loss_level = T * ((level_ev_cell + level_bg_cell) * has_gated).sum() / n_gated
+            loss_level = ((level_ev_cell + level_bg_cell) * has_gated).sum() / n_gated
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

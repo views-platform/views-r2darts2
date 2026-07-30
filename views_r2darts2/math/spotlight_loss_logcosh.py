@@ -96,16 +96,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         true_event_mean = (event_mask * y_true).sum(dim=1) / n_ev.squeeze(1)
         gap = pred_event_mean - true_event_mean
 
-        level_cell = self._asinh_plus(gap)          # FIX 2
+        level_cell = self._log_cosh(gap)          # FIX 2
         w_level = gate.amax(dim=1)
 
         if multivariate:
-            loss_level = (                           # FIX 1: no T
+            loss_level = T * (                           
                 (w_level * level_cell).sum(dim=0)
                 / w_level.sum(dim=0).clamp_min(self._EPS)
             )
         else:
-            loss_level = (                           # FIX 1: no T
+            loss_level = T *(                           
                 (w_level * level_cell).sum()
                 / w_level.sum().clamp_min(self._EPS)
             )

@@ -51,6 +51,8 @@ from views_r2darts2.catalogs.scheduler_catalog import SchedulerCatalog
 from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 from views_r2darts2.infrastructure.callbacks import (
+    LossGradientDiagnosticsCallbackV2,
+    RichLossDiagnosticsCallback,
     TrainingStepPatchCallback,
     GradientHealthCallback,
     NaNDetectionCallback,
@@ -64,6 +66,9 @@ from views_r2darts2.infrastructure.callbacks import (
     InputBatchMonitorCallback,
     LossComponentCallback,
     LossGradientDiagnosticsCallback,
+    RichLossDiagnosticsCallback,
+    LossGradientDiagnosticsCallbackV2
+
 )
 
 
@@ -142,7 +147,9 @@ class ModelCatalog:
             ValMetricsCallback(),
             InputBatchMonitorCallback(),
             LossComponentCallback(),
-            LossGradientDiagnosticsCallback(),
+            # LossGradientDiagnosticsCallback(),
+            RichLossDiagnosticsCallback(log_every_n_epochs=1),  # visual table
+            LossGradientDiagnosticsCallbackV2(log_every_n_epochs=1),  # wandb + console
         ]
         # Wire EarlyStopping if patience is set in config
         early_stopping_patience = self.config.get("early_stopping_patience", None)

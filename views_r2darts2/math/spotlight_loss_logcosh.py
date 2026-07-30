@@ -16,12 +16,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV58 | threshold=%.4f K=%d", non_zero_threshold)
+        logger.info("SpotlightLossLogcosh | threshold=%.4f", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
         a = x.abs()
         return a + F.softplus(-2.0 * a) - math.log(2.0)
+
+    @staticmethod
+    def _tolist(x):
+        val = x.tolist() if isinstance(x, torch.Tensor) else x
+        return val if isinstance(val, list) else [val]
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         if y_pred.dim() == 3 and y_pred.size(-1) == 1:
@@ -73,8 +78,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(gap * density_scale)
         
         # Batch-level: weight by signal strength, gated by has_gated
-        # has_gated: only series with actual signal (events or false alarms) contribute.
-
         event_frac = event_mask.mean().clamp_min(self._EPS)
         has_gated = (gate.sum(dim=1) > self._EPS).float()
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
@@ -99,6 +102,30 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Diagnostic telemetry ──────────────────────────────────────
         with torch.no_grad():
+            # NEW: Density scaling diagnostics
+            density_scale_mean = density_scale.mean()
+            gap_scaled = (gap * density_scale).abs()
+            gap_scaled_mean = gap_scaled.mean()
+            
+            # NEW: Hájek weight diagnostics  
+            w_level_mean = w_level.mean()
+            batch_active_frac = has_gated.mean()
+            
+            # NEW: Gradient direction diagnostics (event vs non-event)
+            grad = self._last_input_grad
+            if grad is not None:
+                g = grad.float()
+                if g.dim() == 2:
+                    g = g.unsqueeze(-1)
+                ev_mask_3d = event_mask.unsqueeze(-1) if event_mask.dim() == 2 else event_mask
+                n_ev_total = ev_mask_3d.sum().clamp_min(1.0)
+                n_nev_total = (1.0 - ev_mask_3d).sum().clamp_min(1.0)
+                grad_ev = (g * ev_mask_3d).sum().item() / n_ev_total.item()
+                grad_nev = (g * (1.0 - ev_mask_3d)).sum().item() / n_nev_total.item()
+            else:
+                grad_ev = 0.0
+                grad_nev = 0.0
+
             if multivariate:
                 _n_ev = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
                 _w_ev = w_dro * event_mask
@@ -123,6 +150,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
+                density_scale_mean_l = self._tolist(density_scale_mean.expand(1) if density_scale_mean.dim() == 0 else density_scale_mean)
+                gap_scaled_mean_l = self._tolist(gap_scaled_mean.expand(1) if gap_scaled_mean.dim() == 0 else gap_scaled_mean)
+                w_level_mean_l = self._tolist(w_level_mean.expand(1) if w_level_mean.dim() == 0 else w_level_mean)
+                batch_active_frac_l = self._tolist(batch_active_frac.expand(1) if batch_active_frac.dim() == 0 else batch_active_frac)
             else:
                 _n_ev = event_mask.sum().clamp_min(1.0)
                 _w_ev = w_dro * event_mask
@@ -146,9 +177,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 shape_dc_l = [(gate * e_shape).mean(dim=1).abs().mean().item()]
 
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
+                density_scale_mean_l = [density_scale_mean.item()]
+                gap_scaled_mean_l = [gap_scaled_mean.item()]
+                w_level_mean_l = [w_level_mean.item()]
+                batch_active_frac_l = [batch_active_frac.item()]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV58: per_channel={comp}")
+            raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
 
         n = len(comp)
         self._last_components = {
@@ -173,13 +208,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
+            # NEW: Density-scaled gap diagnostics
+            "density_scale_mean": density_scale_mean_l,
+            "gap_scaled_mean": gap_scaled_mean_l,
+            # NEW: Hájek weight diagnostics
+            "w_level_mean": w_level_mean_l,
+            "batch_active_frac": batch_active_frac_l,
+            # NEW: Gradient direction
+            "grad_event": [grad_ev],
+            "grad_nonevent": [grad_nev],
         }
 
         logger.debug(
-            "SpotlightLossV58 | shape=%s level=%s total=%.6f",
+            "SpotlightLossLogcosh | shape=%s level=%s total=%.6f",
             shape_c, level_c, total_loss.item(),
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV58(non_zero_threshold={self.tau})"
+        return f"SpotlightLossLogcosh(non_zero_threshold={self.tau})"

@@ -114,6 +114,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Level: log_cosh(e) — absolute, teaches absolute calibration
         # Both see the same population (gated cells), same series (has_gated),
         # same normalization (per-series mean, then batch mean over active).
+        has_event_flat = has_event.squeeze(1)   # (B,) or (B, C) -- diagnostics only
         level_cell = self._log_cosh(e) * gate
 
         if multivariate:

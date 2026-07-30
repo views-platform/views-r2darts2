@@ -16,7 +16,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self.tau = non_zero_threshold
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
-        logger.info("SpotlightLossV58 | threshold=%.4f K=%d", non_zero_threshold, self._K)
+        logger.info("SpotlightLossV58 | threshold=%.4f K=%d", non_zero_threshold)
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
@@ -67,7 +67,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # ── LEVEL ───────────────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         level_cell = self._log_cosh(gap)
-        w_level = gate.amax(dim=1)
+        # w_level = gate.amax(dim=1)
+        w_level = torch.ones_like(gap) 
 
         if multivariate:
             loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)

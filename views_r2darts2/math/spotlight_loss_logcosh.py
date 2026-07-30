@@ -44,6 +44,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Event gate ───────────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
+        # abs_max = y_true.abs()
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
         # ── SHAPE: log_cosh on demeaned errors ────────
@@ -71,12 +72,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── LEVEL: Density-Scaled Gap + Signal-Weighted Hájek + T ────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        
+
         # Series-level: amplify gap for sparse-event series
         n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
         density_scale = torch.sqrt(T / n_ev_flat.clamp_min(T).float())
         level_cell = self._log_cosh(gap * density_scale)
-        
+
         # Batch-level: weight by signal strength, gated by has_gated
         event_frac = event_mask.mean().clamp_min(self._EPS)
         has_gated = (gate.sum(dim=1) > self._EPS).float()
@@ -87,17 +88,32 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
+        # ── Dead-cell anchor at Shape scale ─────────────────
+        # Pushes dead cells toward 0, eliminating the source of gap
+        # contamination (dead cells leaking ~0.13 asinh makes gap always
+        # positive on PGM, causing Level to crush event cells).
+        n_dead = (T - n_ev_flat).clamp_min(1.0)
+        dead_pred = ((1.0 - event_mask) * y_pred).sum(dim=1) / n_dead
+        anchor_cell = self._log_cosh(dead_pred)  # target = 0 (y_true=0 on dead cells)
+
+        if multivariate:
+            loss_anchor = (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+        else:
+            loss_anchor = (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
+
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:
-            per_channel = loss_shape + loss_level
+            per_channel = loss_shape + loss_level + loss_anchor
             total_loss = per_channel.sum()
             shape_c = loss_shape.detach().tolist()
             level_c = loss_level.detach().tolist()
+            anchor_c = loss_anchor.detach().tolist()
             comp = per_channel.detach().tolist()
         else:
-            total_loss = loss_shape + loss_level
+            total_loss = loss_shape + loss_level + loss_anchor
             shape_c = [float(loss_shape.detach())]
             level_c = [float(loss_level.detach())]
+            anchor_c = [float(loss_anchor.detach())]
             comp = [float(total_loss.detach())]
 
         # ── Diagnostic telemetry ──────────────────────────────────────

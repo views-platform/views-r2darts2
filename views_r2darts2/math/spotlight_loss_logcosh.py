@@ -108,17 +108,24 @@ class SpotlightLossLogcosh(torch.nn.Module):
             has_gated = (shape_w.sum(dim=1) > self._EPS).float()
             loss_shape = (per_series * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
-        # ── LEVEL: single mean gap, NO T multiplier ─────────────────
-        has_event_flat = has_event.squeeze(1)   # (B,) or (B, C) -- diagnostics only
-        rms = torch.sqrt((y_true ** 2).mean()).clamp_min(self._EPS)
-        gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = self._log_cosh(gap / rms)
-        sqrt_T = math.sqrt(float(T))
+        # ── LEVEL: per-cell log_cosh on gated cells, matched normalization ──
+        # Same gate, same cells, same normalization as Shape.
+        # Shape: log_cosh(e_shape) — demeaned, teaches relative contrast
+        # Level: log_cosh(e) — absolute, teaches absolute calibration
+        # Both see the same population (gated cells), same series (has_gated),
+        # same normalization (per-series mean, then batch mean over active).
+        level_cell = self._log_cosh(e) * gate
 
         if multivariate:
-            loss_level = sqrt_T * level_cell.mean(dim=0).sum()
+            num_lv = level_cell.sum(dim=(0, 1))
+            den_lv = gate.sum(dim=(0, 1)).clamp_min(self._EPS)
+            per_series_lv = num_lv / den_lv
+            loss_level = (per_series_lv * has_gated).sum() / has_gated.sum().clamp_min(1.0)
         else:
-            loss_level = sqrt_T * level_cell.mean()
+            num_lv = level_cell.sum(dim=1)
+            den_lv = gate.sum(dim=1).clamp_min(self._EPS)
+            per_series_lv = num_lv / den_lv
+            loss_level = (per_series_lv * has_gated).sum() / has_gated.sum().clamp_min(1.0)
 
         # ── Combine ──────────────────────────────────────────────────
         if multivariate:

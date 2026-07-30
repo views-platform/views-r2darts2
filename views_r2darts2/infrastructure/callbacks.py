@@ -1797,7 +1797,6 @@ class RichLossDiagnosticsCallback(Callback):
 # ---------------------------------------------------------------------------
 # Extended Loss Gradient Diagnostics (updated for new telemetry keys)
 # ---------------------------------------------------------------------------
-
 class LossGradientDiagnosticsCallbackV2(Callback):
     """
     Updated gradient diagnostics that include the new density-scaled gap,
@@ -1812,9 +1811,10 @@ class LossGradientDiagnosticsCallbackV2(Callback):
         grad_diag/grad_nonevent
     """
 
-    def __init__(self, log_every_n_epochs: int = 1):
+    def __init__(self, log_every_n_epochs: int = 1, tau: float = 0.88):
         super().__init__()
         self.log_every_n_epochs = log_every_n_epochs
+        self.tau = tau
         self._buf: dict = defaultdict(list)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -1843,19 +1843,14 @@ class LossGradientDiagnosticsCallbackV2(Callback):
             for c, v in enumerate(vals):
                 self._buf[f"grad_diag/ch_{c}/{key}"].append(v)
 
-        # NEW: Gradient direction (scalar, not per-channel)
-        grad_ev = comp.get("grad_event", [0])[0]
-        grad_nev = comp.get("grad_nonevent", [0])[0]
-        self._buf["grad_diag/grad_event"].append(grad_ev)
-        self._buf["grad_diag/grad_nonevent"].append(grad_nev)
-
-        # ── 2. Input-gradient decomposition ─────────────────────────────
+        # ── 2. Input-gradient decomposition + direction ────────────────
         grad = getattr(crit, "_last_input_grad", None)
         if grad is not None:
             g = grad.float().cpu()
             if g.dim() == 2:
                 g = g.unsqueeze(-1)
 
+            # DC/AC decomposition (existing)
             dc = g.mean(dim=1, keepdim=True)
             ac = g - dc
 
@@ -1877,6 +1872,25 @@ class LossGradientDiagnosticsCallbackV2(Callback):
                 self._buf[f"grad_diag/ch_{c}/grad_dc_mag"].append(dc_mag[c].item())
                 self._buf[f"grad_diag/ch_{c}/grad_ac_mag"].append(ac_mag[c].item())
                 self._buf[f"grad_diag/ch_{c}/grad_total_norm"].append(total_g[c].item())
+
+            # NEW: Gradient direction (event vs non-event)
+            # Reconstruct event_mask from the batch target
+            target = batch[-1] if isinstance(batch, (list, tuple)) else batch["target"]
+            if target.dim() == 3 and target.size(-1) == 1:
+                target = target.squeeze(-1)
+            
+            event_mask = (target.abs() > self.tau).float().cpu()
+            if event_mask.dim() == 2:
+                ev_mask = event_mask.unsqueeze(-1)
+            else:
+                ev_mask = event_mask
+
+            n_ev_total = ev_mask.sum().clamp_min(1.0)
+            n_nev_total = (1.0 - ev_mask).sum().clamp_min(1.0)
+            grad_ev = (g * ev_mask).sum().item() / n_ev_total.item()
+            grad_nev = (g * (1.0 - ev_mask)).sum().item() / n_nev_total.item()
+            self._buf["grad_diag/grad_event"].append(grad_ev)
+            self._buf["grad_diag/grad_nonevent"].append(grad_nev)
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:

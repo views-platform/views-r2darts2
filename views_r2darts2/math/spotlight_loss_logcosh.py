@@ -102,14 +102,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Diagnostic telemetry ──────────────────────────────────────
         with torch.no_grad():
-            # NEW: Density scaling diagnostics
-            density_scale_mean = density_scale.mean()
-            gap_scaled = (gap * density_scale).abs()
-            gap_scaled_mean = gap_scaled.mean()
-            
-            # NEW: Hájek weight diagnostics  
-            w_level_mean = w_level.mean()
-            batch_active_frac = has_gated.mean()
+            if multivariate:
+                density_scale_mean = density_scale.mean(dim=0)
+                gap_scaled_mean = (gap * density_scale).abs().mean(dim=0)
+                w_level_mean = w_level.mean(dim=0)
+                batch_active_frac = has_gated.mean(dim=0)
+            else:
+                density_scale_mean = density_scale.mean()
+                gap_scaled_mean = (gap * density_scale).abs().mean()
+                w_level_mean = w_level.mean()
+                batch_active_frac = has_gated.mean()
             
             # NEW: Gradient direction diagnostics (event vs non-event)
             grad = self._last_input_grad
@@ -214,9 +216,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             # NEW: Hájek weight diagnostics
             "w_level_mean": w_level_mean_l,
             "batch_active_frac": batch_active_frac_l,
-            # NEW: Gradient direction
-            "grad_event": [grad_ev],
-            "grad_nonevent": [grad_nev],
         }
 
         logger.debug(

@@ -64,7 +64,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: Density-Scaled Gap + Signal-Weighted Hájek ────────
+        # ── LEVEL: Density-Scaled Gap + Signal-Weighted Hájek + T ────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         
         # Series-level: amplify gap for sparse-event series
@@ -72,9 +72,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         density_scale = torch.sqrt(T / n_ev_flat.clamp_min(T).float())
         level_cell = self._log_cosh(gap * density_scale)
         
-        # Batch-level: weight by signal strength
+        # Batch-level: weight by signal strength, gated by has_gated
+        # has_gated: only series with actual signal (events or false alarms) contribute.
+
         event_frac = event_mask.mean().clamp_min(self._EPS)
-        w_level = torch.sqrt(n_ev_flat.float()) + event_frac
+        has_gated = (gate.sum(dim=1) > self._EPS).float()
+        w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
 
         if multivariate:
             loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)

@@ -48,7 +48,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── SHAPE: log_cosh on demeaned errors ────────
         e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
+        e_shape = e - e_mean.detach()
 
         shape_cell = self._log_cosh(e_shape)
 

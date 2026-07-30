@@ -1781,8 +1781,8 @@ class RichLossDiagnosticsCallback(Callback):
             grad_nev = comp.get("grad_nonevent", [0])[0]
             if grad_ev > 0:
                 summary_lines.append(f"[red]⚠ ch{c}: Event gradient is POSITIVE (pushing DOWN) — collapse risk![/]")
-            elif abs(grad_ev) < 1e-6:
-                summary_lines.append(f"[yellow]⚠ ch{c}: Event gradient is near ZERO — shape loss may be dead[/]")
+            # elif abs(grad_ev) < 1e-6:
+            #     summary_lines.append(f"[yellow]⚠ ch{c}: Event gradient is near ZERO — shape loss may be dead[/]")
             else:
                 summary_lines.append(f"[green]✓ ch{c}: Event gradient is NEGATIVE (pushing UP) — healthy[/]")
 

@@ -64,16 +64,22 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL ───────────────────
+        # ── LEVEL: Density-Scaled Gap + Signal-Weighted Hájek ────────
         gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        level_cell = self._log_cosh(gap)
-        # w_level = gate.amax(dim=1)
-        w_level = torch.ones_like(gap) 
+        
+        # Series-level: amplify gap for sparse-event series
+        n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
+        density_scale = torch.sqrt(T / n_ev_flat.clamp_min(T).float())
+        level_cell = self._log_cosh(gap * density_scale)
+        
+        # Batch-level: weight by signal strength
+        event_frac = event_mask.mean().clamp_min(self._EPS)
+        w_level = torch.sqrt(n_ev_flat.float()) + event_frac
 
         if multivariate:
-            loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

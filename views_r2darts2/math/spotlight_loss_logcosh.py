@@ -77,9 +77,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_level = torch.sqrt(n_ev_flat.float()) + event_frac
 
         if multivariate:
-            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

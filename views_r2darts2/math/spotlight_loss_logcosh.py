@@ -19,7 +19,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components: dict | None = None
         self._last_input_grad: torch.Tensor | None = None
         logger.info(
-            "SpotlightLossV59 | threshold=%.4f K=%d | hurdle-decomposed level",
+            "SpotlightLossV60 | threshold=%.4f K=%d | balanced gradients",
             non_zero_threshold,
             self._K,
         )
@@ -31,6 +31,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _asinh_plus(x: torch.Tensor) -> torch.Tensor:
+        """Loss: x · asinh(x).
+        Gradient: asinh(x) + x / √(1 + x²).
+        Curvature 2.0 at origin (matches MSE), bends to log for large |x|.
+        Never saturates — gradient grows without bound.
+        """
         return x * torch.asinh(x)
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
@@ -82,45 +87,45 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 self._EPS
             )
 
-        # ── LEVEL: Event-conditioned mean gap (FIXED) ────────────────
-        # Calibrates the mean of EVENT predictions against EVENT targets.
-        # Eliminates the degenerate flatline minimum at the global mean.
+        # ── LEVEL: Event-conditioned, asinh_plus, NO T multiplier ────
+        # FIX 1: removed T multiplier (was T × avg, now just avg).
+        #         This makes level gradient O(1/(B·n_ev)), matching shape.
+        # FIX 2: asinh_plus instead of log_cosh.
+        #         tanh saturates at ±1; asinh_plus grows logarithmically.
         pred_event_mean = (event_mask * y_pred).sum(dim=1) / n_ev.squeeze(1)
         true_event_mean = (event_mask * y_true).sum(dim=1) / n_ev.squeeze(1)
         gap = pred_event_mean - true_event_mean
 
-        level_cell = self._log_cosh(gap)
+        level_cell = self._asinh_plus(gap)          # FIX 2
         w_level = gate.amax(dim=1)
 
         if multivariate:
-            loss_level = (
-                T
-                * (w_level * level_cell).sum(dim=0)
+            loss_level = (                           # FIX 1: no T
+                (w_level * level_cell).sum(dim=0)
                 / w_level.sum(dim=0).clamp_min(self._EPS)
             )
         else:
-            loss_level = (
-                T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = (                           # FIX 1: no T
+                (w_level * level_cell).sum()
+                / w_level.sum().clamp_min(self._EPS)
             )
 
-        # ── ZERO-ANCHOR: Hurdle component for non-event cells (NEW) ──
-        # Pushes non-event predictions toward 0 in asinh space.
-        # Weight (1 - gate) smoothly activates as predictions drop below τ.
-        # No new hyperparameters — derived from existing gate.
+        # ── ZERO-ANCHOR: per-series normalization ────────────────────
+        # FIX 3: divide by B (per-series), not zero_w.sum() (per-cell).
+        #         V59 divided by B×(T−n_ev) ≈ 4500 for PGM, diluting
+        #         the gradient 50×.  Per-series normalization makes the
+        #         gradient scale with tanh(ŷ)/B — proportional to how
+        #         far zeros are from zero, not how many there are.
         zero_w = 1.0 - gate
-        zero_cell = self._log_cosh(y_pred)  # target = 0, error = y_pred
+        zero_cell = self._log_cosh(y_pred)
 
         if multivariate:
             loss_zero = (
-                T
-                * (zero_w * zero_cell).sum(dim=(0, 1))
-                / zero_w.sum(dim=(0, 1)).clamp_min(self._EPS)
+                (zero_w * zero_cell).sum(dim=(0, 1)) / B   # FIX 3
             )
         else:
             loss_zero = (
-                T
-                * (zero_w * zero_cell).sum()
-                / zero_w.sum().clamp_min(self._EPS)
+                (zero_w * zero_cell).sum() / B              # FIX 3
             )
 
         # ── Combine ───────────────────────────────────────────────────
@@ -159,12 +164,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_max_l = gap_abs.amax(dim=0).tolist()
                 _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
-                gap_ev_mean_l = ((gap_abs * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
+                gap_ev_mean_l = (
+                    (gap_abs * _ev_mask_s).sum(dim=0) / _n_ev_s
+                ).tolist()
                 gap_ev_max_l = ((gap_abs * _ev_mask_s).amax(dim=0)).tolist()
                 gap_sat_l = (
                     ((gap_abs > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s
                 ).tolist()
-                shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
+                shape_dc_l = (
+                    (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
+                )
                 sl_ratio_l = (
                     loss_shape.detach()
                     / (loss_level + loss_zero).detach().clamp_min(self._EPS)
@@ -188,24 +197,33 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_max_l = [gap_abs.max().item()]
                 _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
-                gap_ev_mean_l = [((gap_abs * _ev_mask_s).sum() / _n_ev_s).item()]
+                gap_ev_mean_l = [
+                    ((gap_abs * _ev_mask_s).sum() / _n_ev_s).item()
+                ]
                 gap_ev_max_l = [(gap_abs * _ev_mask_s).amax().item()]
                 gap_sat_l = [
-                    ((gap_abs > 1.5) * _ev_mask_s).sum().item() / _n_ev_s.item()
+                    ((gap_abs > 1.5) * _ev_mask_s).sum().item()
+                    / _n_ev_s.item()
                 ]
-                shape_dc_l = [(gate * e_shape).mean(dim=1).abs().mean().item()]
+                shape_dc_l = [
+                    (gate * e_shape).mean(dim=1).abs().mean().item()
+                ]
                 sl_ratio_l = [
                     float(
                         (
                             loss_shape.detach()
-                            / (loss_level + loss_zero).detach().clamp_min(self._EPS)
+                            / (loss_level + loss_zero)
+                            .detach()
+                            .clamp_min(self._EPS)
                         ).item()
                     )
                 ]
                 zero_frac_l = [zero_w.mean().item()]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(f"NaN in SpotlightLossV59: per_channel={comp}")
+            raise RuntimeError(
+                f"NaN in SpotlightLossV60: per_channel={comp}"
+            )
 
         n = len(comp)
         self._last_components = {
@@ -235,7 +253,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         }
 
         logger.debug(
-            "SpotlightLossV59 | shape=%s level=%s zero=%s total=%.6f",
+            "SpotlightLossV60 | shape=%s level=%s zero=%s total=%.6f",
             shape_c,
             level_c,
             zero_c,
@@ -244,4 +262,4 @@ class SpotlightLossLogcosh(torch.nn.Module):
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV59(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV60(non_zero_threshold={self.tau})"

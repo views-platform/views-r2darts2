@@ -1,14 +1,31 @@
-"""SpotlightLossV63 — windowed Hájek level + windowed DRO shape.
+"""SpotlightLossV64 — orthogonal mean-gap level + full-horizon DRO shape.
 
-Both components share the same non-overlapping windows of size
-W = max(6, T // 3).
+Level : global mean gap → asinh_plus → Hájek aggregation → T-scaled.
+        Gradient is uniform across all T cells  (DC correction).
 
-Level  : per-window mean errors → log_cosh → Hájek aggregation.
-Shape  : per-window event-demeaned errors → DRO → gate → log_cosh.
+Shape : full-horizon demeaned errors → DRO → gate → log_cosh.
+        Gradient is exactly zero-sum across all T cells  (AC correction).
 
-The per-window demeaning in the shape loss makes its gradient
-zero-sum within each window's events, which is orthogonal to the
-level loss's uniform per-window gradient.
+Orthogonality (exact, per series):
+    The demeaning is in the forward pass: r_i = e_i − mean(e).
+    Therefore d(r_i)/d(e_k) = δ_ik − 1/T, and for any weights w_i:
+
+        Σ_k  ∂L_shape/∂e_k
+      = (1/W) Σ_k [ w_k f′(r_k) − (1/T) Σ_i w_i f′(r_i) ]
+      = (1/W) [ Σ_k w_k f′(r_k) − Σ_i w_i f′(r_i) ]
+      = 0
+
+    This holds for ANY choice of w_i (gate, DRO, etc.).
+    The level gradient is constant across t, so:
+
+        ⟨ ∇L_level , ∇L_shape ⟩  ∝  Σ_k ∂L_shape/∂e_k  =  0
+
+Why this fixes the PGM flatline:
+    Event-masked demeaning gave e_shape = 0 for series with 0–1 events
+    (algebraically: e[ev] − mean({e[ev]}) = 0 when |events| ≤ 1).
+    Full-horizon demeaning gives e_shape ≠ 0 for any non-constant
+    series, so the shape loss pushes spikes up and zeros down even
+    at 98 % zero-inflation, while the level loss calibrates the mean.
 """
 
 import math
@@ -34,30 +51,24 @@ def asinh_plus(x: torch.Tensor) -> torch.Tensor:
     return x * torch.asinh(x)
 
 
-def window_size(T: int) -> int:
-    """Non-overlapping window size for horizon T."""
-    return max(6, T // 3)
-
-
 # ═══════════════════════════════════════════════════════════════════
-#  Windowed Level Loss
+#  Level Loss
 # ═══════════════════════════════════════════════════════════════════
 
-class WindowedLevelLoss:
-    """Windowed Hájek level anchor.
+class LevelLoss:
+    """Global mean-gap level anchor with Hájek normalization.
 
-    Splits the error into non-overlapping windows, evaluates log_cosh
-    on each window's mean error, and aggregates with Hájek
-    self-normalized series weighting:
+        L = T · Σᵢ(wᵢ · φ(gapᵢ)) / Σᵢ(wᵢ)
 
-        L = T · Σᵢ(wᵢ · ℓᵢ) / Σᵢ(wᵢ)
+    gapᵢ = (1/T) Σₜ (ŷᵢₜ − yᵢₜ)      global horizon mean error
+    φ    = asinh_plus                     non-saturating
+    wᵢ   = sigmoid series-magnitude gate  composition-robust
 
-    Hájek normalization makes the loss scale invariant to the
-    peaceful / event composition of the batch.  At 98 % zero-inflation
-    this gives event series ~66 % of the level gradient instead of ~2 %.
+    The factor T inverts the 1/T gradient attenuation of the mean
+    operator, giving per-cell gradient magnitude ≈ φ′(gap) · wᵢ/Σw.
 
-    The factor T compensates for the 1/W gradient attenuation of the
-    window-mean operator.
+    Hájek normalization Σ(w·ℓ)/Σ(w) makes the loss scale invariant
+    to the peaceful/event ratio in the batch.
     """
 
     def __init__(self, tau: float, eps: float = 1e-6):
@@ -72,85 +83,63 @@ class WindowedLevelLoss:
         T: int,
     ) -> tuple[torch.Tensor, dict]:
 
-        W = window_size(T)
-        chunks = e.split(W, dim=1)
-        n_win = len(chunks)
+        multivariate = e.dim() == 3
 
-        # (B, n_win) or (B, n_win, C)
-        win_means = torch.stack([c.mean(dim=1) for c in chunks], dim=1)
-        win_losses = log_cosh(win_means)
+        # ── global mean gap ──────────────────────────────────────────
+        gap = e.mean(dim=1)                       # (B,) | (B, C)
+        level_cell = asinh_plus(gap)
 
         # ── series magnitude gate ────────────────────────────────────
         abs_max_series = torch.max(y_true.abs(), y_pred_det.abs())
-        series_mag = abs_max_series.max(dim=1).values          # (B,) | (B,C)
+        series_mag = abs_max_series.max(dim=1).values
         series_w = 0.0125 + 0.9875 * torch.sigmoid(
             10.0 * (series_mag - self.tau)
         )
 
         # ── Hájek aggregation ────────────────────────────────────────
-        if win_losses.dim() == 3:                              # multivariate
-            num = (series_w.unsqueeze(1) * win_losses).sum(dim=(0, 1))
-            den = (series_w.sum(dim=0) * n_win).clamp(min=self.eps)
-        else:                                                  # univariate
-            num = (series_w.unsqueeze(1) * win_losses).sum()
-            den = (series_w.sum() * n_win).clamp(min=self.eps)
+        if multivariate:
+            num = (series_w * level_cell).sum(dim=0)
+            den = series_w.sum(dim=0).clamp(min=self.eps)
+        else:
+            num = (series_w * level_cell).sum()
+            den = series_w.sum().clamp(min=self.eps)
 
         loss = T * num / den
 
-        aux = {
-            "win_gap_mean":       win_means.abs().mean().item(),
-            "win_gap_max":        win_means.abs().max().item(),
-            "series_w_mean":      series_w.mean().item(),
-            "series_w_std":       series_w.std().item(),
-            "series_w_event_frac": (series_w > 0.5).float().mean().item(),
-            "n_windows":          n_win,
-            "window_size":        W,
-        }
+        with torch.no_grad():
+            aux = {
+                "gap_mean":            gap.abs().mean().item(),
+                "gap_max":             gap.abs().max().item(),
+                "series_w_mean":       series_w.mean().item(),
+                "series_w_std":        series_w.std().item(),
+                "series_w_event_frac": (series_w > 0.5).float().mean().item(),
+            }
         return loss, aux
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Windowed Shape Loss
+#  Shape Loss
 # ═══════════════════════════════════════════════════════════════════
 
-class WindowedShapeLoss:
-    """Windowed event-masked demeaned shape loss with DRO.
+class ShapeLoss:
+    """Full-horizon demeaned shape loss with DRO and gate.
 
-    Uses the same window grid as the level loss.  Within each window:
+    Demeaning is over ALL T cells (not event-masked):
 
-      1. event-masked mean   μ_w = Σ(mask·e) / Σ(mask)
-      2. demean              r  = e − μ_w
-      3. DRO weights         w  = √(|r| / mean|r|), normalised
-      4. gate                g  = σ(15·(max|y|−τ))
-      5. cell loss           ℓ  = log_cosh(r)
+        r = e − mean(e)
 
-    The per-window demeaning makes the shape gradient zero-sum
-    within each window's event cells → orthogonal to the level
-    loss's uniform per-window gradient.
+    This guarantees the shape gradient is exactly zero-sum for any
+    weighting scheme, making it orthogonal to the level loss.
+
+    DRO is computed over all cells.  The sigmoid gate suppresses
+    non-event cells in the loss aggregation, so the effective
+    denominator tracks the number of event cells (implicit Hájek).
     """
 
     def __init__(self, tau: float, eps: float = 1e-6):
         self.tau = tau
         self.eps = eps
 
-    # ── DRO helper ───────────────────────────────────────────────────
-    @staticmethod
-    def _dro_weights(
-        e_shape: torch.Tensor,
-        mask: torch.Tensor,
-        n_ev: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        raw = e_shape.abs().detach()
-        mu = (raw * mask).sum(dim=1, keepdim=True) / n_ev
-        valid = (raw > 1e-6).float()
-        w = torch.sqrt((raw * valid) / mu.clamp_min(eps))
-        w_bar = (w * mask).sum(dim=1, keepdim=True) / n_ev
-        w = w / w_bar.clamp_min(1e-8)
-        w = torch.nan_to_num(w, nan=1.0, posinf=1.0, neginf=0.0)
-        return 1.0 + mask * (w - 1.0)
-
-    # ── forward ──────────────────────────────────────────────────────
     def __call__(
         self,
         e: torch.Tensor,
@@ -159,84 +148,64 @@ class WindowedShapeLoss:
         T: int,
     ) -> tuple[torch.Tensor, dict]:
 
-        W = window_size(T)
         multivariate = e.dim() == 3
 
-        chunks_e = e.split(W, dim=1)
-        chunks_g = gate.split(W, dim=1)
-        chunks_m = event_mask.split(W, dim=1)
+        # ── full-horizon demeaning ───────────────────────────────────
+        e_mean  = e.mean(dim=1, keepdim=True)
+        e_shape = e - e_mean
 
-        # accumulators
+        # ── DRO over all cells ───────────────────────────────────────
+        raw   = e_shape.abs().detach()
+        mu    = raw.mean(dim=1, keepdim=True).clamp_min(self.eps)
+        valid = (raw > 1e-6).float()
+        w_dro = torch.sqrt((raw * valid) / mu)
+        w_bar = w_dro.mean(dim=1, keepdim=True).clamp_min(1e-8)
+        w_dro = w_dro / w_bar
+        w_dro = torch.nan_to_num(w_dro, nan=1.0, posinf=1.0, neginf=0.0)
+
+        # ── gate × DRO × log_cosh ────────────────────────────────────
+        shape_w = gate * w_dro
+        cell    = log_cosh(e_shape)
+
         if multivariate:
-            num = e.new_zeros(e.shape[2])
-            den = e.new_zeros(e.shape[2])
+            loss = (
+                (shape_w * cell).sum(dim=(0, 1))
+                / shape_w.sum(dim=(0, 1)).clamp_min(self.eps)
+            )
         else:
-            num = e.new_zeros(())
-            den = e.new_zeros(())
-
-        diag_dro, diag_mask, diag_ge = [], [], []
-
-        for e_w, g_w, m_w in zip(chunks_e, chunks_g, chunks_m):
-            # 1–2  event-masked demeaning within window
-            n_ev = m_w.sum(dim=1, keepdim=True).clamp_min(self.eps)
-            e_mean = (m_w * e_w).sum(dim=1, keepdim=True) / n_ev
-            e_shape = e_w - e_mean
-
-            # 3  DRO
-            w_dro = self._dro_weights(e_shape, m_w, n_ev, self.eps)
-
-            # 4–5  gate × log_cosh
-            sw = g_w * w_dro
-            cell = log_cosh(e_shape)
-
-            if multivariate:
-                num = num + (sw * cell).sum(dim=(0, 1))
-                den = den + sw.sum(dim=(0, 1))
-            else:
-                num = num + (sw * cell).sum()
-                den = den + sw.sum()
-
-            diag_dro.append(w_dro)
-            diag_mask.append(m_w)
-            diag_ge.append(g_w * e_shape)
-
-        loss = num / den.clamp_min(self.eps)
+            loss = (shape_w * cell).sum() / shape_w.sum().clamp_min(self.eps)
 
         # ── diagnostics ──────────────────────────────────────────────
         with torch.no_grad():
-            cat_dro  = torch.cat(diag_dro,  dim=1)
-            cat_mask = torch.cat(diag_mask, dim=1)
-            cat_ge   = torch.cat(diag_ge,   dim=1)
-
             if multivariate:
-                n_tot = cat_mask.sum(dim=(0, 1)).clamp_min(1.0)
-                w_ev  = cat_dro * cat_mask
+                n_tot = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
+                w_ev  = w_dro * event_mask
                 dm    = w_ev.sum(dim=(0, 1)) / n_tot
                 dw2   = (w_ev ** 2).sum(dim=(0, 1)) / n_tot
                 dstd  = (dw2 - dm ** 2).clamp_min(0).sqrt()
                 aux = {
                     "dro_w_mean":  dm.mean().item(),
                     "dro_w_std":   dstd.mean().item(),
-                    "dro_w_max":   cat_dro.amax(dim=(0, 1)).mean().item(),
-                    "dro_frac_up": (((cat_dro > 1.0) * cat_mask)
+                    "dro_w_max":   w_dro.amax(dim=(0, 1)).mean().item(),
+                    "dro_frac_up": (((w_dro > 1.0) * event_mask)
                                     .sum(dim=(0, 1)) / n_tot).mean().item(),
-                    "event_frac":  cat_mask.mean(dim=(0, 1)).mean().item(),
-                    "shape_dc":    (cat_ge.mean(dim=1).abs()
+                    "event_frac":  event_mask.mean(dim=(0, 1)).mean().item(),
+                    "shape_dc":    ((gate * e_shape).mean(dim=1).abs()
                                     .mean(dim=0).mean().item()),
                 }
             else:
-                n_tot = cat_mask.sum().clamp_min(1.0)
-                w_ev  = cat_dro * cat_mask
+                n_tot = event_mask.sum().clamp_min(1.0)
+                w_ev  = w_dro * event_mask
                 dm    = (w_ev.sum() / n_tot).item()
                 dw2   = ((w_ev ** 2).sum() / n_tot).item()
                 aux = {
                     "dro_w_mean":  dm,
                     "dro_w_std":   max(0.0, dw2 - dm ** 2) ** 0.5,
-                    "dro_w_max":   cat_dro.max().item(),
-                    "dro_frac_up": (((cat_dro > 1.0) * cat_mask)
+                    "dro_w_max":   w_dro.max().item(),
+                    "dro_frac_up": (((w_dro > 1.0) * event_mask)
                                     .sum().item() / n_tot.item()),
-                    "event_frac":  cat_mask.mean().item(),
-                    "shape_dc":    cat_ge.mean(dim=1).abs().mean().item(),
+                    "event_frac":  event_mask.mean().item(),
+                    "shape_dc":    (gate * e_shape).mean(dim=1).abs().mean().item(),
                 }
 
         return loss, aux
@@ -247,37 +216,32 @@ class WindowedShapeLoss:
 # ═══════════════════════════════════════════════════════════════════
 
 class SpotlightLossLogcosh(torch.nn.Module):
-    """V63: windowed Hájek level + windowed DRO shape.
+    """V64: orthogonal mean-gap level + full-horizon DRO shape.
 
-    Both components share the same non-overlapping window grid
-    (W = max(6, T//3)).
+    Level  – global mean gap → asinh_plus → Hájek → T-scaled.
+             Gradient is uniform across T  (DC correction).
 
-    Level  – per-window mean errors → log_cosh → Hájek aggregation.
-             Gradient is uniform within each window  (DC correction).
-
-    Shape  – per-window event-demeaned errors → DRO → gate → log_cosh.
-             Gradient is zero-sum within each window's events
-             (AC correction).
+    Shape  – full-horizon demeaned errors → DRO → gate → log_cosh.
+             Gradient is exactly zero-sum across T  (AC correction).
 
     Orthogonality:
-        ⟨∇L_level^(k), ∇L_shape^(k)⟩ = 0  for every window k,
-        because the level gradient is constant and the shape
-        gradient sums to zero over events.
+        ⟨ ∇L_level , ∇L_shape ⟩ = 0   (exact, per series,
+        for any gate / DRO weighting)
     """
 
     _EPS = 1e-6
-    _K   = 4          # kept for callback compat
+    _K   = 4                              # callback compat
 
     def __init__(self, non_zero_threshold: float = 0.88):
         super().__init__()
         self.tau = non_zero_threshold
-        self.level_loss = WindowedLevelLoss(tau=self.tau, eps=self._EPS)
-        self.shape_loss = WindowedShapeLoss(tau=self.tau, eps=self._EPS)
+        self.level_loss = LevelLoss(tau=self.tau, eps=self._EPS)
+        self.shape_loss = ShapeLoss(tau=self.tau, eps=self._EPS)
         self._last_components: dict | None = None
         self._last_input_grad:  torch.Tensor | None = None
         logger.info(
-            "SpotlightLossV63 | tau=%.4f | windowed Hájek level "
-            "+ windowed DRO shape",
+            "SpotlightLossV64 | tau=%.4f | orthogonal mean-gap level "
+            "+ full-horizon DRO shape",
             self.tau,
         )
 
@@ -326,8 +290,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp    = [float(total_loss.detach())]
 
         # ── telemetry ────────────────────────────────────────────────
-        n = len(comp)
-
+        n  = len(comp)
         sl = loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)
         sl_l = sl.tolist() if multivariate else [float(sl.item())]
 
@@ -342,7 +305,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         if torch.isnan(total_loss):
             raise RuntimeError(
-                f"NaN in SpotlightLossV63: per_channel={comp}"
+                f"NaN in SpotlightLossV64: per_channel={comp}"
             )
 
         def _rep(v: float) -> list:
@@ -373,24 +336,20 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_ev_mean": gap_mean_l,
             "level_gap_ev_max":  gap_max_l,
             "level_gap_sat":     _rep(0.0),
-            # window diagnostics (new)
-            "win_gap_mean":        _rep(lv_aux["win_gap_mean"]),
-            "win_gap_max":         _rep(lv_aux["win_gap_max"]),
+            # level aux
             "series_w_mean":       _rep(lv_aux["series_w_mean"]),
             "series_w_std":        _rep(lv_aux["series_w_std"]),
             "series_w_event_frac": _rep(lv_aux["series_w_event_frac"]),
-            "n_windows":           _rep(lv_aux["n_windows"]),
-            "window_size":         _rep(lv_aux["window_size"]),
         }
 
         logger.debug(
-            "SpotlightLossV63 | sh=%s lv=%s total=%.4f "
-            "win_gap=%.4f ev_w%%=%.1f",
+            "SpotlightLossV64 | sh=%s lv=%s total=%.4f "
+            "gap=%.4f ev_w%%=%.1f",
             shape_c, level_c, total_loss.item(),
-            lv_aux["win_gap_mean"],
+            lv_aux["gap_mean"],
             lv_aux["series_w_event_frac"] * 100,
         )
         return total_loss
 
     def __repr__(self) -> str:
-        return f"SpotlightLossV63(non_zero_threshold={self.tau})"
+        return f"SpotlightLossV64(non_zero_threshold={self.tau})"

@@ -74,7 +74,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # e_shape[dead] < 0 (below mean error), which fought the anchor.
         # Forward value is IDENTICAL (gate*x + (1-gate)*x = x).
         # Backward: ∂e_shape/∂y_pred = gate (only gated cells get full gradient).
-        e_shape = gate * e_shape + (1.0 - gate) * e_shape.detach()
+        
+        # e_shape = gate * e_shape + (1.0 - gate) * e_shape.detach()
 
         shape_cell = self._log_cosh(e_shape)
 
@@ -100,8 +101,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Series-level: amplify gap for sparse-event series
         n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
-        density_scale = torch.sqrt(T / n_ev_flat.clamp_min(T).float()) # no-op. will return 1. just a placeholder
-        # density_scale = torch.sqrt(T / n_ev_flat.clamp_min(1.0).float())
+        # density_scale = torch.sqrt(T / n_ev_flat.clamp_min(T).float()) # no-op. will return 1. just a placeholder
+        density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
         level_cell = self._log_cosh(gap * density_scale)
 
         # Batch-level: weight by signal strength, gated by has_gated

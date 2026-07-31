@@ -8,6 +8,25 @@ logger = logging.getLogger(__name__)
 class SpotlightLossLogcosh(torch.nn.Module):
     """
 
+    V60: Gradient-gated Shape + sum anchor.
+
+    Changes from V59 (all hyperparameter-free):
+      1. Shape: gate the e_shape gradient so dead cells get ~50× less gradient
+         e_shape = gate * e_shape + (1 - gate) * e_shape.detach()
+         Forward: identical. Backward: dead cells (gate≈0) get no Shape gradient.
+         This stops Shape from pushing dead cells UP (which fought the anchor).
+
+      2. Dead-cell anchor: sum-based, no T (from V59)
+         dead_sum = (dead_mask * y_pred).sum(dim=1)
+         Pushes dead cells toward 0. With grad gate, anchor now dominates on dead cells.
+
+    Unchanged from V58:
+      - abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
+      - gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
+      - T multiplier on Level
+      - density_scale, w_level Hájek weighting
+      - DRO with sqrt on |e_shape|
+      - e_mean.detach()
     """
     _EPS = 1e-6
 
@@ -44,12 +63,17 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Event gate ───────────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        # abs_max = y_true.abs()
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
         # ── SHAPE: log_cosh on demeaned errors ────────
         e_mean = e.mean(dim=1, keepdim=True)
-        # e_shape = e - e_mean.detach()
+        e_shape = e - e_mean.detach()
+
+        # V60: Gate the e_shape gradient so dead cells (gate≈0) get ~50× less
+        # Shape gradient. This stops Shape from pushing dead cells UP when
+        # e_shape[dead] < 0 (below mean error), which fought the anchor.
+        # Forward value is IDENTICAL (gate*x + (1-gate)*x = x).
+        # Backward: ∂e_shape/∂y_pred = gate (only gated cells get full gradient).
         e_shape = gate * e_shape + (1.0 - gate) * e_shape.detach()
 
         shape_cell = self._log_cosh(e_shape)
@@ -90,10 +114,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Dead-cell anchor at Shape scale ─────────────────
-        # Uses y_true_mask and its inverse for dead cells
+        # Pushes dead cells toward 0, eliminating gap contamination.
+        # Uses y_true_mask (true events only) inverse for dead cells.
+        # Sum-based: tanh saturates → bounded strong gradient without T.
+        # With V60 grad gate, anchor now dominates on dead cells (Shape muted).
         y_true_mask = (y_true.abs() > self.tau).float()
         dead_mask = 1.0 - y_true_mask
-        dead_sum = (dead_mask * y_pred).sum(dim=1)  # sum (was: mean)
+        dead_sum = (dead_mask * y_pred).sum(dim=1)
         anchor_cell = self._log_cosh(dead_sum)
 
         if multivariate:
@@ -123,13 +150,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_scaled_mean = (gap * density_scale).abs().mean(dim=0)
                 w_level_mean = w_level.mean(dim=0)
                 batch_active_frac = has_gated.mean(dim=0)
+                dead_pred_mean = dead_sum.mean(dim=0) / dead_mask.sum(dim=1).clamp_min(1.0).mean(dim=0)
             else:
                 density_scale_mean = density_scale.mean()
                 gap_scaled_mean = (gap * density_scale).abs().mean()
                 w_level_mean = w_level.mean()
                 batch_active_frac = has_gated.mean()
-            
-            # NEW: Gradient direction diagnostics (event vs non-event)
+                dead_pred_mean = (dead_sum / dead_mask.sum(dim=1).clamp_min(1.0)).mean()
+
+            # Gradient direction diagnostics (event vs non-event)
             grad = self._last_input_grad
             if grad is not None:
                 g = grad.float()
@@ -172,6 +201,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_scaled_mean_l = self._tolist(gap_scaled_mean.expand(1) if gap_scaled_mean.dim() == 0 else gap_scaled_mean)
                 w_level_mean_l = self._tolist(w_level_mean.expand(1) if w_level_mean.dim() == 0 else w_level_mean)
                 batch_active_frac_l = self._tolist(batch_active_frac.expand(1) if batch_active_frac.dim() == 0 else batch_active_frac)
+                dead_pred_mean_l = self._tolist(dead_pred_mean.expand(1) if dead_pred_mean.dim() == 0 else dead_pred_mean)
             else:
                 _n_ev = event_mask.sum().clamp_min(1.0)
                 _w_ev = w_dro * event_mask
@@ -199,6 +229,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 gap_scaled_mean_l = [gap_scaled_mean.item()]
                 w_level_mean_l = [w_level_mean.item()]
                 batch_active_frac_l = [batch_active_frac.item()]
+                dead_pred_mean_l = [dead_pred_mean.item()]
 
         if torch.isnan(total_loss):
             raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
@@ -207,6 +238,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         self._last_components = {
             "shape": shape_c,
             "level": level_c,
+            "anchor": anchor_c,
             "spec": [0.0] * n,
             "weight": [1.0] * n,
             "ema": [float("nan")] * n,
@@ -226,17 +258,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # NEW: Density-scaled gap diagnostics
             "density_scale_mean": density_scale_mean_l,
             "gap_scaled_mean": gap_scaled_mean_l,
-            # NEW: Hájek weight diagnostics
             "w_level_mean": w_level_mean_l,
             "batch_active_frac": batch_active_frac_l,
+            "dead_pred_mean": dead_pred_mean_l,
         }
 
         logger.debug(
-            "SpotlightLossLogcosh | shape=%s level=%s total=%.6f",
-            shape_c, level_c, total_loss.item(),
+            "SpotlightLossLogcosh | shape=%s level=%s anchor=%s total=%.6f",
+            shape_c, level_c, anchor_c, total_loss.item(),
         )
         return total_loss
 

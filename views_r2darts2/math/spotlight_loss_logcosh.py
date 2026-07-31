@@ -89,12 +89,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
             loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Dead-cell anchor at Shape scale ─────────────────
-        # Pushes dead cells toward 0, eliminating the source of gap
-        # contamination (dead cells leaking ~0.13 asinh makes gap always
-        # positive on PGM, causing Level to crush event cells).
-        n_dead = (T - n_ev_flat).clamp_min(1.0)
-        dead_pred = ((1.0 - event_mask) * y_pred).sum(dim=1) / n_dead
-        anchor_cell = self._log_cosh(dead_pred)  # target = 0 (y_true=0 on dead cells)
+        # Uses y_true_mask and its inverse for dead cells
+        y_true_mask = (y_true.abs() > self.tau).float()
+        dead_mask = 1.0 - y_true_mask
+        n_true_dead = dead_mask.sum(dim=1).clamp_min(1.0)
+        dead_pred = (dead_mask * y_pred).sum(dim=1) / n_true_dead
+        anchor_cell = self._log_cosh(dead_pred)
 
         if multivariate:
             loss_anchor = (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)

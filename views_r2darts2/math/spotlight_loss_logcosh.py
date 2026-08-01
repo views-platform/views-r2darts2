@@ -87,7 +87,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Series-level: amplify gap for sparse-event series
         # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
         n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
-        density_scale = torch.sqrt(T / n_ev_flat.clamp_min(1.0).float())
+        density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
         level_cell = self._log_cosh(gap * density_scale)
 
         # Batch-level: weight by signal strength, gated by has_gated

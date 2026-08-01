@@ -79,12 +79,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Route gap gradient to event cells only.
         # VALUE: gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
         # GRADIENT: only event cells (y_true_mask=1) get Level gradient
-        # → density_scale amplifies CLEAN event-cell error, not dead-cell leakage
-        y_pred_for_gap = y_true_mask * y_pred + (1.0 - y_true_mask) * y_pred.detach()
+        # → density_scale amplifies cleaan event-cell error, not dead-cell leakage
+        # y_pred_for_gap = y_true_mask * y_pred + (1.0 - y_true_mask) * y_pred.detach()
+        y_pred_for_gap = event_mask * y_pred + (1.0 - event_mask) * y_pred.detach()
         gap = y_pred_for_gap.mean(dim=1) - y_true.mean(dim=1)
 
         # Series-level: amplify gap for sparse-event series
-        # clamp_min(1.0) instead of clamp_min(T)
+        # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
         n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
         density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
         level_cell = self._log_cosh(gap * density_scale)

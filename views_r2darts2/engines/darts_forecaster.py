@@ -619,7 +619,7 @@ class DartsForecaster:
         )
 
         # Auto-detect num_workers: half of available CPUs, capped at 8.
-        num_workers = min(max((os.cpu_count() or 1) // 2, 0), 8)
+        num_workers = max(os.cpu_count(), 1)
         dataloader_kwargs = (
             {"num_workers": num_workers, "persistent_workers": False}
             if num_workers > 0

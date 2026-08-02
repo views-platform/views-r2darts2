@@ -30,7 +30,7 @@ from darts import TimeSeries
 
 from views_frames import FeatureFrame, SpatioTemporalIndex, SpatialLevel
 
-from views_r2darts2.data.parquet_loader import load_views_parquet
+from views_r2darts2.data.parquet_loader import load_views_parquet, resolve_columns_for_level
 from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 from views_r2darts2.transformers.darts_bridge import build_entity_timeseries
@@ -167,8 +167,16 @@ class ViewsDatasetDarts:
                     ignored_features,
                 )
 
-        time_id = config.get("time_id", "month_id")
-        declared_entity_id = config.get("entity_id", "country_id")
+        # Derive time_id / entity_id from config["level"] so the loader never
+        # silently falls back to a different spatial level than intended.
+        # config["time_id"] / config["entity_id"] are still accepted as explicit
+        # overrides for edge cases, but config["level"] takes priority.
+        level = config.get("level")
+        if level is not None:
+            time_id, declared_entity_id = resolve_columns_for_level(level)
+        else:
+            time_id = config.get("time_id", "month_id")
+            declared_entity_id = config.get("entity_id", "country_id")
 
         frame, features, _ = load_views_parquet(
             file_path,

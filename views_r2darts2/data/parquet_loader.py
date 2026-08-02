@@ -46,13 +46,48 @@ from views_frames import (
 logger = logging.getLogger(__name__)
 
 # Recognized index-column name pairs. The loader infers the spatial level from
-# whichever entity column is present. ``time_id`` is always ``month_id`` for the
-# VIEWS platform, but the loader is generic enough to accept any integer time
-# column declared in the manifest.
+# the entity column that is actually present in the source.
 _LEVEL_BY_ENTITY_COLUMN: dict[str, SpatialLevel] = {
     "country_id": SpatialLevel.CM,
     "priogrid_id": SpatialLevel.PGM,
 }
+
+# Canonical column names for every supported VIEWS spatio-temporal resolution.
+# The first element is the time column, the second is the entity column.
+# Levels follow the VIEWS naming convention:
+#   prefix  — c = country, pg = priogrid
+#   suffix  — m = month, w = week, d = day, y = year
+_LEVEL_COLUMNS: dict[str, tuple[str, str]] = {
+    "cm":  ("month_id",  "country_id"),
+    "pgm": ("month_id",  "priogrid_id"),
+    "cw":  ("week_id",   "country_id"),
+    "pgw": ("week_id",   "priogrid_id"),
+    "cd":  ("day_id",    "country_id"),
+    "pgd": ("day_id",    "priogrid_id"),
+    "cy":  ("year_id",   "country_id"),
+    "pgy": ("year_id",   "priogrid_id"),
+}
+
+
+def resolve_columns_for_level(level: str) -> tuple[str, str]:
+    """Return ``(time_id, entity_id)`` for a VIEWS spatio-temporal level string.
+
+    Args:
+        level: A VIEWS level string (e.g. ``"cm"``, ``"pgm"``, ``"pgd"``).
+
+    Returns:
+        A ``(time_id, entity_id)`` pair suitable for passing to
+        :func:`load_views_parquet`.
+
+    Raises:
+        ParquetLoadError: ``level`` is not a recognised VIEWS level.
+    """
+    if level not in _LEVEL_COLUMNS:
+        raise ParquetLoadError(
+            f"Unrecognised VIEWS level '{level}'. "
+            f"Expected one of {sorted(_LEVEL_COLUMNS)}."
+        )
+    return _LEVEL_COLUMNS[level]
 
 
 class ParquetLoadError(ValueError):
@@ -93,58 +128,44 @@ def _canonical_entity_column(name: str) -> str:
 
 
 def _resolve_entity_column(declared: str, available: set[str]) -> str:
-    """Resolve the actual entity column name against the parquet schema.
+    """Validate that the declared entity column is present in the source schema.
 
-    The caller declares an ``entity_id`` (default ``"country_id"``), but the
-    parquet may use the other level's column (``"priogrid_id"`` for pgm data)
-    or a typo alias (``"priogrid_gid"``). This helper:
-
-        1. If the declared column is present, return it as-is.
-        2. If the declared column is absent, check the other level's canonical
-           column (``country_id`` ↔ ``priogrid_id``).
-        3. Check aliases (``priogrid_gid`` → ``priogrid_id``).
-        4. Log the resolution so the caller can see what happened.
+    The entity and time columns are derived from ``config["level"]`` upstream
+    (via :func:`resolve_columns_for_level`) and therefore must be present
+    exactly as declared — cross-level fallback is explicitly not supported.
+    The only normalization that still happens is the ``priogrid_gid`` typo
+    alias so that legacy datasets written before the canonical name was fixed
+    can still be read.
 
     Args:
-        declared: The entity column name the caller requested.
-        available: The set of column names in the parquet schema.
+        declared: The entity column name expected in the source.
+        available: The set of column names in the source schema.
 
     Returns:
-        The resolved entity column name (one of the canonical names
-        ``country_id`` or ``priogrid_id``).
+        The resolved entity column name (the declared name, or its canonical
+        alias if a known typo is present).
+
+    Raises:
+        ParquetLoadError: The declared column (and any known typo alias) is
+            absent from the source schema.
     """
-    # Step 1: declared column is present.
+    # Exact match — the common case.
     if declared in available:
         return declared
 
-    # Step 2: check the other level's canonical column.
-    canonical_names = set(_LEVEL_BY_ENTITY_COLUMN.keys())
-    for canonical in canonical_names:
-        if canonical != declared and canonical in available:
-            logger.info(
-                "Entity column '%s' not found in parquet — falling back to "
-                "'%s'.", declared, canonical
-            )
-            return canonical
-
-    # Step 3: check aliases (e.g. priogrid_gid → priogrid_id).
+    # Typo-alias normalisation only (e.g. priogrid_gid → priogrid_id).
+    # We do NOT cross the entity boundary (country_id ↔ priogrid_id) — the
+    # correct entity column must come from config["level"].
     for alias, canonical in _ENTITY_ALIASES.items():
-        if alias in available:
+        if canonical == declared and alias in available:
             logger.info(
-                "Entity column '%s' not found in parquet — using alias '%s' "
-                "(will be normalized to '%s' in the frame index).",
-                declared, alias, canonical,
+                "Entity column '%s' resolved via alias '%s'.",
+                declared, alias,
             )
-            # Return the ALIAS name (the actual parquet column), not the
-            # canonical name — the caller needs to read this column from the
-            # parquet. The level is resolved from the canonical name via
-            # ``_resolve_level`` after we know which alias mapped to which
-            # canonical. To make that work, we return the alias here and
-            # adjust ``_resolve_level`` to recognize aliases.
             return alias
 
-    # Step 4: none found — return the declared name so the caller gets the
-    # original "missing column" error message.
+    # Not found — return the declared name so the downstream missing-column
+    # error carries the original column name.
     return declared
 
 

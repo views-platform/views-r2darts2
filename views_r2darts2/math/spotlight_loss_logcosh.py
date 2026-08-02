@@ -105,8 +105,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Uses y_true_mask inverse (true dead + false alarms).
         # Sum-based: tanh saturates → bounded strong gradient without T.
         dead_mask = 1.0 - y_true_mask
-        dead_sum = (dead_mask * y_pred).sum(dim=1)
-        anchor_cell = self._log_cosh(dead_sum)
+        # dead_sum = (dead_mask * y_pred).sum(dim=1)
+        # anchor_cell = self._log_cosh(dead_sum)
+        dead_errors = dead_mask * y_pred  # [B, T]
+        anchor_cell = self._log_cosh(dead_errors).mean(dim=1)  # mean over dead cells
 
         if multivariate:
             loss_anchor = (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -142,7 +144,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             _gap_scaled_cpu = (_gap_cpu * _density_scale_cpu).abs()
             _w_level_cpu    = w_level.cpu()
             _has_gated_cpu  = has_gated.cpu()
-            _dead_sum_cpu   = dead_sum.cpu()
+            _dead_sum_cpu   = dead_errors.cpu()
 
             # Gradient direction diagnostics (event vs non-event)
             grad = self._last_input_grad

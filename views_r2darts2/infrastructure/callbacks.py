@@ -949,9 +949,11 @@ class YHatBarCallback(Callback):
             return
 
         # Shape: (N, T, C) on CPU
-        all_preds = torch.cat(self._preds, dim=0).cpu()
+        all_preds = torch.cat(list(self._preds), dim=0).cpu()
         has_truth = len(self._truths) == len(self._preds)
-        all_truths = torch.cat(self._truths, dim=0).cpu() if has_truth else None
+        all_truths = (
+            torch.cat(list(self._truths), dim=0).cpu() if has_truth else None
+        )
 
         # Convert from transformed space to raw space — keep (N, T, C)
         raw_preds = self._inverse_fn(all_preds)

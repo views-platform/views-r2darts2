@@ -432,8 +432,8 @@ class RevINMonitorCallback(Callback):
         mean = getattr(rin, "mean", None)
         stdev = getattr(rin, "stdev", None)
         if mean is not None and stdev is not None:
-            self._last_mean = mean.detach()
-            self._last_stdev = stdev.detach()
+            self._last_mean = mean.detach().cpu()
+            self._last_stdev = stdev.detach().cpu()
 
     def on_train_epoch_end(self, trainer, pl_module):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
@@ -886,12 +886,17 @@ class YHatBarCallback(Callback):
         target_scaler: str | None = None,
         non_zero_threshold: float = 0.88,
         log_every_n_epochs: int = 1,
+        max_stored_batches: int = 500,
     ):
         super().__init__()
         self.log_every_n_epochs = log_every_n_epochs
         self.non_zero_threshold = non_zero_threshold
-        self._preds: list[torch.Tensor] = []
-        self._truths: list[torch.Tensor] = []
+        # Cap accumulation to avoid unbounded RAM growth on large datasets
+        # (e.g. PGM: 33k batches × 2048 × 36 × 3 × 4B ≈ 28 GB without a cap).
+        # A deque with maxlen keeps the *most recent* N batches; statistics
+        # over 500 batches × 2048 samples are representative for calibration.
+        self._preds: deque[torch.Tensor] = deque(maxlen=max_stored_batches)
+        self._truths: deque[torch.Tensor] = deque(maxlen=max_stored_batches)
         if target_scaler == "AsinhTransform":
             self._inverse_fn = torch.sinh
         else:
@@ -924,12 +929,15 @@ class YHatBarCallback(Callback):
             # Normalise to (B, T, C): unsqueeze trailing dim if missing
             if preds.dim() == 2:
                 preds = preds.unsqueeze(-1)
-            self._preds.append(preds)
+            # Move to CPU immediately — these lists accumulate across all
+            # batches in the epoch. Keeping GPU tensors here causes
+            # linear GPU memory growth.
+            self._preds.append(preds.cpu())
 
         if truth is not None:
             if truth.dim() == 2:
                 truth = truth.unsqueeze(-1)
-            self._truths.append(truth)
+            self._truths.append(truth.cpu())
 
     def on_train_epoch_end(self, trainer, pl_module):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
@@ -1042,6 +1050,8 @@ class YHatBarCallback(Callback):
 
         self._preds.clear()
         self._truths.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------

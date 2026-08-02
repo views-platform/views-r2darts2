@@ -213,8 +213,21 @@ class DartsForecaster:
         self.device = self.get_device()
         logger.info("Using device: %s", self.device)
         if self.device == "cuda" and torch.cuda.is_available():
+            # Must be set before the CUDA context is created (i.e., before
+            # to_device below). Setting it afterwards has no effect.
+            # expandable_segments: instead of requiring one large contiguous
+            # free block, the allocator grows existing segments in place.
+            # This eliminates the class of OOM where total free memory is
+            # sufficient but fragmented into blocks too small for a single
+            # allocation (visible as "X MiB free, Y GiB reserved but
+            # unallocated" in the error message).
+            import os
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
             torch.set_float32_matmul_precision("high")
-            logger.info("Set torch float32 matmul precision to 'high' for CUDA.")
+            logger.info(
+                "CUDA init: PYTORCH_CUDA_ALLOC_CONF=%s, float32 matmul precision='high'.",
+                os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+            )
         if hasattr(self.model, "to_device"):
             self.model.to_device(self.device)
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
@@ -619,7 +632,9 @@ class DartsForecaster:
         )
 
         # Auto-detect num_workers: half of available CPUs, capped at 8.
-        num_workers = max(os.cpu_count(), 1)
+        # Note: max(os.cpu_count(), 1) would use ALL CPUs — use integer division
+        # and cap instead.
+        num_workers = min(max((os.cpu_count() or 1) // 2, 0), 8)
         dataloader_kwargs = (
             {"num_workers": num_workers, "persistent_workers": False}
             if num_workers > 0

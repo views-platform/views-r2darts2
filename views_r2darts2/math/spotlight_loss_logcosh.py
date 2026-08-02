@@ -37,7 +37,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         self._last_input_grad = None
         if y_pred.requires_grad:
-            y_pred.register_hook(lambda g: setattr(self, "_last_input_grad", g.detach()))
+            y_pred.register_hook(lambda g: setattr(self, "_last_input_grad", g.detach().cpu()))
 
         e = y_pred - y_true
 

@@ -129,27 +129,28 @@ class SpotlightLossLogcosh(torch.nn.Module):
             comp = [float(total_loss.detach())]
 
         # ── Diagnostic telemetry ──────────────────────────────────────
+        # All telemetry is computed on CPU to avoid allocating large temporary
+        # tensors on the GPU when device memory is already near capacity.
         with torch.no_grad():
-            if multivariate:
-                density_scale_mean = density_scale.mean(dim=0)
-                gap_scaled_mean = (gap * density_scale).abs().mean(dim=0)
-                w_level_mean = w_level.mean(dim=0)
-                batch_active_frac = has_gated.mean(dim=0)
-                dead_sum_mean = dead_sum.mean(dim=0)
-            else:
-                density_scale_mean = density_scale.mean()
-                gap_scaled_mean = (gap * density_scale).abs().mean()
-                w_level_mean = w_level.mean()
-                batch_active_frac = has_gated.mean()
-                dead_sum_mean = dead_sum.mean()
+            # Move large batch tensors to CPU first; scalars stay as Python floats.
+            _event_mask_cpu = event_mask.cpu()
+            _w_dro_cpu      = w_dro.cpu()
+            _gate_cpu       = gate.cpu()
+            _e_shape_cpu    = e_shape.cpu()
+            _gap_cpu        = (y_pred.mean(dim=1) - y_true.mean(dim=1)).cpu()
+            _density_scale_cpu = density_scale.cpu()
+            _gap_scaled_cpu = (_gap_cpu * _density_scale_cpu).abs()
+            _w_level_cpu    = w_level.cpu()
+            _has_gated_cpu  = has_gated.cpu()
+            _dead_sum_cpu   = dead_sum.cpu()
 
             # Gradient direction diagnostics (event vs non-event)
             grad = self._last_input_grad
             if grad is not None:
-                g = grad.float()
+                g = grad.float().cpu()
                 if g.dim() == 2:
                     g = g.unsqueeze(-1)
-                ev_mask_3d = event_mask.unsqueeze(-1) if event_mask.dim() == 2 else event_mask
+                ev_mask_3d = _event_mask_cpu.unsqueeze(-1) if _event_mask_cpu.dim() == 2 else _event_mask_cpu
                 n_ev_total = ev_mask_3d.sum().clamp_min(1.0)
                 n_nev_total = (1.0 - ev_mask_3d).sum().clamp_min(1.0)
                 grad_ev = (g * ev_mask_3d).sum().item() / n_ev_total.item()
@@ -159,62 +160,60 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 grad_nev = 0.0
 
             if multivariate:
-                _n_ev = event_mask.sum(dim=(0, 1)).clamp_min(1.0)
-                _w_ev = w_dro * event_mask
+                _n_ev = _event_mask_cpu.sum(dim=(0, 1)).clamp_min(1.0)
+                _w_ev = _w_dro_cpu * _event_mask_cpu
                 _dm = _w_ev.sum(dim=(0, 1)) / _n_ev
                 _dw2 = (_w_ev ** 2).sum(dim=(0, 1)) / _n_ev
                 _dstd = (_dw2 - _dm ** 2).clamp_min(0).sqrt()
                 dro_wmean_l = _dm.tolist()
                 dro_wstd_l = _dstd.tolist()
-                dro_wmax_l = w_dro.amax(dim=(0, 1)).tolist()
-                dro_frac_up_l = (((w_dro > 1.0) * event_mask).sum(dim=(0, 1)) / _n_ev).tolist()
-                event_frac_l = event_mask.mean(dim=(0, 1)).tolist()
+                dro_wmax_l = _w_dro_cpu.amax(dim=(0, 1)).tolist()
+                dro_frac_up_l = (((_w_dro_cpu > 1.0) * _event_mask_cpu).sum(dim=(0, 1)) / _n_ev).tolist()
+                event_frac_l = _event_mask_cpu.mean(dim=(0, 1)).tolist()
 
-                gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
-                _ga = gap_global.abs()
+                _ga = _gap_cpu.abs()
                 gap_mean_l = _ga.mean(dim=0).tolist()
                 gap_max_l = _ga.amax(dim=0).tolist()
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+                _ev_mask_s = (_gate_cpu.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum(dim=0).clamp_min(1.0)
                 gap_ev_mean_l = ((_ga * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
                 gap_ev_max_l = ((_ga * _ev_mask_s).amax(dim=0)).tolist()
                 gap_sat_l = (((_ga > 1.5) * _ev_mask_s).sum(dim=0) / _n_ev_s).tolist()
-                shape_dc_l = (gate * e_shape).mean(dim=1).abs().mean(dim=0).tolist()
+                shape_dc_l = (_gate_cpu * _e_shape_cpu).mean(dim=1).abs().mean(dim=0).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
-                density_scale_mean_l = self._tolist(density_scale_mean.expand(1) if density_scale_mean.dim() == 0 else density_scale_mean)
-                gap_scaled_mean_l = self._tolist(gap_scaled_mean.expand(1) if gap_scaled_mean.dim() == 0 else gap_scaled_mean)
-                w_level_mean_l = self._tolist(w_level_mean.expand(1) if w_level_mean.dim() == 0 else w_level_mean)
-                batch_active_frac_l = self._tolist(batch_active_frac.expand(1) if batch_active_frac.dim() == 0 else batch_active_frac)
-                dead_sum_mean_l = self._tolist(dead_sum_mean.expand(1) if dead_sum_mean.dim() == 0 else dead_sum_mean)
+                density_scale_mean_l = self._tolist(_density_scale_cpu.mean(dim=0))
+                gap_scaled_mean_l    = self._tolist(_gap_scaled_cpu.mean(dim=0))
+                w_level_mean_l       = self._tolist(_w_level_cpu.mean(dim=0))
+                batch_active_frac_l  = self._tolist(_has_gated_cpu.mean(dim=0))
+                dead_sum_mean_l      = self._tolist(_dead_sum_cpu.mean(dim=0))
             else:
-                _n_ev = event_mask.sum().clamp_min(1.0)
-                _w_ev = w_dro * event_mask
+                _n_ev = _event_mask_cpu.sum().clamp_min(1.0)
+                _w_ev = _w_dro_cpu * _event_mask_cpu
                 _dm = (_w_ev.sum() / _n_ev).item()
                 _dw2 = ((_w_ev ** 2).sum() / _n_ev).item()
                 dro_wmean_l = [_dm]
                 dro_wstd_l = [max(0.0, _dw2 - _dm ** 2) ** 0.5]
-                dro_wmax_l = [w_dro.max().item()]
-                dro_frac_up_l = [((w_dro > 1.0) * event_mask).sum().item() / _n_ev.item()]
-                event_frac_l = [event_mask.mean().item()]
+                dro_wmax_l = [_w_dro_cpu.max().item()]
+                dro_frac_up_l = [((_w_dro_cpu > 1.0) * _event_mask_cpu).sum().item() / _n_ev.item()]
+                event_frac_l = [_event_mask_cpu.mean().item()]
 
-                gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
-                _ga = gap_global.abs()
+                _ga = _gap_cpu.abs()
                 gap_mean_l = [_ga.mean().item()]
                 gap_max_l = [_ga.max().item()]
-                _ev_mask_s = (gate.amax(dim=1) > 0.5).float()
+                _ev_mask_s = (_gate_cpu.amax(dim=1) > 0.5).float()
                 _n_ev_s = _ev_mask_s.sum().clamp_min(1.0)
                 gap_ev_mean_l = [((_ga * _ev_mask_s).sum() / _n_ev_s).item()]
                 gap_ev_max_l = [((_ga * _ev_mask_s).amax()).item()]
                 gap_sat_l = [(((_ga > 1.5) * _ev_mask_s).sum() / _n_ev_s).item()]
-                shape_dc_l = [(gate * e_shape).mean(dim=1).abs().mean().item()]
+                shape_dc_l = [(_gate_cpu * _e_shape_cpu).mean(dim=1).abs().mean().item()]
 
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
-                density_scale_mean_l = [density_scale_mean.item()]
-                gap_scaled_mean_l = [gap_scaled_mean.item()]
-                w_level_mean_l = [w_level_mean.item()]
-                batch_active_frac_l = [batch_active_frac.item()]
-                dead_sum_mean_l = [dead_sum_mean.item()]
+                density_scale_mean_l = [_density_scale_cpu.mean().item()]
+                gap_scaled_mean_l    = [_gap_scaled_cpu.mean().item()]
+                w_level_mean_l       = [_w_level_cpu.mean().item()]
+                batch_active_frac_l  = [_has_gated_cpu.mean().item()]
+                dead_sum_mean_l      = [_dead_sum_cpu.mean().item()]
 
         if torch.isnan(total_loss):
             raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")

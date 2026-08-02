@@ -111,9 +111,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         anchor_cell = self._log_cosh(dead_errors).mean(dim=1)  # mean over dead cells
 
         if multivariate:
-            loss_anchor = T * (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_anchor = math.asinh(T) * (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_anchor = T * (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_anchor = math.asinh(T) * (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

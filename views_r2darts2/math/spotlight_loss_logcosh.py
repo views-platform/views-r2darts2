@@ -87,8 +87,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Series-level: amplify gap for sparse-event series
         # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
         n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
-        density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
-        level_cell = self._log_cosh(gap * density_scale)
+        # density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
+        # level_cell = self._log_cosh(gap * density_scale)
+        level_cell = self._log_cosh(gap)
 
         # Batch-level: weight by signal strength, gated by has_gated
         event_frac = event_mask.mean().clamp_min(self._EPS)
@@ -138,8 +139,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             _gate_cpu       = gate.cpu()
             _e_shape_cpu    = e_shape.cpu()
             _gap_cpu        = (y_pred.mean(dim=1) - y_true.mean(dim=1)).cpu()
-            _density_scale_cpu = density_scale.cpu()
-            _gap_scaled_cpu = (_gap_cpu * _density_scale_cpu).abs()
+            # _density_scale_cpu = density_scale.cpu()
+            # _gap_scaled_cpu = (_gap_cpu * _density_scale_cpu).abs()
             _w_level_cpu    = w_level.cpu()
             _has_gated_cpu  = has_gated.cpu()
             _dead_sum_cpu   = dead_sum.cpu()
@@ -182,8 +183,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 shape_dc_l = (_gate_cpu * _e_shape_cpu).mean(dim=1).abs().mean(dim=0).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
-                density_scale_mean_l = self._tolist(_density_scale_cpu.mean(dim=0))
-                gap_scaled_mean_l    = self._tolist(_gap_scaled_cpu.mean(dim=0))
+                # density_scale_mean_l = self._tolist(_density_scale_cpu.mean(dim=0))
+                # gap_scaled_mean_l    = self._tolist(_gap_scaled_cpu.mean(dim=0))
                 w_level_mean_l       = self._tolist(_w_level_cpu.mean(dim=0))
                 batch_active_frac_l  = self._tolist(_has_gated_cpu.mean(dim=0))
                 dead_sum_mean_l      = self._tolist(_dead_sum_cpu.mean(dim=0))
@@ -209,8 +210,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 shape_dc_l = [(_gate_cpu * _e_shape_cpu).mean(dim=1).abs().mean().item()]
 
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
-                density_scale_mean_l = [_density_scale_cpu.mean().item()]
-                gap_scaled_mean_l    = [_gap_scaled_cpu.mean().item()]
+                # density_scale_mean_l = [_density_scale_cpu.mean().item()]
+                # gap_scaled_mean_l    = [_gap_scaled_cpu.mean().item()]
                 w_level_mean_l       = [_w_level_cpu.mean().item()]
                 batch_active_frac_l  = [_has_gated_cpu.mean().item()]
                 dead_sum_mean_l      = [_dead_sum_cpu.mean().item()]
@@ -242,8 +243,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            "density_scale_mean": density_scale_mean_l,
-            "gap_scaled_mean": gap_scaled_mean_l,
+            # "density_scale_mean": density_scale_mean_l,
+            # "gap_scaled_mean": gap_scaled_mean_l,
             "w_level_mean": w_level_mean_l,
             "batch_active_frac": batch_active_frac_l,
             "dead_sum_mean": dead_sum_mean_l,

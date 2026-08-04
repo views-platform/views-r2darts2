@@ -337,6 +337,28 @@ class TestViewsDatasetFactory:
         assert ds.features == FEATURES
         assert ds.level == SpatialLevel.CM
 
+    def test_dataset_from_views_path_uses_regression_targets_key(
+        self,
+        synthetic_cm_parquet_small: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Task-split target keys are accepted without legacy ``targets``."""
+        target_path = tmp_path / "validation_viewser_df.parquet"
+        shutil.copy(synthetic_cm_parquet_small, target_path)
+
+        config: dict = {
+            "regression_targets": TARGETS,
+            "features": FEATURES,
+            "time_id": "month_id",
+            "entity_id": "country_id",
+        }
+        ds = ViewsDatasetDarts.from_views_path(
+            path_raw=tmp_path,
+            run_type="validation",
+            config=config,
+        )
+        assert ds.targets == TARGETS
+
 
 class TestViewsDatasetValidation:
     """Constructor-time validation errors."""

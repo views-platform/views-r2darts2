@@ -131,9 +131,12 @@ class ViewsDatasetDarts:
             path_raw: Directory containing the ``<run_type>_viewser_df.parquet``
                 file. Ignored when ``cached_path`` is provided.
             run_type: VIEWS run type (e.g. ``"validation"``, ``"calibration"``).
-            config: Experiment manifest. ``config["targets"]`` is mandatory;
-                ``config["features"]`` is optional (defaults to all non-target
-                value columns when absent — see ``_resolve_features_from_config``).
+            config: Experiment manifest. Target resolution follows the
+                task-split schema first (``regression_targets`` +
+                ``classification_targets``), with legacy ``targets`` accepted
+                as fallback. ``config["features"]`` is optional (defaults to
+                all non-target value columns when absent — see
+                ``_resolve_features_from_config``).
             cached_path: When provided, used directly instead of constructing a
                 path from ``path_raw`` and ``run_type``.
             cache_dir: When provided, the parquet is decoded once and a native
@@ -147,7 +150,7 @@ class ViewsDatasetDarts:
             Path(path_raw) / f"{run_type}_viewser_df.parquet"
         )
 
-        targets = list(config.get("targets") or [])
+        targets = _resolve_targets_from_config(config)
         features = _resolve_features_from_config(config, targets)
 
         # Strict allowlist mode: when feature_scaler_map is provided, only the
@@ -438,6 +441,21 @@ class ViewsDatasetDarts:
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+
+
+def _resolve_targets_from_config(config: Mapping[str, Any]) -> list[str]:
+    """Resolve target columns from config using task-split keys first.
+
+    Canonical schema is ``regression_targets`` + ``classification_targets``.
+    Legacy ``targets`` is still accepted as fallback for backward
+    compatibility.
+    """
+    regression_targets = list(config.get("regression_targets") or [])
+    classification_targets = list(config.get("classification_targets") or [])
+    combined = regression_targets + classification_targets
+    if combined:
+        return combined
+    return list(config.get("targets") or [])
 
 
 def _resolve_features_from_config(

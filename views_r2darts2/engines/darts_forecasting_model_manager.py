@@ -32,7 +32,10 @@ import torch  # noqa: F401 — kept alive for the monkey-patches in apply_all_pa
 from views_frames import PredictionFrame
 
 from views_r2darts2.catalogs.model_catalog import ModelCatalog
-from views_r2darts2.data.views_dataset import ViewsDatasetDarts
+from views_r2darts2.data.views_dataset import (
+    ViewsDatasetDarts,
+    _resolve_targets_from_config,
+)
 from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.infrastructure.patches import apply_all_patches
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
@@ -754,13 +757,14 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
                     ]
 
                 sniffer = CorePredictionSniffer(level=active_config["level"])
+                targets = _resolve_targets_from_config(active_config)
                 for i, df in enumerate(df_predictions):
                     logger.info(
                         "Validating evaluation dataframe of sequence %d/%d",
                         i + 1,
                         len(df_predictions),
                     )
-                    sniffer.sniff_predictions(df, targets=active_config["targets"])
+                    sniffer.sniff_predictions(df, targets=targets)
 
                 if self._has_evaluation_metrics():
                     self._evaluate_prediction_dataframe(

@@ -330,8 +330,9 @@ class DartsForecaster:
             self._move_model_to_device()
             current_device = next(self.model.model.parameters()).device
             if current_device.type == "cpu":
-                raise RuntimeError(
-                    f"Failed to move model from CPU to {self.device}."
+                logger.warning(
+                    "Failed to move model from CPU to %s; continuing on CPU.",
+                    self.device,
                 )
 
     # ------------------------------------------------------------------ persistence

@@ -527,7 +527,8 @@ def _patched_tide_module_forward(
         x_static_covariates,
     ]
     encoded = [t.flatten(start_dim=1) for t in encoded if t is not None]
-    encoded = torch.cat(encoded, dim=1)
+    # static_covariates can arrive as float64; cast once to avoid dtype mismatch in linear layers.
+    encoded = torch.cat(encoded, dim=1).float()
 
     # encode + decode
     encoded = self.encoders(encoded)

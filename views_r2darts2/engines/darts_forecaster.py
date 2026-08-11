@@ -28,6 +28,7 @@ imported, and they are confined to that module.
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 from typing import Any, Mapping
@@ -772,12 +773,8 @@ class DartsForecaster:
             use_cyclic_encoders=self._use_cyclic_encoders,
         )
 
-        # Slice the input window for forecasting based on sequence_number.
-        target_series, past_covariates = self._preprocess_timeseries(
-            timeseries=timeseries,
-            start=self._test_start + sequence_number - self.model.input_chunk_length,
-            end=self._test_start - 1 + sequence_number,
-        )
+        pred_start = self._test_start + sequence_number - self.model.input_chunk_length
+        pred_end = self._test_start - 1 + sequence_number
 
         # Resilient device management: Darts models can drift to CPU in
         # teardown(); restore them if needed before prediction.
@@ -796,37 +793,109 @@ class DartsForecaster:
                     self.device,
                 )
 
-        # Generate forecasts — chunked to cap peak TimeSeries object count.
-        n_entities = len(target_series)
-        if entity_chunk_size is not None and n_entities > entity_chunk_size:
+        if entity_chunk_size is not None:
+            # Chunked path: preprocess and predict entity-by-entity in batches
+            # so that target_series (all entities) is never fully allocated.
+            # Each chunk's raw TimeSeries are nulled out before model inference
+            # so the GC can reclaim full-history objects while the chunk runs.
+            n_total = len(timeseries)
             logger.info(
                 "Chunked prediction: %d entities in chunks of %d (%d chunks).",
-                n_entities,
+                n_total,
                 entity_chunk_size,
-                -(-n_entities // entity_chunk_size),
+                -(-n_total // entity_chunk_size),
             )
-            chunk_frames: list[dict[str, PredictionFrame]] = []
-            for chunk_start in range(0, n_entities, entity_chunk_size):
-                chunk_end = min(chunk_start + entity_chunk_size, n_entities)
+            per_target_values: dict[str, list[np.ndarray]] = {
+                t: [] for t in self.dataset.targets
+            }
+            time_arrays: list[np.ndarray] = []
+            unit_arrays: list[np.ndarray] = []
+            level = self.dataset.level
+            metadata = None
+
+            for chunk_start in range(0, n_total, entity_chunk_size):
+                chunk_end = min(chunk_start + entity_chunk_size, n_total)
                 logger.info(
-                    "Predicting entity chunk %d–%d / %d",
-                    chunk_start + 1, chunk_end, n_entities,
+                    "Predicting entity chunk %d\u2013%d / %d",
+                    chunk_start + 1, chunk_end, n_total,
                 )
-                pc_chunk = (
-                    past_covariates[chunk_start:chunk_end]
-                    if past_covariates is not None
-                    else None
+                chunk_raw = timeseries[chunk_start:chunk_end]
+                # Null out processed slots so the GC can reclaim them before
+                # the next chunk's Darts output is allocated.
+                for i in range(chunk_start, chunk_end):
+                    timeseries[i] = None
+
+                ts_chunk, pc_chunk = self._preprocess_timeseries(
+                    timeseries=chunk_raw,
+                    start=pred_start,
+                    end=pred_end,
                 )
-                chunk_frames.append(
-                    self._predict_chunk(
-                        ts_chunk=target_series[chunk_start:chunk_end],
-                        pc_chunk=pc_chunk,
-                        output_length=output_length,
-                        predict_kwargs=predict_kwargs,
+                del chunk_raw
+                gc.collect()
+
+                if not ts_chunk:
+                    del ts_chunk, pc_chunk
+                    continue
+
+                timeseries_pred = self.model.predict(
+                    n=output_length,
+                    series=ts_chunk,
+                    past_covariates=pc_chunk,
+                    verbose=True,
+                    **predict_kwargs,
+                )
+                del ts_chunk, pc_chunk
+
+                ReproducibilityGate.Data.audit_numerical_sanity(
+                    timeseries_pred, name="Model Predictions"
+                )
+                if self.target_scaler:
+                    timeseries_pred = self._inverse_transform_target_scaler(
+                        timeseries_pred
                     )
+                timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
+                ReproducibilityGate.Data.audit_numerical_sanity(
+                    timeseries_pred, name="Inverse-Transformed Predictions"
                 )
-            predictions = self._merge_prediction_chunks(chunk_frames)
+
+                chunk_preds = prediction_frames_from_darts(
+                    predictions=timeseries_pred,
+                    entity_id_name=self.dataset.entity_id,
+                    target_columns=self.dataset.targets,
+                    level=level,
+                    clip_negatives=True,
+                )
+                del timeseries_pred
+                gc.collect()
+
+                any_tgt = next(iter(chunk_preds))
+                if metadata is None:
+                    metadata = chunk_preds[any_tgt].metadata
+                time_arrays.append(chunk_preds[any_tgt].index.time)
+                unit_arrays.append(chunk_preds[any_tgt].index.unit)
+                for tgt, frame in chunk_preds.items():
+                    per_target_values[tgt].append(frame.values)
+                del chunk_preds
+
+            del timeseries
+
+            time_arr = np.concatenate(time_arrays)
+            unit_arr = np.concatenate(unit_arrays)
+            index = SpatioTemporalIndex(time=time_arr, unit=unit_arr, level=level)
+            predictions = {
+                tgt: PredictionFrame(
+                    np.concatenate(vals, axis=0), index=index, metadata=metadata
+                )
+                for tgt, vals in per_target_values.items()
+            }
         else:
+            target_series, past_covariates = self._preprocess_timeseries(
+                timeseries=timeseries,
+                start=pred_start,
+                end=pred_end,
+            )
+            del timeseries
+
             try:
                 timeseries_pred = self.model.predict(
                     n=output_length,

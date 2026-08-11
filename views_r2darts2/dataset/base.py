@@ -9,6 +9,7 @@ supported input kind and delegates the on-disk write to the matching converter.
 
 from __future__ import annotations
 
+import copy
 import logging
 import uuid
 from pathlib import Path
@@ -19,6 +20,7 @@ import xarray as xr
 
 from views_r2darts2.dataset import converters, readers
 from views_r2darts2.dataset.zarr_store import ZarrStore
+from views_r2darts2.transformers.inverse import extract_fitted_sklearn_scaler
 
 logger = logging.getLogger(__name__)
 
@@ -1054,24 +1056,39 @@ class ViewsDataset:
         return_series: bool = False,
         use_cyclic_encoders: bool = False,
     ):
-        """Fit scalers on the current dataset's data.
+        """Fit scalers on the current dataset's data (numpy-direct, no TimeSeries).
+
+        For datasets with hundreds of thousands of entities (e.g. 259k PRIO-GRID
+        cells), building per-entity Darts :class:`TimeSeries` objects just to fit
+        a scaler is prohibitively slow — 259k Python objects × pandas DataFrame
+        construction per entity. This method bypasses TimeSeries entirely:
+
+            1. Extract the target/feature numpy arrays directly from the xarray
+               dataset (single ``.compute()`` call).
+            2. Apply ``log1p`` if requested (elementwise numpy).
+            3. Reshape to 2-D ``(n_rows, n_components)`` and fit the underlying
+               sklearn transformer directly.
+            4. Wrap the fitted sklearn object in a Darts :class:`Scaler` and
+               manually set ``_fitted_params`` — this marks the Darts Scaler as
+               fitted without going through its per-series ``fit_transform``.
+
+        This is semantically identical to the Darts ``Scaler.fit_transform``
+        with ``global_fit=True`` (which concatenates all series and fits once),
+        but eliminates the O(n_entities) Python overhead.
 
         Args:
             target_scaler: Scaler name for targets (e.g. ``"AsinhTransform"``).
-                ``None`` means no target scaling.
-            feature_scaler: Scaler name for all features. Ignored when
-                ``feature_scaler_map`` is provided.
-            feature_scaler_map: Per-feature scaler map. See
-                :class:`~views_r2darts2.transformers.feature_scaler_manager.FeatureScalerManager`.
-            log_targets: When ``True``, apply ``log1p`` to targets before
-                scaling.
+            feature_scaler: Scaler name for all features.
+            feature_scaler_map: Per-feature scaler map.
+            log_targets: Apply ``log1p`` to targets before scaling.
             log_features: Feature names to apply ``log1p`` to.
-            time_ids: Optional time-id filter — only fit on the selected
-                time steps (prevents test-period leakage).
+            time_ids: Optional time-id filter (prevents test-period leakage).
             return_series: When ``True``, return the fitted+transformed
-                ``(targets_ts, past_cov_ts)`` so callers avoid a second zarr
-                load for the same time range.
+                ``(targets_ts, past_cov_ts)`` Darts TimeSeries lists.
+            use_cyclic_encoders: Append cyclic encoders (only used when
+                ``return_series=True``).
         """
+        import copy
         from views_r2darts2.transformers.feature_scaler_manager import (
             FeatureScalerManager,
         )
@@ -1086,50 +1103,427 @@ class ViewsDataset:
         self._log_features = set(log_features or [])
         self._scalers_fitted = False
 
-        # Instantiate the target scaler.
+        # --- Extract numpy arrays from xarray (single compute) ---------------
+        target_names = list(self.targets)
+        feature_names = list(self.features)
+        target_arr, feature_arr, time_arr, entity_arr = self._extract_numpy_2d(
+            target_names=target_names,
+            feature_names=feature_names,
+            time_ids=time_ids,
+        )
+        # target_arr: (N, n_targets) float32 — row-major (time, entity)
+        # feature_arr: (N, n_features) float32 or None
+
+        # --- Apply log transforms (elementwise numpy) ------------------------
+        if self._log_targets and target_arr is not None:
+            target_arr = np.log1p(np.maximum(target_arr, 0)).astype(np.float32)
+        if self._log_features and feature_arr is not None:
+            for idx, name in enumerate(feature_names):
+                if name in self._log_features:
+                    feature_arr[:, idx] = np.log1p(
+                        np.maximum(feature_arr[:, idx], 0)
+                    )
+
+        # --- Fit target scaler (numpy-direct) --------------------------------
         self._target_scaler = (
             ScalerSelector.instantiate_darts_scaler(target_scaler)
             if target_scaler is not None
             else None
         )
+        if self._target_scaler is not None and target_arr is not None:
+            self._fit_darts_scaler_on_numpy(
+                self._target_scaler, target_arr.astype(np.float64)
+            )
 
-        # Instantiate the feature scaler(s).
-        if not self.features:
+        # --- Fit feature scaler(s) (numpy-direct) ----------------------------
+        if not feature_names:
             self._feature_scaler = None
         elif feature_scaler_map:
             self._feature_scaler = FeatureScalerManager(
                 feature_scaler_map=feature_scaler_map,
                 default_scaler=feature_scaler,
-                all_features=self.features,
+                all_features=feature_names,
             )
+            if feature_arr is not None:
+                self._fit_feature_scaler_manager_on_numpy(
+                    self._feature_scaler, feature_arr.astype(np.float64),
+                    feature_names,
+                )
         else:
-            self._feature_scaler = ScalerSelector.instantiate_darts_scaler(
-                feature_scaler
-            ) if feature_scaler is not None else None
+            self._feature_scaler = (
+                ScalerSelector.instantiate_darts_scaler(feature_scaler)
+                if feature_scaler is not None
+                else None
+            )
+            if self._feature_scaler is not None and feature_arr is not None:
+                self._fit_darts_scaler_on_numpy(
+                    self._feature_scaler, feature_arr.astype(np.float64)
+                )
 
-        # Build Darts TimeSeries from the training partition, fit the scalers.
-        series_list = self.to_darts_timeseries(
-            time_ids=time_ids, use_cyclic_encoders=use_cyclic_encoders
-        )
-        targets_ts, past_cov_ts = self._split_targets_covariates(series_list)
-        targets_ts = self._apply_log_to_targets(targets_ts)
-        if past_cov_ts is not None:
-            past_cov_ts = self._apply_log_to_features(past_cov_ts)
-
-        if self._target_scaler is not None:
-            targets_ts = self._target_scaler.fit_transform(targets_ts)
-        if self._feature_scaler is not None:
-            past_cov_ts = self._feature_scaler.fit_transform(past_cov_ts)
         self._scalers_fitted = True
-        logger.info("Scalers fitted: target=%r, feature=%r",
-                     target_scaler, feature_scaler or feature_scaler_map)
+        logger.info(
+            "Scalers fitted (numpy-direct): target=%r, feature=%r, "
+            "n_rows=%d, n_targets=%d, n_features=%d",
+            target_scaler, feature_scaler or feature_scaler_map,
+            target_arr.shape[0] if target_arr is not None else 0,
+            len(target_names), len(feature_names),
+        )
+
         if return_series:
-            # Downcast to float32 — matches what get_scaled_darts_timeseries does.
-            targets_ts = [ts.astype(np.float32) for ts in targets_ts]
-            if past_cov_ts is not None:
-                past_cov_ts = [pc.astype(np.float32) for pc in past_cov_ts]
-            return targets_ts, past_cov_ts
+            return self._build_scaled_timeseries_from_numpy(
+                target_arr=target_arr,
+                feature_arr=feature_arr,
+                target_names=target_names,
+                feature_names=feature_names,
+                time_arr=time_arr,
+                entity_arr=entity_arr,
+                use_cyclic_encoders=use_cyclic_encoders,
+            )
         return None
+
+    def _extract_numpy_2d(
+        self,
+        *,
+        target_names: list[str],
+        feature_names: list[str],
+        time_ids: Any = None,
+        entity_ids: Any = None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray, np.ndarray]:
+        """Extract target and feature arrays as row-major 2-D numpy.
+
+        Returns:
+            ``(target_arr, feature_arr, time_arr, entity_arr)`` where the
+            arrays are row-major (time, entity) — i.e. entity varies fastest.
+            ``target_arr`` is ``(N, n_targets)``, ``feature_arr`` is
+            ``(N, n_features)`` or ``None``.
+        """
+        all_names = [*feature_names, *target_names]
+        if not all_names:
+            return None, None, np.array([]), np.array([])
+
+        old_broadcast = self.broadcast_features
+        self.broadcast_features = True
+        try:
+            tensor = self._stack_variables(all_names)
+        finally:
+            self.broadcast_features = old_broadcast
+
+        if time_ids is not None:
+            available_times = tensor[self._time_id].values
+            requested = np.array(_as_list(time_ids), dtype=available_times.dtype)
+            missing = np.setdiff1d(requested, available_times)
+            if len(missing) > 0:
+                logger.debug(
+                    "_extract_numpy_2d: %d/%d time_ids absent, zero-filled.",
+                    len(missing), len(requested),
+                )
+            tensor = tensor.reindex(
+                {self._time_id: requested.tolist()}, fill_value=0.0
+            )
+        if entity_ids is not None:
+            tensor = tensor.sel({self._entity_id: _as_list(entity_ids)})
+
+        computed = tensor.compute()
+        # Shape: (T, E, S, F)
+        values_4d = np.nan_to_num(computed.values, nan=0.0)
+        time_arr = computed[self._time_id].values.astype("int64")
+        entity_arr = computed[self._entity_id].values.astype("int64")
+        T, E, S, F = values_4d.shape
+        n_targets = len(target_names)
+        n_features = len(feature_names)
+
+        # Reshape to row-major (T*E, F) — entity varies fastest.
+        # values_4d is (T, E, S, F) → take sample 0 → (T, E, F) → reshape.
+        if S == 1:
+            flat_2d = values_4d[:, :, 0, :]  # (T, E, F)
+        else:
+            # For probabilistic, just take the first sample for fitting.
+            flat_2d = values_4d[:, :, 0, :]
+        flat_2d = flat_2d.reshape(T * E, F)
+
+        # Split into features and targets.
+        feature_arr = (
+            flat_2d[:, :n_features].astype(np.float32) if n_features > 0 else None
+        )
+        target_arr = (
+            flat_2d[:, n_features:].astype(np.float32) if n_targets > 0 else None
+        )
+        return target_arr, feature_arr, time_arr, entity_arr
+
+    @staticmethod
+    def _fit_darts_scaler_on_numpy(
+        darts_scaler: Any, data_2d: np.ndarray
+    ) -> None:
+        """Fit a Darts :class:`Scaler` or :class:`Pipeline` directly on 2-D numpy.
+
+        For a single :class:`Scaler`: fits the underlying sklearn transformer
+        on the raw numpy array and manually sets ``_fitted_params``.
+
+        For a :class:`Pipeline` (chained scalers): builds a single dummy
+        :class:`TimeSeries` from the numpy array and calls ``Pipeline.fit``
+        — this is the one case where we can't avoid TimeSeries entirely, but
+        it's a single dummy series, not 259k.
+        """
+        from darts.dataprocessing.transformers import Scaler
+        from darts.dataprocessing import Pipeline
+        from darts import TimeSeries
+
+        if isinstance(darts_scaler, Pipeline):
+            # Pipeline path: build a single dummy TimeSeries and fit.
+            # The Pipeline internally fits each step sequentially.
+            dummy_ts = TimeSeries.from_values(
+                data_2d.astype(np.float32),
+                columns=[f"col_{i}" for i in range(data_2d.shape[1])],
+            )
+            darts_scaler.fit([dummy_ts])
+            return
+
+        # Single Scaler path: fit the underlying sklearn transformer directly.
+        underlying = copy.deepcopy(darts_scaler.transformer)
+        fitted = underlying.fit(data_2d)
+        darts_scaler._fitted_params = [fitted]
+        darts_scaler._fit_called = True
+
+    @staticmethod
+    def _fit_feature_scaler_manager_on_numpy(
+        manager: Any, data_2d: np.ndarray, feature_names: list[str]
+    ) -> None:
+        """Fit a :class:`FeatureScalerManager` directly on a 2-D numpy array.
+
+        For each scaler group in the manager, extracts the corresponding
+        columns from ``data_2d`` and fits the underlying sklearn transformer.
+        """
+        import copy
+        from darts.dataprocessing import Pipeline
+        from views_r2darts2.transformers.inverse import (
+            fit_scaler_on_concatenated_subset,
+        )
+        from darts import TimeSeries
+
+        components = list(feature_names)
+        for scaler_key, scaler in manager._scalers.items():
+            group_features = manager._scaler_to_features.get(scaler_key, [])
+            feature_indices = [
+                i for i, comp in enumerate(components) if comp in group_features
+            ]
+            if not feature_indices:
+                continue
+            subset = data_2d[:, feature_indices]
+
+            if isinstance(scaler, Pipeline):
+                # For Pipeline scalers, we still need a dummy TimeSeries.
+                # This is the one case where we can't avoid TimeSeries entirely,
+                # but it's a single dummy series, not 259k.
+                dummy_ts = TimeSeries.from_values(
+                    subset.astype(np.float32),
+                    columns=[components[i] for i in feature_indices],
+                )
+                scaler.fit([dummy_ts])
+            else:
+                underlying = copy.deepcopy(scaler.transformer)
+                fitted = underlying.fit(subset)
+                scaler._fitted_params = [fitted]
+                scaler._fit_called = True
+
+    def _build_scaled_timeseries_from_numpy(
+        self,
+        *,
+        target_arr: np.ndarray | None,
+        feature_arr: np.ndarray | None,
+        target_names: list[str],
+        feature_names: list[str],
+        time_arr: np.ndarray,
+        entity_arr: np.ndarray,
+        use_cyclic_encoders: bool = False,
+    ) -> tuple[list, list | None]:
+        """Build scaled Darts TimeSeries from pre-extracted numpy arrays.
+
+        Applies the already-fitted sklearn scalers directly on the numpy arrays
+        (no per-entity TimeSeries transform calls), then constructs the Darts
+        TimeSeries objects from the transformed numpy. This is the fast path
+        for ``return_series=True`` in :meth:`fit_scalers`.
+        """
+        from views_r2darts2.transformers.inverse import (
+            extract_fitted_sklearn_scaler,
+        )
+
+        # Apply scaler transforms in numpy.
+        if target_arr is not None and self._target_scaler is not None:
+            sk = extract_fitted_sklearn_scaler(self._target_scaler)
+            if sk is not None:
+                target_arr = sk.transform(target_arr.astype(np.float64)).astype(np.float32)
+            # Fallback for stateless transforms (FunctionTransformer).
+            elif hasattr(self._target_scaler, "transformer"):
+                inv_func = getattr(self._target_scaler.transformer, "func", None)
+                # For transform, we use the func (not inverse_func).
+                tf_func = inv_func
+                if tf_func is not None:
+                    target_arr = tf_func(target_arr.astype(np.float64)).astype(np.float32)
+
+        if feature_arr is not None and self._feature_scaler is not None:
+            feature_arr = self._transform_feature_arr_numpy(feature_arr, feature_names)
+
+        # Build Darts TimeSeries from the transformed numpy.
+        # Reshape (T*E, F) → (T, E, F) → per-entity (T, F).
+        T = len(time_arr)
+        E = len(entity_arr)
+        all_names = [*feature_names, *target_names]
+        n_feat = len(feature_names)
+        n_targ = len(target_names)
+
+        # Combine features + targets back into a single array.
+        parts = []
+        if feature_arr is not None:
+            parts.append(feature_arr)
+        if target_arr is not None:
+            parts.append(target_arr)
+        if not parts:
+            return [], None
+        combined = np.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+        # Reshape to (T, E, F).
+        combined_3d = combined.reshape(T, E, -1)
+
+        # Cyclic encoders.
+        from views_r2darts2.infrastructure.encoders import (
+            CYCLIC_ENCODERS_BY_RESOLUTION,
+        )
+        feature_columns_ext = list(all_names)
+        cyclic_block = None
+        if use_cyclic_encoders:
+            resolution = self._time_id.split("_")[0][0]
+            cyclic_encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
+            if cyclic_encoders is not None:
+                cyclic_cols = [enc_fn(time_arr).astype(np.float32) for enc_fn in cyclic_encoders]
+                cyclic_block = np.stack(cyclic_cols, axis=1)  # (T, n_enc)
+                feature_columns_ext = [*all_names[:n_feat]] + [
+                    fn.__name__ for fn in cyclic_encoders
+                ] + all_names[n_feat:]
+
+        # Build TimeSeries objects (minimal overhead).
+        import pandas as pd
+        from darts import TimeSeries as _TS
+        from darts.timeseries import (
+            DEFAULT_GLOBAL_STATIC_COV_NAME,
+            STATIC_COV_TAG,
+            HIERARCHY_TAG,
+            METADATA_TAG,
+        )
+
+        shared_time_index = pd.RangeIndex(
+            start=int(time_arr[0]), stop=int(time_arr[-1]) + 1, step=1
+        )
+        shared_components = pd.Index(feature_columns_ext)
+        _static_row_idx = pd.Index([DEFAULT_GLOBAL_STATIC_COV_NAME])
+        _static_col_idx = pd.Index([self._entity_id])
+        _static_col_idx.name = STATIC_COV_TAG
+        _shared_attrs = {HIERARCHY_TAG: None, METADATA_TAG: None}
+
+        series_list = []
+        for e_idx in range(E):
+            entity_vals = combined_3d[:, e_idx, :]  # (T, F)
+            if cyclic_block is not None:
+                # Insert cyclic columns after features, before targets.
+                feat_part = entity_vals[:, :n_feat]
+                targ_part = entity_vals[:, n_feat:]
+                entity_vals = np.concatenate([feat_part, cyclic_block, targ_part], axis=1)
+
+            ts = object.__new__(_TS)
+            ts._time_dim = "time"
+            ts._time_index = shared_time_index
+            ts._freq = 1
+            ts._freq_str = "1"
+            ts._has_datetime_index = False
+            ts._components = shared_components
+            ts._top_level_component = None
+            ts._bottom_level_components = None
+            ts._values = entity_vals[:, :, np.newaxis].astype(np.float32, copy=False)
+            ts._attrs = {
+                STATIC_COV_TAG: pd.DataFrame(
+                    [[float(entity_arr[e_idx])]],
+                    index=_static_row_idx,
+                    columns=_static_col_idx,
+                ),
+                **_shared_attrs,
+            }
+            series_list.append(ts)
+
+        # Split into targets and past_cov.
+        if n_targ == 0:
+            return [], series_list if n_feat > 0 else None
+        if n_feat == 0:
+            return series_list, None
+        # Split: features are first n_feat columns, targets are the rest.
+        # For the split, we need to know if cyclic encoders were added.
+        n_feat_with_cyclic = n_feat + (cyclic_block.shape[1] if cyclic_block is not None else 0)
+        # Use component-name selection (Darts __getitem__ with list works).
+        feat_comp_names = feature_columns_ext[:n_feat_with_cyclic]
+        targ_comp_names = feature_columns_ext[n_feat_with_cyclic:]
+        targets_ts = [ts[list(targ_comp_names)] for ts in series_list]
+        past_cov_ts = [ts[list(feat_comp_names)].astype(np.float32) for ts in series_list]
+        return targets_ts, past_cov_ts
+
+    def _transform_feature_arr_numpy(
+        self, feature_arr: np.ndarray, feature_names: list[str]
+    ) -> np.ndarray:
+        """Apply the feature scaler transform directly on a numpy array."""
+        from views_r2darts2.transformers.inverse import (
+            extract_fitted_sklearn_scaler,
+        )
+        from darts.dataprocessing import Pipeline
+        from darts.dataprocessing.transformers import Scaler
+
+        if isinstance(self._feature_scaler, Pipeline):
+            # Pipeline path: build a dummy TimeSeries and transform.
+            from darts import TimeSeries
+            import pandas as pd
+            dummy_ts = TimeSeries.from_values(
+                feature_arr.astype(np.float32), columns=feature_names,
+            )
+            transformed = self._feature_scaler.transform([dummy_ts])[0]
+            return transformed.all_values(copy=False)[:, :, 0].astype(np.float32)
+
+        # FeatureScalerManager path: per-group transform.
+        if hasattr(self._feature_scaler, "_scalers"):
+            result = feature_arr.copy()
+            components = list(feature_names)
+            for scaler_key, scaler in self._feature_scaler._scalers.items():
+                group_features = self._feature_scaler._scaler_to_features.get(scaler_key, [])
+                indices = [i for i, c in enumerate(components) if c in group_features]
+                if not indices:
+                    continue
+                subset = result[:, indices]
+                if isinstance(scaler, Pipeline):
+                    from darts import TimeSeries
+                    dummy_ts = TimeSeries.from_values(
+                        subset.astype(np.float32),
+                        columns=[components[i] for i in indices],
+                    )
+                    transformed = scaler.transform([dummy_ts])[0]
+                    result[:, indices] = transformed.all_values(copy=False)[:, :, 0]
+                else:
+                    sk = extract_fitted_sklearn_scaler(scaler)
+                    if sk is not None:
+                        result[:, indices] = sk.transform(
+                            subset.astype(np.float64)
+                        ).astype(np.float32)
+                    elif hasattr(scaler, "transformer"):
+                        tf_func = getattr(scaler.transformer, "func", None)
+                        if tf_func is not None:
+                            result[:, indices] = tf_func(
+                                subset.astype(np.float64)
+                            ).astype(np.float32)
+            return result
+
+        # Single Darts Scaler path.
+        sk = extract_fitted_sklearn_scaler(self._feature_scaler)
+        if sk is not None:
+            return sk.transform(feature_arr.astype(np.float64)).astype(np.float32)
+        # Fallback: stateless transform.
+        if hasattr(self._feature_scaler, "transformer"):
+            tf_func = getattr(self._feature_scaler.transformer, "func", None)
+            if tf_func is not None:
+                return tf_func(feature_arr.astype(np.float64)).astype(np.float32)
+        return feature_arr
 
     @property
     def scalers_fitted(self) -> bool:
@@ -1189,11 +1583,21 @@ class ViewsDataset:
         entity_ids: Any = None,
         use_cyclic_encoders: bool = False,
     ) -> tuple[list, list | None]:
-        """Return scaled Darts TimeSeries for the model.
+        """Return scaled Darts TimeSeries for the model (numpy-direct).
 
-        Delegates to :meth:`to_darts_timeseries` for the raw series, then
-        applies log transforms + scaler transforms. Requires
-        :meth:`fit_scalers` to have been called.
+        Like :meth:`fit_scalers`, this method bypasses the per-entity Darts
+        TimeSeries construction for the transform step. It:
+
+            1. Extracts the target/feature numpy arrays from xarray.
+            2. Applies ``log1p`` and scaler transforms in numpy (vectorized
+               across all entities at once — no per-entity Python loop for
+               the transform itself).
+            3. Constructs Darts TimeSeries from the pre-transformed numpy
+               (single loop, minimal overhead per entity).
+
+        This is the fast path for ``model.fit()`` and ``model.predict()`` —
+        the only TimeSeries construction happens here, and the scaler
+        transform is a single numpy call instead of 259k per-entity calls.
 
         Args:
             time_ids: Optional time-id filter.
@@ -1201,28 +1605,54 @@ class ViewsDataset:
             use_cyclic_encoders: Append sin/cos cyclic time encoders.
 
         Returns:
-            ``(targets, past_covariates)`` tuple. ``past_covariates`` is
-            ``None`` when the dataset has no features.
+            ``(targets, past_covariates)`` tuple.
         """
         if not self.scalers_fitted:
             raise RuntimeError("Scalers not fitted. Call fit_scalers first.")
-        series_list = self.to_darts_timeseries(
-            time_ids=time_ids, entity_ids=entity_ids,
+
+        # Extract numpy arrays (single compute from xarray).
+        target_names = list(self.targets)
+        feature_names = list(self.features)
+        target_arr, feature_arr, time_arr, entity_arr = self._extract_numpy_2d(
+            target_names=target_names,
+            feature_names=feature_names,
+            time_ids=time_ids,
+            entity_ids=entity_ids,
+        )
+
+        # Apply log transforms (elementwise numpy).
+        if self._log_targets and target_arr is not None:
+            target_arr = np.log1p(np.maximum(target_arr, 0)).astype(np.float32)
+        if self._log_features and feature_arr is not None:
+            for idx, name in enumerate(feature_names):
+                if name in self._log_features:
+                    feature_arr[:, idx] = np.log1p(
+                        np.maximum(feature_arr[:, idx], 0)
+                    )
+
+        # Apply scaler transforms (numpy-direct, vectorized).
+        if target_arr is not None and self._target_scaler is not None:
+            sk = extract_fitted_sklearn_scaler(self._target_scaler)
+            if sk is not None:
+                target_arr = sk.transform(target_arr.astype(np.float64)).astype(np.float32)
+            elif hasattr(self._target_scaler, "transformer"):
+                tf_func = getattr(self._target_scaler.transformer, "func", None)
+                if tf_func is not None:
+                    target_arr = tf_func(target_arr.astype(np.float64)).astype(np.float32)
+
+        if feature_arr is not None and self._feature_scaler is not None:
+            feature_arr = self._transform_feature_arr_numpy(feature_arr, feature_names)
+
+        # Build Darts TimeSeries from the pre-transformed numpy.
+        return self._build_scaled_timeseries_from_numpy(
+            target_arr=target_arr,
+            feature_arr=feature_arr,
+            target_names=target_names,
+            feature_names=feature_names,
+            time_arr=time_arr,
+            entity_arr=entity_arr,
             use_cyclic_encoders=use_cyclic_encoders,
         )
-        targets, past_cov = self._split_targets_covariates(series_list)
-        targets = self._apply_log_to_targets(targets)
-        if past_cov is not None:
-            past_cov = self._apply_log_to_features(past_cov)
-        if self._target_scaler is not None:
-            targets = self._target_scaler.transform(targets)
-        if self._feature_scaler is not None and past_cov is not None:
-            past_cov = self._feature_scaler.transform(past_cov)
-        # Downcast to float32.
-        targets = [ts.astype(np.float32) for ts in targets]
-        if past_cov is not None:
-            past_cov = [pc.astype(np.float32) for pc in past_cov]
-        return targets, past_cov
 
     def ingest_darts_predictions(
         self,

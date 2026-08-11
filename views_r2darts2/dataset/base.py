@@ -1417,7 +1417,15 @@ class ViewsDataset:
         )
         shared_comps = pd.Index(list(feature_columns_ext))
 
-        for e_idx, entity_id_value in enumerate(entity_arr):
+        from tqdm import tqdm
+
+        for e_idx, entity_id_value in tqdm(
+            enumerate(entity_arr),
+            total=len(entity_arr),
+            desc="Building TimeSeries",
+            unit="entity",
+            leave=False,
+        ):
             if S == 1:
                 vals = all_vals[e_idx]  # (T, F) contiguous view
             else:

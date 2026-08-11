@@ -1142,11 +1142,13 @@ class ViewsDataset:
         """Split a list of Darts TimeSeries into (targets, past_covariates)."""
         if not self.targets:
             return [], None
+        if not self.features:
+            # All columns are targets — skip the column-selection __getitem__
+            # call (259k __init__ invocations for large entity counts).
+            return series_list, None
         targets = [ts[self.targets] for ts in series_list]
-        if self.features:
-            past_cov = [ts[self.features].astype(np.float32) for ts in series_list]
-            return targets, past_cov
-        return targets, None
+        past_cov = [ts[self.features].astype(np.float32) for ts in series_list]
+        return targets, past_cov
 
     def _apply_log_to_targets(self, series_list: list) -> list:
         """Apply log1p to target series (clip negatives first)."""
@@ -1411,7 +1413,7 @@ class ViewsDataset:
 
         # Shared objects — created once, referenced by all entities.
         shared_time_index = pd.RangeIndex(
-            start=int(time_arr[0]), stop=int(time_arr[-1]) + 2, step=1
+            start=int(time_arr[0]), stop=int(time_arr[-1]) + 1, step=1
         )
         shared_components = pd.Index(list(feature_columns_ext))
         _static_row_idx = pd.Index([DEFAULT_GLOBAL_STATIC_COV_NAME])

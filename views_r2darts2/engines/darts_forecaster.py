@@ -163,22 +163,20 @@ class DartsForecaster:
         forecasting-mode carve (when the test partition is too short for a
         validation window, carves val from the train end).
         """
-        # Fit scalers on the training partition (no leakage).
-        self.dataset.fit_scalers(
+        # Fit scalers and return the already-transformed training series in one
+        # pass — avoids a second full zarr load for the same time range.
+        train_time_ids = list(range(self._train_start, self._train_end + 1))
+        target_series, past_covariates = self.dataset.fit_scalers(
             target_scaler=self._target_scaler_cfg,
             feature_scaler=self._feature_scaler_cfg,
             feature_scaler_map=self._feature_scaler_map_cfg,
             log_targets=self._log_targets,
             log_features=self._log_features,
-            time_ids=list(range(self._train_start, self._train_end + 1)),
-        )
-        self.scaler_fitted = True
-
-        # Get scaled training series.
-        target_series, past_covariates = self.dataset.get_scaled_darts_timeseries(
-            time_ids=list(range(self._train_start, self._train_end + 1)),
+            time_ids=train_time_ids,
+            return_series=True,
             use_cyclic_encoders=self._use_cyclic_encoders,
         )
+        self.scaler_fitted = True
 
         # Validation set: test partition (or carved from train end for
         # forecasting mode).

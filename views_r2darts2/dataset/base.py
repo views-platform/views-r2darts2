@@ -1051,12 +1051,10 @@ class ViewsDataset:
         log_targets: bool = False,
         log_features: list[str] | None = None,
         time_ids: Any = None,
-    ) -> None:
+        return_series: bool = False,
+        use_cyclic_encoders: bool = False,
+    ):
         """Fit scalers on the current dataset's data.
-
-        The scalers are stored on the dataset instance
-        (``self._target_scaler``, ``self._feature_scaler``) and used by
-        :meth:`get_scaled_darts_timeseries` and :meth:`ingest_darts_predictions`.
 
         Args:
             target_scaler: Scaler name for targets (e.g. ``"AsinhTransform"``).
@@ -1070,6 +1068,9 @@ class ViewsDataset:
             log_features: Feature names to apply ``log1p`` to.
             time_ids: Optional time-id filter — only fit on the selected
                 time steps (prevents test-period leakage).
+            return_series: When ``True``, return the fitted+transformed
+                ``(targets_ts, past_cov_ts)`` so callers avoid a second zarr
+                load for the same time range.
         """
         from views_r2darts2.transformers.feature_scaler_manager import (
             FeatureScalerManager,
@@ -1107,19 +1108,28 @@ class ViewsDataset:
             ) if feature_scaler is not None else None
 
         # Build Darts TimeSeries from the training partition, fit the scalers.
-        series_list = self.to_darts_timeseries(time_ids=time_ids)
+        series_list = self.to_darts_timeseries(
+            time_ids=time_ids, use_cyclic_encoders=use_cyclic_encoders
+        )
         targets_ts, past_cov_ts = self._split_targets_covariates(series_list)
         targets_ts = self._apply_log_to_targets(targets_ts)
         if past_cov_ts is not None:
             past_cov_ts = self._apply_log_to_features(past_cov_ts)
 
         if self._target_scaler is not None:
-            self._target_scaler.fit_transform(targets_ts)
+            targets_ts = self._target_scaler.fit_transform(targets_ts)
         if self._feature_scaler is not None:
-            self._feature_scaler.fit_transform(past_cov_ts)
+            past_cov_ts = self._feature_scaler.fit_transform(past_cov_ts)
         self._scalers_fitted = True
         logger.info("Scalers fitted: target=%r, feature=%r",
                      target_scaler, feature_scaler or feature_scaler_map)
+        if return_series:
+            # Downcast to float32 — matches what get_scaled_darts_timeseries does.
+            targets_ts = [ts.astype(np.float32) for ts in targets_ts]
+            if past_cov_ts is not None:
+                past_cov_ts = [pc.astype(np.float32) for pc in past_cov_ts]
+            return targets_ts, past_cov_ts
+        return None
 
     @property
     def scalers_fitted(self) -> bool:

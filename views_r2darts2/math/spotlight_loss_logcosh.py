@@ -92,7 +92,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
         density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
         level_cell = self._log_cosh(gap * density_scale)
-        level_cell = self._log_cosh(gap)
+        # level_cell = self._log_cosh(gap)
 
         # Batch-level: weight by signal strength, gated by has_gated
         event_frac = event_mask.mean().clamp_min(self._EPS)

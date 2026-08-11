@@ -39,7 +39,7 @@ from darts.dataprocessing import Pipeline
 from darts.dataprocessing.transformers import Scaler
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
 
-from views_frames import PredictionFrame
+from views_frames import PredictionFrame, SpatioTemporalIndex
 
 from views_r2darts2.data.views_dataset import ViewsDatasetDarts
 from views_r2darts2.infrastructure.device import get_device as _get_device
@@ -663,10 +663,63 @@ class DartsForecaster:
 
     # ------------------------------------------------------------------ predict
 
+    @staticmethod
+    def _merge_prediction_chunks(
+        chunks: list[dict[str, PredictionFrame]],
+    ) -> dict[str, PredictionFrame]:
+        """Concatenate per-chunk PredictionFrames into one frame per target."""
+        targets = list(chunks[0].keys())
+        merged: dict[str, PredictionFrame] = {}
+        for tgt in targets:
+            tgt_chunks = [c[tgt] for c in chunks]
+            values = np.concatenate([f.values for f in tgt_chunks], axis=0)
+            time_arr = np.concatenate([f.index.time for f in tgt_chunks])
+            unit_arr = np.concatenate([f.index.unit for f in tgt_chunks])
+            index = SpatioTemporalIndex(
+                time=time_arr, unit=unit_arr, level=tgt_chunks[0].index.level
+            )
+            merged[tgt] = PredictionFrame(values, index=index, metadata=tgt_chunks[0].metadata)
+        return merged
+
+    def _predict_chunk(
+        self,
+        ts_chunk: list[TimeSeries],
+        pc_chunk: list[TimeSeries] | None,
+        output_length: int,
+        predict_kwargs: dict[str, Any],
+    ) -> dict[str, PredictionFrame]:
+        """Run model inference + inverse transforms on a single entity chunk."""
+        timeseries_pred = self.model.predict(
+            n=output_length,
+            series=ts_chunk,
+            past_covariates=pc_chunk,
+            verbose=True,
+            **predict_kwargs,
+        )
+        ReproducibilityGate.Data.audit_numerical_sanity(
+            timeseries_pred, name="Model Predictions"
+        )
+        if self.target_scaler:
+            timeseries_pred = self._inverse_transform_target_scaler(timeseries_pred)
+        timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
+        ReproducibilityGate.Data.audit_numerical_sanity(
+            timeseries_pred, name="Inverse-Transformed Predictions"
+        )
+        chunk_preds = prediction_frames_from_darts(
+            predictions=timeseries_pred,
+            entity_id_name=self.dataset.entity_id,
+            target_columns=self.dataset.targets,
+            level=self.dataset.level,
+            clip_negatives=True,
+        )
+        del timeseries_pred
+        return chunk_preds
+
     def predict(
         self,
         sequence_number: int,
         output_length: int = 36,
+        entity_chunk_size: int | None = None,
         **predict_kwargs: Any,
     ) -> dict[str, PredictionFrame]:
         """Generate forecasts and return them as a per-target dict of frames.
@@ -743,43 +796,65 @@ class DartsForecaster:
                     self.device,
                 )
 
-        # Generate forecasts.
-        try:
-            timeseries_pred = self.model.predict(
-                n=output_length,
-                series=target_series,
-                past_covariates=past_covariates,
-                verbose=True,
-                **predict_kwargs,
+        # Generate forecasts — chunked to cap peak TimeSeries object count.
+        n_entities = len(target_series)
+        if entity_chunk_size is not None and n_entities > entity_chunk_size:
+            logger.info(
+                "Chunked prediction: %d entities in chunks of %d (%d chunks).",
+                n_entities,
+                entity_chunk_size,
+                -(-n_entities // entity_chunk_size),
             )
-        except Exception as exc:
-            logger.error("Error during prediction: %s", exc)
-            raise
+            chunk_frames: list[dict[str, PredictionFrame]] = []
+            for chunk_start in range(0, n_entities, entity_chunk_size):
+                chunk_end = min(chunk_start + entity_chunk_size, n_entities)
+                logger.info(
+                    "Predicting entity chunk %d–%d / %d",
+                    chunk_start + 1, chunk_end, n_entities,
+                )
+                pc_chunk = (
+                    past_covariates[chunk_start:chunk_end]
+                    if past_covariates is not None
+                    else None
+                )
+                chunk_frames.append(
+                    self._predict_chunk(
+                        ts_chunk=target_series[chunk_start:chunk_end],
+                        pc_chunk=pc_chunk,
+                        output_length=output_length,
+                        predict_kwargs=predict_kwargs,
+                    )
+                )
+            predictions = self._merge_prediction_chunks(chunk_frames)
+        else:
+            try:
+                timeseries_pred = self.model.predict(
+                    n=output_length,
+                    series=target_series,
+                    past_covariates=past_covariates,
+                    verbose=True,
+                    **predict_kwargs,
+                )
+            except Exception as exc:
+                logger.error("Error during prediction: %s", exc)
+                raise
 
-        # Audit model output for numerical sanity BEFORE inverse-transform.
-        ReproducibilityGate.Data.audit_numerical_sanity(
-            timeseries_pred, name="Model Predictions"
-        )
-
-        # Sample-preserving inverse transform.
-        if self.target_scaler:
-            timeseries_pred = self._inverse_transform_target_scaler(timeseries_pred)
-        timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
-
-        # Audit again after inverse-transform.
-        ReproducibilityGate.Data.audit_numerical_sanity(
-            timeseries_pred, name="Inverse-Transformed Predictions"
-        )
-
-        # Convert Darts predictions → {target: PredictionFrame}. Negative
-        # predictions are clipped to 0 inside the bridge (physical floor).
-        predictions = prediction_frames_from_darts(
-            predictions=timeseries_pred,
-            entity_id_name=self.dataset.entity_id,
-            target_columns=self.dataset.targets,
-            level=self.dataset.level,
-            clip_negatives=True,
-        )
+            ReproducibilityGate.Data.audit_numerical_sanity(
+                timeseries_pred, name="Model Predictions"
+            )
+            if self.target_scaler:
+                timeseries_pred = self._inverse_transform_target_scaler(timeseries_pred)
+            timeseries_pred = self._inverse_log_on_predictions(timeseries_pred)
+            ReproducibilityGate.Data.audit_numerical_sanity(
+                timeseries_pred, name="Inverse-Transformed Predictions"
+            )
+            predictions = prediction_frames_from_darts(
+                predictions=timeseries_pred,
+                entity_id_name=self.dataset.entity_id,
+                target_columns=self.dataset.targets,
+                level=self.dataset.level,
+                clip_negatives=True,
+            )
 
         # Final NaN guard on the frame values (one of the per-target frames
         # might have picked up a NaN that the per-series audit missed).

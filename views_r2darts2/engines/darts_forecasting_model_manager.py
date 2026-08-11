@@ -503,6 +503,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
         predict_kwargs = self._get_predict_kwargs(active_config)
         prediction_format = self._get_prediction_format()
+        entity_chunk_size = active_config.get("prediction_entity_chunk_size", 200000)
 
         def predict_sequence(sequence_number: int):
             """Predict a single rolling-origin sequence."""
@@ -512,7 +513,10 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
                 total_sequence_number,
             )
             result = forecaster.predict(
-                sequence_number, time_steps, **predict_kwargs
+                sequence_number,
+                time_steps,
+                entity_chunk_size=entity_chunk_size,
+                **predict_kwargs,
             )
             logger.info(
                 "Completed prediction for sequence %d/%d",

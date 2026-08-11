@@ -486,7 +486,8 @@ def _patched_tide_module_forward(
     by set_mc_dropout(True) automatically, same as all other MCDropout modules.
     No manual _mc_dropout_enabled detection is needed.
     """
-    x, x_future_covariates, x_static_covariates = x_in
+    # Darts passes (x_past, x_future, x_static[, future_target, ...]); discard extras.
+    x, x_future_covariates, x_static_covariates, *_ = x_in
 
     x_lookback = x[:, :, : self.output_dim]
 

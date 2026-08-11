@@ -1394,40 +1394,62 @@ class ViewsDataset:
                     appended_cyclic.append(enc_fn(time_arr).astype(np.float32))
                     feature_columns_ext.append(enc_fn.__name__)
 
-        series_list = []
-        for e_idx, entity_id_value in enumerate(entity_arr):
-            # (T, S, F) → (T, F) for single-sample, or (T, F, S) for multi.
-            entity_values = values_4d[:, e_idx, :, :]  # (T, S, F)
-            # Squeeze sample axis if S==1, Darts wants (T, F) for deterministic.
-            if entity_values.shape[1] == 1:
-                entity_values_2d = entity_values[:, 0, :]  # (T, F)
-            else:
-                # Probabilistic — Darts wants (T, F, S).
-                entity_values_2d = entity_values.transpose(0, 2, 1)  # (T, F, S)
+        # Build all TimeSeries via from_group_dataframe — replaces the Python
+        # for-loop with a pandas groupby (C-level) + joblib-parallel construction.
+        # Falls back to the entity loop only for probabilistic (S>1) series.
+        import os
+        import pandas as pd
+        from darts import TimeSeries as _TS
 
-            # Append cyclic encoder columns.
+        T_len = len(time_arr)
+        E_len = len(entity_arr)
+        S = values_4d.shape[2]
+
+        if S == 1:
+            # (T, E, 1, F) → entity-major 2D array (E*T, F)
+            vals_flat = values_4d[:, :, 0, :].transpose(1, 0, 2).reshape(E_len * T_len, -1)
+
             if appended_cyclic:
-                cyclic_block = np.stack(
-                    [c[: entity_values_2d.shape[0]] for c in appended_cyclic],
-                    axis=-1 if entity_values_2d.ndim == 2 else 1,
+                # tile time-only cyclic arrays across all entities
+                cyclic_flat = np.tile(
+                    np.stack(appended_cyclic, axis=1),  # (T, n_enc)
+                    (E_len, 1),
                 )
-                if entity_values_2d.ndim == 2:
-                    entity_values_2d = np.concatenate(
-                        [entity_values_2d, cyclic_block], axis=1
-                    )
-                else:
-                    entity_values_2d = np.concatenate(
-                        [entity_values_2d, cyclic_block], axis=1
-                    )
+                vals_flat = np.concatenate([vals_flat, cyclic_flat], axis=1)
 
-            ts = build_entity_timeseries(
-                time=time_arr,
-                values=entity_values_2d.astype(np.float32),
-                columns=feature_columns_ext,
-                entity_id_name=self._entity_id,
-                entity_id_value=int(entity_id_value),
+            df = pd.DataFrame(vals_flat.astype(np.float32), columns=feature_columns_ext)
+            df[self._time_id] = np.tile(time_arr, E_len).astype(np.int64)
+            df[self._entity_id] = np.repeat(entity_arr, T_len).astype(np.int64)
+            del vals_flat  # free before joblib workers copy the df
+
+            n_jobs = min(max((os.cpu_count() or 1) // 2, 1), 8)
+            series_list = _TS.from_group_dataframe(
+                df,
+                group_cols=[self._entity_id],
+                time_col=self._time_id,
+                value_cols=feature_columns_ext,
+                freq=1,
+                n_jobs=n_jobs,
+                verbose=False,
             )
-            series_list.append(ts)
+        else:
+            # Probabilistic path — keep the entity loop
+            series_list = []
+            for e_idx, entity_id_value in enumerate(entity_arr):
+                entity_values = values_4d[:, e_idx, :, :]  # (T, S, F)
+                entity_values_2d = entity_values.transpose(0, 2, 1)  # (T, F, S)
+                if appended_cyclic:
+                    cyclic_block = np.stack(
+                        [c[: entity_values_2d.shape[0]] for c in appended_cyclic], axis=1
+                    )
+                    entity_values_2d = np.concatenate([entity_values_2d, cyclic_block], axis=1)
+                series_list.append(build_entity_timeseries(
+                    time=time_arr,
+                    values=entity_values_2d.astype(np.float32),
+                    columns=feature_columns_ext,
+                    entity_id_name=self._entity_id,
+                    entity_id_value=int(entity_id_value),
+                ))
         return series_list
 
 

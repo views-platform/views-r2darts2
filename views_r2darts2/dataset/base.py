@@ -1355,7 +1355,9 @@ class ViewsDataset:
             missing = np.setdiff1d(requested, available_times)
             if len(missing) > 0:
                 n_entities = int(tensor[self._entity_id].shape[0]) if self._entity_id in tensor.dims else "?"
-                logger.warning(
+                # Single tail gap in the training window (e.g. current month not yet ingested) is expected.
+                log_fn = logger.debug if len(missing) == 1 else logger.warning
+                log_fn(
                     "to_darts_timeseries: %d/%d requested time_ids absent from dataset "
                     "and zero-filled for all %s entities. Missing: %s",
                     len(missing), len(requested), n_entities, missing.tolist(),

@@ -133,6 +133,8 @@ class ModelCatalog:
         """
         Returns a dictionary of common PyTorch Lightning Trainer keyword arguments.
         """
+        target_scaler = self.config.get("target_scaler")
+        non_zero_threshold = self.config.get("non_zero_threshold", 0.88)
         # Fortress standard callbacks
         callbacks = [
             TrainingStepPatchCallback(),  # MUST be first: patches training_step to expose predictions
@@ -143,8 +145,8 @@ class ModelCatalog:
             PredictionSanityCallback(),
             LossStabilityCallback(),
             EpochTimingCallback(),
-            YHatBarCallback(),
-            ValMetricsCallback(),
+            YHatBarCallback(target_scaler=target_scaler, non_zero_threshold=non_zero_threshold),
+            ValMetricsCallback(target_scaler=target_scaler),
             InputBatchMonitorCallback(),
             LossComponentCallback(),
             # LossGradientDiagnosticsCallback(),

@@ -163,20 +163,22 @@ class DartsForecaster:
         forecasting-mode carve (when the test partition is too short for a
         validation window, carves val from the train end).
         """
-        # Fit scalers and return the already-transformed training series in one
-        # pass — avoids a second full zarr load for the same time range.
-        train_time_ids = list(range(self._train_start, self._train_end + 1))
-        target_series, past_covariates = self.dataset.fit_scalers(
+        # Fit scalers on the training partition (no leakage).
+        self.dataset.fit_scalers(
             target_scaler=self._target_scaler_cfg,
             feature_scaler=self._feature_scaler_cfg,
             feature_scaler_map=self._feature_scaler_map_cfg,
             log_targets=self._log_targets,
             log_features=self._log_features,
-            time_ids=train_time_ids,
-            return_series=True,
-            use_cyclic_encoders=self._use_cyclic_encoders,
+            time_ids=list(range(self._train_start, self._train_end + 1)),
         )
         self.scaler_fitted = True
+
+        # Get scaled training series.
+        target_series, past_covariates = self.dataset.get_scaled_darts_timeseries(
+            time_ids=list(range(self._train_start, self._train_end + 1)),
+            use_cyclic_encoders=self._use_cyclic_encoders,
+        )
 
         # Validation set: test partition (or carved from train end for
         # forecasting mode).
@@ -211,23 +213,7 @@ class DartsForecaster:
         icl = self.model.input_chunk_length
         ocl = self.model.output_chunk_length
         val_start = self._test_start - icl
-
-        # For forecasting runs the entire test window is future data not yet in
-        # the dataset. Cap val_end at train_end so the val window stays in
-        # available data; the length will fall below icl+ocl, triggering the
-        # carved-from-train fallback below.
-        max_dataset_time = int(
-            self.dataset._ds[self.dataset._time_id].values.max()
-        )
-        if self._test_start > max_dataset_time:
-            val_end = self._train_end
-            logger.info(
-                "Forecasting mode: test_start=%d > max_dataset_time=%d; "
-                "validation will be carved from train end.",
-                self._test_start, max_dataset_time,
-            )
-        else:
-            val_end = self._test_end
+        val_end = self._test_end
 
         val_targets, val_past_cov = self.dataset.get_scaled_darts_timeseries(
             time_ids=list(range(val_start, val_end + 1)),
@@ -244,9 +230,7 @@ class DartsForecaster:
                 "Forecasting mode: val too short (%d < %d). Carving [%d, %d].",
                 max_val_len, min_val_len, carved_start, self._train_end,
             )
-            # Refit scalers on trimmed train to prevent holdout months from
-            # influencing scaler parameters. Save+restore so predict() uses
-            # the full-window scaler that was used to scale the training series.
+            # Refit scalers on trimmed train (no holdout leakage).
             trimmed_end = self._train_end - ocl
             self.dataset.fit_scalers(
                 target_scaler=self._target_scaler_cfg,
@@ -259,15 +243,6 @@ class DartsForecaster:
             val_targets, val_past_cov = self.dataset.get_scaled_darts_timeseries(
                 time_ids=list(range(carved_start, self._train_end + 1)),
                 use_cyclic_encoders=self._use_cyclic_encoders,
-            )
-            # Restore the full-window scaler so inference is consistent with training.
-            self.dataset.fit_scalers(
-                target_scaler=self._target_scaler_cfg,
-                feature_scaler=self._feature_scaler_cfg,
-                feature_scaler_map=self._feature_scaler_map_cfg,
-                log_targets=self._log_targets,
-                log_features=self._log_features,
-                time_ids=list(range(self._train_start, self._train_end + 1)),
             )
 
         return val_targets, val_past_cov

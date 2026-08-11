@@ -178,7 +178,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         path_raw = self._model_path.data_raw
         run_type = active_config["run_type"]
         parquet_path = Path(path_raw) / f"{run_type}_viewser_df.parquet"
-        targets = list(active_config.get("targets") or [])
+        targets = list(active_config.get("targets") or active_config.get("regression_targets") or [])
         level = active_config.get("level", "cm")
         ds = ViewsDataset(parquet_path, targets=targets, broadcast_features=True)
         logger.info("Dataset loaded: %s (%s)", ds, level)
@@ -374,7 +374,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
                 sniffer = CorePredictionSniffer(level=active_config["level"])
                 for i, df in enumerate(df_predictions):
-                    sniffer.sniff_predictions(df, targets=active_config["targets"])
+                    sniffer.sniff_predictions(df, targets=active_config.get("targets") or active_config.get("regression_targets"))
 
                 if self._has_evaluation_metrics():
                     self._evaluate_prediction_dataframe(df_predictions, self._eval_type)

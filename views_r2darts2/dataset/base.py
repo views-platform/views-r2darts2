@@ -1357,8 +1357,8 @@ class ViewsDataset:
         computed = tensor.compute()
         time_arr = computed[self._time_id].values.astype("int64")
         entity_arr = computed[self._entity_id].values.astype("int64")
-        # Shape: (T, E, S, F) → need per-entity (T, F) slices.
-        values_4d = computed.values  # (T, E, S, F)
+        # NaN = structural sparsity (entity absent for those time steps) → treat as 0.
+        values_4d = np.nan_to_num(computed.values, nan=0.0)  # (T, E, S, F)
 
         # Cyclic encoders.
         feature_columns_ext = list(value_columns)

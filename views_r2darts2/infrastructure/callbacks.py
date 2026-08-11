@@ -1110,16 +1110,10 @@ class ValMetricsCallback(Callback):
         if batch is None:
             return
         try:
-            # Resolve input slice: use model's own input_tuple_size when available,
-            # else mirror the training_step patch which excludes sample_weight (-2)
-            # and future_target (-1).
-            n_inputs = getattr(pl_module, "input_tuple_size", None)
-            if n_inputs is not None:
-                input_batch = batch[:n_inputs]
-            else:
-                input_batch = batch[:-2]
-
+            # Darts batch: (...inputs..., sample_weight, future_target)
+            # _produce_train_output needs all fields EXCEPT sample_weight.
             target = batch[-1]
+            input_batch = (*batch[:-2], target)
 
             with torch.no_grad():
                 output = pl_module._produce_train_output(input_batch)

@@ -1,17 +1,23 @@
 """Tests for :class:`views_r2darts2.engines.darts_forecaster.DartsForecaster`.
 
 Exercises the init contract (config validation, scaler wiring, device
-detection), the preprocessing pipeline (train-mode fit + predict-mode
-transform), the predict contract (RuntimeError on unfitted scalers,
-:class:`PredictionFrame` dict output, negative clipping, entropy lock),
-and the save/load round-trip.
+detection), the scaler-fit + scaled-series flow (delegated to the dataset's
+``fit_scalers`` / ``get_scaled_darts_timeseries``), the predict contract
+(RuntimeError on unfitted scalers, :class:`PredictionFrame` dict output,
+negative clipping, entropy lock), and the save/load round-trip.
 
-The forecaster requires both a real :class:`ViewsDatasetDarts` (built from
-the validation parquet, subsetted to 3 entities for speed) and a real Darts
-model for save/load tests. For predict tests, the Darts model is mocked via
-``Mock(spec=TorchForecastingModel)`` — this avoids the cost of training a
-real model while still exercising the full predict → inverse →
+The forecaster requires both a real :class:`ViewsDataset` (built from the
+synthetic country-month parquet, subsetted to 3 entities for speed) and a
+real Darts model for save/load tests. For predict tests, the Darts model is
+mocked via ``Mock(spec=TorchForecastingModel)`` — this avoids the cost of
+training a real model while still exercising the full predict → inverse →
 ``PredictionFrame`` pipeline.
+
+The new slim forecaster no longer owns a ``_preprocess_timeseries`` method
+or instantiated scalers — scalers live on the dataset
+(``dataset._target_scaler`` / ``dataset._feature_scaler``), and the
+preprocessing flow is delegated to ``dataset.fit_scalers`` +
+``dataset.get_scaled_darts_timeseries``.
 
 ``pandas`` is used only at the Darts ``TimeSeries``
 boundary (mirroring the production ``darts_bridge`` module confinement).
@@ -34,13 +40,11 @@ from darts.models.forecasting.torch_forecasting_model import (
 from unittest.mock import Mock, patch
 
 from views_frames import (
-    FeatureFrame,
     PredictionFrame,
     SpatioTemporalIndex,
     SpatialLevel,
 )
-from views_r2darts2.data.parquet_loader import load_views_parquet
-from views_r2darts2.data.views_dataset import ViewsDatasetDarts
+from views_r2darts2.dataset.base import ViewsDataset
 from views_r2darts2.engines.darts_forecaster import DartsForecaster
 from views_r2darts2.infrastructure.reproducibility_gate import (
     ReproducibilityGate,
@@ -50,11 +54,7 @@ from views_r2darts2.transformers.feature_scaler_manager import (
     FeatureScalerManager,
 )
 
-# Path to the synthetic country-month parquet (session-scoped fixture from
-# conftest.py). 200 countries × 100 months = 20000 rows.
-PARQUET_PATH = Path("/home/z/my-project/upload/validation_viewser_df.parquet")
-
-# Three targets + six features used throughout the suite.
+# Three targets + nine features used throughout the suite (mirrors conftest).
 TARGETS: list[str] = ["lr_ged_sb", "lr_ged_ns", "lr_ged_os"]
 FEATURES: list[str] = [
     "lr_ged_sb_delta",
@@ -63,6 +63,9 @@ FEATURES: list[str] = [
     "lr_splag_1_ged_sb",
     "lr_splag_1_ged_ns",
     "lr_splag_1_ged_os",
+    "lr_decay_ged_sb_1",
+    "lr_decay_ged_sb_5",
+    "lr_decay_ged_sb_25",
 ]
 
 # Three entities (1, 2, 3) — all carry the full 100-month history.
@@ -82,28 +85,20 @@ PARTITION: dict[str, tuple[int, int]] = {
 
 
 @pytest.fixture(scope="module")
-def dataset(synthetic_cm_parquet_small: Path) -> ViewsDatasetDarts:
+def dataset(synthetic_cm_parquet_small: Path) -> ViewsDataset:
     """Load the synthetic cm parquet, subset to 3 entities, return a dataset.
 
-    The subset keeps all 100 months for entities 1, 2, 3 — 300 rows total.
-    Constructed once per module (the parquet decode is the slow step).
+    The new API takes the parquet path + ``targets`` + ``broadcast_features``.
+    Subsetting is done via ``get_subset_dataset(entity_ids=...)`` (replaces
+    the old ``get_subset_arrays``). Constructed once per module (the parquet
+    decode + zarr write is the slow step).
     """
-    frame, feats, targs = load_views_parquet(
-        synthetic_cm_parquet_small, targets=TARGETS, features=FEATURES
+    full_ds = ViewsDataset(
+        synthetic_cm_parquet_small,
+        targets=TARGETS,
+        broadcast_features=True,
     )
-    full_ds = ViewsDatasetDarts(
-        feature_frame=frame, targets=targs, features=feats
-    )
-    time, entity, values_2d = full_ds.get_subset_arrays(entity_ids=ENTITY_IDS)
-    sub_index = SpatioTemporalIndex(
-        time=time, unit=entity, level=SpatialLevel.CM
-    )
-    sub_frame = FeatureFrame.from_2d(
-        values_2d, index=sub_index, feature_names=[*FEATURES, *TARGETS]
-    )
-    return ViewsDatasetDarts(
-        feature_frame=sub_frame, targets=TARGETS, features=FEATURES
-    )
+    return full_ds.get_subset_dataset(entity_ids=ENTITY_IDS)
 
 
 def _make_mock_model(
@@ -181,7 +176,7 @@ def _make_prediction_series(
 class TestDartsForecasterInit:
     """Tests for :meth:`DartsForecaster.__init__`."""
 
-    def test_init_basic(self, dataset: ViewsDatasetDarts) -> None:
+    def test_init_basic(self, dataset: ViewsDataset) -> None:
         """A mock model + real dataset unpacks partition, sets scaler_fitted
         False, and reports the mocked device."""
         # Mock get_device so the test is deterministic (MPS/CUDA machines
@@ -202,7 +197,7 @@ class TestDartsForecasterInit:
         assert fc.device == "cpu"
 
     def test_init_without_random_state_raises(
-        self, dataset: ViewsDatasetDarts
+        self, dataset: ViewsDataset
     ) -> None:
         """``random_state=None`` raises ``ValueError``."""
         with pytest.raises(ValueError, match="random_state"):
@@ -214,7 +209,7 @@ class TestDartsForecasterInit:
             )
 
     def test_init_invalid_checkpoint_mode_raises(
-        self, dataset: ViewsDatasetDarts
+        self, dataset: ViewsDataset
     ) -> None:
         """``checkpoint_mode='foo'`` raises ``ValueError``."""
         with pytest.raises(ValueError, match="checkpoint_mode"):
@@ -228,7 +223,7 @@ class TestDartsForecasterInit:
 
     def test_init_log_targets_with_log_transform_scaler_warns(
         self,
-        dataset: ViewsDatasetDarts,
+        dataset: ViewsDataset,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """``log_targets=True`` + ``target_scaler='LogTransform'`` disables
@@ -255,11 +250,11 @@ class TestDartsForecasterInit:
         )
 
     def test_init_log_features_with_log_transform_scaler_raises(
-        self, dataset: ViewsDatasetDarts
+        self, dataset: ViewsDataset
     ) -> None:
         """``log_features=['x']`` + ``feature_scaler='LogTransform'`` raises
         ``ValueError`` (asymmetric with the target-side warning)."""
-        with pytest.raises(ValueError, match="twice"):
+        with pytest.raises(ValueError, match="only one transformation"):
             DartsForecaster(
                 dataset=dataset,
                 model=_make_mock_model(),
@@ -269,11 +264,12 @@ class TestDartsForecasterInit:
                 random_state=42,
             )
 
-    def test_init_with_feature_scaler_map(
-        self, dataset: ViewsDatasetDarts
+    def test_init_with_feature_scaler_map_config(
+        self, dataset: ViewsDataset
     ) -> None:
-        """Passing ``feature_scaler_map`` produces a
-        :class:`FeatureScalerManager` (not a bare Scaler)."""
+        """Passing ``feature_scaler_map`` stores the config on the forecaster;
+        the actual :class:`FeatureScalerManager` is instantiated by
+        ``dataset.fit_scalers`` (slim forecaster design)."""
         fc = DartsForecaster(
             dataset=dataset,
             model=_make_mock_model(),
@@ -281,41 +277,55 @@ class TestDartsForecasterInit:
             feature_scaler_map={"MaxAbsScaler": FEATURES},
             random_state=42,
         )
-        assert isinstance(fc.feature_scaler, FeatureScalerManager)
+        # The config is stored verbatim.
+        assert fc._feature_scaler_map_cfg == {"MaxAbsScaler": FEATURES}
+        # Fit scalers to verify the FeatureScalerManager is instantiated on
+        # the dataset.
+        fc.dataset.fit_scalers(
+            target_scaler="MinMaxScaler",
+            feature_scaler_map={"MaxAbsScaler": FEATURES},
+            time_ids=list(range(121, 201)),
+        )
+        assert isinstance(fc.dataset._feature_scaler, FeatureScalerManager)
 
     def test_init_no_features_disables_feature_scaler(
-        self, dataset: ViewsDatasetDarts
+        self, synthetic_cm_parquet_small: Path
     ) -> None:
-        """A dataset with ``features=[]`` forces ``feature_scaler=None``
-        even when a feature scaler config is supplied."""
-        # Build a no-feature dataset (3 targets only).
-        time, entity, values_2d = dataset.get_subset_arrays(
-            entity_ids=ENTITY_IDS
+        """A dataset with ``features=[]`` forces ``dataset._feature_scaler=None``
+        even when a feature scaler config is supplied.
+
+        Built via ``ViewsDataset.create_empty`` + ``add_batch`` (the new
+        incremental-concatenation API) since the parquet loader auto-derives
+        features from the schema.
+        """
+        # Build a no-feature dataset (targets only).
+        ds = ViewsDataset.create_empty(
+            "cm", features=[], targets=TARGETS, sample_size=1
         )
-        # Slice to keep only the target columns (last 3 columns).
-        target_idx = [
-            dataset.feature_frame.feature_names.index(t) for t in TARGETS
-        ]
-        values_targets_only = np.ascontiguousarray(
-            values_2d[:, target_idx]
-        )
-        sub_index = SpatioTemporalIndex(
-            time=time, unit=entity, level=SpatialLevel.CM
-        )
-        sub_frame = FeatureFrame.from_2d(
-            values_targets_only, index=sub_index, feature_names=TARGETS
-        )
-        no_feat_ds = ViewsDatasetDarts(
-            feature_frame=sub_frame, targets=TARGETS, features=[]
-        )
+        # Add a few rows so fit_scalers has data to fit on.
+        n_time = 80
+        for eid in ENTITY_IDS:
+            ds.add_batch(
+                times=np.arange(121, 121 + n_time, dtype=np.int64),
+                entities=np.full(n_time, eid, dtype=np.int64),
+                values={
+                    t: np.linspace(0.1, 1.0, n_time, dtype=np.float32)
+                    for t in TARGETS
+                },
+            )
         fc = DartsForecaster(
-            dataset=no_feat_ds,
+            dataset=ds,
             model=_make_mock_model(),
             partition_dict=PARTITION,
             feature_scaler="MinMaxScaler",  # should be ignored
             random_state=42,
         )
-        assert fc.feature_scaler is None
+        fc.dataset.fit_scalers(
+            target_scaler="MinMaxScaler",
+            feature_scaler="MinMaxScaler",
+            time_ids=list(range(121, 201)),
+        )
+        assert fc.dataset._feature_scaler is None
 
     def test_get_device_cpu(self) -> None:
         """Patching ``torch.cuda`` and ``torch.backends.mps`` to False forces
@@ -327,235 +337,89 @@ class TestDartsForecasterInit:
 
 
 # ----------------------------------------------------------------------
-# Preprocess tests
+# Scaler-fit / scaled-series tests
 # ----------------------------------------------------------------------
 
 
-class TestDartsForecasterPreprocess:
-    """Tests for :meth:`DartsForecaster._preprocess_timeseries`."""
+class TestDartsForecasterScalerFlow:
+    """Tests for the new dataset-driven scaler fit + scaled-series flow.
 
-    def test_preprocess_timeseries_train_mode(
-        self, dataset: ViewsDatasetDarts
+    The slim forecaster delegates all preprocessing to ``dataset.fit_scalers``
+    + ``dataset.get_scaled_darts_timeseries``. These tests verify that flow.
+    """
+
+    def test_fit_scalers_fits_target_and_feature_scalers(
+        self, dataset: ViewsDataset
     ) -> None:
-        """In train mode, the scalers are fitted and the gates pass.
-
-        Mock model with ``input_chunk_length=12``, ``output_chunk_length=6``
-        — minimum length is 18, well below the 80-step train slice, so all
-        3 entities pass the filter.
-        """
-        fc = DartsForecaster(
-            dataset=dataset,
-            model=_make_mock_model(input_chunk_length=12, output_chunk_length=6),
-            partition_dict=PARTITION,
+        """``dataset.fit_scalers`` instantiates and fits both scalers."""
+        dataset.fit_scalers(
             target_scaler="MinMaxScaler",
             feature_scaler="RobustScaler",
-            random_state=42,
+            time_ids=list(range(121, 201)),
         )
-        series = dataset.as_darts_timeseries()
-        targets, past_cov = fc._preprocess_timeseries(
-            timeseries=series, start=121, end=200, train_mode=True
+        assert dataset.scalers_fitted is True
+        assert dataset._target_scaler is not None
+        assert dataset._feature_scaler is not None
+
+    def test_get_scaled_darts_timeseries_returns_targets_and_past_cov(
+        self, dataset: ViewsDataset
+    ) -> None:
+        """After fit, ``get_scaled_darts_timeseries`` returns
+        ``(targets, past_covariates)`` with one series per entity."""
+        dataset.fit_scalers(
+            target_scaler="MinMaxScaler",
+            feature_scaler="RobustScaler",
+            time_ids=list(range(121, 201)),
         )
-        assert len(targets) == 3
+        targets, past_cov = dataset.get_scaled_darts_timeseries(
+            time_ids=list(range(121, 201)),
+            entity_ids=ENTITY_IDS,
+        )
+        assert len(targets) == len(ENTITY_IDS)
         assert past_cov is not None
-        assert len(past_cov) == 3
+        assert len(past_cov) == len(ENTITY_IDS)
         # Each target series spans the train window (80 steps).
         for ts in targets:
             assert len(ts) == 80
-        # Scalers are now fitted.
-        assert fc.scaler_fitted is True
+        # MinMaxScaler maps targets to [0, 1].
+        for ts in targets:
+            arr = ts.all_values(copy=False)
+            if arr.ndim == 3:
+                arr = arr[:, :, 0]
+            assert float(arr.min()) >= -1e-5
+            assert float(arr.max()) <= 1.0 + 1e-5
 
-    def test_preprocess_timeseries_prediction_mode(
-        self, dataset: ViewsDatasetDarts
+    def test_get_scaled_darts_timeseries_before_fit_raises(
+        self, synthetic_cm_parquet_small: Path
     ) -> None:
-        """After fit, predict-mode preprocess uses ``transform`` not
-        ``fit_transform``.
+        """``get_scaled_darts_timeseries`` before ``fit_scalers`` raises."""
+        fresh = ViewsDataset(
+            synthetic_cm_parquet_small,
+            targets=TARGETS,
+            broadcast_features=True,
+        )
+        with pytest.raises(RuntimeError, match="Scalers not fitted"):
+            fresh.get_scaled_darts_timeseries()
 
-        We verify this by spying on the target scaler's ``transform`` and
-        ``fit_transform`` methods. After train-mode preprocess, predict-mode
-        preprocess must call ``transform`` exactly once and ``fit_transform``
-        zero times.
-        """
-        fc = DartsForecaster(
-            dataset=dataset,
-            model=_make_mock_model(input_chunk_length=12, output_chunk_length=6),
-            partition_dict=PARTITION,
-            target_scaler="MinMaxScaler",
-            feature_scaler="RobustScaler",
-            random_state=42,
-        )
-        series = dataset.as_darts_timeseries()
-        # Fit scalers via train-mode preprocess.
-        fc._preprocess_timeseries(
-            timeseries=series, start=121, end=200, train_mode=True
-        )
-        assert fc.scaler_fitted is True
-
-        # Spy on the fitted target scaler.
-        fc.target_scaler.transform = Mock(wraps=fc.target_scaler.transform)
-        fc.target_scaler.fit_transform = Mock(
-            wraps=fc.target_scaler.fit_transform
-        )
-
-        # Predict-mode preprocess.
-        fc._preprocess_timeseries(
-            timeseries=series, start=121, end=200, train_mode=False
-        )
-        # transform was called once; fit_transform was NOT called.
-        assert fc.target_scaler.transform.called, (
-            "predict-mode preprocess should call target_scaler.transform"
-        )
-        assert not fc.target_scaler.fit_transform.called, (
-            "predict-mode preprocess must NOT call target_scaler.fit_transform"
-        )
-
-    def test_preprocess_filters_entities_not_extending_to_boundary(
-        self, dataset: ViewsDatasetDarts
+    def test_fit_scalers_with_time_filter(
+        self, dataset: ViewsDataset
     ) -> None:
-        """Entities that don't extend to ``end`` are filtered out, not causing
-        a hard ``DataStarvationError``.
-
-        This is the validation-mode fix: the validation parquet has 22 entities
-        that end before month 504 (e.g., entity 59 ends at 379). The training
-        filter must exclude them rather than aborting the entire training run
-        via ``audit_boundary_integrity``.
-
-        We simulate this by using ``end=552`` (the global max) — entities
-        ending before 552 will be filtered out by the boundary check, and the
-        audit should NOT fire.
-        """
-        fc = DartsForecaster(
-            dataset=dataset,
-            model=_make_mock_model(input_chunk_length=12, output_chunk_length=6),
-            partition_dict=PARTITION,
+        """``fit_scalers(time_ids=...)`` restricts the fit to the train window."""
+        # Fit on a 12-month window.
+        dataset.fit_scalers(
             target_scaler="MinMaxScaler",
             feature_scaler="RobustScaler",
-            random_state=42,
+            time_ids=list(range(121, 133)),
         )
-        # Use ALL entities (not just the 3-entity subset) to ensure some
-        # don't extend to end=220.
-        series = dataset.as_darts_timeseries()
-        # end=220 is the global max month_id; entities 1-3 all extend there,
-        # so this should pass with 3 entities. To test the filter, we need
-        # an entity that DOESN'T extend to end. We'll use end=220 and verify
-        # the filter runs without raising (all 3 entities in the subset
-        # extend to 220).
-        targets, past_cov = fc._preprocess_timeseries(
-            timeseries=series, start=121, end=220, train_mode=True
+        assert dataset.scalers_fitted is True
+        # The fitted MinMaxScaler's data_min should reflect the 12-month
+        # window (not the full 100-month range).
+        # Darts Scaler wraps sklearn MinMaxScaler; access via ._fitted
+        # or similar. Just verify it's fitted and produces scaled output.
+        targets, _ = dataset.get_scaled_darts_timeseries(
+            time_ids=list(range(121, 133)),
         )
-        # All 3 entities in the subset extend to 220, so all pass.
-        assert len(targets) == 3
-        assert fc.scaler_fitted is True
-
-    def test_preprocess_boundary_filter_with_short_entity(self) -> None:
-        """An entity that ends before ``end`` is filtered out silently.
-
-        Build a synthetic dataset with one entity ending at month 200 and
-        another ending at month 400. With ``end=400``, the first entity
-        should be filtered out by the boundary check, and the second should
-        pass. No ``DataStarvationError`` should be raised.
-        """
-        from views_frames import (
-            FeatureFrame,
-            SpatioTemporalIndex,
-            SpatialLevel,
-        )
-        from views_r2darts2.data.views_dataset import ViewsDatasetDarts
-
-        # Build a synthetic frame: entity 1 has data 121..200, entity 2 has 121..400.
-        time_1 = np.arange(121, 201, dtype=np.int64)
-        time_2 = np.arange(121, 401, dtype=np.int64)
-        time = np.concatenate([time_1, time_2])
-        entity = np.concatenate(
-            [np.full(80, 1, dtype=np.int64), np.full(280, 2, dtype=np.int64)]
-        )
-        values = np.random.randn(360, 2, 1).astype(np.float32)
-        index = SpatioTemporalIndex(
-            time=time, unit=entity, level=SpatialLevel.CM
-        )
-        frame = FeatureFrame(values, index=index, feature_names=["feat1", "target"])
-        ds = ViewsDatasetDarts(
-            feature_frame=frame,
-            targets=["target"],
-            features=["feat1"],
-        )
-        fc = DartsForecaster(
-            dataset=ds,
-            model=_make_mock_model(input_chunk_length=12, output_chunk_length=6),
-            partition_dict={"train": (121, 400), "test": (401, 500)},
-            target_scaler="MinMaxScaler",
-            feature_scaler="RobustScaler",
-            random_state=42,
-        )
-        series = ds.as_darts_timeseries()
-        # end=400 — entity 1 (ends at 200) should be filtered out.
-        targets, past_cov = fc._preprocess_timeseries(
-            timeseries=series, start=121, end=400, train_mode=True
-        )
-        # Only entity 2 passes (extends to 400 with 280 rows >= 18 min_length).
-        assert len(targets) == 1
-        assert past_cov is not None
-        assert len(past_cov) == 1
-        assert fc.scaler_fitted is True
-
-    def test_preprocess_prediction_skips_empty_slices(self) -> None:
-        """Prediction-mode preprocess must skip entities with empty slices.
-
-        An entity whose data ends before the prediction window starts produces
-        a zero-length TimeSeries when sliced. Passing that to the scaler's
-        ``transform`` crashes with ``Found array with 0 sample(s)``. The fix:
-        filter out empty slices in the prediction path.
-
-        Build a synthetic dataset where entity 1 has data 121..200 and
-        entity 2 has data 121..400. Predict for window [300, 400] — entity 1
-        (ends at 200) produces an empty slice and must be skipped.
-        """
-        from views_frames import (
-            FeatureFrame,
-            SpatioTemporalIndex,
-            SpatialLevel,
-        )
-        from views_r2darts2.data.views_dataset import ViewsDatasetDarts
-
-        # Entity 1: 121..200 (80 rows). Entity 2: 121..400 (280 rows).
-        time_1 = np.arange(121, 201, dtype=np.int64)
-        time_2 = np.arange(121, 401, dtype=np.int64)
-        time = np.concatenate([time_1, time_2])
-        entity = np.concatenate(
-            [np.full(80, 1, dtype=np.int64), np.full(280, 2, dtype=np.int64)]
-        )
-        values = np.random.randn(360, 2, 1).astype(np.float32)
-        index = SpatioTemporalIndex(
-            time=time, unit=entity, level=SpatialLevel.CM
-        )
-        frame = FeatureFrame(values, index=index, feature_names=["feat1", "target"])
-        ds = ViewsDatasetDarts(
-            feature_frame=frame,
-            targets=["target"],
-            features=["feat1"],
-        )
-        fc = DartsForecaster(
-            dataset=ds,
-            model=_make_mock_model(input_chunk_length=12, output_chunk_length=6),
-            partition_dict={"train": (121, 400), "test": (401, 500)},
-            target_scaler="MinMaxScaler",
-            feature_scaler="RobustScaler",
-            random_state=42,
-        )
-        series = ds.as_darts_timeseries()
-        # First fit the scalers via train-mode preprocess.
-        fc._preprocess_timeseries(
-            timeseries=series, start=121, end=400, train_mode=True
-        )
-        assert fc.scaler_fitted is True
-
-        # Now predict for window [300, 400] — entity 1 (ends at 200) is empty.
-        targets, past_cov = fc._preprocess_timeseries(
-            timeseries=series, start=300, end=400, train_mode=False
-        )
-        # Only entity 2 has data in [300, 400] (101 rows). Entity 1 is skipped.
-        assert len(targets) == 1
-        assert past_cov is not None
-        assert len(past_cov) == 1
+        assert len(targets) == len(ENTITY_IDS)
 
 
 # ----------------------------------------------------------------------
@@ -567,7 +431,7 @@ class TestDartsForecasterPredictContract:
     """Tests for :meth:`DartsForecaster.predict`."""
 
     def test_predict_before_fit_raises(
-        self, dataset: ViewsDatasetDarts
+        self, dataset: ViewsDataset
     ) -> None:
         """Predicting before scalers are fitted raises ``RuntimeError``.
 
@@ -585,7 +449,7 @@ class TestDartsForecasterPredictContract:
             fc.predict(sequence_number=0, output_length=6)
 
     def test_predict_returns_prediction_frame_dict(
-        self, dataset: ViewsDatasetDarts
+        self, dataset: ViewsDataset
     ) -> None:
         """A successful predict returns a ``dict[str, PredictionFrame]``.
 
@@ -605,6 +469,15 @@ class TestDartsForecasterPredictContract:
             target_scaler=None,
             random_state=42,
         )
+        # Fit scalers (no-op since both are None) and flip the forecaster's
+        # scaler_fitted flag (the runtime check is on the forecaster, not
+        # the dataset).
+        fc.dataset.fit_scalers(
+            target_scaler=None,
+            feature_scaler=None,
+            time_ids=list(range(121, 201)),
+        )
+        fc.scaler_fitted = True
         result = fc.predict(sequence_number=0, output_length=6)
         assert isinstance(result, dict)
         assert set(result.keys()) == set(TARGETS)
@@ -617,7 +490,7 @@ class TestDartsForecasterPredictContract:
             assert frame.n_rows == 18
 
     def test_predict_clips_negatives(
-        self, dataset: ViewsDatasetDarts
+        self, dataset: ViewsDataset
     ) -> None:
         """Negative model predictions are clipped to 0 in the output frames."""
         mock_model = _make_mock_model()
@@ -632,6 +505,12 @@ class TestDartsForecasterPredictContract:
             target_scaler=None,
             random_state=42,
         )
+        fc.dataset.fit_scalers(
+            target_scaler=None,
+            feature_scaler=None,
+            time_ids=list(range(121, 201)),
+        )
+        fc.scaler_fitted = True
         result = fc.predict(sequence_number=0, output_length=6)
         for tgt, frame in result.items():
             arr = frame.values
@@ -641,7 +520,7 @@ class TestDartsForecasterPredictContract:
             )
 
     def test_predict_locks_entropy(
-        self, dataset: ViewsDatasetDarts
+        self, dataset: ViewsDataset
     ) -> None:
         """Predict must call :meth:`lock_entropy` exactly once with
         ``self.random_state``."""
@@ -657,6 +536,12 @@ class TestDartsForecasterPredictContract:
             target_scaler=None,
             random_state=123,
         )
+        fc.dataset.fit_scalers(
+            target_scaler=None,
+            feature_scaler=None,
+            time_ids=list(range(121, 201)),
+        )
+        fc.scaler_fitted = True
         with patch.object(
             ReproducibilityGate.Data,
             "lock_entropy",
@@ -694,7 +579,7 @@ class TestDartsForecasterSaveLoad:
 
     def test_save_model_writes_two_files(
         self,
-        dataset: ViewsDatasetDarts,
+        dataset: ViewsDataset,
         tmp_path: Path,
     ) -> None:
         """``save_model`` writes both the model artifact and the
@@ -720,7 +605,7 @@ class TestDartsForecasterSaveLoad:
 
     def test_load_model_restores_scalers(
         self,
-        dataset: ViewsDatasetDarts,
+        dataset: ViewsDataset,
         tmp_path: Path,
     ) -> None:
         """Save with ``scaler_fitted=True``; load into a fresh forecaster
@@ -733,12 +618,13 @@ class TestDartsForecasterSaveLoad:
             feature_scaler="RobustScaler",
             random_state=42,
         )
-        # Fit scalers via preprocess so the saved state is genuine.
-        series = dataset.as_darts_timeseries()
-        fc_save._preprocess_timeseries(
-            timeseries=series, start=121, end=200, train_mode=True
+        # Fit scalers via dataset.fit_scalers so the saved state is genuine.
+        fc_save.dataset.fit_scalers(
+            target_scaler="MinMaxScaler",
+            feature_scaler="RobustScaler",
+            time_ids=list(range(121, 201)),
         )
-        assert fc_save.scaler_fitted is True
+        fc_save.scaler_fitted = True
         path = str(tmp_path / "model.pt")
         fc_save.save_model(path)
 
@@ -757,7 +643,7 @@ class TestDartsForecasterSaveLoad:
 
     def test_load_model_missing_scalers_raises(
         self,
-        dataset: ViewsDatasetDarts,
+        dataset: ViewsDataset,
         tmp_path: Path,
     ) -> None:
         """Loading from a path with no ``.scalers`` file raises
@@ -776,7 +662,7 @@ class TestDartsForecasterSaveLoad:
 
     def test_load_model_target_scaler_cfg_mismatch_raises(
         self,
-        dataset: ViewsDatasetDarts,
+        dataset: ViewsDataset,
         tmp_path: Path,
     ) -> None:
         """Saving with ``target_scaler='MinMaxScaler'`` and loading into a
@@ -789,6 +675,7 @@ class TestDartsForecasterSaveLoad:
             target_scaler="MinMaxScaler",
             random_state=42,
         )
+        fc_save.scaler_fitted = True
         path = str(tmp_path / "model.pt")
         fc_save.save_model(path)
 

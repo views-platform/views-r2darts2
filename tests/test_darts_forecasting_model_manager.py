@@ -57,7 +57,9 @@ class TestResolveTotalSequenceNumber:
         Must fail loudly.
         """
         partition = {"test": (100, 110)}  # test_len = 11
-        with pytest.raises(ValueError, match="test partition length"):
+        # The new error message is "Test partition length (11) < max_steps (12).";
+        # match case-insensitively to stay robust to capitalisation changes.
+        with pytest.raises(ValueError, match="(?i)test partition length"):
             DartsForecastingModelManager._resolve_total_sequence_number(
                 partition, max_steps=12
             )
@@ -375,8 +377,13 @@ class TestPredictionFormat:
         result = mgr._format_forecast_predictions(preds)
         assert result is preds  # identity — no conversion
 
-    def test_dataframe_mode_missing_level_raises(self) -> None:
-        """Dataframe mode requires config['level'] for entity-id resolution."""
+    def test_dataframe_mode_without_level_uses_default_entity_id(self) -> None:
+        """Dataframe mode no longer requires config['level']; the new slim
+        manager falls back to ``config.get('entity_id', 'country_id')`` for
+        entity-id resolution. This replaces the legacy ``config['level']``
+        validation, which has been removed.
+        """
+        import pandas as pd
         from views_frames import (
             PredictionFrame,
             SpatioTemporalIndex,
@@ -384,36 +391,14 @@ class TestPredictionFormat:
         )
         import numpy as np
 
+        # No 'level' key — should NOT raise.
         mgr = self._make_manager({"prediction_format": "dataframe"})
         time = np.array([100], dtype=np.int64)
         entity = np.array([1], dtype=np.int64)
         index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
         frame = PredictionFrame(np.array([[0.5]], dtype=np.float32), index=index)
 
-        with pytest.raises(ValueError, match=r"config\['level'\]"):
-            mgr._format_forecast_predictions({"lr_ged_sb": frame})
-
-    def test_materialize_prediction_frames_to_memmap(self, tmp_path) -> None:
-        """PredictionFrame mode persists to disk and reloads as memmap-backed arrays."""
-        from views_frames import (
-            PredictionFrame,
-            SpatioTemporalIndex,
-            SpatialLevel,
-        )
-        import numpy as np
-
-        time = np.array([100, 101], dtype=np.int64)
-        entity = np.array([1, 1], dtype=np.int64)
-        index = SpatioTemporalIndex(time=time, unit=entity, level=SpatialLevel.CM)
-        frame = PredictionFrame(np.array([[0.5], [1.5]], dtype=np.float32), index=index)
-
-        memmap_preds = DartsForecastingModelManager._materialize_prediction_frames_to_memmap(
-            {"lr_ged_sb": frame},
-            tmp_path,
-            sequence_number=0,
-        )
-
-        assert "lr_ged_sb" in memmap_preds
-        loaded = memmap_preds["lr_ged_sb"]
-        assert isinstance(loaded.values, np.memmap)
-        assert np.array_equal(loaded.values, frame.values)
+        result = mgr._format_forecast_predictions({"lr_ged_sb": frame})
+        assert isinstance(result, pd.DataFrame)
+        # The default entity_id column is ``country_id``.
+        assert "country_id" in result.index.names

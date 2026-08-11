@@ -61,7 +61,7 @@ class _PatchedTrainingStep:
         pl_module.last_predictions = preds
         pl_module.last_targets = target.detach()
 
-        return loss
+        return {"loss": loss, "preds": preds}
 
 
 class TrainingStepPatchCallback(Callback):

@@ -213,7 +213,23 @@ class DartsForecaster:
         icl = self.model.input_chunk_length
         ocl = self.model.output_chunk_length
         val_start = self._test_start - icl
-        val_end = self._test_end
+
+        # For forecasting runs the entire test window is future data not yet in
+        # the dataset. Cap val_end at train_end so the val window stays in
+        # available data; the length will fall below icl+ocl, triggering the
+        # carved-from-train fallback below.
+        max_dataset_time = int(
+            self.dataset._ds[self.dataset._time_id].values.max()
+        )
+        if self._test_start > max_dataset_time:
+            val_end = self._train_end
+            logger.info(
+                "Forecasting mode: test_start=%d > max_dataset_time=%d; "
+                "validation will be carved from train end.",
+                self._test_start, max_dataset_time,
+            )
+        else:
+            val_end = self._test_end
 
         val_targets, val_past_cov = self.dataset.get_scaled_darts_timeseries(
             time_ids=list(range(val_start, val_end + 1)),

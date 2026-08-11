@@ -91,7 +91,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
         n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
         density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
-        level_cell = self._log_cosh(gap * density_scale)
+        # density_scale as loss weight, not input normaliser — avoids tanh saturation at small gaps
+        level_cell = density_scale * self._log_cosh(gap)
         # level_cell = self._log_cosh(gap)
 
         # Batch-level: weight by signal strength, gated by has_gated
@@ -113,9 +114,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         anchor_cell = self._log_cosh(dead_sum)
 
         if multivariate:
-            loss_anchor = T * (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_anchor = (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_anchor = T * (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_anchor = (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

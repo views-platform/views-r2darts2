@@ -1347,9 +1347,20 @@ class ViewsDataset:
             tensor = self._stack_variables(value_columns)
         finally:
             self.broadcast_features = old_broadcast
-        # Apply time/entity filters.
+        # Apply time/entity filters — reindex to fill missing time steps with 0
+        # rather than raising KeyError. Missing time IDs mean no events recorded.
         if time_ids is not None:
-            tensor = tensor.sel({self._time_id: _as_list(time_ids)})
+            available_times = tensor[self._time_id].values
+            requested = np.array(_as_list(time_ids), dtype=available_times.dtype)
+            missing = np.setdiff1d(requested, available_times)
+            if len(missing) > 0:
+                n_entities = int(tensor[self._entity_id].shape[0]) if self._entity_id in tensor.dims else "?"
+                logger.warning(
+                    "to_darts_timeseries: %d/%d requested time_ids absent from dataset "
+                    "and zero-filled for all %s entities. Missing: %s",
+                    len(missing), len(requested), n_entities, missing.tolist(),
+                )
+            tensor = tensor.reindex({self._time_id: requested.tolist()}, fill_value=0.0)
         if entity_ids is not None:
             tensor = tensor.sel({self._entity_id: _as_list(entity_ids)})
 

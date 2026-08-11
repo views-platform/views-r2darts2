@@ -37,10 +37,10 @@ class _PatchedTrainingStep:
 
     def __call__(self, train_batch, batch_idx):
         pl_module = self.pl_module
-        # Darts convention: batch[-1] = future target, batch[-2] = sample weights
-        output = pl_module._produce_train_output(train_batch[:-2])
+        # Darts batch: (...inputs..., sample_weight, future_target); skip sample_weight for _produce_train_output.
         sample_weight = train_batch[-2]
         target = train_batch[-1]
+        output = pl_module._produce_train_output((*train_batch[:-2], target))
         loss = pl_module._compute_loss(
             output, target, pl_module.train_criterion, sample_weight
         )

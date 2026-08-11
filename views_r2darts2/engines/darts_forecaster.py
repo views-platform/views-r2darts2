@@ -244,7 +244,9 @@ class DartsForecaster:
                 "Forecasting mode: val too short (%d < %d). Carving [%d, %d].",
                 max_val_len, min_val_len, carved_start, self._train_end,
             )
-            # Refit scalers on trimmed train (no holdout leakage).
+            # Refit scalers on trimmed train to prevent holdout months from
+            # influencing scaler parameters. Save+restore so predict() uses
+            # the full-window scaler that was used to scale the training series.
             trimmed_end = self._train_end - ocl
             self.dataset.fit_scalers(
                 target_scaler=self._target_scaler_cfg,
@@ -257,6 +259,15 @@ class DartsForecaster:
             val_targets, val_past_cov = self.dataset.get_scaled_darts_timeseries(
                 time_ids=list(range(carved_start, self._train_end + 1)),
                 use_cyclic_encoders=self._use_cyclic_encoders,
+            )
+            # Restore the full-window scaler so inference is consistent with training.
+            self.dataset.fit_scalers(
+                target_scaler=self._target_scaler_cfg,
+                feature_scaler=self._feature_scaler_cfg,
+                feature_scaler_map=self._feature_scaler_map_cfg,
+                log_targets=self._log_targets,
+                log_features=self._log_features,
+                time_ids=list(range(self._train_start, self._train_end + 1)),
             )
 
         return val_targets, val_past_cov

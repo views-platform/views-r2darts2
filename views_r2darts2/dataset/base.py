@@ -1051,25 +1051,23 @@ class ViewsDataset:
         log_targets: bool = False,
         log_features: list[str] | None = None,
         time_ids: Any = None,
-    ) -> None:
+        return_series: bool = False,
+        use_cyclic_encoders: bool = False,
+    ):
         """Fit scalers on the current dataset's data.
-
-        The scalers are stored on the dataset instance
-        (``self._target_scaler``, ``self._feature_scaler``) and used by
-        :meth:`get_scaled_darts_timeseries` and :meth:`ingest_darts_predictions`.
 
         Args:
             target_scaler: Scaler name for targets (e.g. ``"AsinhTransform"``).
-                ``None`` means no target scaling.
-            feature_scaler: Scaler name for all features. Ignored when
-                ``feature_scaler_map`` is provided.
-            feature_scaler_map: Per-feature scaler map. See
-                :class:`~views_r2darts2.transformers.feature_scaler_manager.FeatureScalerManager`.
-            log_targets: When ``True``, apply ``log1p`` to targets before
-                scaling.
+            feature_scaler: Scaler name for all features.
+            feature_scaler_map: Per-feature scaler map.
+            log_targets: Apply ``log1p`` to targets before scaling.
             log_features: Feature names to apply ``log1p`` to.
-            time_ids: Optional time-id filter — only fit on the selected
-                time steps (prevents test-period leakage).
+            time_ids: Optional time-id filter (prevents test-period leakage).
+            return_series: When ``True``, return the fitted+transformed
+                ``(targets_ts, past_cov_ts)`` so callers avoid a second data
+                load for the same time range.
+            use_cyclic_encoders: Passed through to :meth:`to_darts_timeseries`
+                when ``return_series=True``.
         """
         from views_r2darts2.transformers.feature_scaler_manager import (
             FeatureScalerManager,
@@ -1107,19 +1105,29 @@ class ViewsDataset:
             ) if feature_scaler is not None else None
 
         # Build Darts TimeSeries from the training partition, fit the scalers.
-        series_list = self.to_darts_timeseries(time_ids=time_ids)
+        series_list = self.to_darts_timeseries(
+            time_ids=time_ids,
+            use_cyclic_encoders=use_cyclic_encoders if return_series else False,
+        )
         targets_ts, past_cov_ts = self._split_targets_covariates(series_list)
         targets_ts = self._apply_log_to_targets(targets_ts)
         if past_cov_ts is not None:
             past_cov_ts = self._apply_log_to_features(past_cov_ts)
 
         if self._target_scaler is not None:
-            self._target_scaler.fit_transform(targets_ts)
+            targets_ts = self._target_scaler.fit_transform(targets_ts)
         if self._feature_scaler is not None:
-            self._feature_scaler.fit_transform(past_cov_ts)
+            past_cov_ts = self._feature_scaler.fit_transform(past_cov_ts)
         self._scalers_fitted = True
         logger.info("Scalers fitted: target=%r, feature=%r",
                      target_scaler, feature_scaler or feature_scaler_map)
+        if return_series:
+            # Downcast to float32 — scalers like AsinhTransform return float64.
+            targets_ts = [ts if ts.dtype == np.float32 else ts.astype(np.float32) for ts in targets_ts]
+            if past_cov_ts is not None:
+                past_cov_ts = [pc if pc.dtype == np.float32 else pc.astype(np.float32) for pc in past_cov_ts]
+            return targets_ts, past_cov_ts
+        return None
 
     @property
     def scalers_fitted(self) -> bool:
@@ -1132,11 +1140,13 @@ class ViewsDataset:
         """Split a list of Darts TimeSeries into (targets, past_covariates)."""
         if not self.targets:
             return [], None
+        if not self.features:
+            # value_columns == targets only; series already contain only target
+            # columns — skip the per-entity __getitem__ call (259k __init__ calls).
+            return series_list, None
         targets = [ts[self.targets] for ts in series_list]
-        if self.features:
-            past_cov = [ts[self.features].astype(np.float32) for ts in series_list]
-            return targets, past_cov
-        return targets, None
+        past_cov = [ts[self.features].astype(np.float32) for ts in series_list]
+        return targets, past_cov
 
     def _apply_log_to_targets(self, series_list: list) -> list:
         """Apply log1p to target series (clip negatives first)."""
@@ -1383,39 +1393,51 @@ class ViewsDataset:
                     feature_columns_ext.append(enc_fn.__name__)
 
         series_list = []
-        for e_idx, entity_id_value in enumerate(entity_arr):
-            # (T, S, F) → (T, F) for single-sample, or (T, F, S) for multi.
-            entity_values = values_4d[:, e_idx, :, :]  # (T, S, F)
-            # Squeeze sample axis if S==1, Darts wants (T, F) for deterministic.
-            if entity_values.shape[1] == 1:
-                entity_values_2d = entity_values[:, 0, :]  # (T, F)
-            else:
-                # Probabilistic — Darts wants (T, F, S).
-                entity_values_2d = entity_values.transpose(0, 2, 1)  # (T, F, S)
+        import pandas as pd
+        from darts import TimeSeries as _TS
 
-            # Append cyclic encoder columns.
+        S = values_4d.shape[2]
+
+        if S == 1:
+            # Entity-major C-contiguous array: arr[e_idx] is a (T, F) view — no per-entity copy.
+            all_vals = np.ascontiguousarray(
+                values_4d[:, :, 0, :].transpose(1, 0, 2), dtype=np.float32
+            )  # (E, T, F)
             if appended_cyclic:
-                cyclic_block = np.stack(
-                    [c[: entity_values_2d.shape[0]] for c in appended_cyclic],
-                    axis=-1 if entity_values_2d.ndim == 2 else 1,
-                )
-                if entity_values_2d.ndim == 2:
-                    entity_values_2d = np.concatenate(
-                        [entity_values_2d, cyclic_block], axis=1
-                    )
-                else:
-                    entity_values_2d = np.concatenate(
-                        [entity_values_2d, cyclic_block], axis=1
-                    )
+                cyc = np.stack(appended_cyclic, axis=1).astype(np.float32)  # (T, n_cyc)
+                cyc_tiled = np.ascontiguousarray(
+                    np.broadcast_to(cyc[np.newaxis], (len(entity_arr), len(time_arr), len(appended_cyclic)))
+                )  # (E, T, n_cyc)
+                all_vals = np.concatenate([all_vals, cyc_tiled], axis=2)  # (E, T, F+n_cyc)
 
-            ts = build_entity_timeseries(
-                time=time_arr,
-                values=entity_values_2d.astype(np.float32),
-                columns=feature_columns_ext,
-                entity_id_name=self._entity_id,
-                entity_id_value=int(entity_id_value),
-            )
-            series_list.append(ts)
+        # Pre-compute objects shared across all entities.
+        # pd.RangeIndex avoids _restore_range_indexed(); copy=False skips deepcopy+values.copy().
+        shared_ri = pd.RangeIndex(
+            start=int(time_arr[0]), stop=int(time_arr[-1]) + 1, step=1
+        )
+        shared_comps = pd.Index(list(feature_columns_ext))
+
+        for e_idx, entity_id_value in enumerate(entity_arr):
+            if S == 1:
+                vals = all_vals[e_idx]  # (T, F) contiguous view
+            else:
+                # Probabilistic path — still uses the loop.
+                ev = values_4d[:, e_idx, :, :]  # (T, S, F)
+                vals = ev.transpose(0, 2, 1).astype(np.float32, copy=False)  # (T, F, S)
+                if appended_cyclic:
+                    cb = np.stack([c[:vals.shape[0]] for c in appended_cyclic], axis=1)
+                    vals = np.concatenate([vals, cb[:, :, np.newaxis]], axis=1)
+
+            series_list.append(_TS(
+                times=shared_ri,
+                values=vals,
+                components=shared_comps,
+                static_covariates=pd.Series(
+                    [np.float32(entity_id_value)],
+                    index=pd.Index([self._entity_id]),
+                ),
+                copy=False,
+            ))
         return series_list
 
 

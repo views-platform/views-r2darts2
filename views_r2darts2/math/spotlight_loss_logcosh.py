@@ -84,14 +84,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # # y_pred_for_gap = event_mask * y_pred + (1.0 - event_mask) * y_pred.detach() # no
         # gap = y_pred_for_gap.mean(dim=1) - y_true.mean(dim=1)
 
-        # n_ev_safe = y_true_mask.sum(dim=1).clamp_min(1.0)
-        # gap = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
-
         n_ev_safe = y_true_mask.sum(dim=1).clamp_min(1.0)
-        gap_event = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
-        gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        has_events = (y_true_mask.sum(dim=1) > 0.5).float()
-        gap = has_events * gap_event + (1.0 - has_events) * gap_global
+        gap = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
 
         # Series-level: amplify gap for sparse-event series
         # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
@@ -107,9 +101,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
 
         if multivariate:
-            loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Dead-cell anchor at Shape scale ─────────────────
         # Pushes dead cells toward 0, eliminating gap contamination source.

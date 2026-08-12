@@ -106,6 +106,25 @@ class ReproducibilityGate:
             "mc_dropout",
         ]
 
+        # Core genome subset that applies to sklearn-based models. These
+        # models (currently only ``MarkovModel``) bypass the torch-specific
+        # genes (loss_function, lr, weight_decay, batch_size, n_epochs,
+        # optimizer_cls, lr_scheduler_cls, early_stopping_*,
+        # gradient_clip_val, num_samples, mc_dropout).
+        SKLEARN_CORE_GENOME: list[str] = [
+            "random_state",
+            "steps",
+            "run_type",
+            "name",
+            "algorithm",
+        ]
+
+        # Algorithm names that are sklearn-based (not torch). The
+        # reproducibility gate uses this set to route sklearn models through
+        # the SKLEARN_CORE_GENOME + their own ALGORITHM_GENOMES entry,
+        # skipping the optimizer / scheduler / loss genome checks entirely.
+        SKLEARN_ALGORITHMS: set[str] = {"MarkovModel"}
+
         NULLABLE_PARAMS: set[str] = {
             "hidden_fc_sizes",
             "pooling_kernel_sizes",
@@ -113,6 +132,13 @@ class ReproducibilityGate:
             "categorical_embedding_sizes",
             "temporal_hidden_size_past",
             "temporal_hidden_size_future",
+            # MarkovModel — nullable list-of-features arguments. When None,
+            # the model uses all available columns.
+            "state_features",
+            "fatalities_features",
+            "rf_class_params",
+            "rf_reg_params",
+            "add_encoders",
         }
 
         ALGORITHM_GENOMES = {
@@ -273,6 +299,25 @@ class ReproducibilityGate:
                 "dropout",
                 "use_reversible_instance_norm",
             ],
+            # ----------------------------------------------------------------
+            # Sklearn-based models — bypass the torch genome entirely.
+            # ----------------------------------------------------------------
+            # MarkovModel does NOT use input_chunk_length, output_chunk_length,
+            # loss_fn, optimizer, scheduler, or pl_trainer_kwargs. Its genome
+            # is the minimal set of hyperparameters it actually consumes.
+            # ``audit_manifest`` routes MarkovModel through
+            # ``SKLEARN_CORE_GENOME`` (instead of ``CORE_GENOME``) and skips
+            # the optimizer / scheduler / loss genome checks entirely.
+            "MarkovModel": [
+                "targets",
+                "markov_target",
+                "markov_method",
+                "regression_method",
+                "markov_threshold",
+                "n_jobs",
+                # state_features and fatalities_features are nullable
+                # (None means "use all columns").
+            ],
         }
 
         # Optimizer-specific genes
@@ -385,18 +430,32 @@ class ReproducibilityGate:
             Genome → Scheduler Genome → Loss Genome → None-values in all
             required keys (excluding :attr:`NULLABLE_PARAMS`).
 
+            Sklearn-based models (defined by :attr:`SKLEARN_ALGORITHMS`) skip
+            the optimizer / scheduler / loss genome checks entirely. They use
+            :attr:`SKLEARN_CORE_GENOME` (a subset of :attr:`CORE_GENOME`)
+            instead of the full :attr:`CORE_GENOME`.
+
             Raises:
                 MissingHyperparameterError: Any mandatory key is absent or
                     ``None`` (and not in :attr:`NULLABLE_PARAMS`).
             """
-            for key in ReproducibilityGate.Config.CORE_GENOME:
+            algorithm = config.get("algorithm")
+            is_sklearn = algorithm in ReproducibilityGate.Config.SKLEARN_ALGORITHMS
+
+            # --- Core genome (sklearn subset for sklearn models).
+            core_genome = (
+                ReproducibilityGate.Config.SKLEARN_CORE_GENOME
+                if is_sklearn
+                else ReproducibilityGate.Config.CORE_GENOME
+            )
+            for key in core_genome:
                 if key not in config:
                     raise MissingHyperparameterError(
                         f"MANDATORY PARAMETER MISSING: '{key}' not in config. "
                         "The manifest must declare every core genome key."
                     )
 
-            algorithm = config.get("algorithm")
+            # --- Algorithm genome.
             algo_genes = ReproducibilityGate.Config.ALGORITHM_GENOMES.get(
                 algorithm, []
             )
@@ -407,36 +466,41 @@ class ReproducibilityGate:
                         f"algorithm '{algorithm}'."
                     )
 
-            optimizer = config.get("optimizer_cls")
-            opt_genes = ReproducibilityGate.Config.OPTIMIZER_GENOMES.get(
-                optimizer, []
-            )
-            for key in opt_genes:
-                if key not in config:
-                    raise MissingHyperparameterError(
-                        f"MANDATORY OPTIMIZER GENE MISSING: '{key}' for "
-                        f"optimizer '{optimizer}'."
-                    )
+            # --- Sklearn models stop here — no optimizer / scheduler / loss.
+            opt_genes: list[str] = []
+            sched_genes: list[str] = []
+            loss_genes: list[str] = []
+            if not is_sklearn:
+                optimizer = config.get("optimizer_cls")
+                opt_genes = ReproducibilityGate.Config.OPTIMIZER_GENOMES.get(
+                    optimizer, []
+                )
+                for key in opt_genes:
+                    if key not in config:
+                        raise MissingHyperparameterError(
+                            f"MANDATORY OPTIMIZER GENE MISSING: '{key}' for "
+                            f"optimizer '{optimizer}'."
+                        )
 
-            scheduler = config.get("lr_scheduler_cls")
-            sched_genes = ReproducibilityGate.Config.SCHEDULER_GENOMES.get(
-                scheduler, []
-            )
-            for key in sched_genes:
-                if key not in config:
-                    raise MissingHyperparameterError(
-                        f"MANDATORY SCHEDULER GENE MISSING: '{key}' for "
-                        f"scheduler '{scheduler}'."
-                    )
+                scheduler = config.get("lr_scheduler_cls")
+                sched_genes = ReproducibilityGate.Config.SCHEDULER_GENOMES.get(
+                    scheduler, []
+                )
+                for key in sched_genes:
+                    if key not in config:
+                        raise MissingHyperparameterError(
+                            f"MANDATORY SCHEDULER GENE MISSING: '{key}' for "
+                            f"scheduler '{scheduler}'."
+                        )
 
-            loss = config.get("loss_function")
-            loss_genes = ReproducibilityGate.Config.LOSS_GENOMES.get(loss, [])
-            for key in loss_genes:
-                if key not in config:
-                    raise MissingHyperparameterError(
-                        f"MANDATORY LOSS GENE MISSING: '{key}' for "
-                        f"loss '{loss}'."
-                    )
+                loss = config.get("loss_function")
+                loss_genes = ReproducibilityGate.Config.LOSS_GENOMES.get(loss, [])
+                for key in loss_genes:
+                    if key not in config:
+                        raise MissingHyperparameterError(
+                            f"MANDATORY LOSS GENE MISSING: '{key}' for "
+                            f"loss '{loss}'."
+                        )
 
             # Final pass: no None values in any required key (excluding nullable).
             nullable = ReproducibilityGate.Config.NULLABLE_PARAMS
@@ -444,7 +508,7 @@ class ReproducibilityGate:
                 if value is None and key not in nullable:
                     # Only raise for keys we know are mandatory. Other keys
                     # may legitimately be None.
-                    in_core = key in ReproducibilityGate.Config.CORE_GENOME
+                    in_core = key in core_genome
                     in_algo = key in algo_genes
                     in_opt = key in opt_genes
                     in_sched = key in sched_genes
@@ -458,6 +522,10 @@ class ReproducibilityGate:
         def audit_architecture(config: Mapping[str, Any]) -> None:
             """Ensure ``len(steps) % output_chunk_length == 0``.
 
+            Sklearn-based models (defined by :attr:`SKLEARN_ALGORITHMS`) skip
+            this check entirely — they do not use ``output_chunk_length`` for
+            forecast-horizon alignment.
+
             Emits loud warnings if ``steps`` is not the standard 36-month
             horizon or if the first step is not 1 (VIEWS month_id start).
 
@@ -465,6 +533,29 @@ class ReproducibilityGate:
                 ArchitectureMismatchError: ``steps`` length is not divisible
                     by ``output_chunk_length``.
             """
+            algorithm = config.get("algorithm")
+            if algorithm in ReproducibilityGate.Config.SKLEARN_ALGORITHMS:
+                # Sklearn models have their own step handling — skip the
+                # output_chunk_length divisibility check.
+                steps = config.get("steps")
+                if steps is not None:
+                    steps_list = list(steps) if not isinstance(steps, int) else [steps]
+                    if len(steps_list) != 36:
+                        logger.warning(
+                            "Non-standard horizon: len(steps)=%d (expected 36). "
+                            "Step grid: %s",
+                            len(steps_list),
+                            steps_list,
+                        )
+                    if steps_list and steps_list[0] != 1:
+                        logger.warning(
+                            "Step grid does not start at 1 (starts at %d). The "
+                            "VIEWS month_id convention expects step 1 to be the "
+                            "first forecast month.",
+                            steps_list[0],
+                        )
+                return
+
             steps = config.get("steps")
             output_chunk_length = config.get("output_chunk_length")
             if steps is None or output_chunk_length is None:

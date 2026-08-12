@@ -22,10 +22,12 @@ model lifecycle (device, fit, predict, save/load) and the partition windows.
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping
+from typing import Any, Mapping, Union
 
 import torch
+from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
+from darts.models.forecasting.sklearn_model import SKLearnModel
 
 from views_frames import PredictionFrame
 
@@ -61,7 +63,7 @@ class DartsForecaster:
     def __init__(
         self,
         dataset: ViewsDataset,
-        model: TorchForecastingModel,
+        model: Union[TorchForecastingModel, SKLearnModel],
         partition_dict: dict,
         feature_scaler: str | None = None,
         target_scaler: str | None = None,
@@ -77,7 +79,10 @@ class DartsForecaster:
 
         Args:
             dataset: The :class:`ViewsDataset` (zarr-backed, owns scalers).
-            model: A Darts :class:`TorchForecastingModel` instance.
+            model: A Darts :class:`TorchForecastingModel` or
+                :class:`SKLearnModel` instance. Sklearn models bypass the
+                torch-specific train/predict path (no checkpoints, no device
+                moves, no ``_build_inference_dataset``).
             partition_dict: ``{"train": (start, end), "test": (start, end)}``.
             feature_scaler: Scaler name for all features.
             target_scaler: Scaler name for targets.
@@ -87,7 +92,8 @@ class DartsForecaster:
             random_state: Random seed (mandatory).
             static_covariate_stats: Static covariate config (unused in slim
                 version — static covariates are computed by the dataset).
-            checkpoint_mode: ``"best"`` or ``"last"``.
+            checkpoint_mode: ``"best"`` or ``"last"``. Ignored for sklearn
+                models (no checkpoint machinery).
             use_cyclic_encoders: Append sin/cos cyclic time encoders.
 
         Raises:
@@ -136,13 +142,31 @@ class DartsForecaster:
 
         self.scaler_fitted = False
         self.device = _get_device()
-        logger.info("Using device: %s", self.device)
-        self._move_model_to_device()
+        # Detect sklearn-based models — these bypass the torch-specific
+        # train/predict path. The MarkovModel is the canonical example.
+        self._is_sklearn_model = isinstance(self.model, SKLearnModel)
+        if self._is_sklearn_model:
+            # Sklearn models have no device concept — force 'cpu' so the
+            # downstream parallelism check in DartsForecastingModelManager
+            # (``if forecaster.device == "cpu"``) takes the multi-worker path.
+            self.device = "cpu"
+            logger.info(
+                "Using sklearn-based model %s — torch device checks bypassed.",
+                type(self.model).__name__,
+            )
+        else:
+            logger.info("Using device: %s", self.device)
+            self._move_model_to_device()
 
     # ------------------------------------------------------------------ device
 
     def _move_model_to_device(self) -> None:
-        """Move the model to the configured device."""
+        """Move the model to the configured device.
+
+        No-op for sklearn-based models (no torch parameters to move).
+        """
+        if self._is_sklearn_model:
+            return
         if hasattr(self.model, "to_device"):
             self.model.to_device(self.device)
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
@@ -162,6 +186,11 @@ class DartsForecaster:
         the scaled TimeSeries from the training partition. Handles the
         forecasting-mode carve (when the test partition is too short for a
         validation window, carves val from the train end).
+
+        For sklearn-based models (e.g. MarkovModel), the validation-set
+        carve and torch-specific kwargs (``val_series``, ``val_past_cov``,
+        ``dataloader_kwargs``) are skipped — sklearn models do not consume
+        them.
         """
         # Fit scalers and return the already-transformed training series in one
         # zarr load — avoids a second full read for the same time range.
@@ -177,6 +206,15 @@ class DartsForecaster:
             use_cyclic_encoders=self._use_cyclic_encoders,
         )
         self.scaler_fitted = True
+
+        # Sklearn models do not use a validation set, dataloader_kwargs, or
+        # checkpoint reload. Pass only the scaled series.
+        if self._is_sklearn_model:
+            self.model.fit(
+                series=target_series,
+                past_covariates=past_covariates,
+            )
+            return
 
         # Validation set: test partition (or carved from train end for
         # forecasting mode).
@@ -263,6 +301,13 @@ class DartsForecaster:
         large entity counts (e.g. 259k PRIO-GRID cells) where building
         259k output TimeSeries objects causes OOM kills.
 
+        For sklearn-based models (e.g. MarkovModel), the predict path is
+        simpler: the model's ``predict(n, series, past_covariates)`` method
+        is called directly (returning a list of :class:`TimeSeries`), and
+        the resulting series are fed to ``ingest_darts_predictions`` (the
+        TimeSeries-based ingestion path). Sklearn models do not support
+        ``values_only=True``.
+
         Args:
             sequence_number: Rolling-origin sequence index (0 = first test step).
             output_length: Number of time steps to forecast.
@@ -309,10 +354,60 @@ class DartsForecaster:
             pred_time_start, pred_time_start + output_length, dtype=np.int64
         )
 
+        # --- Sklearn-model predict path -----------------------------------
+        # SKLearnModel-based models (e.g. MarkovModel) do not support the
+        # ``_build_inference_dataset`` / ``predict_from_dataset`` interface.
+        # Call ``model.predict`` directly — it returns a list of TimeSeries
+        # (one per entity) which we then ingest via the TimeSeries-based
+        # path.
+        if self._is_sklearn_model:
+            try:
+                pred_series = self.model.predict(
+                    n=output_length,
+                    series=target_series,
+                    past_covariates=past_covariates,
+                )
+            except Exception as exc:
+                logger.error("Error during sklearn-model prediction: %s", exc)
+                raise
+            finally:
+                del target_series, past_covariates
+                gc.collect()
+
+            # Normalise to a list.
+            if isinstance(pred_series, TimeSeries):
+                pred_series = [pred_series]
+            elif not isinstance(pred_series, list):
+                pred_series = list(pred_series)
+
+            # Audit for NaN/Inf.
+            for i, ts in enumerate(pred_series):
+                arr = ts.all_values(copy=False)
+                if np.isnan(arr).any() or np.isinf(arr).any():
+                    raise NumericalSanityError(
+                        f"NaN/Inf in sklearn-model predictions (series {i}, "
+                        f"shape={arr.shape})."
+                    )
+
+            frames = self.dataset.ingest_darts_predictions(
+                predictions=pred_series,
+                apply_inverse=True,
+                clip_negatives=True,
+            )
+            del pred_series
+            gc.collect()
+
+            for target, frame in frames.items():
+                if np.isnan(frame.values).any():
+                    raise NumericalSanityError(
+                        f"NaNs in final PredictionFrame for target '{target}'."
+                    )
+            return frames
+
+        # --- Torch predict path: values_only=True -------------------------
         # Device management.
         self._ensure_model_on_device()
 
-        # --- Fast prediction path: values_only=True ------------------------
         # Bypasses Darts' output TimeSeries construction entirely. The model
         # returns (predictions, series_schemas, pred_starts) as raw numpy.
         # This avoids building 259k TimeSeries + 259k pandas DataFrames on
@@ -420,7 +515,12 @@ class DartsForecaster:
         return predictions, series_schemas, pred_starts
 
     def _ensure_model_on_device(self) -> None:
-        """Ensure the model is on the configured device (restore from CPU drift)."""
+        """Ensure the model is on the configured device (restore from CPU drift).
+
+        No-op for sklearn-based models (no torch parameters).
+        """
+        if self._is_sklearn_model:
+            return
         current_device = next(self.model.model.parameters()).device
         if self.device != "cpu" and current_device.type == "cpu":
             logger.info("Restoring model to %s...", self.device)
@@ -435,7 +535,14 @@ class DartsForecaster:
     # ------------------------------------------------------------------ persistence
 
     def save_model(self, path: str) -> None:
-        """Save the Darts model + scaler state to disk."""
+        """Save the Darts model + scaler state to disk.
+
+        For sklearn-based models, ``model.save(path)`` uses pickle (via
+        darts' SKLearnModel.save). For torch models, ``model.save(path)``
+        uses torch's checkpoint format. The scaler sidecar (``path.scalers``)
+        is always written via ``torch.save`` (pickle underneath) — works for
+        both.
+        """
         path = str(path)
         self.model.save(path=path)
         torch.save(
@@ -453,7 +560,12 @@ class DartsForecaster:
         )
 
     def load_model(self, path: str) -> None:
-        """Load the Darts model + scaler state from disk."""
+        """Load the Darts model + scaler state from disk.
+
+        For sklearn-based models, ``model.__class__.load(path)`` uses pickle
+        (via darts' SKLearnModel.load). The ``map_location`` kwarg is only
+        passed for torch models — SKLearnModel.load does not accept it.
+        """
         path = str(path)
         scaler_data = torch.load(
             path + ".scalers", map_location="cpu", weights_only=False
@@ -474,9 +586,13 @@ class DartsForecaster:
                 f"'{saved_cfg}' but config has '{self._target_scaler_cfg}'."
             )
 
-        # Load the model.
-        self.model = self.model.__class__.load(
-            path=path, map_location=str(self.device)
-        )
+        # Load the model. Torch models accept ``map_location``; sklearn
+        # models (SKLearnModel.load) do not.
+        if self._is_sklearn_model:
+            self.model = self.model.__class__.load(path=path)
+        else:
+            self.model = self.model.__class__.load(
+                path=path, map_location=str(self.device)
+            )
         self._move_model_to_device()
         logger.info("Model loaded on device %s.", self.device)

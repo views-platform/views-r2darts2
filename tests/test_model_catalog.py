@@ -268,7 +268,7 @@ class TestModelCatalogInitialization:
         assert catalog.device == "cpu"
 
 
-        assert len(catalog.models) == 10
+        assert len(catalog.models) == 11
 
 
 
@@ -385,7 +385,7 @@ class TestModelCatalogMethods:
         catalog = ModelCatalog(basic_config)
         models = catalog.list_models()
 
-        assert len(models) == 10
+        assert len(models) == 11
         assert "NBEATSModel" in models
         assert "NHiTSModel" in models
         assert "TFTModel" in models
@@ -396,6 +396,7 @@ class TestModelCatalogMethods:
         assert "NLinearModel" in models
         assert "TiDEModel" in models
         assert "DLinearModel" in models
+        assert "MarkovModel" in models
 
     @patch("torch.serialization.add_safe_globals")
     def test_get_model_valid(self, mock_safe_globals, basic_config):
@@ -705,6 +706,102 @@ class TestTiDEModel:
 
         call_kwargs = mock_tide_cls.call_args[1]
         assert call_kwargs["input_chunk_length"] == 48
+
+
+class TestMarkovModel:
+    """Test suite for MarkovModel creation — the sklearn-based exception."""
+
+    def test_markov_model_bypasses_torch_setup(self, basic_config):
+        """MarkovModel config does NOT instantiate loss_fn / optimizer /
+        scheduler catalogs (those are torch-specific and would crash on the
+        minimal Markov genome).
+        """
+        config = {
+            "algorithm": "MarkovModel",
+            "name": "markov_test",
+            "run_type": "test",
+            "random_state": 42,
+            "steps": [1, 2, 3],
+            "targets": ["lr_ged_sb"],
+            "markov_target": "lr_ged_sb",
+            "markov_method": "direct",
+            "regression_method": "single",
+            "markov_threshold": 0,
+            "n_jobs": -1,
+            # Deliberately OMIT loss_function, optimizer_cls,
+            # lr_scheduler_cls, batch_size, n_epochs, etc. — MarkovModel
+            # does not need them and the gate must NOT require them.
+        }
+        catalog = ModelCatalog(config)
+        assert catalog._is_sklearn_model is True
+        assert catalog.loss_fn is None
+        assert catalog.likelihood is None
+        assert catalog.opt_catalog is None
+        assert catalog.sched_catalog is None
+
+    def test_markov_model_returns_markov_model_instance(self, basic_config):
+        """``_get_markov_model`` returns a :class:`MarkovModel` instance."""
+        from views_r2darts2.models.markov_model import MarkovModel
+
+        config = {
+            "algorithm": "MarkovModel",
+            "name": "markov_test",
+            "run_type": "test",
+            "random_state": 42,
+            "steps": [1, 2, 3],
+            "targets": ["lr_ged_sb"],
+            "markov_target": "lr_ged_sb",
+            "markov_method": "direct",
+            "regression_method": "single",
+            "markov_threshold": 0,
+            "n_jobs": -1,
+        }
+        catalog = ModelCatalog(config)
+        model = catalog._get_markov_model()
+        assert isinstance(model, MarkovModel)
+        assert model._steps == [1, 2, 3]
+        assert model._targets == ["lr_ged_sb"]
+        assert model._markov_target == "lr_ged_sb"
+        assert model._markov_method == "direct"
+
+    def test_markov_model_is_in_list_models(self, basic_config):
+        """``MarkovModel`` appears in ``list_models`` output."""
+        config = {
+            "algorithm": "MarkovModel",
+            "name": "markov_test",
+            "run_type": "test",
+            "random_state": 42,
+            "steps": [1, 2, 3],
+            "targets": ["lr_ged_sb"],
+            "markov_target": "lr_ged_sb",
+            "markov_method": "direct",
+            "regression_method": "single",
+            "markov_threshold": 0,
+            "n_jobs": -1,
+        }
+        catalog = ModelCatalog(config)
+        assert "MarkovModel" in catalog.list_models()
+
+    def test_markov_model_get_model_dispatches_correctly(self, basic_config):
+        """``get_model("MarkovModel")`` returns a MarkovModel instance."""
+        from views_r2darts2.models.markov_model import MarkovModel
+
+        config = {
+            "algorithm": "MarkovModel",
+            "name": "markov_test",
+            "run_type": "test",
+            "random_state": 42,
+            "steps": [1, 2, 3],
+            "targets": ["lr_ged_sb"],
+            "markov_target": "lr_ged_sb",
+            "markov_method": "direct",
+            "regression_method": "single",
+            "markov_threshold": 0,
+            "n_jobs": -1,
+        }
+        catalog = ModelCatalog(config)
+        model = catalog.get_model("MarkovModel")
+        assert isinstance(model, MarkovModel)
 
 
 class TestConfigurationHandling:

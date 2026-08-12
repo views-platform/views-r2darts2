@@ -933,22 +933,25 @@ class ViewsDataset:
         """
         import zarr
 
-        store_path = str(self._store.path / self._ds.attrs.get("_store_name", "dataset.zarr"))
-        # Find the actual zarr path by re-opening the dataset and checking
-        # its encoding. The simplest approach: re-open the store directory
-        # and write directly.
-        # We need to find where the zarr group lives. The _ds was opened from
-        # a path; we can get it from the encoding.
+        # Find the zarr path — check encoding first, then scan the store dir.
         zarr_path = None
         for var in self._ds.data_vars:
             enc = self._ds[var].encoding
             if "source" in enc:
-                zarr_path = enc["source"]
-                # The source is like "/tmp/.../dataset_xxxx.zarr/<var>"
-                zarr_path = str(Path(zarr_path).parent)
+                zarr_path = str(Path(enc["source"]).parent)
                 break
         if zarr_path is None:
-            # Fallback: re-save the full dataset (simple but not incremental).
+            # The encoding doesn't carry the source path (xarray may omit it).
+            # Scan the store directory for .zarr groups.
+            for child in self._store.path.iterdir():
+                if child.is_dir() and child.suffix == ".zarr":
+                    zarr_path = str(child)
+                    break
+                # Also check for directories containing .zgroup
+                if child.is_dir() and (child / ".zgroup").exists():
+                    zarr_path = str(child)
+                    break
+        if zarr_path is None:
             self._append_fallback(times, entities, cols)
             return
 
@@ -956,13 +959,10 @@ class ViewsDataset:
         time_coord = self._ds[self._time_id].values.astype("int64")
         entity_coord = self._ds[self._entity_id].values.astype("int64")
 
-        # Determine new times and entities that need to be added.
         new_times = np.setdiff1d(times, time_coord)
         new_entities = np.setdiff1d(entities, entity_coord)
 
         if new_times.size or new_entities.size:
-            # Resize: rebuild the store with extended coordinates.
-            # This is the simplest correct approach for zarr v3.
             self._append_fallback(times, entities, cols)
             return
 
@@ -1266,176 +1266,6 @@ class ViewsDataset:
         )
         return frames
 
-    def ingest_numpy_predictions(
-        self,
-        predictions: np.ndarray,
-        entity_ids: np.ndarray,
-        time_ids: np.ndarray,
-        *,
-        apply_inverse: bool = True,
-        clip_negatives: bool = True,
-    ) -> dict[str, Any]:
-        """Ingest raw numpy predictions (bypassing Darts TimeSeries entirely).
-
-        This is the memory-efficient prediction path for large entity counts
-        (e.g. 259k PRIO-GRID cells). The standard
-        :meth:`ingest_darts_predictions` builds a Darts :class:`TimeSeries`
-        per entity — 259k Python objects + 259k pandas DataFrames — which
-        causes OOM kills. This method works with raw numpy arrays throughout:
-
-            1. Apply inverse scaler transforms directly on the numpy array
-               (vectorized — no per-entity Python loop).
-            2. Build :class:`PredictionFrame` objects from the numpy array +
-               the entity/time index arrays.
-
-        Args:
-            predictions: Shape ``(n_entities, n_time, n_components, n_samples)``
-                float32. This is the raw output of Darts'
-                ``predict_from_dataset(values_only=True)``.
-            entity_ids: 1-D int64 array of entity ids (length ``n_entities``).
-            time_ids: 1-D int64 array of time ids (length ``n_time``).
-            apply_inverse: When ``True``, apply the inverse target scaler and
-                inverse log transform (numpy-direct).
-            clip_negatives: When ``True``, clip negative predictions to 0.
-
-        Returns:
-            A ``{target_name: PredictionFrame}`` dict.
-        """
-        from views_r2darts2.transformers.inverse import (
-            extract_fitted_sklearn_scaler,
-        )
-        from views_frames import (
-            PredictionFrame, SpatioTemporalIndex, SpatialLevel, FrameMetadata,
-        )
-
-        # predictions shape: (n_entities, n_time, n_components, n_samples)
-        n_entities, n_time, n_components, n_samples = predictions.shape
-        target_names = list(self.targets)
-        n_targets = len(target_names)
-
-        # Determine which component indices are targets.
-        # Darts returns all components in the order they were in the input series.
-        # We need to figure out the target component indices.
-        # For now, assume the last n_targets components are the targets (the
-        # standard layout when features come before targets).
-        # TODO: make this robust by passing component names from the forecaster.
-        target_indices = list(range(n_components - n_targets, n_components))
-
-        # Extract target values: (n_entities, n_time, n_targets, n_samples)
-        target_values = predictions[:, :, target_indices, :]
-
-        # Apply inverse transforms (numpy-direct, vectorized).
-        if apply_inverse and self.scalers_fitted:
-            target_values = self._inverse_transform_numpy_predictions(
-                target_values
-            )
-
-        # Clip negatives.
-        if clip_negatives:
-            np.maximum(target_values, 0.0, out=target_values)
-
-        # Build PredictionFrames — one per target.
-        # Build the SpatioTemporalIndex: (entity, time) grid, entity-major.
-        # time_ids has shape (n_time,), entity_ids has shape (n_entities,)
-        t_grid, e_grid = np.meshgrid(time_ids, entity_ids, indexing="ij")
-        # t_grid: (n_time, n_entities), e_grid: (n_time, n_entities)
-        # We want row-major (time, entity) — entity varies fastest.
-        time_flat = t_grid.T.ravel()  # (n_entities * n_time,) — entity-major
-        entity_flat = e_grid.T.ravel()
-        # Actually, we want time-major to match the existing convention.
-        # meshgrid with indexing="ij" gives (time, entity) — reshape row-major.
-        time_flat = t_grid.ravel()  # time varies slowest
-        entity_flat = e_grid.ravel()
-
-        index = SpatioTemporalIndex(
-            time=time_flat.astype(np.int64),
-            unit=entity_flat.astype(np.int64),
-            level=self._build_spatial_level(),
-        )
-        metadata = FrameMetadata(model="darts")
-
-        frames: dict[str, Any] = {}
-        for t_idx, target_name in enumerate(target_names):
-            # target_values: (n_entities, n_time, n_targets, n_samples)
-            # Extract this target: (n_entities, n_time, n_samples)
-            # Reshape to (n_entities * n_time, n_samples) — entity-major.
-            # But the index is time-major (time, entity).
-            # We need to transpose to (n_time, n_entities, n_samples) then flatten.
-            vals = target_values[:, :, t_idx, :]  # (n_entities, n_time, n_samples)
-            # Transpose to (n_time, n_entities, n_samples) to match time-major index.
-            vals = vals.transpose(1, 0, 2)  # (n_time, n_entities, n_samples)
-            vals = vals.reshape(n_time * n_entities, n_samples).astype(np.float32)
-            frames[target_name] = PredictionFrame(
-                vals, index=index, metadata=metadata,
-            )
-        return frames
-
-    def _inverse_transform_numpy_predictions(
-        self, target_values: np.ndarray
-    ) -> np.ndarray:
-        """Apply inverse target scaler + inverse log to raw numpy predictions.
-
-        Args:
-            target_values: Shape ``(n_entities, n_time, n_targets, n_samples)``.
-
-        Returns:
-            Same shape, inverse-transformed.
-        """
-        from views_r2darts2.transformers.inverse import (
-            extract_fitted_sklearn_scaler,
-        )
-        from darts.dataprocessing import Pipeline
-
-        if not self._target_scaler:
-            return target_values
-
-        n_entities, n_time, n_targets, n_samples = target_values.shape
-
-        if isinstance(self._target_scaler, Pipeline):
-            # Pipeline path: we need to reshape to 2-D, inverse-transform,
-            # and reshape back. Use the sklearn objects from the pipeline.
-            # Flatten to (n_entities * n_time * n_samples, n_targets)
-            flat = target_values.reshape(-1, n_targets).astype(np.float64)
-            # Apply each step's inverse in reverse order.
-            for scaler in reversed(self._target_scaler._transformers):
-                sk = extract_fitted_sklearn_scaler(scaler)
-                if sk is not None:
-                    # Clamp to prevent overflow (sinh of large values).
-                    flat = np.clip(flat, -88.0, 88.0)
-                    flat = sk.inverse_transform(flat)
-                elif hasattr(scaler, "transformer"):
-                    inv_func = getattr(scaler.transformer, "inverse_func", None)
-                    if inv_func is not None:
-                        flat = np.clip(flat, -88.0, 88.0)
-                        flat = inv_func(flat)
-            target_values = flat.reshape(
-                n_entities, n_time, n_targets, n_samples
-            ).astype(np.float32)
-        else:
-            # Single Scaler path.
-            sk = extract_fitted_sklearn_scaler(self._target_scaler)
-            if sk is not None:
-                flat = target_values.reshape(-1, n_targets).astype(np.float64)
-                flat = sk.inverse_transform(flat)
-                target_values = flat.reshape(
-                    n_entities, n_time, n_targets, n_samples
-                ).astype(np.float32)
-            elif hasattr(self._target_scaler, "transformer"):
-                inv_func = getattr(self._target_scaler.transformer, "inverse_func", None)
-                if inv_func is not None:
-                    flat = np.clip(
-                        target_values.astype(np.float64), -88.0, 88.0
-                    )
-                    target_values = inv_func(flat).astype(np.float32)
-
-        # Apply inverse log if log_targets was set.
-        if getattr(self, "_log_targets", False):
-            target_values = np.expm1(
-                np.maximum(target_values, 0)
-            ).astype(np.float32)
-
-        return target_values
-
     def _inverse_transform_predictions(self, predictions: list) -> list:
         """Apply inverse target scaler + inverse log to predictions."""
         from views_r2darts2.transformers.inverse import (
@@ -1479,6 +1309,432 @@ class ViewsDataset:
         """Return the :class:`views_frames.SpatialLevel` for this dataset."""
         from views_frames import SpatialLevel
         return SpatialLevel[_ENTITY_LEVEL.get(self._entity_id, "CM")]
+
+    # ------------------------------------------------------------------ #
+    # Batch prediction support (numpy-direct, zarr-backed, no TimeSeries)
+    # ------------------------------------------------------------------ #
+
+    def _extract_numpy_2d(
+        self,
+        *,
+        target_names: list[str],
+        feature_names: list[str],
+        time_ids: Any = None,
+        entity_ids: Any = None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray, np.ndarray]:
+        """Extract target and feature arrays as row-major 2-D numpy.
+
+        Returns ``(target_arr, feature_arr, time_arr, entity_arr)`` where
+        arrays are row-major (time, entity) — entity varies fastest.
+        ``target_arr`` is ``(N, n_targets)``, ``feature_arr`` is
+        ``(N, n_features)`` or ``None``.
+        """
+        all_names = [*feature_names, *target_names]
+        if not all_names:
+            return None, None, np.array([]), np.array([])
+
+        old_broadcast = self.broadcast_features
+        self.broadcast_features = True
+        try:
+            tensor = self._stack_variables(all_names)
+        finally:
+            self.broadcast_features = old_broadcast
+
+        if time_ids is not None:
+            available_times = tensor[self._time_id].values
+            requested = np.array(_as_list(time_ids), dtype=available_times.dtype)
+            missing = np.setdiff1d(requested, available_times)
+            if len(missing) > 0:
+                logger.debug(
+                    "_extract_numpy_2d: %d/%d time_ids absent, zero-filled.",
+                    len(missing), len(requested),
+                )
+            tensor = tensor.reindex(
+                {self._time_id: requested.tolist()}, fill_value=0.0
+            )
+        if entity_ids is not None:
+            tensor = tensor.sel({self._entity_id: _as_list(entity_ids)})
+
+        computed = tensor.compute()
+        values_4d = np.nan_to_num(computed.values, nan=0.0)
+        time_arr = computed[self._time_id].values.astype("int64")
+        entity_arr = computed[self._entity_id].values.astype("int64")
+        T, E, S, F = values_4d.shape
+        n_targets = len(target_names)
+        n_features = len(feature_names)
+
+        if S == 1:
+            flat_2d = values_4d[:, :, 0, :]
+        else:
+            flat_2d = values_4d[:, :, 0, :]
+        flat_2d = flat_2d.reshape(T * E, F)
+
+        feature_arr = (
+            flat_2d[:, :n_features].astype(np.float32) if n_features > 0 else None
+        )
+        target_arr = (
+            flat_2d[:, n_features:].astype(np.float32) if n_targets > 0 else None
+        )
+        return target_arr, feature_arr, time_arr, entity_arr
+
+    def create_prediction_scaffold(
+        self,
+        *,
+        entity_ids: np.ndarray,
+        time_ids: np.ndarray,
+        target_names: list[str],
+        sample_size: int = 1,
+    ) -> "ViewsDataset":
+        """Create an empty zarr-backed prediction dataset (scaffold).
+
+        The scaffold is a :class:`ViewsDataset` in prediction mode with:
+            * One ``pred_<target>`` variable per target.
+            * The given ``entity_ids`` and ``time_ids`` as coordinates.
+            * All values initialized to NaN.
+
+        Use :meth:`add_batch` to fill it incrementally, then
+        :meth:`_to_prediction_frames` to convert to PredictionFrame dict.
+
+        Args:
+            entity_ids: 1-D int64 array of entity ids.
+            time_ids: 1-D int64 array of prediction time ids.
+            target_names: List of target column names.
+            sample_size: Number of samples per (time, entity) cell.
+
+        Returns:
+            An empty :class:`ViewsDataset` in prediction mode.
+        """
+        pred_var_names = [f"pred_{t}" for t in target_names]
+        coords = {
+            self._time_id: np.asarray(time_ids, dtype="int64"),
+            self._entity_id: np.asarray(entity_ids, dtype="int64"),
+            "sample": np.arange(sample_size, dtype="int64"),
+        }
+        T, E = len(time_ids), len(entity_ids)
+        data_vars: dict[str, Any] = {}
+        for name in pred_var_names:
+            data_vars[name] = (
+                (self._time_id, self._entity_id, "sample"),
+                np.full((T, E, sample_size), np.nan, dtype=np.float32),
+            )
+        ds = xr.Dataset(data_vars, coords=coords)
+        ds.attrs.update({
+            "is_prediction": True,
+            "sample_size": int(sample_size),
+            "targets": list(target_names),
+            "features": [],
+            "pred_vars": pred_var_names,
+            "text_cols": [],
+            "time_id": self._time_id,
+            "entity_id": self._entity_id,
+            "broadcast_features": False,
+        })
+        scaffold = type(self)(ds)
+        # The scaffold was built from an in-memory xarray Dataset. The
+        # ViewsDataset constructor writes it to a zarr store, so add_batch's
+        # _write_rows can find the zarr path via encoding. However, if the
+        # constructor didn't write it (because it was already a Dataset),
+        # we need to ensure the zarr path is available.
+        return scaffold
+
+    def _apply_transforms_numpy(
+        self,
+        target_arr: np.ndarray | None,
+        feature_arr: np.ndarray | None,
+        feature_names: list[str],
+        target_names: list[str],
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Apply log + scaler transforms on raw numpy arrays (vectorized).
+
+        This is the numpy-direct equivalent of the TimeSeries-based
+        ``_apply_log_to_targets`` + ``scaler.transform`` chain. It avoids
+        building any Darts TimeSeries objects — the transforms are applied
+        as vectorized numpy operations on the 2-D arrays.
+        """
+        from views_r2darts2.transformers.inverse import (
+            extract_fitted_sklearn_scaler,
+        )
+        from darts.dataprocessing import Pipeline
+
+        if getattr(self, "_log_targets", False) and target_arr is not None:
+            target_arr = np.log1p(
+                np.maximum(target_arr, 0)
+            ).astype(np.float32)
+
+        if getattr(self, "_log_features", None) and feature_arr is not None:
+            for idx, name in enumerate(feature_names):
+                if name in self._log_features:
+                    feature_arr[:, idx] = np.log1p(
+                        np.maximum(feature_arr[:, idx], 0)
+                    )
+
+        if target_arr is not None and self._target_scaler is not None:
+            sk = extract_fitted_sklearn_scaler(self._target_scaler)
+            if sk is not None:
+                target_arr = sk.transform(
+                    target_arr.astype(np.float64)
+                ).astype(np.float32)
+            elif hasattr(self._target_scaler, "transformer"):
+                tf_func = getattr(self._target_scaler.transformer, "func", None)
+                if tf_func is not None:
+                    target_arr = tf_func(
+                        target_arr.astype(np.float64)
+                    ).astype(np.float32)
+
+        if feature_arr is not None and self._feature_scaler is not None:
+            feature_arr = self._transform_feature_arr_numpy(
+                feature_arr, feature_names
+            )
+
+        return target_arr, feature_arr
+
+    def _transform_feature_arr_numpy(
+        self, feature_arr: np.ndarray, feature_names: list[str]
+    ) -> np.ndarray:
+        """Apply the feature scaler transform directly on a numpy array."""
+        from views_r2darts2.transformers.inverse import (
+            extract_fitted_sklearn_scaler,
+        )
+        from darts.dataprocessing import Pipeline
+
+        if hasattr(self._feature_scaler, "_scalers"):
+            result = feature_arr.copy()
+            components = list(feature_names)
+            for scaler_key, scaler in self._feature_scaler._scalers.items():
+                group_features = self._feature_scaler._scaler_to_features.get(
+                    scaler_key, []
+                )
+                indices = [
+                    i for i, c in enumerate(components) if c in group_features
+                ]
+                if not indices:
+                    continue
+                subset = result[:, indices]
+                if isinstance(scaler, Pipeline):
+                    from darts import TimeSeries
+                    dummy_ts = TimeSeries.from_values(
+                        subset.astype(np.float32),
+                        columns=[components[i] for i in indices],
+                    )
+                    transformed = scaler.transform([dummy_ts])[0]
+                    result[:, indices] = transformed.all_values(
+                        copy=False
+                    )[:, :, 0]
+                else:
+                    sk = extract_fitted_sklearn_scaler(scaler)
+                    if sk is not None:
+                        result[:, indices] = sk.transform(
+                            subset.astype(np.float64)
+                        ).astype(np.float32)
+                    elif hasattr(scaler, "transformer"):
+                        tf_func = getattr(scaler.transformer, "func", None)
+                        if tf_func is not None:
+                            result[:, indices] = tf_func(
+                                subset.astype(np.float64)
+                            ).astype(np.float32)
+            return result
+
+        if isinstance(self._feature_scaler, Pipeline):
+            from darts import TimeSeries
+            dummy_ts = TimeSeries.from_values(
+                feature_arr.astype(np.float32), columns=feature_names,
+            )
+            transformed = self._feature_scaler.transform([dummy_ts])[0]
+            return transformed.all_values(copy=False)[:, :, 0].astype(np.float32)
+
+        sk = extract_fitted_sklearn_scaler(self._feature_scaler)
+        if sk is not None:
+            return sk.transform(
+                feature_arr.astype(np.float64)
+            ).astype(np.float32)
+        if hasattr(self._feature_scaler, "transformer"):
+            tf_func = getattr(self._feature_scaler.transformer, "func", None)
+            if tf_func is not None:
+                return tf_func(
+                    feature_arr.astype(np.float64)
+                ).astype(np.float32)
+        return feature_arr
+
+    def _build_batch_timeseries(
+        self,
+        *,
+        target_arr: np.ndarray | None,
+        feature_arr: np.ndarray | None,
+        target_names: list[str],
+        feature_names: list[str],
+        time_arr: np.ndarray,
+        entity_arr: np.ndarray,
+        use_cyclic_encoders: bool = False,
+    ) -> tuple[list, list | None]:
+        """Build Darts TimeSeries from pre-transformed numpy arrays.
+
+        This builds a **small** list of TimeSeries (one per entity in the
+        batch, not all 259k). Used by the batch prediction path.
+        """
+        import pandas as pd
+        from darts import TimeSeries as _TS
+        from views_r2darts2.infrastructure.encoders import (
+            CYCLIC_ENCODERS_BY_RESOLUTION,
+        )
+
+        T = len(time_arr)
+        E = len(entity_arr)
+        n_feat = len(feature_names)
+        n_targ = len(target_names)
+
+        parts = []
+        if feature_arr is not None:
+            parts.append(feature_arr)
+        if target_arr is not None:
+            parts.append(target_arr)
+        if not parts:
+            return [], None
+        combined = np.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+        combined_3d = combined.reshape(T, E, -1)
+
+        all_names = [*feature_names, *target_names]
+        feature_columns_ext = list(all_names)
+        cyclic_block = None
+        if use_cyclic_encoders:
+            resolution = self._time_id.split("_")[0][0]
+            cyclic_encoders = CYCLIC_ENCODERS_BY_RESOLUTION.get(resolution)
+            if cyclic_encoders is not None:
+                cyclic_cols = [
+                    enc_fn(time_arr).astype(np.float32)
+                    for enc_fn in cyclic_encoders
+                ]
+                cyclic_block = np.stack(cyclic_cols, axis=1)
+                feature_columns_ext = (
+                    [*all_names[:n_feat]]
+                    + [fn.__name__ for fn in cyclic_encoders]
+                    + all_names[n_feat:]
+                )
+
+        shared_ri = pd.RangeIndex(
+            start=int(time_arr[0]), stop=int(time_arr[-1]) + 1, step=1
+        )
+        shared_comps = pd.Index(feature_columns_ext)
+
+        series_list = []
+        for e_idx in range(E):
+            entity_vals = combined_3d[:, e_idx, :]
+            if cyclic_block is not None:
+                feat_part = entity_vals[:, :n_feat]
+                targ_part = entity_vals[:, n_feat:]
+                entity_vals = np.concatenate(
+                    [feat_part, cyclic_block, targ_part], axis=1
+                )
+            ts = _TS(
+                times=shared_ri,
+                values=entity_vals[:, :, np.newaxis].astype(np.float32),
+                components=shared_comps,
+                static_covariates=pd.Series(
+                    [np.float32(entity_arr[e_idx])],
+                    index=pd.Index([self._entity_id]),
+                ),
+                copy=False,
+            )
+            series_list.append(ts)
+
+        if n_targ == 0:
+            return [], series_list if n_feat > 0 else None
+        if n_feat == 0:
+            return series_list, None
+        n_feat_with_cyclic = n_feat + (
+            cyclic_block.shape[1] if cyclic_block is not None else 0
+        )
+        feat_comp_names = feature_columns_ext[:n_feat_with_cyclic]
+        targ_comp_names = feature_columns_ext[n_feat_with_cyclic:]
+        targets_ts = [ts[list(targ_comp_names)] for ts in series_list]
+        past_cov_ts = [
+            ts[list(feat_comp_names)].astype(np.float32) for ts in series_list
+        ]
+        return targets_ts, past_cov_ts
+
+    def _inverse_transform_numpy_predictions(
+        self, predictions: np.ndarray
+    ) -> np.ndarray:
+        """Apply inverse target scaler + inverse log to raw numpy predictions."""
+        from views_r2darts2.transformers.inverse import (
+            extract_fitted_sklearn_scaler,
+        )
+        from darts.dataprocessing import Pipeline
+
+        if not getattr(self, "_target_scaler", None):
+            return predictions
+
+        n_entities, n_time, n_components, n_samples = predictions.shape
+        n_targets = len(self.targets)
+        target_indices = list(range(n_components - n_targets, n_components))
+        target_values = predictions[:, :, target_indices, :].copy()
+
+        if isinstance(self._target_scaler, Pipeline):
+            flat = target_values.reshape(-1, n_targets).astype(np.float64)
+            for scaler in reversed(self._target_scaler._transformers):
+                sk = extract_fitted_sklearn_scaler(scaler)
+                if sk is not None:
+                    flat = np.clip(flat, -88.0, 88.0)
+                    flat = sk.inverse_transform(flat)
+                elif hasattr(scaler, "transformer"):
+                    inv_func = getattr(
+                        scaler.transformer, "inverse_func", None
+                    )
+                    if inv_func is not None:
+                        flat = np.clip(flat, -88.0, 88.0)
+                        flat = inv_func(flat)
+            target_values = flat.reshape(
+                n_entities, n_time, n_targets, n_samples
+            ).astype(np.float32)
+        else:
+            sk = extract_fitted_sklearn_scaler(self._target_scaler)
+            if sk is not None:
+                flat = target_values.reshape(-1, n_targets).astype(np.float64)
+                flat = sk.inverse_transform(flat)
+                target_values = flat.reshape(
+                    n_entities, n_time, n_targets, n_samples
+                ).astype(np.float32)
+            elif hasattr(self._target_scaler, "transformer"):
+                inv_func = getattr(
+                    self._target_scaler.transformer, "inverse_func", None
+                )
+                if inv_func is not None:
+                    flat = np.clip(
+                        target_values.astype(np.float64), -88.0, 88.0
+                    )
+                    target_values = inv_func(flat).astype(np.float32)
+
+        if getattr(self, "_log_targets", False):
+            target_values = np.expm1(
+                np.maximum(target_values, 0)
+            ).astype(np.float32)
+
+        predictions[:, :, target_indices, :] = target_values
+        return predictions
+
+    def _to_prediction_frames(self) -> dict[str, Any]:
+        """Convert a prediction-mode dataset to ``{target: PredictionFrame}`` dict."""
+        from views_frames import (
+            PredictionFrame,
+            SpatioTemporalIndex,
+            SpatialLevel,
+            FrameMetadata,
+        )
+
+        if not self.is_prediction:
+            raise ValueError("_to_prediction_frames requires prediction mode.")
+
+        frames: dict[str, Any] = {}
+        for target_name in self.targets:
+            pred_var = f"pred_{target_name}"
+            if pred_var not in self._ds.data_vars:
+                continue
+            single_ds = self._ds[[pred_var]]
+            single_ds.attrs = dict(self._ds.attrs)
+            single_ds.attrs["targets"] = [target_name]
+            single_ds.attrs["pred_vars"] = [pred_var]
+            temp_ds = type(self)(single_ds)
+            frames[target_name] = temp_ds.to_predictionframe()
+        return frames
 
     # ------------------------------------------------------------------ #
     # Darts TimeSeries bridge

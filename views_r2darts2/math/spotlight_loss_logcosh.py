@@ -103,7 +103,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # the shared per-series mean and collapsing all countries to one RevIN-scaled template).
         density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
         level_cell = self._log_cosh(gap * density_scale)   # tanh(0.45 * 2.5) = tanh(1.13)
-        loss_level = T * (w_level * level_cell).sum() / w_level.sum()
 
         # Batch-level: weight by signal strength, gated by has_gated
         # FIX: Use event_mask instead of gate for has_gated. The old gate-based has_gated
@@ -113,6 +112,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         event_frac = event_mask.mean().clamp_min(self._EPS)
         has_gated = (event_mask.sum(dim=1) > self._EPS).float()
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
+
+        loss_level = T * (w_level * level_cell).sum() / w_level.sum()
 
         if multivariate:
             loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)

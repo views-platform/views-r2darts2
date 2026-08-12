@@ -273,6 +273,14 @@ class ReproducibilityGate:
                 "dropout",
                 "use_reversible_instance_norm",
             ],
+            "MarkovModel": [
+                "input_chunk_length",
+                "output_chunk_length",
+                "markov_threshold",
+                "markov_method",
+                "regression_method",
+                "n_jobs",
+            ],
         }
 
         # Optimizer-specific genes

@@ -110,6 +110,7 @@ class ModelCatalog:
             "TiDEModel": self._get_tide_model,
             "DLinearModel": self._get_dlinear_model,
             "TSMixerModel": self._get_tsmixer_model,
+            "MarkovModel": self._get_markov_model,
         }
         self.config = config
         self.device = get_device()
@@ -442,4 +443,39 @@ class ModelCatalog:
             dropout=self.config.get("dropout"),
             use_static_covariates=self.config.get("use_static_covariates"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
+        )
+
+    def _get_markov_model(self):
+        """Build a MarkovModel (sklearn RandomForest-based, non-torch).
+
+        The MarkovModel does NOT use torch, pytorch_lightning, or any of the
+        torch-related infrastructure. It uses sklearn RandomForest classifiers
+        and regressors internally. It still goes through the same
+        ``DartsForecaster.fit()`` / ``predict()`` pipeline.
+
+        Config keys consumed:
+            * ``input_chunk_length``: Input window (default 12).
+            * ``output_chunk_length``: Output window (default 36).
+            * ``markov_threshold``: Fatality threshold for state computation.
+            * ``markov_method``: ``"direct"`` or ``"transition"``.
+            * ``regression_method``: ``"single"`` or ``"multi"``.
+            * ``random_state``: Random seed.
+            * ``n_jobs``: Parallel jobs for sklearn (default -1).
+            * ``rf_class_params``: Extra params for RandomForestClassifier.
+            * ``rf_reg_params``: Extra params for RandomForestRegressor.
+        """
+        from views_r2darts2.math.markov_model import MarkovModel
+
+        ReproducibilityGate.Config.audit_architecture(self.config)
+
+        return MarkovModel(
+            input_chunk_length=self.config.get("input_chunk_length", 12),
+            output_chunk_length=self.config.get("output_chunk_length", 36),
+            markov_threshold=self.config.get("markov_threshold", 0),
+            markov_method=self.config.get("markov_method", "direct"),
+            regression_method=self.config.get("regression_method", "single"),
+            random_state=self.config.get("random_state", 42),
+            n_jobs=self.config.get("n_jobs", -1),
+            rf_class_params=self.config.get("rf_class_params"),
+            rf_reg_params=self.config.get("rf_reg_params"),
         )

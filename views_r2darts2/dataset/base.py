@@ -9,6 +9,7 @@ supported input kind and delegates the on-disk write to the matching converter.
 
 from __future__ import annotations
 
+import copy
 import logging
 import uuid
 from pathlib import Path
@@ -19,6 +20,7 @@ import xarray as xr
 
 from views_r2darts2.dataset import converters, readers
 from views_r2darts2.dataset.zarr_store import ZarrStore
+from views_r2darts2.transformers.inverse import extract_fitted_sklearn_scaler
 
 logger = logging.getLogger(__name__)
 
@@ -933,7 +935,12 @@ class ViewsDataset:
         """
         import zarr
 
-        # Find the zarr path — check encoding first, then scan the store dir.
+        store_path = str(self._store.path / self._ds.attrs.get("_store_name", "dataset.zarr"))
+        # Find the actual zarr path by re-opening the dataset and checking
+        # its encoding. The simplest approach: re-open the store directory
+        # and write directly.
+        # We need to find where the zarr group lives. The _ds was opened from
+        # a path; we can get it from the encoding.
         zarr_path = None
         for var in self._ds.data_vars:
             enc = self._ds[var].encoding
@@ -947,7 +954,6 @@ class ViewsDataset:
                 if child.is_dir() and child.suffix == ".zarr":
                     zarr_path = str(child)
                     break
-                # Also check for directories containing .zgroup
                 if child.is_dir() and (child / ".zgroup").exists():
                     zarr_path = str(child)
                     break
@@ -959,10 +965,13 @@ class ViewsDataset:
         time_coord = self._ds[self._time_id].values.astype("int64")
         entity_coord = self._ds[self._entity_id].values.astype("int64")
 
+        # Determine new times and entities that need to be added.
         new_times = np.setdiff1d(times, time_coord)
         new_entities = np.setdiff1d(entities, entity_coord)
 
         if new_times.size or new_entities.size:
+            # Resize: rebuild the store with extended coordinates.
+            # This is the simplest correct approach for zarr v3.
             self._append_fallback(times, entities, cols)
             return
 

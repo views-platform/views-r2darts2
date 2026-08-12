@@ -49,7 +49,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         y_true_mask = (y_true.abs() > self.tau).float()
 
         # ── SHAPE: log_cosh on demeaned errors ────────
-        e_mean = e.mean(dim=1, keepdim=True)
+        # Demean by event-cell mean so dead-cell over-prediction doesn't contaminate e_shape
+        _n_ev_true = y_true_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        e_mean = (y_true_mask * e).sum(dim=1, keepdim=True) / _n_ev_true
         e_shape = e - e_mean.detach()
 
         # Shape gradient only through true-event cells; false positives get no shape pull

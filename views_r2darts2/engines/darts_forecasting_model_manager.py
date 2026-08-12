@@ -210,6 +210,7 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
                 else None
             ),
             use_cyclic_encoders=active_config.get("use_cyclic_encoders", False),
+            batch_size=active_config.get("batch_size", 1000),
         )
         if checkpoint_mode is not None:
             kwargs["checkpoint_mode"] = checkpoint_mode

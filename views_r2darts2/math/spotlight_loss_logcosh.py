@@ -102,7 +102,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # per-series density weighting (which amplified LEVEL on sparse series, over-driving
         # the shared per-series mean and collapsing all countries to one RevIN-scaled template).
         density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
-        level_cell = self._log_cosh(gap * density_scale)   # tanh(0.45 * 2.5) = tanh(1.13)
+        level_cell = self._log_cosh(gap)   # tanh(0.45 * 2.5) = tanh(1.13)
 
         # Batch-level: weight by signal strength, gated by has_gated
         # FIX: Use event_mask instead of gate for has_gated. The old gate-based has_gated

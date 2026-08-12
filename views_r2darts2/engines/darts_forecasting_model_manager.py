@@ -438,8 +438,21 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
     def _get_predict_kwargs(self, config: Mapping[str, Any]) -> dict:
         """Extract and validate kwargs for ``predict()``."""
+        algorithm = config.get("algorithm")
+        if algorithm == "MarkovModel":
+            # MarkovModel is non-torch and should not require DL inference keys.
+            kwargs: dict[str, Any] = {}
+            if "num_samples" in config:
+                kwargs["num_samples"] = config["num_samples"]
+            if "mc_dropout" in config:
+                kwargs["mc_dropout"] = config["mc_dropout"]
+            return kwargs
+
         mandatory = ["num_samples", "mc_dropout"]
         missing = [k for k in mandatory if k not in config]
         if missing:
             raise ValueError(f"Missing mandatory prediction parameters: {missing}.")
-        return {"num_samples": config["num_samples"], "mc_dropout": config["mc_dropout"]}
+        return {
+            "num_samples": config["num_samples"],
+            "mc_dropout": config["mc_dropout"],
+        }

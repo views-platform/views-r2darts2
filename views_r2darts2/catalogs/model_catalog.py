@@ -125,8 +125,12 @@ class ModelCatalog:
             self.likelihood = _LIKELIHOOD_REGISTRY[loss_name]()
             logger.info("Using Darts likelihood: %s (loss_fn=None)", loss_name)
         else:
-            self.loss_fn = LossCatalog(self.config).get_loss()
-            self.likelihood = None
+            if self.config.get("algorithm") == "MarkovModel":
+                self.loss_fn = None
+                self.likelihood = None
+            else:
+                self.loss_fn = LossCatalog(self.config).get_loss()
+                self.likelihood = None
         self.opt_catalog = OptimizerCatalog(self.config)
         self.sched_catalog = SchedulerCatalog(self.config)
 

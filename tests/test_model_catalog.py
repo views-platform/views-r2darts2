@@ -268,7 +268,7 @@ class TestModelCatalogInitialization:
         assert catalog.device == "cpu"
 
 
-        assert len(catalog.models) == 10
+        assert len(catalog.models) == 11
 
 
 
@@ -385,7 +385,7 @@ class TestModelCatalogMethods:
         catalog = ModelCatalog(basic_config)
         models = catalog.list_models()
 
-        assert len(models) == 10
+        assert len(models) == 11
         assert "NBEATSModel" in models
         assert "NHiTSModel" in models
         assert "TFTModel" in models

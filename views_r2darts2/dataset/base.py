@@ -1266,6 +1266,176 @@ class ViewsDataset:
         )
         return frames
 
+    def ingest_numpy_predictions(
+        self,
+        predictions: np.ndarray,
+        entity_ids: np.ndarray,
+        time_ids: np.ndarray,
+        *,
+        apply_inverse: bool = True,
+        clip_negatives: bool = True,
+    ) -> dict[str, Any]:
+        """Ingest raw numpy predictions (bypassing Darts TimeSeries entirely).
+
+        This is the memory-efficient prediction path for large entity counts
+        (e.g. 259k PRIO-GRID cells). The standard
+        :meth:`ingest_darts_predictions` builds a Darts :class:`TimeSeries`
+        per entity — 259k Python objects + 259k pandas DataFrames — which
+        causes OOM kills. This method works with raw numpy arrays throughout:
+
+            1. Apply inverse scaler transforms directly on the numpy array
+               (vectorized — no per-entity Python loop).
+            2. Build :class:`PredictionFrame` objects from the numpy array +
+               the entity/time index arrays.
+
+        Args:
+            predictions: Shape ``(n_entities, n_time, n_components, n_samples)``
+                float32. This is the raw output of Darts'
+                ``predict_from_dataset(values_only=True)``.
+            entity_ids: 1-D int64 array of entity ids (length ``n_entities``).
+            time_ids: 1-D int64 array of time ids (length ``n_time``).
+            apply_inverse: When ``True``, apply the inverse target scaler and
+                inverse log transform (numpy-direct).
+            clip_negatives: When ``True``, clip negative predictions to 0.
+
+        Returns:
+            A ``{target_name: PredictionFrame}`` dict.
+        """
+        from views_r2darts2.transformers.inverse import (
+            extract_fitted_sklearn_scaler,
+        )
+        from views_frames import (
+            PredictionFrame, SpatioTemporalIndex, SpatialLevel, FrameMetadata,
+        )
+
+        # predictions shape: (n_entities, n_time, n_components, n_samples)
+        n_entities, n_time, n_components, n_samples = predictions.shape
+        target_names = list(self.targets)
+        n_targets = len(target_names)
+
+        # Determine which component indices are targets.
+        # Darts returns all components in the order they were in the input series.
+        # We need to figure out the target component indices.
+        # For now, assume the last n_targets components are the targets (the
+        # standard layout when features come before targets).
+        # TODO: make this robust by passing component names from the forecaster.
+        target_indices = list(range(n_components - n_targets, n_components))
+
+        # Extract target values: (n_entities, n_time, n_targets, n_samples)
+        target_values = predictions[:, :, target_indices, :]
+
+        # Apply inverse transforms (numpy-direct, vectorized).
+        if apply_inverse and self.scalers_fitted:
+            target_values = self._inverse_transform_numpy_predictions(
+                target_values
+            )
+
+        # Clip negatives.
+        if clip_negatives:
+            np.maximum(target_values, 0.0, out=target_values)
+
+        # Build PredictionFrames — one per target.
+        # Build the SpatioTemporalIndex: (entity, time) grid, entity-major.
+        # time_ids has shape (n_time,), entity_ids has shape (n_entities,)
+        t_grid, e_grid = np.meshgrid(time_ids, entity_ids, indexing="ij")
+        # t_grid: (n_time, n_entities), e_grid: (n_time, n_entities)
+        # We want row-major (time, entity) — entity varies fastest.
+        time_flat = t_grid.T.ravel()  # (n_entities * n_time,) — entity-major
+        entity_flat = e_grid.T.ravel()
+        # Actually, we want time-major to match the existing convention.
+        # meshgrid with indexing="ij" gives (time, entity) — reshape row-major.
+        time_flat = t_grid.ravel()  # time varies slowest
+        entity_flat = e_grid.ravel()
+
+        index = SpatioTemporalIndex(
+            time=time_flat.astype(np.int64),
+            unit=entity_flat.astype(np.int64),
+            level=self._build_spatial_level(),
+        )
+        metadata = FrameMetadata(model="darts")
+
+        frames: dict[str, Any] = {}
+        for t_idx, target_name in enumerate(target_names):
+            # target_values: (n_entities, n_time, n_targets, n_samples)
+            # Extract this target: (n_entities, n_time, n_samples)
+            # Reshape to (n_entities * n_time, n_samples) — entity-major.
+            # But the index is time-major (time, entity).
+            # We need to transpose to (n_time, n_entities, n_samples) then flatten.
+            vals = target_values[:, :, t_idx, :]  # (n_entities, n_time, n_samples)
+            # Transpose to (n_time, n_entities, n_samples) to match time-major index.
+            vals = vals.transpose(1, 0, 2)  # (n_time, n_entities, n_samples)
+            vals = vals.reshape(n_time * n_entities, n_samples).astype(np.float32)
+            frames[target_name] = PredictionFrame(
+                vals, index=index, metadata=metadata,
+            )
+        return frames
+
+    def _inverse_transform_numpy_predictions(
+        self, target_values: np.ndarray
+    ) -> np.ndarray:
+        """Apply inverse target scaler + inverse log to raw numpy predictions.
+
+        Args:
+            target_values: Shape ``(n_entities, n_time, n_targets, n_samples)``.
+
+        Returns:
+            Same shape, inverse-transformed.
+        """
+        from views_r2darts2.transformers.inverse import (
+            extract_fitted_sklearn_scaler,
+        )
+        from darts.dataprocessing import Pipeline
+
+        if not self._target_scaler:
+            return target_values
+
+        n_entities, n_time, n_targets, n_samples = target_values.shape
+
+        if isinstance(self._target_scaler, Pipeline):
+            # Pipeline path: we need to reshape to 2-D, inverse-transform,
+            # and reshape back. Use the sklearn objects from the pipeline.
+            # Flatten to (n_entities * n_time * n_samples, n_targets)
+            flat = target_values.reshape(-1, n_targets).astype(np.float64)
+            # Apply each step's inverse in reverse order.
+            for scaler in reversed(self._target_scaler._transformers):
+                sk = extract_fitted_sklearn_scaler(scaler)
+                if sk is not None:
+                    # Clamp to prevent overflow (sinh of large values).
+                    flat = np.clip(flat, -88.0, 88.0)
+                    flat = sk.inverse_transform(flat)
+                elif hasattr(scaler, "transformer"):
+                    inv_func = getattr(scaler.transformer, "inverse_func", None)
+                    if inv_func is not None:
+                        flat = np.clip(flat, -88.0, 88.0)
+                        flat = inv_func(flat)
+            target_values = flat.reshape(
+                n_entities, n_time, n_targets, n_samples
+            ).astype(np.float32)
+        else:
+            # Single Scaler path.
+            sk = extract_fitted_sklearn_scaler(self._target_scaler)
+            if sk is not None:
+                flat = target_values.reshape(-1, n_targets).astype(np.float64)
+                flat = sk.inverse_transform(flat)
+                target_values = flat.reshape(
+                    n_entities, n_time, n_targets, n_samples
+                ).astype(np.float32)
+            elif hasattr(self._target_scaler, "transformer"):
+                inv_func = getattr(self._target_scaler.transformer, "inverse_func", None)
+                if inv_func is not None:
+                    flat = np.clip(
+                        target_values.astype(np.float64), -88.0, 88.0
+                    )
+                    target_values = inv_func(flat).astype(np.float32)
+
+        # Apply inverse log if log_targets was set.
+        if getattr(self, "_log_targets", False):
+            target_values = np.expm1(
+                np.maximum(target_values, 0)
+            ).astype(np.float32)
+
+        return target_values
+
     def _inverse_transform_predictions(self, predictions: list) -> list:
         """Apply inverse target scaler + inverse log to predictions."""
         from views_r2darts2.transformers.inverse import (

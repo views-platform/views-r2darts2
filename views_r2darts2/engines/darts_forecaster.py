@@ -255,6 +255,14 @@ class DartsForecaster:
     ) -> dict[str, PredictionFrame]:
         """Generate forecasts and return them as a per-target dict of frames.
 
+        Uses Darts' ``predict_from_dataset(values_only=True)`` to bypass
+        output :class:`TimeSeries` construction entirely — the model returns
+        raw numpy arrays, which are inverse-transformed and converted to
+        :class:`PredictionFrame` objects without ever building per-entity
+        Darts ``TimeSeries`` on the output side. This is critical for
+        large entity counts (e.g. 259k PRIO-GRID cells) where building
+        259k output TimeSeries objects causes OOM kills.
+
         Args:
             sequence_number: Rolling-origin sequence index (0 = first test step).
             output_length: Number of time steps to forecast.
@@ -273,6 +281,9 @@ class DartsForecaster:
                 "Call train() or load_model() first."
             )
 
+        import gc
+        import numpy as np
+
         # Lock entropy for reproducible probabilistic samples.
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
@@ -285,40 +296,128 @@ class DartsForecaster:
             use_cyclic_encoders=self._use_cyclic_encoders,
         )
 
+        # Capture the entity/time index before freeing the input series.
+        # All entities share the same time index (integer step 1).
+        entity_ids = np.array([
+            int(ts.static_covariates[self.dataset._entity_id].iloc[0])
+            for ts in target_series
+        ], dtype=np.int64)
+        time_index_start = int(target_series[0].time_index[0])
+        # The prediction time ids start one step after the input window ends.
+        pred_time_start = int(target_series[0].time_index[-1]) + 1
+        pred_time_ids = np.arange(
+            pred_time_start, pred_time_start + output_length, dtype=np.int64
+        )
+
         # Device management.
         self._ensure_model_on_device()
 
-        # Predict.
+        # --- Fast prediction path: values_only=True ------------------------
+        # Bypasses Darts' output TimeSeries construction entirely. The model
+        # returns (predictions, series_schemas, pred_starts) as raw numpy.
+        # This avoids building 259k TimeSeries + 259k pandas DataFrames on
+        # the output side — the single biggest memory consumer.
         try:
-            timeseries_pred = self.model.predict(
-                n=output_length,
-                series=target_series,
-                past_covariates=past_covariates,
-                verbose=True,
-                **predict_kwargs,
+            # Use predict_from_dataset with values_only=True.
+            # We need to build the inference dataset ourselves, then call
+            # predict_from_dataset directly.
+            predictions, series_schemas, pred_starts = (
+                self._predict_values_only(
+                    n=output_length,
+                    series=target_series,
+                    past_covariates=past_covariates,
+                    **predict_kwargs,
+                )
             )
         except Exception as exc:
             logger.error("Error during prediction: %s", exc)
             raise
+        finally:
+            # Free the input TimeSeries immediately — they're no longer needed.
+            del target_series, past_covariates
+            gc.collect()
 
-        # Audit model output for numerical sanity BEFORE inverse-transform.
-        ReproducibilityGate.Data.audit_numerical_sanity(
-            timeseries_pred, name="Model Predictions"
+        # Audit model output for numerical sanity (numpy-direct).
+        if np.isnan(predictions).any() or np.isinf(predictions).any():
+            raise NumericalSanityError(
+                f"NaN/Inf in model predictions (shape={predictions.shape})."
+            )
+
+        # Inverse-transform + convert to PredictionFrames (numpy-direct).
+        # This bypasses ingest_darts_predictions (which needs TimeSeries)
+        # and uses ingest_numpy_predictions (which works on raw numpy).
+        frames = self.dataset.ingest_numpy_predictions(
+            predictions=predictions,
+            entity_ids=entity_ids,
+            time_ids=pred_time_ids,
+            apply_inverse=True,
+            clip_negatives=True,
         )
 
-        # Inverse-transform + convert to PredictionFrames via the dataset.
-        frames = self.dataset.ingest_darts_predictions(
-            timeseries_pred, apply_inverse=True, clip_negatives=True,
-        )
+        # Free the raw predictions array.
+        del predictions
+        gc.collect()
 
         # Final NaN guard on the PredictionFrame values.
-        import numpy as np
         for target, frame in frames.items():
             if np.isnan(frame.values).any():
                 raise NumericalSanityError(
                     f"NaNs in final PredictionFrame for target '{target}'."
                 )
         return frames
+
+    def _predict_values_only(
+        self,
+        n: int,
+        series: list,
+        past_covariates: list | None = None,
+        **predict_kwargs: Any,
+    ) -> tuple:
+        """Run prediction with ``values_only=True`` to bypass output TimeSeries.
+
+        Returns:
+            ``(predictions, series_schemas, pred_starts)`` where:
+            * ``predictions``: shape ``(n_entities, n_time, n_components, n_samples)``
+            * ``series_schemas``: list of schema dicts (one per entity)
+            * ``pred_starts``: list of prediction start times (one per entity)
+        """
+        # Extract predict kwargs.
+        num_samples = predict_kwargs.pop("num_samples", 1)
+        mc_dropout = predict_kwargs.pop("mc_dropout", False)
+        batch_size = predict_kwargs.pop("batch_size", None)
+        verbose = predict_kwargs.pop("verbose", True)
+        # Any remaining kwargs are ignored (Darts doesn't accept them).
+
+        # Build the inference dataset from the TimeSeries list.
+        # This is where the input TimeSeries are consumed — after this, the
+        # dataset holds torch tensors, not TimeSeries, so we can free the
+        # original list.
+        dataset = self.model._build_inference_dataset(
+            n=n,
+            series=series,
+            past_covariates=past_covariates,
+            future_covariates=None,
+            stride=0,
+            bounds=None,
+        )
+
+        # Free the input TimeSeries — the dataset has already extracted the
+        # tensor data from them.
+        del series, past_covariates
+
+        # Call predict_from_dataset with values_only=True.
+        predictions, series_schemas, pred_starts = (
+            self.model.predict_from_dataset(
+                n=n,
+                dataset=dataset,
+                batch_size=batch_size,
+                verbose=verbose,
+                num_samples=num_samples,
+                mc_dropout=mc_dropout,
+                values_only=True,
+            )
+        )
+        return predictions, series_schemas, pred_starts
 
     def _ensure_model_on_device(self) -> None:
         """Ensure the model is on the configured device (restore from CPU drift)."""

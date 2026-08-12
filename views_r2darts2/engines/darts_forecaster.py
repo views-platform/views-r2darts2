@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping
 
+import numpy as np
 import torch
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
 
@@ -453,6 +454,23 @@ class DartsForecaster:
         Returns:
             Shape ``(n_entities, n_time, n_components, n_samples)`` numpy array.
         """
+        if not isinstance(self.model, TorchForecastingModel):
+            raw_preds = self.model.predict(
+                n=n,
+                series=series,
+                past_covariates=past_covariates,
+                num_samples=num_samples,
+                verbose=False,
+            )
+            pred_list = raw_preds if isinstance(raw_preds, list) else [raw_preds]
+            batch_vals: list[np.ndarray] = []
+            for ts in pred_list:
+                vals = ts.all_values(copy=False)
+                if vals.ndim == 2:
+                    vals = vals[:, :, np.newaxis]
+                batch_vals.append(vals.astype(np.float32, copy=False))
+            return np.stack(batch_vals, axis=0)
+
         # Build the inference dataset from the TimeSeries list.
         dataset = self.model._build_inference_dataset(
             n=n,

@@ -114,6 +114,7 @@ class ModelCatalog:
         }
         self.config = config
         self.device = get_device()
+        self._is_markov = self.config.get("algorithm") == "MarkovModel"
 
         # DELEGATION: Specialized catalogs handle genomic translation.
         # Darts Likelihood objects are mutually exclusive with loss_fn —
@@ -125,14 +126,18 @@ class ModelCatalog:
             self.likelihood = _LIKELIHOOD_REGISTRY[loss_name]()
             logger.info("Using Darts likelihood: %s (loss_fn=None)", loss_name)
         else:
-            if self.config.get("algorithm") == "MarkovModel":
+            if self._is_markov:
                 self.loss_fn = None
                 self.likelihood = None
             else:
                 self.loss_fn = LossCatalog(self.config).get_loss()
                 self.likelihood = None
-        self.opt_catalog = OptimizerCatalog(self.config)
-        self.sched_catalog = SchedulerCatalog(self.config)
+        if self._is_markov:
+            self.opt_catalog = None
+            self.sched_catalog = None
+        else:
+            self.opt_catalog = OptimizerCatalog(self.config)
+            self.sched_catalog = SchedulerCatalog(self.config)
 
     def _get_common_pl_trainer_kwargs(self, extra_callbacks=None):
         """
@@ -219,6 +224,10 @@ class ModelCatalog:
         Returns:
             dict: Mapping of parameter names to DNA values.
         """
+        if self.opt_catalog is None or self.sched_catalog is None:
+            raise RuntimeError(
+                "Torch model args requested for a non-torch configuration."
+            )
         return {
             "input_chunk_length": self.config.get("input_chunk_length"),
             "output_chunk_length": self.config.get("output_chunk_length"),

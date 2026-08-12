@@ -5,6 +5,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class SpotlightLossLogcosh(torch.nn.Module):
     """
     """
@@ -85,7 +86,14 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # gap = y_pred_for_gap.mean(dim=1) - y_true.mean(dim=1)
 
         n_ev_safe = y_true_mask.sum(dim=1).clamp_min(1.0)
-        gap = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
+        # FIX: Event-only gap with fallback to global gap for dead-only series.
+        # For series WITH events: gap = mean(event_pred) - mean(event_true) — clean.
+        # For series WITHOUT events: gap = y_pred.mean() - y_true.mean() — prevents
+        #   Level from providing zero gradient (which caused template collapse).
+        gap_event = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
+        gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
+        has_events = (y_true_mask.sum(dim=1) > 0.5).float()
+        gap = has_events * gap_event + (1.0 - has_events) * gap_global
 
         # Series-level: amplify gap for sparse-event series
         # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
@@ -96,8 +104,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(gap)
 
         # Batch-level: weight by signal strength, gated by has_gated
+        # FIX: Use event_mask instead of gate for has_gated. The old gate-based has_gated
+        # zeroed out dead-only series (gate≈0), defeating the gap fallback above.
+        # event_mask includes false alarms (y_pred > tau), so any series where the model
+        # is predicting something gets a non-zero Level weight.
         event_frac = event_mask.mean().clamp_min(self._EPS)
-        has_gated = (gate.sum(dim=1) > self._EPS).float()
+        has_gated = (event_mask.sum(dim=1) > self._EPS).float()
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
 
         if multivariate:
@@ -142,7 +154,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
             _w_dro_cpu      = w_dro.cpu()
             _gate_cpu       = gate.cpu()
             _e_shape_cpu    = e_shape.cpu()
-            _gap_cpu        = (y_pred.mean(dim=1) - y_true.mean(dim=1)).cpu()
+            # FIX: Telemetry gap now matches actual Level gap (event-only with fallback).
+            _gap_cpu        = gap.detach().cpu()
             # _density_scale_cpu = density_scale.cpu()
             # _gap_scaled_cpu = (_gap_cpu * _density_scale_cpu).abs()
             _w_level_cpu    = w_level.cpu()

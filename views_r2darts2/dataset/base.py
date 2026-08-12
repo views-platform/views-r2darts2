@@ -1158,10 +1158,7 @@ class ViewsDataset:
         if not self.features:
             return series_list, None
 
-        # Determine the target component names.
         target_set = set(self.targets)
-
-        # For each series, select targets and past_covariates by component name.
         targets = [ts[list(self.targets)] for ts in series_list]
 
         # Past covariates = all components that are NOT targets.

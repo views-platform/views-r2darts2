@@ -231,8 +231,7 @@ class DartsForecaster:
 
         # For forecasting runs the entire test window is future data not yet in
         # the dataset. Cap val_end at train_end so the val window stays in
-        # available data; the length will fall below icl+ocl, triggering the
-        # carved-from-train fallback below.
+        # available data.
         max_dataset_time = int(
             self.dataset._ds[self.dataset._time_id].values.max()
         )

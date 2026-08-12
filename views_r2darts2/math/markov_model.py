@@ -665,20 +665,31 @@ class MarkovModel(GlobalForecastingModel):
         train_mask = (target_time >= self._train_start) & (target_time <= self._train_end)
         train_mask &= np.array([s is not None for s in target_states])
 
+        # Convert states to string values for numpy vectorized comparison.
+        # numpy's == operator doesn't work with Enum objects in object arrays.
+        sorted_states_str = np.array(
+            [s.value if isinstance(s, MarkovState) else str(s) for s in sorted_states],
+            dtype=object,
+        )
+        # Also convert target_states to plain strings (sklearn mangles Enum objects).
+        target_states_str = np.array(
+            [s.value if isinstance(s, MarkovState) else str(s) if s is not None else None
+             for s in target_states],
+            dtype=object,
+        )
+
         comp_state_models = self._state_models_by_comp.setdefault(component, {})
         comp_state_models[step] = {}
         for state in self._markov_states:
-            state_mask = sorted_states == state
+            state_mask = sorted_states_str == state.value
             combined_mask = train_mask & state_mask
             if combined_mask.sum() == 0:
                 continue
 
             X_train = features[sort_idx][combined_mask]
-            y_train = np.array([target_states[i] for i in np.where(combined_mask)[0]])
+            y_train = np.array([target_states_str[i] for i in np.where(combined_mask)[0]])
 
             if len(np.unique(y_train)) < 2:
-                # Sparse/conflict data often yields deterministic transitions
-                # for a given origin state and horizon. Keep that signal.
                 clf = DummyClassifier(strategy="most_frequent")
                 clf.fit(X_train, y_train)
                 comp_state_models[step][state] = clf
@@ -732,10 +743,17 @@ class MarkovModel(GlobalForecastingModel):
         train_mask &= ~np.isnan(fatalities_target)
         train_mask &= np.array([s is not None for s in target_states])
 
+        # Convert target states to string values for numpy comparison.
+        target_states_str = np.array(
+            [s.value if isinstance(s, MarkovState) else str(s) if s is not None else ""
+             for s in target_states],
+            dtype=object,
+        )
+
         comp_fatality_models = self._fatality_models_by_comp.setdefault(component, {})
         comp_fatality_models[step] = {}
         for state in [MarkovState.ESC, MarkovState.WAR]:
-            state_mask = target_states == state
+            state_mask = target_states_str == state.value
             combined_mask = train_mask & state_mask
             if combined_mask.sum() == 0:
                 continue

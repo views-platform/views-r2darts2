@@ -288,9 +288,9 @@ class DartsForecaster:
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
         # Extract predict kwargs.
-        num_samples = predict_kwargs.pop("num_samples")
-        mc_dropout = predict_kwargs.pop("mc_dropout")
-        batch_size = predict_kwargs.pop("batch_size")
+        num_samples = predict_kwargs.get("num_samples")
+        mc_dropout = predict_kwargs.get("mc_dropout")
+        batch_size = predict_kwargs.get("batch_size")
 
         # Compute the input window.
         icl = self.model.input_chunk_length

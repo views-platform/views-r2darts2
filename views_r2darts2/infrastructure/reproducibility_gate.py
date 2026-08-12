@@ -308,6 +308,10 @@ class ReproducibilityGate:
             # ``audit_manifest`` routes MarkovModel through
             # ``SKLEARN_CORE_GENOME`` (instead of ``CORE_GENOME``) and skips
             # the optimizer / scheduler / loss genome checks entirely.
+            #
+            # NOTE: the canonical config key for the target list is
+            # ``regression_targets`` (not ``targets``) — this matches the
+            # rest of the views-pipeline-core config convention.
             "MarkovModel": [
                 "regression_targets",
                 "markov_target",

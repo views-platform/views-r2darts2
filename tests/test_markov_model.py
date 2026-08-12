@@ -135,7 +135,7 @@ def _make_markov_config(
         "run_type": "test",
         "random_state": 42,
         "steps": steps,
-        "targets": list(targets),
+        "regression_targets": list(targets),
         "markov_target": markov_target,
         "markov_method": markov_method,
         "regression_method": regression_method,
@@ -683,8 +683,8 @@ class TestReproducibilityGateSklearnBypass:
 
     def test_audit_manifest_missing_target_raises(self) -> None:
         config = _make_markov_config()
-        del config["targets"]
-        with pytest.raises(MissingHyperparameterError, match="targets"):
+        del config["regression_targets"]
+        with pytest.raises(MissingHyperparameterError, match="regression_targets"):
             ReproducibilityGate.Config.audit_manifest(config)
 
     def test_audit_manifest_does_not_require_loss_function(self) -> None:

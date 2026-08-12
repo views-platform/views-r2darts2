@@ -142,6 +142,9 @@ class DartsForecaster:
 
         self.scaler_fitted = False
         self.device = _get_device()
+        # Store the full partition dict for later use (e.g., re-attaching
+        # the dataset to a loaded sklearn model).
+        self._partition_dict = dict(partition_dict)
         # Detect sklearn-based models — these bypass the torch-specific
         # train/predict path. The MarkovModel is the canonical example.
         self._is_sklearn_model = isinstance(self.model, SKLearnModel)
@@ -154,6 +157,12 @@ class DartsForecaster:
                 "Using sklearn-based model %s — torch device checks bypassed.",
                 type(self.model).__name__,
             )
+            # Give the model access to the dataset so it can use the full
+            # data infrastructure (FeatureFrame API, zarr-backed lazy
+            # loading, index validation). The model's fit/predict methods
+            # check for ``self._dataset`` and use it when available.
+            if hasattr(self.model, "set_dataset"):
+                self.model.set_dataset(self.dataset, partition_dict=self._partition_dict)
         else:
             logger.info("Using device: %s", self.device)
             self._move_model_to_device()
@@ -187,11 +196,44 @@ class DartsForecaster:
         forecasting-mode carve (when the test partition is too short for a
         validation window, carves val from the train end).
 
-        For sklearn-based models (e.g. MarkovModel), the validation-set
-        carve and torch-specific kwargs (``val_series``, ``val_past_cov``,
-        ``dataloader_kwargs``) are skipped — sklearn models do not consume
-        them.
+        For sklearn-based models (e.g. MarkovModel), the scaler-fitting,
+        validation-set carve, and torch-specific kwargs (``val_series``,
+        ``val_past_cov``, ``dataloader_kwargs``) are all skipped — sklearn
+        models do their own internal transforms and do not consume torch
+        plumbing. The model is given access to the dataset directly (via
+        ``set_dataset`` in ``__init__``) so it can use the FeatureFrame API.
         """
+        # Sklearn models bypass the scaler-fitting and validation-set carve
+        # entirely. The MarkovModel does its own log1p transform and does
+        # not use external scalers — fitting scalers here would be wasted
+        # work (and could cause double-transform issues if log_targets is
+        # also set). The model uses the dataset directly via set_dataset.
+        if self._is_sklearn_model:
+            # Mark the scaler as "fitted" so predict() doesn't raise.
+            # No actual scalers are fitted — the MarkovModel applies its
+            # own transforms internally.
+            self.scaler_fitted = True
+            # Call model.fit with the raw (unscaled) TimeSeries. When a
+            # dataset is attached, the model ignores these series and
+            # uses the dataset's FeatureFrame API instead. The series are
+            # passed only for darts interface compliance.
+            train_time_ids = list(range(self._train_start, self._train_end + 1))
+            target_series, past_covariates = self.dataset.to_darts_timeseries(
+                time_ids=train_time_ids,
+                use_cyclic_encoders=self._use_cyclic_encoders,
+            ), None
+            # Split into targets and past_covariates (the MarkovModel
+            # expects the standard darts two-argument interface).
+            target_series, past_covariates = self.dataset._split_targets_covariates(
+                target_series
+            )
+            self.model.fit(
+                series=target_series,
+                past_covariates=past_covariates,
+            )
+            return
+
+        # --- Torch model path ---
         # Fit scalers and return the already-transformed training series in one
         # zarr load — avoids a second full read for the same time range.
         train_time_ids = list(range(self._train_start, self._train_end + 1))
@@ -206,15 +248,6 @@ class DartsForecaster:
             use_cyclic_encoders=self._use_cyclic_encoders,
         )
         self.scaler_fitted = True
-
-        # Sklearn models do not use a validation set, dataloader_kwargs, or
-        # checkpoint reload. Pass only the scaled series.
-        if self._is_sklearn_model:
-            self.model.fit(
-                series=target_series,
-                past_covariates=past_covariates,
-            )
-            return
 
         # Validation set: test partition (or carved from train end for
         # forecasting mode).
@@ -332,14 +365,26 @@ class DartsForecaster:
         # Lock entropy for reproducible probabilistic samples.
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
-        # Get scaled input window for this sequence.
+        # Get input window for this sequence.
+        # Sklearn models do not use external scalers — fetch raw
+        # (unscaled) TimeSeries directly from the dataset. Torch models
+        # use the scaler-fitted path (``get_scaled_darts_timeseries``).
         icl = self.model.input_chunk_length
         start = self._test_start + sequence_number - icl
         end = self._test_start - 1 + sequence_number
-        target_series, past_covariates = self.dataset.get_scaled_darts_timeseries(
-            time_ids=list(range(start, end + 1)),
-            use_cyclic_encoders=self._use_cyclic_encoders,
-        )
+        if self._is_sklearn_model:
+            series_list = self.dataset.to_darts_timeseries(
+                time_ids=list(range(start, end + 1)),
+                use_cyclic_encoders=self._use_cyclic_encoders,
+            )
+            target_series, past_covariates = self.dataset._split_targets_covariates(
+                series_list
+            )
+        else:
+            target_series, past_covariates = self.dataset.get_scaled_darts_timeseries(
+                time_ids=list(range(start, end + 1)),
+                use_cyclic_encoders=self._use_cyclic_encoders,
+            )
 
         # Capture the entity/time index before freeing the input series.
         # All entities share the same time index (integer step 1).
@@ -595,4 +640,11 @@ class DartsForecaster:
                 path=path, map_location=str(self.device)
             )
         self._move_model_to_device()
+
+        # Re-attach the dataset to sklearn models (the loaded model
+        # instance does not carry the dataset reference — it was set on
+        # the pre-load instance by __init__).
+        if self._is_sklearn_model and hasattr(self.model, "set_dataset"):
+            self.model.set_dataset(self.dataset, partition_dict=self._partition_dict)
+
         logger.info("Model loaded on device %s.", self.device)

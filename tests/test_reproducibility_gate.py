@@ -268,7 +268,8 @@ class TestSklearnBypass:
             "run_type": "calibration",
             "random_state": 42,
             "steps": [1, 2, 3],
-            "targets": ["lr_ged_sb"],
+            "targets": ["lr_ged_sb"],  # legacy key — the gate uses regression_targets
+            "regression_targets": ["lr_ged_sb"],
             "markov_target": "lr_ged_sb",
             "markov_method": "direct",
             "regression_method": "single",
@@ -292,11 +293,11 @@ class TestSklearnBypass:
             ReproducibilityGate.Config.audit_manifest(config)
 
     def test_audit_manifest_missing_targets_raises(self) -> None:
-        """Removing ``targets`` (Markov algorithm gene) raises
+        """Removing ``regression_targets`` (Markov algorithm gene) raises
         :class:`MissingHyperparameterError`."""
         config = self._minimal_markov_config()
-        del config["targets"]
-        with pytest.raises(MissingHyperparameterError, match="targets"):
+        del config["regression_targets"]
+        with pytest.raises(MissingHyperparameterError, match="regression_targets"):
             ReproducibilityGate.Config.audit_manifest(config)
 
     def test_audit_manifest_missing_random_state_raises(self) -> None:
@@ -360,7 +361,7 @@ class TestSklearnBypass:
         assert "MarkovModel" in ReproducibilityGate.Config.ALGORITHM_GENOMES
         genes = ReproducibilityGate.Config.ALGORITHM_GENOMES["MarkovModel"]
         # Required genes.
-        assert "targets" in genes
+        assert "regression_targets" in genes
         assert "markov_target" in genes
         assert "markov_method" in genes
         assert "regression_method" in genes

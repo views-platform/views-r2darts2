@@ -1,4 +1,9 @@
 """A Markov prediction model for forecasting fatalities.
+
+Translated from the original pandas-based ``MarkovModel`` implementation
+(https://github.com/prio-data/viewsforecasting/tree/main/Tools/new_markov)
+to a numpy-only, darts-compatible form.
+
 Key differences from the original:
 
 * Subclasses :class:`darts.models.forecasting.sklearn_model.SKLearnModel` so it
@@ -114,6 +119,8 @@ class MarkovStateModel:
     :class:`RandomForestClassifier` is fitted per starting state — only
     samples whose ``markov_state`` equals the starting state are used to fit
     that classifier.
+
+    Numpy-only — no pandas dependency.
     """
 
     def __init__(
@@ -581,14 +588,24 @@ class MarkovModel(SKLearnModel):
         self._fatalities_feature_idx: np.ndarray = np.array([], dtype=np.int64)
         self._markov_target_idx: int = -1
         self._target_indices: dict[str, int] = {}
-        # Train window (filled by fit):
+        # Train/test window (set by set_dataset or derived from data in fit):
         self._train_start: int = 0
         self._train_end: int = 0
+        self._test_start: int = 0
+        self._test_end: int = 0
         # Caches for predict:
         self._data_values: Optional[np.ndarray] = None
         self._data_time_ids: Optional[np.ndarray] = None
         self._data_entity_ids: Optional[np.ndarray] = None
         self._data_markov_state: Optional[np.ndarray] = None
+
+        # --- ViewsDataset reference (set by DartsForecaster for sklearn models).
+        # When non-None, fit/predict use the dataset's FeatureFrame API
+        # instead of flattening Darts TimeSeries. This gives the MarkovModel
+        # access to the full data infrastructure (zarr-backed lazy loading,
+        # FeatureFrame conversion, index validation).
+        self._dataset: Any = None
+        self._partition_dict: Optional[dict] = None
 
         # --- Determine output_chunk_length if not provided.
         max_step = max(self._steps)
@@ -614,6 +631,52 @@ class MarkovModel(SKLearnModel):
             random_state=random_state,
             **kwargs,
         )
+
+    # ==================================================================
+    # ViewsDataset integration
+    # ==================================================================
+
+    def set_dataset(
+        self,
+        dataset: Any,
+        partition_dict: Optional[dict] = None,
+    ) -> None:
+        """Attach a :class:`ViewsDataset` to this model.
+
+        When a dataset is attached, :meth:`fit` and :meth:`predict` use the
+        dataset's :meth:`ViewsDataset.to_featureframe` API to obtain the
+        flat ``(N, F)`` feature matrix + index arrays, instead of flattening
+        Darts ``TimeSeries``. This gives the MarkovModel access to the full
+        data infrastructure (zarr-backed lazy loading, FeatureFrame
+        conversion, index validation, scaler management).
+
+        The :class:`DartsForecaster` calls this automatically for sklearn
+        models. Standalone callers (tests, notebooks) can call it manually
+        to use the dataset path; if not called, the model falls back to
+        the Darts TimeSeries path.
+
+        Args:
+            dataset: A :class:`ViewsDataset` (or compatible) instance.
+            partition_dict: Optional ``{"train": (start, end), "test":
+                (start, end)}`` dict. When provided, the train window
+                boundaries are taken from here (matching the original
+                pandas-based implementation). When ``None``, the
+                boundaries are derived from the data's min/max time_ids.
+        """
+        self._dataset = dataset
+        self._partition_dict = (
+            dict(partition_dict) if partition_dict is not None else None
+        )
+        if self._partition_dict is not None:
+            if "train" in self._partition_dict:
+                self._train_start, self._train_end = self._partition_dict["train"]
+            if "test" in self._partition_dict:
+                self._test_start, self._test_end = self._partition_dict["test"]
+            # Infer the entity_id / time_id column names from the dataset.
+            if hasattr(dataset, "_entity_id"):
+                self._entity_id = str(dataset._entity_id)
+            if hasattr(dataset, "_time_id"):
+                self._time_id = str(dataset._time_id)
 
     # ==================================================================
     # Public darts interface
@@ -673,8 +736,18 @@ class MarkovModel(SKLearnModel):
         kwargs.pop("val_past_covariates", None)
         kwargs.pop("dataloader_kwargs", None)
 
-        # --- Flatten the darts TimeSeries to (N, F) numpy + index arrays.
-        flat = _flatten_timeseries_list(series, past_covariates)
+        # --- Obtain the flat (N, F) matrix + index arrays.
+        # When a ViewsDataset is attached (via set_dataset), use the
+        # dataset's FeatureFrame API — this is the preferred path that
+        # leverages the full data infrastructure (zarr-backed lazy loading,
+        # index validation, etc.). Otherwise, flatten the Darts TimeSeries.
+        if self._dataset is not None:
+            flat = _flatten_from_dataset(
+                self._dataset,
+                time_ids=list(range(self._train_start, self._train_end + 1)),
+            )
+        else:
+            flat = _flatten_timeseries_list(series, past_covariates)
         # flat: dict with keys 'values', 'time_ids', 'entity_ids',
         # 'columns' (list of column names in order).
 
@@ -739,12 +812,31 @@ class MarkovModel(SKLearnModel):
         for tgt_name, tgt_idx in self._target_indices.items():
             values[:, tgt_idx] = np.log1p(np.maximum(values[:, tgt_idx], 0.0))
 
-        # Determine train window from the time_ids present in the input
-        # series. The darts forecaster already filters to the train partition
-        # before calling fit, so the min/max time_ids here ARE the train
-        # window boundaries.
-        self._train_start = int(time_ids.min())
-        self._train_end = int(time_ids.max())
+        # Determine the train window boundaries.
+        # When a partition_dict was provided (via set_dataset), use those
+        # values — this matches the original pandas-based implementation
+        # which uses the partitioner_dict's train_start/train_end to filter
+        # the training data. Otherwise, derive from the data's min/max
+        # time_ids (the DartsForecaster already filters to the train
+        # partition before calling fit).
+        if self._partition_dict is not None and "train" in self._partition_dict:
+            # partition_dict values already set in set_dataset; verify they
+            # are consistent with the data.
+            data_min = int(time_ids.min())
+            data_max = int(time_ids.max())
+            if data_min < self._train_start or data_max > self._train_end:
+                logger.warning(
+                    "MarkovModel.fit: data time range [%d, %d] extends "
+                    "beyond partition train window [%d, %d]. Using data "
+                    "range for training.",
+                    data_min, data_max,
+                    self._train_start, self._train_end,
+                )
+                self._train_start = data_min
+                self._train_end = data_max
+        else:
+            self._train_start = int(time_ids.min())
+            self._train_end = int(time_ids.max())
 
         # Compute Markov states from markov_target.
         markov_state = self._add_markov_states(
@@ -871,9 +963,42 @@ class MarkovModel(SKLearnModel):
         """
         _check_is_fitted(self, "is_fitted_")
 
-        # If the caller passed new series, use them; otherwise use the
-        # cached training data.
-        if series is not None or past_covariates is not None:
+        # --- Obtain the input data for prediction.
+        # Priority:
+        # 1. If a ViewsDataset is attached, use it to fetch the prediction
+        #    input month directly (the preferred path that leverages the
+        #    full data infrastructure).
+        # 2. If the caller passed new series/covariates, flatten them.
+        # 3. Otherwise, use the cached training data (predict from the
+        #    last observed month).
+        if self._dataset is not None and series is not None:
+            # The DartsForecaster passes the input TimeSeries for the
+            # current month. Extract the time id from the series and use
+            # the dataset to fetch the same month's data.
+            ts_list = [series] if isinstance(series, TimeSeries) else list(series)
+            if ts_list:
+                current_time = int(ts_list[0].time_index[-1])
+                flat = _flatten_from_dataset(
+                    self._dataset,
+                    time_ids=[current_time],
+                )
+                values = flat["values"].astype(np.float32, copy=True)
+                time_ids = flat["time_ids"].astype(np.int64, copy=False)
+                entity_ids = flat["entity_ids"].astype(np.int64, copy=False)
+                values, time_ids, entity_ids = _fill_missing_combinations(
+                    values, time_ids, entity_ids
+                )
+                for tgt_name, tgt_idx in self._target_indices.items():
+                    values[:, tgt_idx] = np.log1p(np.maximum(values[:, tgt_idx], 0.0))
+                markov_state = self._add_markov_states(
+                    values, time_ids, entity_ids, self._markov_target_idx
+                )
+            else:
+                values = self._data_values
+                time_ids = self._data_time_ids
+                entity_ids = self._data_entity_ids
+                markov_state = self._data_markov_state
+        elif series is not None or past_covariates is not None:
             flat = _flatten_timeseries_list(series, past_covariates)
             values = flat["values"].astype(np.float32, copy=True)
             time_ids = flat["time_ids"].astype(np.int64, copy=False)
@@ -1222,6 +1347,74 @@ class MarkovModel(SKLearnModel):
 # ----------------------------------------------------------------------
 # Numpy helpers — flat representation for the Markov logic
 # ----------------------------------------------------------------------
+
+
+def _flatten_from_dataset(
+    dataset: Any,
+    time_ids: Optional[list[int]] = None,
+) -> dict:
+    """Flatten a :class:`ViewsDataset` to the same dict format as
+    :func:`_flatten_timeseries_list`.
+
+    Uses the dataset's :meth:`to_featureframe` API to obtain the flat
+    ``(N, F)`` feature matrix + index arrays. This is the preferred path
+    when a :class:`ViewsDataset` is available — it leverages the full data
+    infrastructure (zarr-backed lazy loading, index validation).
+
+    Args:
+        dataset: A :class:`ViewsDataset` (or compatible) instance.
+        time_ids: Optional list of time ids to filter the dataset to
+            before flattening. When ``None``, the entire dataset is used.
+
+    Returns:
+        A dict with keys:
+            * ``values``: ``(N, F)`` float32 array (features + targets).
+            * ``time_ids``: ``(N,)`` int64 array.
+            * ``entity_ids``: ``(N,)`` int64 array.
+            * ``columns``: list of column names (features + targets).
+    """
+    # Subset the dataset to the requested time_ids.
+    if time_ids is not None:
+        ds = dataset.get_subset_dataset(time_ids=time_ids)
+    else:
+        ds = dataset
+
+    # Use the dataset's FeatureFrame API to get the flat representation.
+    frame = ds.to_featureframe()
+
+    # values: (N, F, S) → (N, F) — squeeze the sample axis.
+    vals = frame.values
+    if vals.ndim == 3:
+        vals = vals[:, :, 0]
+    vals = np.ascontiguousarray(vals, dtype=np.float32)
+
+    # Extract time_ids and entity_ids from the SpatioTemporalIndex.
+    time_arr = frame.index.time.astype(np.int64)
+    entity_arr = frame.index.unit.astype(np.int64)
+
+    # Column names: features + targets (the order returned by
+    # ViewsDataset.to_featureframe).
+    columns = list(frame.feature_names)
+
+    # Reorder columns to match the TimeSeries path's convention:
+    # targets first, then features. This ensures that both paths
+    # produce identical RandomForest inputs (the RF's random feature
+    # selection depends on column order, so mismatched orders would
+    # lead to different trees and different predictions).
+    target_cols = [c for c in columns if c in getattr(dataset, "targets", [])]
+    feature_cols = [c for c in columns if c not in target_cols]
+    canonical_order = target_cols + feature_cols
+    if columns != canonical_order:
+        reorder_idx = [columns.index(c) for c in canonical_order]
+        vals = vals[:, reorder_idx]
+        columns = canonical_order
+
+    return {
+        "values": vals,
+        "time_ids": time_arr,
+        "entity_ids": entity_arr,
+        "columns": columns,
+    }
 
 
 def _flatten_timeseries_list(

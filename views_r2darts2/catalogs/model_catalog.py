@@ -504,7 +504,7 @@ class ModelCatalog:
         elif isinstance(steps, int):
             steps = [steps]
 
-        targets = self.config.get("targets") or self.config.get("regression_targets")
+        targets = self.config.get("regression_targets") or self.config.get("targets")
         if isinstance(targets, str):
             targets = [targets]
 

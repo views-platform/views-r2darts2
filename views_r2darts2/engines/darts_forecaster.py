@@ -217,11 +217,34 @@ class DartsForecaster:
                 logger.warning("checkpoint_mode='last' reload failed: %s", exc)
 
     def _build_validation_set(self):
-        """Build the validation set (test partition or carved from train end)."""
+        """Build the validation set (test partition or carved from train end).
+
+        IMPORTANT: This method must NOT refit the scalers. The scalers were
+        fitted in :meth:`train` on the full training partition. Refitting here
+        would change the scaler parameters, causing a mismatch between the
+        training data (transformed with the original scaler) and the
+        validation/prediction data (transformed with the refit scaler).
+        """
         icl = self.model.input_chunk_length
         ocl = self.model.output_chunk_length
         val_start = self._test_start - icl
-        val_end = self._test_end
+
+        # For forecasting runs the entire test window is future data not yet in
+        # the dataset. Cap val_end at train_end so the val window stays in
+        # available data; the length will fall below icl+ocl, triggering the
+        # carved-from-train fallback below.
+        max_dataset_time = int(
+            self.dataset._ds[self.dataset._time_id].values.max()
+        )
+        if self._test_start > max_dataset_time:
+            val_end = self._train_end
+            logger.info(
+                "Forecasting mode: test_start=%d > max_dataset_time=%d; "
+                "validation will be carved from train end.",
+                self._test_start, max_dataset_time,
+            )
+        else:
+            val_end = self._test_end
 
         val_targets, val_past_cov = self.dataset.get_scaled_darts_timeseries(
             time_ids=list(range(val_start, val_end + 1)),
@@ -232,21 +255,11 @@ class DartsForecaster:
         min_val_len = icl + ocl
         max_val_len = max((len(ts) for ts in val_targets), default=0)
         if max_val_len < min_val_len:
-            # Carve from train end.
+            # Carve from train end — NO scaler refit (preserves train-time scaler).
             carved_start = self._train_end - ocl - icl + 1
             logger.info(
                 "Forecasting mode: val too short (%d < %d). Carving [%d, %d].",
                 max_val_len, min_val_len, carved_start, self._train_end,
-            )
-            # Refit scalers on trimmed train (no holdout leakage).
-            trimmed_end = self._train_end - ocl
-            self.dataset.fit_scalers(
-                target_scaler=self._target_scaler_cfg,
-                feature_scaler=self._feature_scaler_cfg,
-                feature_scaler_map=self._feature_scaler_map_cfg,
-                log_targets=self._log_targets,
-                log_features=self._log_features,
-                time_ids=list(range(self._train_start, trimmed_end + 1)),
             )
             val_targets, val_past_cov = self.dataset.get_scaled_darts_timeseries(
                 time_ids=list(range(carved_start, self._train_end + 1)),

@@ -1146,15 +1146,33 @@ class ViewsDataset:
     def _split_targets_covariates(
         self, series_list: list
     ) -> tuple[list, list | None]:
-        """Split a list of Darts TimeSeries into (targets, past_covariates)."""
+        """Split a list of Darts TimeSeries into (targets, past_covariates).
+
+        When cyclic encoders have been appended, the series components include
+        extra columns (``month_sin``, ``month_cos``, etc.) that are NOT in
+        ``self.features``. This method correctly identifies all non-target
+        components as past covariates.
+        """
         if not self.targets:
             return [], None
         if not self.features:
-            # value_columns == targets only; series already contain only target
-            # columns — skip the per-entity __getitem__ call (259k __init__ calls).
             return series_list, None
-        targets = [ts[self.targets] for ts in series_list]
-        past_cov = [ts[self.features].astype(np.float32) for ts in series_list]
+
+        # Determine the target component names.
+        target_set = set(self.targets)
+
+        # For each series, select targets and past_covariates by component name.
+        targets = [ts[list(self.targets)] for ts in series_list]
+
+        # Past covariates = all components that are NOT targets.
+        # This includes the original features AND any cyclic encoder columns
+        # that were appended by to_darts_timeseries.
+        sample_comps = list(series_list[0].components)
+        cov_comp_names = [c for c in sample_comps if c not in target_set]
+        if cov_comp_names:
+            past_cov = [ts[cov_comp_names].astype(np.float32) for ts in series_list]
+        else:
+            past_cov = None
         return targets, past_cov
 
     def _apply_log_to_targets(self, series_list: list) -> list:

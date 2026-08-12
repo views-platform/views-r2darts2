@@ -114,7 +114,6 @@ class ModelCatalog:
         }
         self.config = config
         self.device = get_device()
-        self._is_markov = self.config.get("algorithm") == "MarkovModel"
 
         # DELEGATION: Specialized catalogs handle genomic translation.
         # Darts Likelihood objects are mutually exclusive with loss_fn —
@@ -126,18 +125,10 @@ class ModelCatalog:
             self.likelihood = _LIKELIHOOD_REGISTRY[loss_name]()
             logger.info("Using Darts likelihood: %s (loss_fn=None)", loss_name)
         else:
-            if self._is_markov:
-                self.loss_fn = None
-                self.likelihood = None
-            else:
-                self.loss_fn = LossCatalog(self.config).get_loss()
-                self.likelihood = None
-        if self._is_markov:
-            self.opt_catalog = None
-            self.sched_catalog = None
-        else:
-            self.opt_catalog = OptimizerCatalog(self.config)
-            self.sched_catalog = SchedulerCatalog(self.config)
+            self.loss_fn = LossCatalog(self.config).get_loss()
+            self.likelihood = None
+        self.opt_catalog = OptimizerCatalog(self.config)
+        self.sched_catalog = SchedulerCatalog(self.config)
 
     def _get_common_pl_trainer_kwargs(self, extra_callbacks=None):
         """
@@ -224,10 +215,6 @@ class ModelCatalog:
         Returns:
             dict: Mapping of parameter names to DNA values.
         """
-        if self.opt_catalog is None or self.sched_catalog is None:
-            raise RuntimeError(
-                "Torch model args requested for a non-torch configuration."
-            )
         return {
             "input_chunk_length": self.config.get("input_chunk_length"),
             "output_chunk_length": self.config.get("output_chunk_length"),
@@ -459,24 +446,7 @@ class ModelCatalog:
         )
 
     def _get_markov_model(self):
-        """Build a MarkovModel (sklearn RandomForest-based, non-torch).
-
-        The MarkovModel does NOT use torch, pytorch_lightning, or any of the
-        torch-related infrastructure. It uses sklearn RandomForest classifiers
-        and regressors internally. It still goes through the same
-        ``DartsForecaster.fit()`` / ``predict()`` pipeline.
-
-        Config keys consumed:
-            * ``input_chunk_length``: Input window (default 12).
-            * ``output_chunk_length``: Output window (default 36).
-            * ``markov_threshold``: Fatality threshold for state computation.
-            * ``markov_method``: ``"direct"`` or ``"transition"``.
-            * ``regression_method``: ``"single"`` or ``"multi"``.
-            * ``random_state``: Random seed.
-            * ``n_jobs``: Parallel jobs for sklearn (default -1).
-            * ``rf_class_params``: Extra params for RandomForestClassifier.
-            * ``rf_reg_params``: Extra params for RandomForestRegressor.
-        """
+        """Build a MarkovModel (sklearn RandomForest-based, non-torch)."""
         from views_r2darts2.math.markov_model import MarkovModel
 
         ReproducibilityGate.Config.audit_architecture(self.config)
@@ -491,5 +461,4 @@ class ModelCatalog:
             n_jobs=self.config.get("n_jobs", -1),
             rf_class_params=self.config.get("rf_class_params"),
             rf_reg_params=self.config.get("rf_reg_params"),
-            add_encoders=self._resolve_add_encoders(),
         )

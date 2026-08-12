@@ -454,11 +454,13 @@ class TestDartsForecasterPredictContract:
         """A successful predict returns a ``dict[str, PredictionFrame]``.
 
         Uses ``target_scaler=None`` so the inverse-transform step is skipped.
-        Mocks the batch prediction path (``_build_inference_dataset`` +
-        ``predict_from_dataset(values_only=True)``) to return raw numpy.
+        Mocks ``predict_from_dataset`` with ``values_only=True`` to return
+        raw numpy (the fast path that bypasses output TimeSeries).
         """
         mock_model = _make_mock_model()
-        # Mock the batch prediction path.
+        # The new predict path calls predict_from_dataset(values_only=True)
+        # which returns (predictions, schemas, pred_starts).
+        # predictions shape: (n_entities, n_time, n_components, n_samples)
         n_entities = len(ENTITY_IDS)
         n_time = 6  # output_length
         n_targets = len(TARGETS)
@@ -467,9 +469,13 @@ class TestDartsForecasterPredictContract:
             (n_entities, n_time, n_targets, n_samples), 0.5, dtype=np.float32
         )
         mock_model.predict_from_dataset.return_value = (
-            mock_predictions, [{}] * n_entities, list(range(n_entities)),
+            mock_predictions,  # predictions
+            [{}] * n_entities,  # schemas
+            list(range(n_entities)),  # pred_starts
         )
+        # Mock _build_inference_dataset to return a dummy.
         mock_model._build_inference_dataset.return_value = Mock()
+
         fc = DartsForecaster(
             dataset=dataset,
             model=mock_model,
@@ -477,9 +483,6 @@ class TestDartsForecasterPredictContract:
             target_scaler=None,
             random_state=42,
         )
-        # Fit scalers (no-op since both are None) and flip the forecaster's
-        # scaler_fitted flag (the runtime check is on the forecaster, not
-        # the dataset).
         fc.dataset.fit_scalers(
             target_scaler=None,
             feature_scaler=None,
@@ -490,10 +493,7 @@ class TestDartsForecasterPredictContract:
         assert isinstance(result, dict)
         assert set(result.keys()) == set(TARGETS)
         for tgt, frame in result.items():
-            assert isinstance(frame, PredictionFrame), (
-                f"result['{tgt}'] is {type(frame).__name__}, expected "
-                "PredictionFrame"
-            )
+            assert isinstance(frame, PredictionFrame)
             # 3 entities × 6 time steps = 18 rows.
             assert frame.n_rows == 18
 
@@ -513,6 +513,7 @@ class TestDartsForecasterPredictContract:
             mock_predictions, [{}] * n_entities, list(range(n_entities)),
         )
         mock_model._build_inference_dataset.return_value = Mock()
+
         fc = DartsForecaster(
             dataset=dataset,
             model=mock_model,
@@ -551,6 +552,7 @@ class TestDartsForecasterPredictContract:
             mock_predictions, [{}] * n_entities, list(range(n_entities)),
         )
         mock_model._build_inference_dataset.return_value = Mock()
+
         fc = DartsForecaster(
             dataset=dataset,
             model=mock_model,

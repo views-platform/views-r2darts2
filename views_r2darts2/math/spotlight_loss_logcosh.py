@@ -49,12 +49,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         y_true_mask = (y_true.abs() > self.tau).float()
 
         # ── SHAPE: log_cosh on demeaned errors ────────
-        # Demean by the event-cell mean of e (== the LEVEL gap) so SHAPE sees only
-        # deviations FROM the level → orthogonal to LEVEL. The all-cell mean is ≈0 on
-        # 98%-zero data, so it left the event level inside e_shape (SHAPE redundant
-        # with LEVEL, no pattern signal → flat template scaled by RevIN).
-        _n_true = y_true_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        e_mean = (y_true_mask * e).sum(dim=1, keepdim=True) / _n_true
+        e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean.detach()
 
         # Gate the e_shape gradient so dead cells (gate≈0) get ~50× less

@@ -309,7 +309,7 @@ class ReproducibilityGate:
             # ``SKLEARN_CORE_GENOME`` (instead of ``CORE_GENOME``) and skips
             # the optimizer / scheduler / loss genome checks entirely.
             "MarkovModel": [
-                "targets",
+                "regression_targets",
                 "markov_target",
                 "markov_method",
                 "regression_method",

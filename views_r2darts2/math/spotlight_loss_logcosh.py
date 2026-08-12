@@ -49,7 +49,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         y_true_mask = (y_true.abs() > self.tau).float()
 
         # ── SHAPE: log_cosh on demeaned errors ────────
-        e_mean = e.mean(dim=1, keepdim=True)
+        # Demean by the event-cell mean of e (== the LEVEL gap) so SHAPE sees only
+        # deviations FROM the level → orthogonal to LEVEL. The all-cell mean is ≈0 on
+        # 98%-zero data, so it left the event level inside e_shape (SHAPE redundant
+        # with LEVEL, no pattern signal → flat template scaled by RevIN).
+        _n_true = y_true_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        e_mean = (y_true_mask * e).sum(dim=1, keepdim=True) / _n_true
         e_shape = e - e_mean.detach()
 
         # Gate the e_shape gradient so dead cells (gate≈0) get ~50× less
@@ -90,10 +95,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Series-level: amplify gap for sparse-event series
         # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
         n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
-        density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
-        # density_scale as loss weight, not input normaliser — avoids tanh saturation at small gaps
-        level_cell = density_scale * self._log_cosh(gap)
-        # level_cell = self._log_cosh(gap)
+        # Pure logcosh(gap). LEVEL dominance comes from the `T *` factor below, not from
+        # per-series density weighting (which amplified LEVEL on sparse series, over-driving
+        # the shared per-series mean and collapsing all countries to one RevIN-scaled template).
+        level_cell = self._log_cosh(gap)
 
         # Batch-level: weight by signal strength, gated by has_gated
         event_frac = event_mask.mean().clamp_min(self._EPS)
@@ -101,9 +106,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
 
         if multivariate:
-            loss_level = (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Dead-cell anchor at Shape scale ─────────────────
         # Pushes dead cells toward 0, eliminating gap contamination source.

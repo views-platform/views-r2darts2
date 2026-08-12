@@ -101,7 +101,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Pure logcosh(gap). LEVEL dominance comes from the `T *` factor below, not from
         # per-series density weighting (which amplified LEVEL on sparse series, over-driving
         # the shared per-series mean and collapsing all countries to one RevIN-scaled template).
-        level_cell = self._log_cosh(gap)
+        density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
+        level_cell = self._log_cosh(gap * density_scale)   # tanh(0.45 * 2.5) = tanh(1.13)
+        loss_level = T * (w_level * level_cell).sum() / w_level.sum()
 
         # Batch-level: weight by signal strength, gated by has_gated
         # FIX: Use event_mask instead of gate for has_gated. The old gate-based has_gated
@@ -124,11 +126,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
         dead_mask = 1.0 - y_true_mask
         dead_sum = (dead_mask * y_pred).sum(dim=1)
         anchor_cell = self._log_cosh(dead_sum)
+        density_scale_mean = density_scale.mean()
 
         if multivariate:
-            loss_anchor = (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_anchor = density_scale_mean * (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_anchor = (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_anchor = density_scale_mean * (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

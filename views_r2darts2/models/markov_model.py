@@ -1361,6 +1361,12 @@ def _flatten_from_dataset(
     when a :class:`ViewsDataset` is available — it leverages the full data
     infrastructure (zarr-backed lazy loading, index validation).
 
+    Note: this function intentionally avoids ``get_subset_dataset`` (which
+    re-creates a ViewsDataset and triggers a ``to_zarr`` write that can
+    fail on Dask chunk alignment for the production parquet files).
+    Instead, it calls ``to_featureframe`` on the original dataset and
+    filters the resulting arrays by ``time_ids`` using a boolean mask.
+
     Args:
         dataset: A :class:`ViewsDataset` (or compatible) instance.
         time_ids: Optional list of time ids to filter the dataset to
@@ -1373,14 +1379,10 @@ def _flatten_from_dataset(
             * ``entity_ids``: ``(N,)`` int64 array.
             * ``columns``: list of column names (features + targets).
     """
-    # Subset the dataset to the requested time_ids.
-    if time_ids is not None:
-        ds = dataset.get_subset_dataset(time_ids=time_ids)
-    else:
-        ds = dataset
-
-    # Use the dataset's FeatureFrame API to get the flat representation.
-    frame = ds.to_featureframe()
+    # Get the full FeatureFrame from the original dataset (no subsetting —
+    # subsetting via get_subset_dataset triggers a to_zarr write that can
+    # fail on Dask chunk alignment).
+    frame = dataset.to_featureframe()
 
     # values: (N, F, S) → (N, F) — squeeze the sample axis.
     vals = frame.values
@@ -1408,6 +1410,15 @@ def _flatten_from_dataset(
         reorder_idx = [columns.index(c) for c in canonical_order]
         vals = vals[:, reorder_idx]
         columns = canonical_order
+
+    # Filter by time_ids (in-place, after the column reorder — avoids the
+    # get_subset_dataset → to_zarr write that fails on Dask chunk alignment).
+    if time_ids is not None and len(time_ids) > 0:
+        time_set = np.array(time_ids, dtype=np.int64)
+        mask = np.isin(time_arr, time_set)
+        vals = vals[mask]
+        time_arr = time_arr[mask]
+        entity_arr = entity_arr[mask]
 
     return {
         "values": vals,

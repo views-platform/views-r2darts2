@@ -497,3 +497,83 @@ class TestPathParity:
                     atol=1e-6,
                     err_msg=f"Pair {key}, column {col}: values differ",
                 )
+
+    def test_flatten_from_dataset_time_ids_filtering(self, tmp_path: Path) -> None:
+        """Regression test: ``_flatten_from_dataset`` must correctly filter
+        by ``time_ids`` without calling ``get_subset_dataset`` (which
+        triggers a ``to_zarr`` write that fails on Dask chunk alignment
+        for production parquet files).
+
+        This test verifies that:
+          1. The filtering produces the correct subset of rows.
+          2. The function does NOT call ``get_subset_dataset`` (which
+             would re-create a ViewsDataset and trigger a zarr write).
+        """
+        from views_r2darts2.models.markov_model import _flatten_from_dataset
+
+        parquet_path = tmp_path / "validation_viewser_df.parquet"
+        _write_synthetic_parquet(parquet_path)
+        dataset = ViewsDataset(
+            parquet_path, targets=TARGETS, broadcast_features=True
+        )
+
+        # Request only a subset of time_ids.
+        requested_time_ids = list(range(130, 140))  # 10 months
+        flat = _flatten_from_dataset(dataset, time_ids=requested_time_ids)
+
+        # The returned time_ids must be exactly the requested set.
+        returned_time_set = set(flat["time_ids"].tolist())
+        assert returned_time_set == set(requested_time_ids), (
+            f"Expected time_ids {set(requested_time_ids)}, got "
+            f"{returned_time_set}"
+        )
+
+        # The number of rows must be (n_entities × n_requested_months).
+        n_entities = 3
+        n_requested = len(requested_time_ids)
+        assert flat["values"].shape[0] == n_entities * n_requested
+
+        # The columns must be in canonical order (targets first, then
+        # features).
+        assert flat["columns"][0] in TARGETS
+        for t in TARGETS:
+            assert t in flat["columns"]
+
+    def test_flatten_from_dataset_avoids_get_subset_dataset(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression test: ``_flatten_from_dataset`` must NOT call
+        ``get_subset_dataset`` (which triggers a ``to_zarr`` write that
+        fails on Dask chunk alignment for production parquet files).
+
+        This test patches ``get_subset_dataset`` to raise if called,
+        verifying that the function uses the FeatureFrame + boolean-mask
+        path instead.
+        """
+        from views_r2darts2.models.markov_model import _flatten_from_dataset
+
+        parquet_path = tmp_path / "validation_viewser_df.parquet"
+        _write_synthetic_parquet(parquet_path)
+        dataset = ViewsDataset(
+            parquet_path, targets=TARGETS, broadcast_features=True
+        )
+
+        # Patch get_subset_dataset to raise if called.
+        def _explode(*args, **kwargs):
+            raise AssertionError(
+                "_flatten_from_dataset must NOT call get_subset_dataset "
+                "(it triggers a to_zarr write that fails on Dask chunk "
+                "alignment for production parquet files)."
+            )
+
+        original = dataset.get_subset_dataset
+        dataset.get_subset_dataset = _explode  # type: ignore[assignment]
+        try:
+            # Must not raise — the function should use to_featureframe +
+            # boolean mask filtering instead.
+            flat = _flatten_from_dataset(
+                dataset, time_ids=list(range(130, 140))
+            )
+            assert flat["values"].shape[0] > 0
+        finally:
+            dataset.get_subset_dataset = original  # type: ignore[assignment]

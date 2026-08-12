@@ -106,8 +106,15 @@ class MarkovModel(GlobalForecastingModel):
         # Fitted state.
         self._state_models: dict[int, dict[MarkovState, RandomForestClassifier]] = {}
         self._fatality_models: dict[int, dict[MarkovState, RandomForestRegressor]] = {}
+        self._state_models_by_comp: dict[
+            str, dict[int, dict[MarkovState, RandomForestClassifier]]
+        ] = {}
+        self._fatality_models_by_comp: dict[
+            str, dict[int, dict[MarkovState, RandomForestRegressor]]
+        ] = {}
         self._markov_features: list[str] = []
         self._fatalities_features: list[str] = []
+        self._target_names: list[str] = []
         self._target_name: str = ""
         self._train_start: int = 0
         self._train_end: int = 0
@@ -122,7 +129,7 @@ class MarkovModel(GlobalForecastingModel):
     @property
     def supports_multivariate(self) -> bool:
         """Whether the model supports multivariate targets."""
-        return False
+        return True
 
     @property
     def supports_past_covariates(self) -> bool:
@@ -252,10 +259,11 @@ class MarkovModel(GlobalForecastingModel):
             else [None] * len(series_list)
         )
 
-        # Extract target name from the first series's components.
+        # Extract target names from the first series's components.
         target_names = list(series_list[0].components)
-        if len(target_names) > 1:
-            raise ValueError("MarkovModel currently only supports a single target.")
+        if len(target_names) == 0:
+            raise ValueError("MarkovModel requires at least one target component.")
+        self._target_names = target_names
         self._target_name = target_names[0]
 
         # Extract feature names from past covariates (if any).
@@ -281,12 +289,24 @@ class MarkovModel(GlobalForecastingModel):
         all_entity_ids: list[np.ndarray] = []
 
         for idx, (ts, cov) in enumerate(zip(series_list, cov_list)):
-            # Extract target values: (T, 1) → (T,)
+            # Extract target values as (T, C).
             target_arr = ts.all_values(copy=False)
             if target_arr.ndim == 3:
-                target_arr = target_arr[:, :, 0]  # (T, 1) → (T,)
+                target_arr = target_arr[:, :, 0]
+            elif target_arr.ndim == 1:
+                target_arr = target_arr.reshape(-1, 1)
             else:
-                target_arr = target_arr[:, 0]
+                target_arr = np.asarray(target_arr)
+            target_arr = np.asarray(target_arr, dtype=np.float32)
+            if target_arr.ndim != 2:
+                raise ValueError(
+                    f"Unexpected target array shape {target_arr.shape}; expected 2D (T, C)."
+                )
+            if target_arr.shape[1] != len(self._target_names):
+                raise ValueError(
+                    "Target component mismatch between series; "
+                    f"expected {len(self._target_names)} got {target_arr.shape[1]}."
+                )
             times = np.asarray(ts.time_index.values, dtype=np.int64)
 
             # Extract entity id from static covariates.
@@ -305,10 +325,13 @@ class MarkovModel(GlobalForecastingModel):
                 feat_arr = cov.all_values(copy=False)
                 if feat_arr.ndim == 3:
                     feat_arr = feat_arr[:, :, 0]  # (T, F, 1) → (T, F)
+                elif feat_arr.ndim == 1:
+                    feat_arr = feat_arr.reshape(-1, 1)
                 else:
                     feat_arr = feat_arr  # (T, F)
             else:
-                feat_arr = target_arr.reshape(-1, 1)  # use target as feature
+                # No covariates: use all target components as features.
+                feat_arr = target_arr
 
             all_target_vals.append(target_arr)
             all_feature_vals.append(feat_arr)
@@ -316,40 +339,61 @@ class MarkovModel(GlobalForecastingModel):
             all_entity_ids.append(np.full(len(times), entity_id, dtype=np.int64))
 
         # Concatenate all entities.
-        target_flat = np.concatenate(all_target_vals)
+        target_flat_all = np.concatenate(all_target_vals, axis=0)
         feature_flat = np.concatenate(all_feature_vals, axis=0)
         time_flat = np.concatenate(all_time_ids)
         entity_flat = np.concatenate(all_entity_ids)
-
-        # Apply log1p to target (matching the original model).
-        target_flat = np.log1p(np.maximum(target_flat, 0))
-
-        # Compute Markov states.
-        markov_states = self._compute_markov_states_batch(
-            target_flat, time_flat, entity_flat
-        )
 
         # Fit state models and fatality models.
         markov_steps = self._steps if self._markov_method == "direct" else [1]
         regression_steps = self._steps if self._regression_method == "multi" else [1]
 
         logger.info(
-            "MarkovModel.fit: %d entities, %d rows, %d steps, method=%s/%s",
-            len(series_list), len(target_flat), len(self._steps),
+            "MarkovModel.fit: %d entities, %d rows, %d targets, %d steps, method=%s/%s",
+            len(series_list), target_flat_all.shape[0], len(self._target_names), len(self._steps),
             self._markov_method, self._regression_method,
         )
 
-        for step in markov_steps:
-            self._fit_state_model(
-                step, feature_flat, target_flat, markov_states,
-                time_flat, entity_flat,
+        self._state_models_by_comp = {}
+        self._fatality_models_by_comp = {}
+        for comp_idx, comp_name in enumerate(self._target_names):
+            target_flat = target_flat_all[:, comp_idx]
+            target_flat = np.log1p(np.maximum(target_flat, 0))
+
+            markov_states = self._compute_markov_states_batch(
+                target_flat, time_flat, entity_flat
             )
 
-        for step in regression_steps:
-            self._fit_fatality_model(
-                step, feature_flat, target_flat, markov_states,
-                time_flat, entity_flat,
-            )
+            self._state_models_by_comp[comp_name] = {}
+            self._fatality_models_by_comp[comp_name] = {}
+
+            for step in markov_steps:
+                self._fit_state_model(
+                    step,
+                    feature_flat,
+                    target_flat,
+                    markov_states,
+                    time_flat,
+                    entity_flat,
+                    component=comp_name,
+                )
+
+            for step in regression_steps:
+                self._fit_fatality_model(
+                    step,
+                    feature_flat,
+                    target_flat,
+                    markov_states,
+                    time_flat,
+                    entity_flat,
+                    component=comp_name,
+                )
+
+        # Backward-compatible aliases for single-target diagnostics.
+        if len(self._target_names) == 1:
+            only = self._target_names[0]
+            self._state_models = self._state_models_by_comp[only]
+            self._fatality_models = self._fatality_models_by_comp[only]
 
         self._is_fitted = True
         logger.info("MarkovModel.fit complete.")
@@ -409,40 +453,28 @@ class MarkovModel(GlobalForecastingModel):
         # Extract the last time step's target and features.
         target_arr = ts.all_values(copy=False)
         if target_arr.ndim == 3:
-            target_val = float(target_arr[-1, 0, 0])
+            target_last = target_arr[:, :, 0]
+        elif target_arr.ndim == 1:
+            target_last = target_arr.reshape(-1, 1)
         else:
-            target_val = float(target_arr[-1, 0])
-
-        # Apply log1p (matching training).
-        target_log = np.log1p(max(target_val, 0))
+            target_last = target_arr
+        target_last = np.asarray(target_last, dtype=np.float32)
 
         # Extract features for the last time step.
         if cov is not None:
             feat_arr = cov.all_values(copy=False)
             if feat_arr.ndim == 3:
                 feat_last = feat_arr[-1, :, 0]  # (F,)
+            elif feat_arr.ndim == 1:
+                feat_last = feat_arr
             else:
                 feat_last = feat_arr[-1, :]
         else:
-            feat_last = np.array([target_log], dtype=np.float32)
+            feat_last = target_last[-1, :]
 
         # Compute current Markov state.
         # Need t-1 value — get from the second-to-last time step.
-        if target_arr.ndim == 3:
-            if target_arr.shape[0] >= 2:
-                target_t_min_1 = float(target_arr[-2, 0, 0])
-            else:
-                target_t_min_1 = 0.0
-        else:
-            if target_arr.shape[0] >= 2:
-                target_t_min_1 = float(target_arr[-2, 0])
-            else:
-                target_t_min_1 = 0.0
-        target_t_min_1_log = np.log1p(max(target_t_min_1, 0))
-
-        current_state = self._compute_markov_state(
-            target_log, target_t_min_1_log, self._markov_threshold
-        )
+        prev_idx = -2 if target_last.shape[0] >= 2 else -1
 
         # Get time index for predictions.
         last_time = int(ts.time_index[-1])
@@ -451,32 +483,43 @@ class MarkovModel(GlobalForecastingModel):
         )
 
         # Predict for each step.
-        predictions = np.zeros(n, dtype=np.float32)
-        for step_idx in range(n):
-            step = step_idx + 1
-            pred = self._predict_step(
-                step, feat_last.reshape(1, -1), current_state,
+        pred_mat = np.zeros((n, len(self._target_names)), dtype=np.float32)
+        feat_input = feat_last.reshape(1, -1)
+        for comp_idx, comp_name in enumerate(self._target_names):
+            target_log = np.log1p(max(float(target_last[-1, comp_idx]), 0.0))
+            target_t_min_1_log = np.log1p(max(float(target_last[prev_idx, comp_idx]), 0.0))
+            current_state = self._compute_markov_state(
+                target_log, target_t_min_1_log, self._markov_threshold
             )
-            predictions[step_idx] = pred
+            for step_idx in range(n):
+                step = step_idx + 1
+                pred = self._predict_step(
+                    step, feat_input, current_state, component=comp_name
+                )
+                pred_mat[step_idx, comp_idx] = pred
 
         # Inverse log transform.
-        predictions = np.expm1(predictions)
-        predictions = np.maximum(predictions, 0.0)
+        pred_mat = np.expm1(pred_mat)
+        pred_mat = np.maximum(pred_mat, 0.0)
 
         # Build output TimeSeries.
-        components = pd.Index([f"pred_{self._target_name}"])
+        components = pd.Index([f"pred_{name}" for name in self._target_names])
         static_cov = ts.static_covariates
 
         return TimeSeries(
             times=pred_times,
-            values=predictions[:, np.newaxis].astype(np.float32),
+            values=pred_mat.astype(np.float32),
             components=components,
             static_covariates=static_cov,
             copy=False,
         )
 
     def _predict_step(
-        self, step: int, features: np.ndarray, current_state: MarkovState,
+        self,
+        step: int,
+        features: np.ndarray,
+        current_state: MarkovState,
+        component: str,
     ) -> float:
         """Predict fatalities for a single step.
 
@@ -486,10 +529,11 @@ class MarkovModel(GlobalForecastingModel):
         """
         # Get the state model for this step.
         model_step = step if self._markov_method == "direct" else 1
-        if model_step not in self._state_models:
+        comp_state_models = self._state_models_by_comp.get(component, {})
+        if model_step not in comp_state_models:
             return 0.0
 
-        state_models = self._state_models[model_step]
+        state_models = comp_state_models[model_step]
         if current_state not in state_models:
             return 0.0
 
@@ -512,10 +556,11 @@ class MarkovModel(GlobalForecastingModel):
 
         # Get fatality predictions for ESC and WAR states.
         reg_step = step if self._regression_method == "multi" else 1
-        if reg_step not in self._fatality_models:
+        comp_fatality_models = self._fatality_models_by_comp.get(component, {})
+        if reg_step not in comp_fatality_models:
             return 0.0
 
-        fatality_models = self._fatality_models[reg_step]
+        fatality_models = comp_fatality_models[reg_step]
         esc_fatalities = 0.0
         war_fatalities = 0.0
 
@@ -596,6 +641,7 @@ class MarkovModel(GlobalForecastingModel):
         markov_states: np.ndarray,
         time_ids: np.ndarray,
         entity_ids: np.ndarray,
+        component: str,
     ) -> None:
         """Fit per-state RandomForestClassifier models for a given step."""
         # Create shifted target state (state at t+step).
@@ -616,7 +662,8 @@ class MarkovModel(GlobalForecastingModel):
         train_mask = (target_time >= self._train_start) & (target_time <= self._train_end)
         train_mask &= np.array([s is not None for s in target_states])
 
-        self._state_models[step] = {}
+        comp_state_models = self._state_models_by_comp.setdefault(component, {})
+        comp_state_models[step] = {}
         for state in self._markov_states:
             state_mask = sorted_states == state
             combined_mask = train_mask & state_mask
@@ -635,11 +682,11 @@ class MarkovModel(GlobalForecastingModel):
                 **self._rf_class_params,
             )
             clf.fit(X_train, y_train)
-            self._state_models[step][state] = clf
+            comp_state_models[step][state] = clf
 
         logger.info(
-            "MarkovModel: fitted state model for step %d (%d states)",
-            step, len(self._state_models[step]),
+            "MarkovModel[%s]: fitted state model for step %d (%d states)",
+            component, step, len(comp_state_models[step]),
         )
 
     def _fit_fatality_model(
@@ -650,6 +697,7 @@ class MarkovModel(GlobalForecastingModel):
         markov_states: np.ndarray,
         time_ids: np.ndarray,
         entity_ids: np.ndarray,
+        component: str,
     ) -> None:
         """Fit per-state RandomForestRegressor models for a given step."""
         sort_idx = np.lexsort((time_ids, entity_ids))
@@ -676,7 +724,8 @@ class MarkovModel(GlobalForecastingModel):
         train_mask &= ~np.isnan(fatalities_target)
         train_mask &= np.array([s is not None for s in target_states])
 
-        self._fatality_models[step] = {}
+        comp_fatality_models = self._fatality_models_by_comp.setdefault(component, {})
+        comp_fatality_models[step] = {}
         for state in [MarkovState.ESC, MarkovState.WAR]:
             state_mask = target_states == state
             combined_mask = train_mask & state_mask
@@ -692,11 +741,11 @@ class MarkovModel(GlobalForecastingModel):
                 **self._rf_reg_params,
             )
             reg.fit(X_train, y_train)
-            self._fatality_models[step][state] = reg
+            comp_fatality_models[step][state] = reg
 
         logger.info(
-            "MarkovModel: fitted fatality model for step %d (%d states)",
-            step, len(self._fatality_models[step]),
+            "MarkovModel[%s]: fitted fatality model for step %d (%d states)",
+            component, step, len(comp_fatality_models[step]),
         )
 
     @staticmethod

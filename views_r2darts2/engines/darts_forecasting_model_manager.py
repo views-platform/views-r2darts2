@@ -174,11 +174,48 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
     # ------------------------------------------------------------------ factory
 
     def _build_dataset(self, active_config: Mapping[str, Any]) -> ViewsDataset:
-        """Build a :class:`ViewsDataset` from the config's parquet path."""
-        path_raw = self._model_path.data_raw
+        """Build a :class:`ViewsDataset` from the config's parquet path.
+
+        The datafactory saves files as ``{run_type}_datafactory_df.parquet``,
+        while the legacy pipeline used ``{run_type}_viewser_df.parquet``.
+        Try both, plus any ``.parquet`` file in the data_raw directory that
+        starts with the run_type.
+        """
+        path_raw = Path(self._model_path.data_raw)
         run_type = active_config["run_type"]
-        parquet_path = Path(path_raw) / f"{run_type}_viewser_df.parquet"
-        targets = list(active_config.get("targets") or active_config.get("regression_targets") or [])
+
+        # Try the known filename patterns in order of preference.
+        candidates = [
+            path_raw / f"{run_type}_datafactory_df.parquet",
+            path_raw / f"{run_type}_viewser_df.parquet",
+        ]
+
+        # Also glob for any parquet matching {run_type}_*.parquet.
+        for child in sorted(path_raw.glob(f"{run_type}_*.parquet")):
+            if child not in candidates:
+                candidates.append(child)
+
+        parquet_path = None
+        for candidate in candidates:
+            if candidate.exists():
+                parquet_path = candidate
+                break
+
+        if parquet_path is None:
+            # List available parquet files for the error message.
+            available = [c.name for c in path_raw.glob("*.parquet")] if path_raw.exists() else []
+            raise FileNotFoundError(
+                f"No parquet file found for run_type='{run_type}' in {path_raw}. "
+                f"Tried: {[str(c) for c in candidates]}. "
+                f"Available .parquet files: {available}"
+            )
+
+        logger.info("Loading dataset from: %s", parquet_path)
+        targets = list(
+            active_config.get("targets")
+            or active_config.get("regression_targets")
+            or []
+        )
         level = active_config.get("level", "cm")
         ds = ViewsDataset(parquet_path, targets=targets, broadcast_features=True)
         logger.info("Dataset loaded: %s (%s)", ds, level)

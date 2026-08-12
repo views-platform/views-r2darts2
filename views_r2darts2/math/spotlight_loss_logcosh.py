@@ -54,7 +54,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # Gate the e_shape gradient so dead cells (gate≈0) get ~50× less
         # Shape gradient. Stops Shape from pushing dead cells UP.
-        e_shape = gate * e_shape + (1.0 - gate) * e_shape.detach()
+        # e_shape = gate * e_shape + (1.0 - gate) * e_shape.detach()
 
         shape_cell = self._log_cosh(e_shape)
 

@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any, Sequence
 
 import numpy as np
+from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
 from darts import TimeSeries
@@ -545,7 +546,9 @@ class MarkovModel(GlobalForecastingModel):
         # Map probabilities to states.
         prob_map: dict[MarkovState, float] = {}
         for cls, prob in zip(classes, probs):
-            if isinstance(cls, str):
+            if isinstance(cls, MarkovState):
+                state = cls
+            elif isinstance(cls, str):
                 try:
                     state = MarkovState(cls)
                 except ValueError:
@@ -674,6 +677,11 @@ class MarkovModel(GlobalForecastingModel):
             y_train = np.array([target_states[i] for i in np.where(combined_mask)[0]])
 
             if len(np.unique(y_train)) < 2:
+                # Sparse/conflict data often yields deterministic transitions
+                # for a given origin state and horizon. Keep that signal.
+                clf = DummyClassifier(strategy="most_frequent")
+                clf.fit(X_train, y_train)
+                comp_state_models[step][state] = clf
                 continue
 
             clf = RandomForestClassifier(

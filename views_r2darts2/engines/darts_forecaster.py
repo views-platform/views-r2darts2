@@ -454,6 +454,25 @@ class DartsForecaster:
         Returns:
             Shape ``(n_entities, n_time, n_components, n_samples)`` numpy array.
         """
+        has_past_covariates = bool(past_covariates)
+
+        # Targets-only path: bypass all covariate-aware Darts plumbing.
+        if not has_past_covariates:
+            raw_preds = self.model.predict(
+                n=n,
+                series=series,
+                num_samples=num_samples,
+                verbose=False,
+            )
+            pred_list = raw_preds if isinstance(raw_preds, list) else [raw_preds]
+            batch_vals: list[np.ndarray] = []
+            for ts in pred_list:
+                vals = ts.all_values(copy=False)
+                if vals.ndim == 2:
+                    vals = vals[:, :, np.newaxis]
+                batch_vals.append(vals.astype(np.float32, copy=False))
+            return np.stack(batch_vals, axis=0)
+
         if not isinstance(self.model, TorchForecastingModel):
             raw_preds = self.model.predict(
                 n=n,

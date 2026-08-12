@@ -257,7 +257,7 @@ class DartsForecaster:
 
         Uses :func:`views_r2darts2.dataset.batch_predict.batch_predict` which:
             1. Creates a zarr-backed prediction scaffold on disk.
-            2. Iterates over entities in batches (default 1000).
+            2. Iterates over entities in batches.
             3. For each batch: extracts numpy → transforms → builds a small
                list of Darts TimeSeries → predicts with ``values_only=True``
                → inverse-transforms in numpy → writes to the scaffold.

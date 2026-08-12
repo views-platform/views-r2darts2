@@ -52,11 +52,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean.detach()
 
-        # Gate the e_shape gradient so dead cells (gate≈0) get ~50× less
-        # Shape gradient. Stops Shape from pushing dead cells UP.
-        # e_shape = gate * e_shape + (1.0 - gate) * e_shape.detach()
-
-        shape_cell = self._log_cosh(e_shape)
+        # Shape gradient only through true-event cells; false positives get no shape pull
+        shape_cell = self._log_cosh(y_true_mask * e_shape + (1.0 - y_true_mask) * e_shape.detach())
 
         # DRO weighting
         event_mask = (abs_max > self.tau).float()

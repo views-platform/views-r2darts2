@@ -130,9 +130,9 @@ class SpotlightLossLogcosh(torch.nn.Module):
         density_scale_mean = density_scale.mean()
 
         if multivariate:
-            loss_anchor = density_scale_mean * (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_anchor = (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_anchor = density_scale_mean * (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_anchor = (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Combine ───────────────────────────────────────────────────
         if multivariate:

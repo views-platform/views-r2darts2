@@ -159,6 +159,60 @@ class MarkovModel(GlobalForecastingModel):
         """Minimum input chunk length."""
         return self._input_chunk_length
 
+    @property
+    def min_train_samples(self) -> int:
+        """Minimum number of training samples required by the model."""
+        return 1
+
+    @property
+    def _target_window_lengths(self) -> tuple[int, int]:
+        """Target input/output window lengths used by Darts sanity checks."""
+        return self._input_chunk_length, self._output_chunk_length
+
+    @property
+    def extreme_lags(
+        self,
+    ) -> tuple[
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+        int,
+    ]:
+        """Return lag limits in Darts' expected 7-tuple format."""
+        return (
+            -self._input_chunk_length,
+            self._output_chunk_length - 1,
+            -self._input_chunk_length,
+            -1,
+            None,
+            None,
+            0,
+        )
+
+    @property
+    def _model_encoder_settings(
+        self,
+    ) -> tuple[
+        int | None,
+        int | None,
+        bool,
+        bool,
+        list[int] | None,
+        list[int] | None,
+    ]:
+        """Expose encoder metadata consumed by Darts' base model utilities."""
+        return (
+            self._input_chunk_length,
+            self._output_chunk_length,
+            True,
+            False,
+            None,
+            None,
+        )
+
     def fit(
         self,
         series: TimeSeries | Sequence[TimeSeries],
@@ -182,7 +236,12 @@ class MarkovModel(GlobalForecastingModel):
         Returns:
             self.
         """
-        from darts import TimeSeries as _TS
+        super().fit(
+            series=series,
+            past_covariates=past_covariates,
+            future_covariates=future_covariates,
+            verbose=kwargs.get("verbose"),
+        )
 
         series_list = series if isinstance(series, (list, tuple)) else [series]
         cov_list = (

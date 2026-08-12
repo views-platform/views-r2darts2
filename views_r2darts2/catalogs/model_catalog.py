@@ -491,4 +491,5 @@ class ModelCatalog:
             n_jobs=self.config.get("n_jobs", -1),
             rf_class_params=self.config.get("rf_class_params"),
             rf_reg_params=self.config.get("rf_reg_params"),
+            add_encoders=self._resolve_add_encoders(),
         )

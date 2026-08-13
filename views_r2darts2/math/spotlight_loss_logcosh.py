@@ -113,12 +113,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         has_gated = (event_mask.sum(dim=1) > self._EPS).float()
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
 
-        loss_level = T * (w_level * level_cell).sum() / w_level.sum()
-
         if multivariate:
-            loss_level = (T + density_scale) * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
         else:
-            loss_level = (T + density_scale) * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
+            loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
         # ── Dead-cell anchor at Shape scale ─────────────────
         # Pushes dead cells toward 0, eliminating gap contamination source.

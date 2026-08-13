@@ -1600,6 +1600,7 @@ class ViewsDataset:
         # Build the shared SpatioTemporalIndex (time-major).
         index = self._build_prediction_index()
         meta = metadata if metadata is not None else FrameMetadata(model="darts")
+        expected_entities = set(self._ds[self._entity_id].values.astype("int64").tolist())
 
         frames: dict[str, Any] = {}
         for target_name in target_names:
@@ -1612,8 +1613,37 @@ class ViewsDataset:
             # time-major to (time * entity, sample).
             arr = np.array(group[pred_var], dtype=np.float32)
             t, e, s = arr.shape
+
+            # If an entity is all-NaN across all forecast steps/samples, it was
+            # never written by the streaming batch loop (zarr write-side issue).
+            entity_all_nan = np.isnan(arr).all(axis=(0, 2))
+            if bool(entity_all_nan.any()):
+                missing_entities = self._ds[self._entity_id].values[entity_all_nan]
+                logger.warning(
+                    "Streaming scaffold has %d entities with all-NaN values for %s. "
+                    "First missing entity ids: %s",
+                    int(entity_all_nan.sum()),
+                    pred_var,
+                    missing_entities[:20].tolist(),
+                )
+
             y_pred = np.ascontiguousarray(arr.reshape(t * e, s))
-            frames[target_name] = PredictionFrame(y_pred, index=index, metadata=meta)
+            frame = PredictionFrame(y_pred, index=index, metadata=meta)
+
+            # Conversion guard: ensure entity ids in the frame index match the
+            # scaffold coordinate exactly.
+            actual_entities = set(np.asarray(frame.index.unit, dtype=np.int64).tolist())
+            if actual_entities != expected_entities:
+                missing = sorted(expected_entities - actual_entities)
+                extra = sorted(actual_entities - expected_entities)
+                raise ValueError(
+                    "Entity mismatch after scaffold->PredictionFrame conversion "
+                    f"for {pred_var}: expected={len(expected_entities)}, "
+                    f"actual={len(actual_entities)}, missing_head={missing[:20]}, "
+                    f"extra_head={extra[:20]}."
+                )
+
+            frames[target_name] = frame
         return frames
 
     def _build_prediction_index(self) -> Any:

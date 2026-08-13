@@ -447,6 +447,7 @@ class DartsForecaster:
                     raise NumericalSanityError(
                         f"NaNs in final PredictionFrame for target '{target}'."
                     )
+            self._audit_entity_coverage(entity_ids=entity_ids, frames=frames)
             return frames
 
         # --- Torch predict path: values_only=True -------------------------
@@ -482,6 +483,7 @@ class DartsForecaster:
                     raise NumericalSanityError(
                         f"NaNs in final PredictionFrame for target '{target}'."
                     )
+            self._audit_entity_coverage(entity_ids=entity_ids, frames=frames)
             return frames
 
         # In-memory path: single predict_from_dataset call.
@@ -536,7 +538,25 @@ class DartsForecaster:
                 raise NumericalSanityError(
                     f"NaNs in final PredictionFrame for target '{target}'."
                 )
+        self._audit_entity_coverage(entity_ids=entity_ids, frames=frames)
         return frames
+
+    def _audit_entity_coverage(
+        self, *, entity_ids: np.ndarray, frames: dict[str, PredictionFrame]
+    ) -> None:
+        """Log/raise when produced frames do not cover expected entities."""
+        expected = set(np.asarray(entity_ids, dtype=np.int64).tolist())
+        for target, frame in frames.items():
+            actual = set(np.asarray(frame.index.unit, dtype=np.int64).tolist())
+            if actual != expected:
+                missing = sorted(expected - actual)
+                extra = sorted(actual - expected)
+                raise ValueError(
+                    "PredictionFrame entity coverage mismatch for "
+                    f"target='{target}': expected={len(expected)}, "
+                    f"actual={len(actual)}, missing_head={missing[:20]}, "
+                    f"extra_head={extra[:20]}."
+                )
 
     def _predict_values_only(
         self,

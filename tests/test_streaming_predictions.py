@@ -306,8 +306,8 @@ class TestStreamingParity:
 class TestStreamingThreshold:
     """Tests for ``_should_stream_predictions`` and the batch loop."""
 
-    def test_small_forecast_does_not_stream(self, tmp_path: Path) -> None:
-        """A small deterministic forecast uses the in-memory path."""
+    def test_small_forecast_streams_by_default(self, tmp_path: Path) -> None:
+        """With STREAMING_CELL_THRESHOLD=1, even small forecasts use streaming."""
         dataset = _build_dataset(tmp_path)
         fc = DartsForecaster(
             dataset=dataset,
@@ -316,10 +316,10 @@ class TestStreamingThreshold:
             target_scaler=None,
             random_state=42,
         )
-        # 3 entities × 6 steps × 3 targets × 1 sample = 54 cells.
+        # 3 entities × 6 steps × 3 targets × 1 sample = 54 cells > 1 threshold.
         assert fc._should_stream_predictions(
             n_entities=3, n_time=6, num_samples=1
-        ) is False
+        ) is True
 
     def test_large_forecast_streams(self, tmp_path: Path) -> None:
         """A large probabilistic forecast uses the streaming path."""

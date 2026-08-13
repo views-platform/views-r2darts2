@@ -658,8 +658,8 @@ class DartsForecaster:
         target_names = list(self.dataset.targets)
         n_targets = len(target_names)
         n_entities = len(target_series)
-        # Use half of batch_size for entity batching (or default to 500)
-        entity_batch_size = (batch_size // 2) if batch_size else (self.STREAMING_ENTITY_BATCH // 2)
+        # Use half of batch_size for entity batching (or default to 500), minimum 1
+        entity_batch_size = max(1, (batch_size // 2) if batch_size else (self.STREAMING_ENTITY_BATCH // 2))
 
         # Create the zarr-backed scaffold sized for the full grid.
         scaffold = ViewsDataset.create_prediction_scaffold(

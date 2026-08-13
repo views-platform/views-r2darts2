@@ -656,8 +656,10 @@ class DartsForecaster:
         verbose = predict_kwargs.get("verbose", True)
 
         target_names = list(self.dataset.targets)
+        n_targets = len(target_names)
         n_entities = len(target_series)
-        entity_batch_size = self.STREAMING_ENTITY_BATCH // 2
+        # Use half of batch_size for entity batching (or default to 500)
+        entity_batch_size = (batch_size // 2) if batch_size else (self.STREAMING_ENTITY_BATCH // 2)
 
         # Create the zarr-backed scaffold sized for the full grid.
         scaffold = ViewsDataset.create_prediction_scaffold(
@@ -677,8 +679,8 @@ class DartsForecaster:
 
         logger.info(
             "Streaming predictions: %d entities × %d steps × %d samples "
-            "(batch=%d) → zarr scaffold",
-            n_entities, output_length, num_samples, entity_batch_size,
+            "(entity_batch=%d, model_batch=%s) → zarr scaffold",
+            n_entities, output_length, num_samples, entity_batch_size, batch_size,
         )
 
         # Run predict_from_dataset in entity batches.
@@ -718,15 +720,22 @@ class DartsForecaster:
                     f"(entities {start}:{end}, shape={batch_preds.shape})."
                 )
 
+            # Extract target components from model output (which includes features + targets).
+            # Darts returns all components in the order they were in the input series.
+            # The last n_targets components are the targets (standard layout: features before targets).
+            n_components = batch_preds.shape[2]
+            target_indices = list(range(n_components - n_targets, n_components))
+            batch_target_preds = batch_preds[:, :, target_indices, :]
+
             scaffold.write_prediction_batch(
-                target_values=batch_preds,
+                target_values=batch_target_preds,
                 entity_ids_batch=batch_entity_ids,
                 time_ids=pred_time_ids,
                 target_names=target_names,
                 apply_inverse=True,
                 clip_negatives=True,
             )
-            del batch_preds
+            del batch_preds, batch_target_preds
             gc.collect()
             logger.info(
                 "Streaming batch %d/%d written (entities %d:%d).",

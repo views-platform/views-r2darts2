@@ -39,6 +39,7 @@ class ViewsDataset:
         self._user_metadata = metadata or {}
         self._store = ZarrStore()
         zarr_path = self._ingest(source, targets, broadcast_features)
+        self._zarr_path = zarr_path  # disk-backed zarr group path
         self._ds = readers.open_zarr_dir(zarr_path)
         self._load_schema()
         self.validate_indices()
@@ -1405,19 +1406,14 @@ class ViewsDataset:
         entity_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "ViewsDataset":
-        """Create an in-memory prediction scaffold sized for the full grid.
+        """Create a disk-backed (zarr) prediction scaffold for the full grid.
 
         The scaffold is a prediction-mode :class:`ViewsDataset` with one
         ``pred_<target>`` variable per target, pre-allocated to shape
         ``(n_time, n_entities, sample_size)`` and filled with NaN. Rows are
-        populated incrementally via :meth:`write_prediction_batch`.
-
-        The scaffold is kept fully in-memory (not zarr-backed) so that
-        :meth:`write_prediction_batch` can mutate the arrays directly
-        without zarr round-trips. The data is converted to
-        :class:`PredictionFrame` objects via
-        :meth:`to_predictionframe_per_target` at the end — the scaffold is
-        not persisted to disk.
+        populated incrementally via :meth:`write_prediction_batch`, which
+        writes directly to the zarr store on disk — the full predictions
+        array is never held in memory at once.
 
         Args:
             entity_ids: 1-D int64 array of entity ids (the full set).
@@ -1468,19 +1464,8 @@ class ViewsDataset:
             "broadcast_features": False,
             **(metadata or {}),
         })
-
-        # Build the ViewsDataset WITHOUT zarr ingestion — keep the data
-        # purely in-memory so write_prediction_batch can mutate the arrays
-        # directly. The scaffold is a transient object that gets converted
-        # to PredictionFrames and then discarded.
-        scaffold = ViewsDataset.__new__(ViewsDataset)
-        scaffold.broadcast_features = False
-        scaffold._user_metadata = metadata or {}
-        scaffold._store = None  # no zarr store
-        scaffold._ds = ds  # in-memory xarray Dataset
-        scaffold._load_schema()
-        scaffold.validate_indices()
-        return scaffold
+        # Create a zarr-backed ViewsDataset (disk-backed, lazy reads).
+        return ViewsDataset.for_loa(level_lower, ds)
 
     def write_prediction_batch(
         self,
@@ -1492,14 +1477,15 @@ class ViewsDataset:
         apply_inverse: bool = True,
         clip_negatives: bool = True,
     ) -> None:
-        """Write one batch of predictions into the scaffold.
+        """Write one batch of predictions into the zarr-backed scaffold.
 
         Applies the same inverse-transform + clip path as
         :meth:`ingest_numpy_predictions`, then writes the batch directly
-        into the scaffold's in-memory xarray Dataset via coordinate
-        selection. The dataset is persisted to zarr once at the end (via
-        :meth:`to_predictionframe_per_target`), avoiding the expensive
-        ``add_batch`` → ``_append_fallback`` round-trip per batch.
+        to the zarr store on disk via ``zarr.open_group``. The scaffold
+        was pre-allocated with the full grid, so every (time, entity)
+        cell already exists — we just fill it. Successive batch writes
+        accumulate on disk; the full predictions array is never held in
+        memory.
 
         Args:
             target_values: Shape
@@ -1515,6 +1501,8 @@ class ViewsDataset:
                 and inverse log transform (numpy-direct).
             clip_negatives: When ``True``, clip negative predictions to 0.
         """
+        import zarr
+
         if not self.is_prediction:
             raise ValueError(
                 "write_prediction_batch requires a prediction-mode scaffold"
@@ -1532,11 +1520,10 @@ class ViewsDataset:
         if clip_negatives:
             np.maximum(target_values, 0.0, out=target_values)
 
-        # Write directly into the in-memory xarray Dataset. The scaffold
-        # was pre-allocated with the full grid, so every (time, entity)
-        # cell already exists — we just fill it. We use ``.values`` (which
-        # returns a writable numpy view for in-memory datasets) and write
-        # in-place so successive batch writes accumulate.
+        # Open the zarr group for direct writes. The scaffold's _zarr_path
+        # was set by __init__ (via for_loa → _ingest).
+        zarr_path = str(self._zarr_path)
+        group = zarr.open_group(zarr_path, mode="a")
         time_coord = self._ds[self._time_id].values
         entity_coord = self._ds[self._entity_id].values
 
@@ -1545,18 +1532,20 @@ class ViewsDataset:
 
         for t_idx, target_name in enumerate(target_names):
             pred_var = f"pred_{target_name}"
-            if pred_var not in self._ds.data_vars:
+            if pred_var not in group:
                 raise KeyError(
                     f"Scaffold is missing prediction variable '{pred_var}'. "
-                    f"Available: {list(self._ds.data_vars)}."
+                    f"Available: {list(group.array_keys())}."
                 )
             # Extract this target: (n_batch, n_time, n_samples).
             vals = target_values[:, :, t_idx, :]
-            # Get the underlying numpy array and write in-place.
-            arr = self._ds[pred_var].values
+            zarr_arr = group[pred_var]
+            # Write each entity's predictions directly to the zarr array.
+            # zarr arrays support numpy-style slice assignment, which writes
+            # to disk without materialising the full array in memory.
             for e_i, entity_id in enumerate(entity_ids_batch):
                 ep = int(np.searchsorted(entity_coord, entity_id))
-                arr[t_start:t_start + n_time, ep, :] = vals[e_i]
+                zarr_arr[t_start:t_start + n_time, ep, :] = vals[e_i]
 
     def to_predictionframe_per_target(
         self, *, metadata: Any = None
@@ -1568,6 +1557,10 @@ class ViewsDataset:
         fastest) — matching the layout produced by
         :meth:`ingest_numpy_predictions`.
 
+        Reads the predictions from the zarr store on disk (re-opening to
+        pick up batch writes that may not be reflected in the cached
+        xarray Dataset).
+
         Args:
             metadata: Optional :class:`FrameMetadata` to attach to each
                 frame. When ``None``, a default ``FrameMetadata(model="darts")``
@@ -1576,6 +1569,7 @@ class ViewsDataset:
         Returns:
             ``{target_name: PredictionFrame}`` dict.
         """
+        import zarr
         from views_frames import (
             PredictionFrame, SpatioTemporalIndex, SpatialLevel, FrameMetadata,
         )
@@ -1587,12 +1581,16 @@ class ViewsDataset:
 
         target_names = list(self.targets)
         if not target_names:
-            # Fall back to pred_vars minus the "pred_" prefix.
             target_names = [
                 p[len("pred_"):] for p in self.pred_vars
             ]
         if not target_names:
             raise ValueError("Scaffold has no targets / pred_vars.")
+
+        # Re-open the zarr group to pick up batch writes. The lazy xarray
+        # Dataset (self._ds) may have cached NaN values from the initial
+        # read; reading from zarr directly guarantees we see the writes.
+        group = zarr.open_group(str(self._zarr_path), mode="r")
 
         # Build the shared SpatioTemporalIndex (time-major).
         index = self._build_prediction_index()
@@ -1601,15 +1599,13 @@ class ViewsDataset:
         frames: dict[str, Any] = {}
         for target_name in target_names:
             pred_var = f"pred_{target_name}"
-            if pred_var not in self._ds.data_vars:
+            if pred_var not in group:
                 raise KeyError(
                     f"Scaffold is missing prediction variable '{pred_var}'."
                 )
-            # Materialise the (time, entity, sample) array and flatten
+            # Read the (time, entity, sample) array from zarr and flatten
             # time-major to (time * entity, sample).
-            arr = self._ds[pred_var].transpose(
-                self._time_id, self._entity_id, "sample"
-            ).values.astype(np.float32)
+            arr = np.array(group[pred_var], dtype=np.float32)
             t, e, s = arr.shape
             y_pred = np.ascontiguousarray(arr.reshape(t * e, s))
             frames[target_name] = PredictionFrame(y_pred, index=index, metadata=meta)

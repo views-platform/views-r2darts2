@@ -282,6 +282,7 @@ class ReproducibilityGate:
             "RAdam": ["lr", "weight_decay"],
             "SGD": ["lr", "weight_decay", "momentum"],
             "RMSprop": ["lr", "weight_decay", "momentum", "alpha"],
+            "Muon": ["lr", "weight_decay"],
         }
 
         # Optional optimizer genes that are allowed when present but not mandatory.

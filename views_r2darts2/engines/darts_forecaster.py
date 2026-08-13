@@ -459,13 +459,12 @@ class DartsForecaster:
         # zarr-backed scaffold). The streaming path keeps peak memory
         # bounded for probabilistic forecasts (num_samples large) and/or
         # huge entity counts (e.g. 259k PRIO-GRID cells).
-        num_samples = predict_kwargs.get("num_samples")
-        # use_streaming = self._should_stream_predictions(
-        #     n_entities=len(entity_ids),
-        #     n_time=output_length,
-        #     num_samples=num_samples,
-        # )
-        use_streaming = True
+        num_samples = predict_kwargs.get("num_samples", 1)
+        use_streaming = self._should_stream_predictions(
+            n_entities=len(entity_ids),
+            n_time=output_length,
+            num_samples=num_samples,
+        )
 
         if use_streaming:
             frames = self._predict_streaming(
@@ -510,7 +509,7 @@ class DartsForecaster:
             del target_series, past_covariates
             gc.collect()
 
-        # Audit model output for numerical sanity (numpy-direct)..
+        # Audit model output for numerical sanity (numpy-direct).
         if np.isnan(predictions).any() or np.isinf(predictions).any():
             raise NumericalSanityError(
                 f"NaN/Inf in model predictions (shape={predictions.shape})."
@@ -555,10 +554,10 @@ class DartsForecaster:
             * ``pred_starts``: list of prediction start times (one per entity)
         """
         # Extract predict kwargs.
-        num_samples = predict_kwargs.get("num_samples")
-        mc_dropout = predict_kwargs.get("mc_dropout")
-        batch_size = predict_kwargs.get("batch_size")
-        verbose = predict_kwargs.get("verbose", True)
+        num_samples = predict_kwargs.pop("num_samples", 1)
+        mc_dropout = predict_kwargs.pop("mc_dropout", False)
+        batch_size = predict_kwargs.pop("batch_size", None)
+        verbose = predict_kwargs.pop("verbose", True)
         # Any remaining kwargs are ignored (Darts doesn't accept them).
 
         # Build the inference dataset from the TimeSeries list.
@@ -593,36 +592,32 @@ class DartsForecaster:
         return predictions, series_schemas, pred_starts
 
     # ------------------------------------------------------------------ #
-    # Streaming prediction path (zarr-backed scaffold)
+    # Streaming prediction path (in-memory scaffold)
     # ------------------------------------------------------------------ #
 
-    #: Threshold above which the streaming path is used. The full
-    #: predictions array has shape
-    #: ``(n_entities, n_time, n_components, n_samples)`` float32 — 4 bytes
-    #: per cell. When the array exceeds this many cells, we switch to the
-    #: streaming path (entity-batched predict_from_dataset + zarr scaffold).
-    #: Default: 50M cells (~200 MB float32) — large enough that the
-    #: in-memory path is still used for small deterministic forecasts,
-    #: small enough that probabilistic PGM forecasts (259k × 36 × 3 × 500
-    #: ≈ 14B cells) always stream.
+    #: Threshold above which the streaming path is used. Set to 1 so the
+    #: streaming path is always used (regardless of the number of rows).
+    #: The streaming path runs ``predict_from_dataset`` in entity batches
+    #: and writes each batch to an in-memory scaffold, keeping peak memory
+    #: bounded.
     STREAMING_CELL_THRESHOLD: int = 1
 
     #: Default entity batch size for the streaming path. Each batch runs
-    #: one ``predict_from_dataset`` call, so smaller batches mean lower
-    #: peak memory but more calls. Tuned for PGM (259k entities → ~260
-    #: batches of 1000).
+    #: one ``predict_from_dataset`` call. When the model's ``batch_size``
+    #: is available, the actual entity batch size is set to
+    #: ``batch_size // 2`` (half the torch batch size) so each batch
+    #: processes a manageable number of entities. This value is used as
+    #: a fallback when ``batch_size`` is not set.
     STREAMING_ENTITY_BATCH: int = 1000
 
     def _should_stream_predictions(
         self, *, n_entities: int, n_time: int, num_samples: int
     ) -> bool:
-        """Return ``True`` when the full predictions array would be large.
+        """Return ``True`` when the streaming path should be used.
 
-        The threshold is :attr:`STREAMING_CELL_THRESHOLD` cells. The
-        component count is approximated as ``len(self.dataset.targets)``
-        (the in-memory path also includes feature components, but the
-        target count is the dominant factor for the final PredictionFrame
-        size).
+        With the default :attr:`STREAMING_CELL_THRESHOLD` of 1, the
+        streaming path is always used. Override the threshold to a higher
+        value to fall back to the in-memory path for small forecasts.
         """
         n_components = max(1, len(self.dataset.targets))
         n_cells = n_entities * n_time * n_components * max(1, num_samples)
@@ -656,12 +651,16 @@ class DartsForecaster:
         verbose = predict_kwargs.get("verbose", True)
 
         target_names = list(self.dataset.targets)
-        n_targets = len(target_names)
         n_entities = len(target_series)
-        # Use half of batch_size for entity batching (or default to 500), minimum 1
-        entity_batch_size = max(1, (batch_size // 2) if batch_size else (self.STREAMING_ENTITY_BATCH // 2))
+        # Entity batch size = half the torch batch size (when available),
+        # falling back to STREAMING_ENTITY_BATCH. This keeps each batch's
+        # memory footprint manageable while amortising the per-call overhead.
+        if batch_size is not None and batch_size > 1:
+            entity_batch_size = max(1, batch_size // 2)
+        else:
+            entity_batch_size = self.STREAMING_ENTITY_BATCH
 
-        # Create the zarr-backed scaffold sized for the full grid.
+        # Create the in-memory scaffold sized for the full grid.
         scaffold = ViewsDataset.create_prediction_scaffold(
             entity_ids=entity_ids,
             time_ids=pred_time_ids,
@@ -679,8 +678,8 @@ class DartsForecaster:
 
         logger.info(
             "Streaming predictions: %d entities × %d steps × %d samples "
-            "(entity_batch=%d, model_batch=%s) → zarr scaffold",
-            n_entities, output_length, num_samples, entity_batch_size, batch_size,
+            "(batch=%d) → zarr scaffold",
+            n_entities, output_length, num_samples, entity_batch_size,
         )
 
         # Run predict_from_dataset in entity batches.
@@ -720,22 +719,15 @@ class DartsForecaster:
                     f"(entities {start}:{end}, shape={batch_preds.shape})."
                 )
 
-            # Extract target components from model output (which includes features + targets).
-            # Darts returns all components in the order they were in the input series.
-            # The last n_targets components are the targets (standard layout: features before targets).
-            n_components = batch_preds.shape[2]
-            target_indices = list(range(n_components - n_targets, n_components))
-            batch_target_preds = batch_preds[:, :, target_indices, :]
-
             scaffold.write_prediction_batch(
-                target_values=batch_target_preds,
+                target_values=batch_preds,
                 entity_ids_batch=batch_entity_ids,
                 time_ids=pred_time_ids,
                 target_names=target_names,
                 apply_inverse=True,
                 clip_negatives=True,
             )
-            del batch_preds, batch_target_preds
+            del batch_preds
             gc.collect()
             logger.info(
                 "Streaming batch %d/%d written (entities %d:%d).",

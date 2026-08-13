@@ -307,7 +307,7 @@ class TestStreamingThreshold:
     """Tests for ``_should_stream_predictions`` and the batch loop."""
 
     def test_small_forecast_streams_by_default(self, tmp_path: Path) -> None:
-        """With STREAMING_CELL_THRESHOLD=1, even small forecasts use streaming."""
+        """With the default threshold of 1, even a small forecast streams."""
         dataset = _build_dataset(tmp_path)
         fc = DartsForecaster(
             dataset=dataset,
@@ -316,7 +316,7 @@ class TestStreamingThreshold:
             target_scaler=None,
             random_state=42,
         )
-        # 3 entities × 6 steps × 3 targets × 1 sample = 54 cells > 1 threshold.
+        # 3 entities × 6 steps × 3 targets × 1 sample = 54 cells > 1.
         assert fc._should_stream_predictions(
             n_entities=3, n_time=6, num_samples=1
         ) is True
@@ -374,6 +374,66 @@ class TestStreamingThreshold:
         )
         # 3 entities / batch=1 → 3 predict_from_dataset calls.
         assert mock_model.predict_from_dataset.call_count == 3
+
+    def test_all_entities_present_in_output(self, tmp_path: Path) -> None:
+        """Every entity in the input must appear in the streaming output.
+
+        Regression test for the bug where the streaming scaffold was
+        zarr-backed and successive batch writes overwrote each other,
+        leaving only the last batch's entities in the output.
+        """
+        dataset = _build_dataset(tmp_path)
+        mock_model = _make_mock_model()
+        n_entities = len(ENTITY_IDS)
+        n_time = 6
+        n_targets = len(TARGETS)
+        _seed_mock_predictions(
+            mock_model,
+            n_entities=n_entities,
+            n_time=n_time,
+            n_targets=n_targets,
+            n_samples=1,
+        )
+        fc = DartsForecaster(
+            dataset=dataset,
+            model=mock_model,
+            partition_dict=PARTITION,
+            target_scaler=None,
+            random_state=42,
+        )
+        fc.dataset.fit_scalers(
+            target_scaler=None,
+            feature_scaler=None,
+            time_ids=list(range(121, 201)),
+        )
+        fc.scaler_fitted = True
+        # Force streaming with small batches.
+        fc.STREAMING_CELL_THRESHOLD = 0
+        fc.STREAMING_ENTITY_BATCH = 1  # one entity per batch → 3 batches
+
+        frames = fc.predict(
+            sequence_number=0,
+            output_length=n_time,
+            num_samples=1,
+            mc_dropout=False,
+        )
+
+        # Every target must have all 3 entities × 6 time steps = 18 rows.
+        for tgt, frame in frames.items():
+            assert frame.n_rows == n_entities * n_time, (
+                f"target '{tgt}': expected {n_entities * n_time} rows, "
+                f"got {frame.n_rows}"
+            )
+            # Every entity must appear in the index.
+            frame_entity_ids = set(frame.index.unit.tolist())
+            assert frame_entity_ids == set(ENTITY_IDS), (
+                f"target '{tgt}': expected entities {set(ENTITY_IDS)}, "
+                f"got {frame_entity_ids}"
+            )
+            # No NaN values (every cell must be filled).
+            assert not np.isnan(frame.values).any(), (
+                f"target '{tgt}': NaN values in output"
+            )
 
 
 # ----------------------------------------------------------------------

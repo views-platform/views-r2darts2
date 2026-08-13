@@ -758,7 +758,7 @@ class ViewsDataset:
         self._store.close()
 
     def __del__(self) -> None:
-        if hasattr(self, "_store"):
+        if getattr(self, "_store", None) is not None:
             self._store.close()
 
     def validate_indices(self) -> None:
@@ -1405,12 +1405,19 @@ class ViewsDataset:
         entity_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "ViewsDataset":
-        """Create a zarr-backed prediction scaffold sized for the full grid.
+        """Create an in-memory prediction scaffold sized for the full grid.
 
         The scaffold is a prediction-mode :class:`ViewsDataset` with one
         ``pred_<target>`` variable per target, pre-allocated to shape
         ``(n_time, n_entities, sample_size)`` and filled with NaN. Rows are
         populated incrementally via :meth:`write_prediction_batch`.
+
+        The scaffold is kept fully in-memory (not zarr-backed) so that
+        :meth:`write_prediction_batch` can mutate the arrays directly
+        without zarr round-trips. The data is converted to
+        :class:`PredictionFrame` objects via
+        :meth:`to_predictionframe_per_target` at the end — the scaffold is
+        not persisted to disk.
 
         Args:
             entity_ids: 1-D int64 array of entity ids (the full set).
@@ -1461,7 +1468,19 @@ class ViewsDataset:
             "broadcast_features": False,
             **(metadata or {}),
         })
-        return ViewsDataset.for_loa(level_lower, ds)
+
+        # Build the ViewsDataset WITHOUT zarr ingestion — keep the data
+        # purely in-memory so write_prediction_batch can mutate the arrays
+        # directly. The scaffold is a transient object that gets converted
+        # to PredictionFrames and then discarded.
+        scaffold = ViewsDataset.__new__(ViewsDataset)
+        scaffold.broadcast_features = False
+        scaffold._user_metadata = metadata or {}
+        scaffold._store = None  # no zarr store
+        scaffold._ds = ds  # in-memory xarray Dataset
+        scaffold._load_schema()
+        scaffold.validate_indices()
+        return scaffold
 
     def write_prediction_batch(
         self,
@@ -1513,9 +1532,11 @@ class ViewsDataset:
         if clip_negatives:
             np.maximum(target_values, 0.0, out=target_values)
 
-        # Write directly into the in-memory xarray Dataset via coordinate
-        # selection. The scaffold was pre-allocated with the full grid, so
-        # every (time, entity) cell already exists — we just fill it.
+        # Write directly into the in-memory xarray Dataset. The scaffold
+        # was pre-allocated with the full grid, so every (time, entity)
+        # cell already exists — we just fill it. We use ``.values`` (which
+        # returns a writable numpy view for in-memory datasets) and write
+        # in-place so successive batch writes accumulate.
         time_coord = self._ds[self._time_id].values
         entity_coord = self._ds[self._entity_id].values
 
@@ -1531,16 +1552,11 @@ class ViewsDataset:
                 )
             # Extract this target: (n_batch, n_time, n_samples).
             vals = target_values[:, :, t_idx, :]
-            # Get a writable copy of the variable's values.
+            # Get the underlying numpy array and write in-place.
             arr = self._ds[pred_var].values
             for e_i, entity_id in enumerate(entity_ids_batch):
                 ep = int(np.searchsorted(entity_coord, entity_id))
                 arr[t_start:t_start + n_time, ep, :] = vals[e_i]
-            # Write back to the Dataset.
-            self._ds[pred_var] = (
-                (self._time_id, self._entity_id, "sample"),
-                arr,
-            )
 
     def to_predictionframe_per_target(
         self, *, metadata: Any = None

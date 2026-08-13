@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import xarray as xr
+import zarr
 
 from views_r2darts2.dataset import converters, readers
 from views_r2darts2.dataset.zarr_store import ZarrStore

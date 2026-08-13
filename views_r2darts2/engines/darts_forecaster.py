@@ -208,28 +208,70 @@ class DartsForecaster:
                 logger.warning("checkpoint_mode='last' reload failed: %s", exc)
 
     def _build_validation_set(self):
-        """Build the validation set (test partition or carved from train end)."""
+        """Build the validation set (test partition or carved from train end).
+
+        In forecasting mode, the test partition contains future months that
+        don't exist in the data yet — we carve the validation set from the
+        train end instead. This is detected by checking whether the test
+        partition's time_ids are present in the dataset.
+        """
         icl = self.model.input_chunk_length
         ocl = self.model.output_chunk_length
+
+        # Check if the test partition exists in the dataset. In forecasting
+        # mode, the test months (e.g. 560-596) are future months that haven't
+        # been observed yet — they're not in the data. Fetching them would
+        # trigger zero-fill warnings and produce useless all-zero validation
+        # series. Detect this upfront and carve from the train end.
+        available_times = set(
+            int(t) for t in self.dataset._ds[self.dataset._time_id].values
+        )
+        test_times = set(range(self._test_start, self._test_end + 1))
+        test_coverage = len(test_times & available_times) / max(len(test_times), 1)
+
+        if test_coverage < 0.5:
+            # Forecasting mode: test partition mostly absent from data.
+            # Carve validation from the train end immediately.
+            carved_start = self._train_end - ocl - icl + 1
+            logger.info(
+                "Forecasting mode: test partition [%d, %d] is %d%% present in "
+                "data. Carving validation from train end [%d, %d].",
+                self._test_start, self._test_end, int(test_coverage * 100),
+                carved_start, self._train_end,
+            )
+            # Refit scalers on trimmed train (no holdout leakage).
+            trimmed_end = self._train_end - ocl
+            self.dataset.fit_scalers(
+                target_scaler=self._target_scaler_cfg,
+                feature_scaler=self._feature_scaler_cfg,
+                feature_scaler_map=self._feature_scaler_map_cfg,
+                log_targets=self._log_targets,
+                log_features=self._log_features,
+                time_ids=list(range(self._train_start, trimmed_end + 1)),
+            )
+            val_targets, val_past_cov = self.dataset.get_scaled_darts_timeseries(
+                time_ids=list(range(carved_start, self._train_end + 1)),
+                use_cyclic_encoders=self._use_cyclic_encoders,
+            )
+            return val_targets, val_past_cov
+
+        # Calibration/validation mode: test partition exists in the data.
         val_start = self._test_start - icl
         val_end = self._test_end
-
         val_targets, val_past_cov = self.dataset.get_scaled_darts_timeseries(
             time_ids=list(range(val_start, val_end + 1)),
             use_cyclic_encoders=self._use_cyclic_encoders,
         )
 
-        # Check if val is too short (forecasting mode).
+        # Check if val is too short (edge case for very short test partitions).
         min_val_len = icl + ocl
         max_val_len = max((len(ts) for ts in val_targets), default=0)
         if max_val_len < min_val_len:
-            # Carve from train end.
             carved_start = self._train_end - ocl - icl + 1
             logger.info(
-                "Forecasting mode: val too short (%d < %d). Carving [%d, %d].",
+                "Val too short (%d < %d). Carving [%d, %d].",
                 max_val_len, min_val_len, carved_start, self._train_end,
             )
-            # Refit scalers on trimmed train (no holdout leakage).
             trimmed_end = self._train_end - ocl
             self.dataset.fit_scalers(
                 target_scaler=self._target_scaler_cfg,
@@ -360,9 +402,9 @@ class DartsForecaster:
         """
         import gc
 
-        num_samples = predict_kwargs.get("num_samples")
-        mc_dropout = predict_kwargs.get("mc_dropout")
-        batch_size = predict_kwargs.get("batch_size")
+        num_samples = predict_kwargs.get("num_samples", 1)
+        mc_dropout = predict_kwargs.get("mc_dropout", False)
+        batch_size = predict_kwargs.get("batch_size", None)
         verbose = predict_kwargs.get("verbose", True)
 
         target_names = list(self.dataset.targets)

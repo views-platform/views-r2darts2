@@ -22,12 +22,11 @@ model lifecycle (device, fit, predict, save/load) and the partition windows.
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Union
+from typing import Any, Mapping
 
+import numpy as np
 import torch
-from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
-from darts.models.forecasting.sklearn_model import SKLearnModel
 
 from views_frames import PredictionFrame
 
@@ -63,7 +62,7 @@ class DartsForecaster:
     def __init__(
         self,
         dataset: ViewsDataset,
-        model: Union[TorchForecastingModel, SKLearnModel],
+        model: TorchForecastingModel,
         partition_dict: dict,
         feature_scaler: str | None = None,
         target_scaler: str | None = None,
@@ -79,10 +78,7 @@ class DartsForecaster:
 
         Args:
             dataset: The :class:`ViewsDataset` (zarr-backed, owns scalers).
-            model: A Darts :class:`TorchForecastingModel` or
-                :class:`SKLearnModel` instance. Sklearn models bypass the
-                torch-specific train/predict path (no checkpoints, no device
-                moves, no ``_build_inference_dataset``).
+            model: A Darts :class:`TorchForecastingModel` instance.
             partition_dict: ``{"train": (start, end), "test": (start, end)}``.
             feature_scaler: Scaler name for all features.
             target_scaler: Scaler name for targets.
@@ -92,8 +88,7 @@ class DartsForecaster:
             random_state: Random seed (mandatory).
             static_covariate_stats: Static covariate config (unused in slim
                 version — static covariates are computed by the dataset).
-            checkpoint_mode: ``"best"`` or ``"last"``. Ignored for sklearn
-                models (no checkpoint machinery).
+            checkpoint_mode: ``"best"`` or ``"last"``.
             use_cyclic_encoders: Append sin/cos cyclic time encoders.
 
         Raises:
@@ -142,40 +137,13 @@ class DartsForecaster:
 
         self.scaler_fitted = False
         self.device = _get_device()
-        # Store the full partition dict for later use (e.g., re-attaching
-        # the dataset to a loaded sklearn model).
-        self._partition_dict = dict(partition_dict)
-        # Detect sklearn-based models — these bypass the torch-specific
-        # train/predict path. The MarkovModel is the canonical example.
-        self._is_sklearn_model = isinstance(self.model, SKLearnModel)
-        if self._is_sklearn_model:
-            # Sklearn models have no device concept — force 'cpu' so the
-            # downstream parallelism check in DartsForecastingModelManager
-            # (``if forecaster.device == "cpu"``) takes the multi-worker path.
-            self.device = "cpu"
-            logger.info(
-                "Using sklearn-based model %s — torch device checks bypassed.",
-                type(self.model).__name__,
-            )
-            # Give the model access to the dataset so it can use the full
-            # data infrastructure (FeatureFrame API, zarr-backed lazy
-            # loading, index validation). The model's fit/predict methods
-            # check for ``self._dataset`` and use it when available.
-            if hasattr(self.model, "set_dataset"):
-                self.model.set_dataset(self.dataset, partition_dict=self._partition_dict)
-        else:
-            logger.info("Using device: %s", self.device)
-            self._move_model_to_device()
+        logger.info("Using device: %s", self.device)
+        self._move_model_to_device()
 
     # ------------------------------------------------------------------ device
 
     def _move_model_to_device(self) -> None:
-        """Move the model to the configured device.
-
-        No-op for sklearn-based models (no torch parameters to move).
-        """
-        if self._is_sklearn_model:
-            return
+        """Move the model to the configured device."""
         if hasattr(self.model, "to_device"):
             self.model.to_device(self.device)
         elif hasattr(self.model, "model") and hasattr(self.model.model, "to"):
@@ -195,45 +163,7 @@ class DartsForecaster:
         the scaled TimeSeries from the training partition. Handles the
         forecasting-mode carve (when the test partition is too short for a
         validation window, carves val from the train end).
-
-        For sklearn-based models (e.g. MarkovModel), the scaler-fitting,
-        validation-set carve, and torch-specific kwargs (``val_series``,
-        ``val_past_cov``, ``dataloader_kwargs``) are all skipped — sklearn
-        models do their own internal transforms and do not consume torch
-        plumbing. The model is given access to the dataset directly (via
-        ``set_dataset`` in ``__init__``) so it can use the FeatureFrame API.
         """
-        # Sklearn models bypass the scaler-fitting and validation-set carve
-        # entirely. The MarkovModel does its own log1p transform and does
-        # not use external scalers — fitting scalers here would be wasted
-        # work (and could cause double-transform issues if log_targets is
-        # also set). The model uses the dataset directly via set_dataset.
-        if self._is_sklearn_model:
-            # Mark the scaler as "fitted" so predict() doesn't raise.
-            # No actual scalers are fitted — the MarkovModel applies its
-            # own transforms internally.
-            self.scaler_fitted = True
-            # Call model.fit with the raw (unscaled) TimeSeries. When a
-            # dataset is attached, the model ignores these series and
-            # uses the dataset's FeatureFrame API instead. The series are
-            # passed only for darts interface compliance.
-            train_time_ids = list(range(self._train_start, self._train_end + 1))
-            target_series, past_covariates = self.dataset.to_darts_timeseries(
-                time_ids=train_time_ids,
-                use_cyclic_encoders=self._use_cyclic_encoders,
-            ), None
-            # Split into targets and past_covariates (the MarkovModel
-            # expects the standard darts two-argument interface).
-            target_series, past_covariates = self.dataset._split_targets_covariates(
-                target_series
-            )
-            self.model.fit(
-                series=target_series,
-                past_covariates=past_covariates,
-            )
-            return
-
-        # --- Torch model path ---
         # Fit scalers and return the already-transformed training series in one
         # zarr load — avoids a second full read for the same time range.
         train_time_ids = list(range(self._train_start, self._train_end + 1))
@@ -327,24 +257,18 @@ class DartsForecaster:
         """Generate forecasts and return them as a per-target dict of frames.
 
         Uses Darts' ``predict_from_dataset(values_only=True)`` to bypass
-        output :class:`TimeSeries` construction entirely — the model returns
-        raw numpy arrays, which are inverse-transformed and converted to
-        :class:`PredictionFrame` objects without ever building per-entity
-        Darts ``TimeSeries`` on the output side. This is critical for
-        large entity counts (e.g. 259k PRIO-GRID cells) where building
-        259k output TimeSeries objects causes OOM kills.
-
-        For sklearn-based models (e.g. MarkovModel), the predict path is
-        simpler: the model's ``predict(n, series, past_covariates)`` method
-        is called directly (returning a list of :class:`TimeSeries`), and
-        the resulting series are fed to ``ingest_darts_predictions`` (the
-        TimeSeries-based ingestion path). Sklearn models do not support
-        ``values_only=True``.
+        output :class:`TimeSeries` construction entirely. The model runs in
+        entity batches; each batch's predictions are written to a
+        :class:`DatasetBuilder` scaffold on disk, so peak memory is one
+        batch — never the full ``(n_entities, n_time, n_targets, n_samples)``
+        grid. This is critical for large entity counts (e.g. 259k PRIO-GRID
+        cells) and/or probabilistic forecasts (e.g. 500 samples) where
+        materializing the full predictions array causes OOM kills.
 
         Args:
             sequence_number: Rolling-origin sequence index (0 = first test step).
             output_length: Number of time steps to forecast.
-            **predict_kwargs: Forwarded to ``model.predict``.
+            **predict_kwargs: Forwarded to ``model.predict_from_dataset``.
 
         Returns:
             ``{target_name: PredictionFrame}`` dict.
@@ -360,142 +284,46 @@ class DartsForecaster:
             )
 
         import gc
-        import numpy as np
 
         # Lock entropy for reproducible probabilistic samples.
         ReproducibilityGate.Data.lock_entropy(self.random_state)
 
-        # Get input window for this sequence.
-        # Sklearn models do not use external scalers — fetch raw
-        # (unscaled) TimeSeries directly from the dataset. Torch models
-        # use the scaler-fitted path (``get_scaled_darts_timeseries``).
+        # Get scaled input window for this sequence.
         icl = self.model.input_chunk_length
         start = self._test_start + sequence_number - icl
         end = self._test_start - 1 + sequence_number
-        if self._is_sklearn_model:
-            series_list = self.dataset.to_darts_timeseries(
-                time_ids=list(range(start, end + 1)),
-                use_cyclic_encoders=self._use_cyclic_encoders,
-            )
-            target_series, past_covariates = self.dataset._split_targets_covariates(
-                series_list
-            )
-        else:
-            target_series, past_covariates = self.dataset.get_scaled_darts_timeseries(
-                time_ids=list(range(start, end + 1)),
-                use_cyclic_encoders=self._use_cyclic_encoders,
-            )
+        target_series, past_covariates = self.dataset.get_scaled_darts_timeseries(
+            time_ids=list(range(start, end + 1)),
+            use_cyclic_encoders=self._use_cyclic_encoders,
+        )
 
         # Capture the entity/time index before freeing the input series.
-        # All entities share the same time index (integer step 1).
         entity_ids = np.array([
             int(ts.static_covariates[self.dataset._entity_id].iloc[0])
             for ts in target_series
         ], dtype=np.int64)
-        time_index_start = int(target_series[0].time_index[0])
-        # The prediction time ids start one step after the input window ends.
         pred_time_start = int(target_series[0].time_index[-1]) + 1
         pred_time_ids = np.arange(
             pred_time_start, pred_time_start + output_length, dtype=np.int64
         )
 
-        # --- Sklearn-model predict path -----------------------------------
-        # SKLearnModel-based models (e.g. MarkovModel) do not support the
-        # ``_build_inference_dataset`` / ``predict_from_dataset`` interface.
-        # Call ``model.predict`` directly — it returns a list of TimeSeries
-        # (one per entity) which we then ingest via the TimeSeries-based
-        # path.
-        if self._is_sklearn_model:
-            try:
-                pred_series = self.model.predict(
-                    n=output_length,
-                    series=target_series,
-                    past_covariates=past_covariates,
-                )
-            except Exception as exc:
-                logger.error("Error during sklearn-model prediction: %s", exc)
-                raise
-            finally:
-                del target_series, past_covariates
-                gc.collect()
-
-            # Normalise to a list.
-            if isinstance(pred_series, TimeSeries):
-                pred_series = [pred_series]
-            elif not isinstance(pred_series, list):
-                pred_series = list(pred_series)
-
-            # Audit for NaN/Inf.
-            for i, ts in enumerate(pred_series):
-                arr = ts.all_values(copy=False)
-                if np.isnan(arr).any() or np.isinf(arr).any():
-                    raise NumericalSanityError(
-                        f"NaN/Inf in sklearn-model predictions (series {i}, "
-                        f"shape={arr.shape})."
-                    )
-
-            frames = self.dataset.ingest_darts_predictions(
-                predictions=pred_series,
-                apply_inverse=True,
-                clip_negatives=True,
-            )
-            del pred_series
-            gc.collect()
-
-            for target, frame in frames.items():
-                if np.isnan(frame.values).any():
-                    raise NumericalSanityError(
-                        f"NaNs in final PredictionFrame for target '{target}'."
-                    )
-            return frames
-
-        # --- Torch predict path: values_only=True -------------------------
         # Device management.
         self._ensure_model_on_device()
 
-        # Bypasses Darts' output TimeSeries construction entirely. The model
-        # returns (predictions, series_schemas, pred_starts) as raw numpy.
-        # This avoids building 259k TimeSeries + 259k pandas DataFrames on
-        # the output side — the single biggest memory consumer.
-        try:
-            # Use predict_from_dataset with values_only=True.
-            # We need to build the inference dataset ourselves, then call
-            # predict_from_dataset directly.
-            predictions, series_schemas, pred_starts = (
-                self._predict_values_only(
-                    n=output_length,
-                    series=target_series,
-                    past_covariates=past_covariates,
-                    **predict_kwargs,
-                )
-            )
-        except Exception as exc:
-            logger.error("Error during prediction: %s", exc)
-            raise
-        finally:
-            # Free the input TimeSeries immediately — they're no longer needed.
-            del target_series, past_covariates
-            gc.collect()
-
-        # Audit model output for numerical sanity (numpy-direct).
-        if np.isnan(predictions).any() or np.isinf(predictions).any():
-            raise NumericalSanityError(
-                f"NaN/Inf in model predictions (shape={predictions.shape})."
-            )
-
-        # Inverse-transform + convert to PredictionFrames (numpy-direct).
-        # This bypasses ingest_darts_predictions (which needs TimeSeries)
-        # and uses ingest_numpy_predictions (which works on raw numpy).
-        frames = self.dataset.ingest_numpy_predictions(
-            predictions=predictions,
+        # --- Streaming prediction path via DatasetBuilder ---------------
+        # The builder pre-allocates a NaN-filled Zarr skeleton (metadata
+        # only — nothing in RAM) and scatter-writes each batch to disk.
+        # Peak memory is one batch, never the grid.
+        frames = self._predict_streaming(
+            target_series=target_series,
+            past_covariates=past_covariates,
             entity_ids=entity_ids,
-            time_ids=pred_time_ids,
-            apply_inverse=True,
-            clip_negatives=True,
+            pred_time_ids=pred_time_ids,
+            output_length=output_length,
+            **predict_kwargs,
         )
 
-        # Free the raw predictions array.
-        del predictions
+        del target_series, past_covariates
         gc.collect()
 
         # Final NaN guard on the PredictionFrame values.
@@ -505,6 +333,183 @@ class DartsForecaster:
                     f"NaNs in final PredictionFrame for target '{target}'."
                 )
         return frames
+
+    #: Default entity batch size for the streaming path. Each batch runs
+    #: one ``predict_from_dataset`` call. When the model's ``batch_size``
+    #: is available, the actual entity batch size is set to
+    #: ``batch_size // 2`` (half the torch batch size). This value is the
+    #: fallback when ``batch_size`` is not set.
+    STREAMING_ENTITY_BATCH: int = 1000
+
+    def _predict_streaming(
+        self,
+        *,
+        target_series: list,
+        past_covariates: list | None,
+        entity_ids: np.ndarray,
+        pred_time_ids: np.ndarray,
+        output_length: int,
+        **predict_kwargs: Any,
+    ) -> dict[str, PredictionFrame]:
+        """Run prediction in entity batches, writing each batch to a builder.
+
+        Uses :meth:`ViewsDataset.builder` to scaffold a disk-backed Zarr
+        store, then runs ``predict_from_dataset`` per entity batch and
+        writes the batch to the scaffold via ``write_batch``. The scaffold
+        is converted to ``{target: PredictionFrame}`` at the end.
+        """
+        import gc
+
+        num_samples = predict_kwargs.get("num_samples")
+        mc_dropout = predict_kwargs.get("mc_dropout")
+        batch_size = predict_kwargs.get("batch_size")
+        verbose = predict_kwargs.get("verbose", True)
+
+        target_names = list(self.dataset.targets)
+        n_entities = len(target_series)
+        # Entity batch size = half the torch batch size (when available),
+        # falling back to STREAMING_ENTITY_BATCH.
+        if batch_size is not None and batch_size > 1:
+            entity_batch_size = max(1, batch_size // 2)
+        else:
+            entity_batch_size = self.STREAMING_ENTITY_BATCH
+
+        # Determine the LOA code and variable specs for the builder.
+        loa = self._dataset_level_code()
+        pred_vars = {f"pred_{t}": "num3" for t in target_names}
+
+        logger.info(
+            "Streaming predictions: %d entities × %d steps × %d samples "
+            "(batch=%d) → builder scaffold",
+            n_entities, output_length, num_samples, entity_batch_size,
+        )
+
+        # Create the builder scaffold (disk-backed Zarr, metadata only).
+        with ViewsDataset.builder(
+            loa=loa,
+            times=pred_time_ids,
+            entities=entity_ids,
+            variables=pred_vars,
+            sample_size=int(num_samples),
+            targets=pred_vars.keys(),
+        ) as b:
+            # Run predict_from_dataset in entity batches.
+            for start in range(0, n_entities, entity_batch_size):
+                end = min(start + entity_batch_size, n_entities)
+                batch_series = target_series[start:end]
+                batch_cov = (
+                    past_covariates[start:end] if past_covariates else None
+                )
+                batch_entity_ids = entity_ids[start:end]
+
+                inference_dataset = self.model._build_inference_dataset(
+                    n=output_length,
+                    series=batch_series,
+                    past_covariates=batch_cov,
+                    future_covariates=None,
+                    stride=0,
+                    bounds=None,
+                )
+                del batch_series, batch_cov
+
+                batch_preds, _, _ = self.model.predict_from_dataset(
+                    n=output_length,
+                    dataset=inference_dataset,
+                    batch_size=batch_size,
+                    verbose=verbose,
+                    num_samples=num_samples,
+                    mc_dropout=mc_dropout,
+                    values_only=True,
+                )
+                del inference_dataset
+
+                # Audit each batch for numerical sanity before writing.
+                if np.isnan(batch_preds).any() or np.isinf(batch_preds).any():
+                    raise NumericalSanityError(
+                        f"NaN/Inf in streaming batch predictions "
+                        f"(entities {start}:{end}, shape={batch_preds.shape})."
+                    )
+
+                # Extract target components and write to the builder.
+                # batch_preds shape: (n_batch, n_time, n_components, n_samples)
+                n_batch = batch_preds.shape[0]
+                n_time = batch_preds.shape[1]
+                n_targets = len(target_names)
+                # Assume the last n_targets components are the targets.
+                target_indices = list(range(
+                    batch_preds.shape[2] - n_targets, batch_preds.shape[2]
+                ))
+
+                # Apply inverse transforms + clip (numpy-direct).
+                target_values = batch_preds[:, :, target_indices, :]
+                if self.dataset.scalers_fitted:
+                    target_values = self.dataset._inverse_transform_numpy_predictions(
+                        target_values
+                    )
+                np.maximum(target_values, 0.0, out=target_values)
+
+                # Write per-target to the builder. Each target is a separate
+                # column. The builder expects (N, S) per (time, entity) row.
+                # We expand the batch into (time * entity) rows per target.
+                # time-major: time varies slowest, entity varies fastest.
+                t_grid, e_grid = np.meshgrid(
+                    pred_time_ids, batch_entity_ids, indexing="ij"
+                )
+                time_flat = t_grid.ravel()      # (n_time * n_batch,)
+                entity_flat = e_grid.ravel()    # (n_time * n_batch,)
+
+                for t_idx, target_name in enumerate(target_names):
+                    pred_var = f"pred_{target_name}"
+                    # Extract this target: (n_batch, n_time, n_samples).
+                    vals = target_values[:, :, t_idx, :]
+                    # Transpose to (n_time, n_batch, n_samples) then reshape
+                    # to (n_time * n_batch, n_samples) — time-major.
+                    vals = vals.transpose(1, 0, 2).reshape(
+                        n_time * n_batch, -1
+                    ).astype(np.float32)
+                    b.write_batch(
+                        times=time_flat,
+                        entities=entity_flat,
+                        columns={pred_var: vals},
+                    )
+
+                del batch_preds, target_values
+                gc.collect()
+                logger.info(
+                    "Streaming batch %d/%d written (entities %d:%d).",
+                    start // entity_batch_size + 1,
+                    (n_entities + entity_batch_size - 1) // entity_batch_size,
+                    start, end,
+                )
+
+            ds = b.build()
+
+        # Convert the built dataset to per-target PredictionFrames.
+        frames: dict[str, PredictionFrame] = {}
+        from views_frames import (
+            PredictionFrame as _PF, SpatioTemporalIndex, FrameMetadata,
+        )
+        index = ds._build_index()
+        meta = FrameMetadata(model="darts")
+        for target_name in target_names:
+            pred_var = f"pred_{target_name}"
+            arr = ds.to_xarray()[pred_var].transpose(
+                ds._time_id, ds._entity_id, "sample"
+            ).values.astype(np.float32)
+            t, e, s = arr.shape
+            y_pred = np.ascontiguousarray(arr.reshape(t * e, s))
+            frames[target_name] = _PF(y_pred, index=index, metadata=meta)
+        ds.close()
+        return frames
+
+    def _dataset_level_code(self) -> str:
+        """Return the VIEWS LOA code for the dataset's entity level."""
+        eid = self.dataset._entity_id
+        if eid == "priogrid_id":
+            return "pgm"
+        if eid == "country_id":
+            return "cm"
+        return f"{eid[0]}m" if eid else "cm"
 
     def _predict_values_only(
         self,
@@ -560,12 +565,7 @@ class DartsForecaster:
         return predictions, series_schemas, pred_starts
 
     def _ensure_model_on_device(self) -> None:
-        """Ensure the model is on the configured device (restore from CPU drift).
-
-        No-op for sklearn-based models (no torch parameters).
-        """
-        if self._is_sklearn_model:
-            return
+        """Ensure the model is on the configured device (restore from CPU drift)."""
         current_device = next(self.model.model.parameters()).device
         if self.device != "cpu" and current_device.type == "cpu":
             logger.info("Restoring model to %s...", self.device)
@@ -580,14 +580,7 @@ class DartsForecaster:
     # ------------------------------------------------------------------ persistence
 
     def save_model(self, path: str) -> None:
-        """Save the Darts model + scaler state to disk.
-
-        For sklearn-based models, ``model.save(path)`` uses pickle (via
-        darts' SKLearnModel.save). For torch models, ``model.save(path)``
-        uses torch's checkpoint format. The scaler sidecar (``path.scalers``)
-        is always written via ``torch.save`` (pickle underneath) — works for
-        both.
-        """
+        """Save the Darts model + scaler state to disk."""
         path = str(path)
         self.model.save(path=path)
         torch.save(
@@ -605,12 +598,7 @@ class DartsForecaster:
         )
 
     def load_model(self, path: str) -> None:
-        """Load the Darts model + scaler state from disk.
-
-        For sklearn-based models, ``model.__class__.load(path)`` uses pickle
-        (via darts' SKLearnModel.load). The ``map_location`` kwarg is only
-        passed for torch models — SKLearnModel.load does not accept it.
-        """
+        """Load the Darts model + scaler state from disk."""
         path = str(path)
         scaler_data = torch.load(
             path + ".scalers", map_location="cpu", weights_only=False
@@ -631,20 +619,9 @@ class DartsForecaster:
                 f"'{saved_cfg}' but config has '{self._target_scaler_cfg}'."
             )
 
-        # Load the model. Torch models accept ``map_location``; sklearn
-        # models (SKLearnModel.load) do not.
-        if self._is_sklearn_model:
-            self.model = self.model.__class__.load(path=path)
-        else:
-            self.model = self.model.__class__.load(
-                path=path, map_location=str(self.device)
-            )
+        # Load the model.
+        self.model = self.model.__class__.load(
+            path=path, map_location=str(self.device)
+        )
         self._move_model_to_device()
-
-        # Re-attach the dataset to sklearn models (the loaded model
-        # instance does not carry the dataset reference — it was set on
-        # the pre-load instance by __init__).
-        if self._is_sklearn_model and hasattr(self.model, "set_dataset"):
-            self.model.set_dataset(self.dataset, partition_dict=self._partition_dict)
-
         logger.info("Model loaded on device %s.", self.device)

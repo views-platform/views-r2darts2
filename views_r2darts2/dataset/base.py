@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 _ENTITY_LEVEL = {"priogrid_id": "PGM", "country_id": "CM"}
 
 
+def _loa_to_class(loa: str) -> type:
+    """Map a VIEWS loa code to the dataset subclass (unknown -> base)."""
+    from views_r2darts2.dataset.subclasses import (
+        CDataset, CMDataset, CYDataset,
+        PGDataset, PGMDataset, PGYDataset,
+    )
+    return {
+        "pgm": PGMDataset, "pgy": PGYDataset, "pg": PGDataset,
+        "cm": CMDataset, "cy": CYDataset, "c": CDataset,
+    }.get((loa or "").lower(), ViewsDataset)
+
+
 class ViewsDataset:
     """A lazy, Zarr-backed spatiotemporal dataset (time × entity × sample)."""
 
@@ -231,8 +243,11 @@ class ViewsDataset:
     def to_predictionframe(self) -> Any:
         """Convert to a ``views_frames.PredictionFrame`` (prediction mode only).
 
-        Uses ``to_tensor()`` (a single lazy dask operation) and reshapes
-        the result — one compute call instead of T separate disk reads.
+        Uses the target's zarr variable directly (a single lazy dask
+        operation) and reshapes the result — one compute call instead of T
+        separate disk reads. When the dataset has multiple ``pred_``
+        variables but a single declared target, only the target variable is
+        exported (the others are auxiliary columns).
         """
         if not self.is_prediction:
             raise ValueError("to_predictionframe requires prediction mode")
@@ -242,10 +257,28 @@ class ViewsDataset:
             )
         from views_frames import PredictionFrame, FrameMetadata
 
-        tensor = self.to_tensor()  # (T, E, S, 1) lazy
-        computed = tensor.compute()
-        t, e, s, _ = computed.shape
-        y_pred = np.ascontiguousarray(computed.values.reshape(t * e, s))
+        # Select only the target's pred_ variable (not all pred_vars).
+        # The target name may or may not have the ``pred_`` prefix — handle
+        # both cases (builder passes ``pred_a`` as the target; legacy paths
+        # pass ``ged_sb`` and the pred_var is ``pred_ged_sb``).
+        target_name = self.targets[0]
+        if target_name.startswith("pred_"):
+            pred_var = target_name
+        elif f"pred_{target_name}" in self._ds.data_vars:
+            pred_var = f"pred_{target_name}"
+        else:
+            pred_var = target_name
+        if pred_var not in self._ds.data_vars:
+            raise KeyError(
+                f"Target variable '{pred_var}' not found in dataset. "
+                f"Available: {list(self._ds.data_vars)}."
+            )
+        # (T, E, S) → (T*E, S) — time-major flatten.
+        arr = self._ds[pred_var].transpose(
+            self._time_id, self._entity_id, "sample"
+        ).values
+        t, e, s = arr.shape
+        y_pred = np.ascontiguousarray(arr.reshape(t * e, s))
 
         index = self._build_index()
         meta = FrameMetadata.from_dict(self.metadata) if self.metadata else None
@@ -730,16 +763,69 @@ class ViewsDataset:
         :class:`ViewsDataset` — same behaviour as the legacy
         ``_ViewsDataset(source=...)`` path.
         """
-        from views_r2darts2.dataset.subclasses import (
-            CDataset, CMDataset, CYDataset,
-            PGDataset, PGMDataset, PGYDataset,
+        return _loa_to_class(loa)(source, **kwargs)
+
+    @classmethod
+    def builder(
+        cls,
+        loa: str,
+        times: Any,
+        entities: Any,
+        variables: Any,
+        *,
+        sample_size: int = 1,
+        targets: list[str] | None = None,
+        broadcast_features: bool = False,
+        metadata: dict[str, Any] | None = None,
+        path: str | Path | None = None,
+        strict: bool = False,
+        track_coverage: bool = False,
+    ) -> "DatasetBuilder":  # type: ignore[name-defined]
+        """Scaffold a dataset from scratch and stream batches into it.
+
+        Returns a :class:`DatasetBuilder`: the Zarr skeleton is pre-allocated
+        on disk (metadata only) and filled batch by batch, so peak memory is
+        one batch — never the grid. ``loa`` fixes the dimension names
+        (``pgm`` -> ``month_id``/``priogrid_id``, ``cm`` -> ``month_id``/
+        ``country_id``, ...), so callers never touch the Zarr schema::
+
+            with ViewsDataset.builder(
+                loa="pgm", times=months, entities=priogrid_ids,
+                variables={"pred_ln_sb_best": "num3"}, sample_size=32,
+                targets=["pred_ln_sb_best"],
+            ) as b:
+                for t, ents, vals in prediction_batches():
+                    b.write_batch(times=t, entities=ents,
+                                  columns={"pred_ln_sb_best": vals})
+                    del vals  # on disk now
+                ds = b.build()  # a real PGMDataset, lazy
+        """
+        from views_r2darts2.dataset.builder import DatasetBuilder
+        return DatasetBuilder(
+            loa, times, entities, variables,
+            sample_size=sample_size, targets=targets,
+            broadcast_features=broadcast_features, metadata=metadata,
+            path=path, strict=strict, track_coverage=track_coverage,
         )
-        _LOA_TO_CLASS = {
-            "pgm": PGMDataset, "pgy": PGYDataset, "pg": PGDataset,
-            "cm":  CMDataset,  "cy":  CYDataset,  "c":  CDataset,
-        }
-        klass = _LOA_TO_CLASS.get((loa or "").lower(), ViewsDataset)
-        return klass(source, **kwargs)
+
+    @classmethod
+    def _adopt_store(cls, store: ZarrStore, zarr_path: Path) -> "ViewsDataset":
+        """Wrap an already-written store without re-ingesting it.
+
+        Used by :class:`DatasetBuilder`, which streams data directly to disk;
+        running ``_ingest`` again would copy the whole store. Construction is
+        otherwise identical to ``__init__``: open lazily, load the schema,
+        and validate indices through the subclass chain when ``cls`` is a
+        LOA subclass.
+        """
+        obj = cls.__new__(cls)
+        obj.broadcast_features = False
+        obj._user_metadata = {}
+        obj._store = store
+        obj._ds = readers.open_zarr_dir(zarr_path)
+        obj._load_schema()
+        obj.validate_indices()
+        return obj
 
     # ---- xarray access -----------------------------------------------------
     def to_xarray(self) -> xr.Dataset:

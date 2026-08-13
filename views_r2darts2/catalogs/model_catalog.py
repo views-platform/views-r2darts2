@@ -30,7 +30,6 @@ from darts.utils.likelihood_models import (
 )
 from views_r2darts2.infrastructure.device import get_device
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
-from views_r2darts2.models.markov_model import MarkovModel
 
 # Darts likelihood objects keyed by config string.
 # When one of these is selected, loss_fn must be None.
@@ -76,17 +75,6 @@ from views_r2darts2.infrastructure.callbacks import (
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------------------------------------------------
-# Sklearn-based models
-# ----------------------------------------------------------------------
-# These models bypass the torch-specific infrastructure (loss_fn, optimizer,
-# scheduler, pl_trainer_kwargs, likelihood). They are registered in the
-# catalog like any other model, but ``_get_common_model_args`` and the
-# ``__init__`` wiring skip the torch plumbing for them. The reproducibility
-# gate also keys off this set to skip the torch-specific genome checks.
-SKLEARN_MODELS: set[str] = {"MarkovModel"}
-
-
 class ModelCatalog:
     """
     Central repository for translating DNA manifests into concrete Darts Model instances.
@@ -122,24 +110,9 @@ class ModelCatalog:
             "TiDEModel": self._get_tide_model,
             "DLinearModel": self._get_dlinear_model,
             "TSMixerModel": self._get_tsmixer_model,
-            "MarkovModel": self._get_markov_model,
         }
         self.config = config
         self.device = get_device()
-
-        # Sklearn-based models (e.g. MarkovModel) bypass the torch-specific
-        # infrastructure: no loss_fn, no likelihood, no optimizer, no
-        # scheduler, no pl_trainer_kwargs. The ReproducibilityGate also keys
-        # off this set to skip the torch-specific genome checks.
-        algorithm = self.config.get("algorithm")
-        self._is_sklearn_model = algorithm in SKLEARN_MODELS
-
-        if self._is_sklearn_model:
-            self.loss_fn = None
-            self.likelihood = None
-            self.opt_catalog = None
-            self.sched_catalog = None
-            return
 
         # DELEGATION: Specialized catalogs handle genomic translation.
         # Darts Likelihood objects are mutually exclusive with loss_fn —
@@ -469,65 +442,4 @@ class ModelCatalog:
             dropout=self.config.get("dropout"),
             use_static_covariates=self.config.get("use_static_covariates"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
-        )
-
-    # ------------------------------------------------------------------
-    # Sklearn-based models
-    # ------------------------------------------------------------------
-    # The MarkovModel is the one exception to the torch-based pipeline.
-    # It bypasses ``_get_common_model_args`` (which carries loss_fn,
-    # optimizer, scheduler, pl_trainer_kwargs — all torch-specific) and
-    # instead receives only its own genome (markov_method, regression_method,
-    # rf_class_params, etc.). The ReproducibilityGate keys off the
-    # SKLEARN_MODELS set to skip the torch-specific genome checks.
-
-    def _get_markov_model(self) -> MarkovModel:
-        """Construct a :class:`MarkovModel` from the config.
-
-        The Markov genome is defined in
-        :attr:`ReproducibilityGate.Config.ALGORITHM_GENOMES["MarkovModel"]`.
-        The torch-specific kwargs (loss_fn, optimizer, scheduler,
-        pl_trainer_kwargs) are NOT passed — MarkovModel does not accept them.
-        """
-        # The architectural audit (steps % output_chunk_length == 0) does
-        # not apply to MarkovModel — it has its own step handling.
-        if not self._is_sklearn_model:
-            # Defensive: someone called _get_markov_model on a non-Markov
-            # config. Fall through to the torch audit path.
-            ReproducibilityGate.Config.audit_architecture(self.config)
-
-        steps = self.config.get("steps")
-        if isinstance(steps, list):
-            steps = list(steps)
-        elif isinstance(steps, range):
-            steps = list(steps)
-        elif isinstance(steps, int):
-            steps = [steps]
-
-        targets = self.config.get("regression_targets") or self.config.get("targets")
-        if isinstance(targets, str):
-            targets = [targets]
-
-        markov_target = self.config.get("markov_target")
-        if markov_target is None and targets:
-            # Default to the first target column.
-            markov_target = targets[0]
-
-        return MarkovModel(
-            steps=steps,
-            targets=list(targets) if targets else [],
-            markov_target=markov_target,
-            state_features=self.config.get("state_features"),
-            fatalities_features=self.config.get("fatalities_features"),
-            markov_method=self.config.get("markov_method", "direct"),
-            regression_method=self.config.get("regression_method", "single"),
-            markov_threshold=self.config.get("markov_threshold", 0),
-            random_state=self.config.get("random_state", 42),
-            n_jobs=self.config.get("n_jobs", -1),
-            rf_class_params=self.config.get("rf_class_params"),
-            rf_reg_params=self.config.get("rf_reg_params"),
-            output_chunk_length=self.config.get("output_chunk_length", 1),
-            output_chunk_shift=self.config.get("output_chunk_shift", 0),
-            add_encoders=self.config.get("add_encoders"),
-            use_static_covariates=self.config.get("use_static_covariates", False),
         )

@@ -420,14 +420,19 @@ class GridWriter:
         skeleton.to_zarr(store_path, mode="w", compute=False, consolidated=False)
         self._group = zarr.open_group(str(store_path), mode="a")
 
+    @property
+    def group(self) -> "zarr.Group":
+        """The open Zarr group of the pre-allocated skeleton."""
+        return self._group
+
     def write_batch(
         self, times_b: np.ndarray, entities_b: np.ndarray, cols_b: dict[str, np.ndarray]
     ) -> None:
         tp = np.searchsorted(self.times, times_b)
         ep = np.searchsorted(self.entities, entities_b)
-        for name, spec in self.specs.items():
+        for name, values in cols_b.items():
+            spec = self.specs[name]
             arr = self._group[name]
-            values = cols_b[name]
             if spec == "num3":
                 block = np.asarray(values, dtype=_FLOAT).reshape(len(tp), -1)
                 s = block.shape[1]

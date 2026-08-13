@@ -5,6 +5,16 @@ as chunked Zarr arrays on disk and every accessor returns Dask-backed
 ``xarray`` objects, so peak memory is bounded by the largest chunk rather than
 the row count.
 
+Reading existing data (DataFrame, Parquet, PredictionFrame, FeatureFrame) goes
+through the converters in :mod:`views_r2darts2.dataset.converters`. Producing
+data incrementally (e.g. prediction batches) goes through
+:class:`views_r2darts2.dataset.builder.DatasetBuilder` via
+:meth:`ViewsDataset.builder` — the builder pre-allocates a NaN-filled Zarr
+skeleton (metadata only) and scatter-writes each batch to disk, so peak memory
+is one batch, never the grid. A built dataset supports every existing export
+(``to_predictionframe``, ``save_parquet``, ``save_zarr``, ``save_predstore``,
+``save_appwrite``).
+
 This module is self-contained — it does NOT import from
 ``views_pipeline_core``. The ``ViewsDataset`` class and its subclasses live
 in the local ``base.py`` / ``subclasses.py`` files.
@@ -26,6 +36,7 @@ __all__ = [
     "CMDataset",
     "CYDataset",
     "ZarrStore",
+    "DatasetBuilder",
 ]
 
 
@@ -39,4 +50,7 @@ def __getattr__(name: str) -> Any:
     if name == "ZarrStore":
         from views_r2darts2.dataset.zarr_store import ZarrStore
         return ZarrStore
+    if name == "DatasetBuilder":
+        from views_r2darts2.dataset.builder import DatasetBuilder
+        return DatasetBuilder
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

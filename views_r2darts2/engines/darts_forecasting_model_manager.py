@@ -174,32 +174,14 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
     # ------------------------------------------------------------------ factory
 
     def _build_dataset(self, active_config: Mapping[str, Any]) -> ViewsDataset:
-        """Build a :class:`ViewsDataset` from the config's parquet path.
-
-        The data factory saves parquet files with either the legacy
-        ``{run_type}_viewser_df.parquet`` suffix or the newer
-        ``{run_type}_datafactory_df.parquet`` suffix. Try both.
-        """
+        """Build a :class:`ViewsDataset` from the config's parquet path."""
         path_raw = self._model_path.data_raw
         run_type = active_config["run_type"]
-        candidates = [
-            Path(path_raw) / f"{run_type}_viewser_df.parquet",
-            Path(path_raw) / f"{run_type}_datafactory_df.parquet",
-        ]
-        parquet_path = None
-        for c in candidates:
-            if c.exists():
-                parquet_path = c
-                break
-        if parquet_path is None:
-            raise FileNotFoundError(
-                f"Could not find parquet file in {path_raw}. "
-                f"Tried: {[str(c) for c in candidates]}"
-            )
+        parquet_path = Path(path_raw) / f"{run_type}_viewser_df.parquet"
         targets = list(active_config.get("targets") or active_config.get("regression_targets") or [])
         level = active_config.get("level", "cm")
         ds = ViewsDataset(parquet_path, targets=targets, broadcast_features=True)
-        logger.info("Dataset loaded from %s: %s (%s)", parquet_path, ds, level)
+        logger.info("Dataset loaded: %s (%s)", ds, level)
         return ds
 
     def _build_forecaster(

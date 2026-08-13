@@ -5,7 +5,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 class SpotlightLossLogcosh(torch.nn.Module):
     """
     """
@@ -53,15 +52,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean.detach()
 
-        # Gate the e_shape gradient so dead cells (gate≈0) get ~50× less
-        # Shape gradient. Stops Shape from pushing dead cells UP.
-        e_shape = gate * e_shape + (1.0 - gate) * e_shape.detach()
-
-        shape_cell = self._log_cosh(e_shape)
+        # Shape gradient only through true-event cells; false positives get no shape pull
+        shape_cell = self._log_cosh(y_true_mask * e_shape + (1.0 - y_true_mask) * e_shape.detach())
 
         # DRO weighting
         event_mask = (abs_max > self.tau).float()
-        raw_abs = e_shape.abs().detach()
+
+        # raw_abs = e_shape.abs().detach()
+        # Ground DRO in absolute error: upweights the most-wrong cells regardless of
+        # sign, so severely over-predicted event cells get amplified downward push.
+        raw_abs = e.abs().detach()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
@@ -86,14 +86,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # gap = y_pred_for_gap.mean(dim=1) - y_true.mean(dim=1)
 
         n_ev_safe = y_true_mask.sum(dim=1).clamp_min(1.0)
-        # FIX: Event-only gap with fallback to global gap for dead-only series.
-        # For series WITH events: gap = mean(event_pred) - mean(event_true) — clean.
-        # For series WITHOUT events: gap = y_pred.mean() - y_true.mean() — prevents
-        #   Level from providing zero gradient (which caused template collapse).
-        gap_event = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
-        gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        has_events = (y_true_mask.sum(dim=1) > 0.5).float()
-        gap = has_events * gap_event + (1.0 - has_events) * gap_global
+        gap = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
 
         # Series-level: amplify gap for sparse-event series
         # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
@@ -101,16 +94,11 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # Pure logcosh(gap). LEVEL dominance comes from the `T *` factor below, not from
         # per-series density weighting (which amplified LEVEL on sparse series, over-driving
         # the shared per-series mean and collapsing all countries to one RevIN-scaled template).
-        density_scale = torch.asinh(T / n_ev_flat.clamp_min(1.0).float())
-        level_cell = self._log_cosh(gap)   # tanh(0.45 * 2.5) = tanh(1.13)
+        level_cell = self._log_cosh(gap)
 
         # Batch-level: weight by signal strength, gated by has_gated
-        # FIX: Use event_mask instead of gate for has_gated. The old gate-based has_gated
-        # zeroed out dead-only series (gate≈0), defeating the gap fallback above.
-        # event_mask includes false alarms (y_pred > tau), so any series where the model
-        # is predicting something gets a non-zero Level weight.
         event_frac = event_mask.mean().clamp_min(self._EPS)
-        has_gated = (event_mask.sum(dim=1) > self._EPS).float()
+        has_gated = (gate.sum(dim=1) > self._EPS).float()
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
 
         if multivariate:
@@ -125,7 +113,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
         dead_mask = 1.0 - y_true_mask
         dead_sum = (dead_mask * y_pred).sum(dim=1)
         anchor_cell = self._log_cosh(dead_sum)
-        density_scale_mean = density_scale.mean()
 
         if multivariate:
             loss_anchor = (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -156,8 +143,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
             _w_dro_cpu      = w_dro.cpu()
             _gate_cpu       = gate.cpu()
             _e_shape_cpu    = e_shape.cpu()
-            # FIX: Telemetry gap now matches actual Level gap (event-only with fallback).
-            _gap_cpu        = gap.detach().cpu()
+            _gap_cpu        = (y_pred.mean(dim=1) - y_true.mean(dim=1)).cpu()
             # _density_scale_cpu = density_scale.cpu()
             # _gap_scaled_cpu = (_gap_cpu * _density_scale_cpu).abs()
             _w_level_cpu    = w_level.cpu()

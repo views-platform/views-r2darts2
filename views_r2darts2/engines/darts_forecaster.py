@@ -510,7 +510,7 @@ class DartsForecaster:
             del target_series, past_covariates
             gc.collect()
 
-        # Audit model output for numerical sanity (numpy-direct).
+        # Audit model output for numerical sanity (numpy-direct)..
         if np.isnan(predictions).any() or np.isinf(predictions).any():
             raise NumericalSanityError(
                 f"NaN/Inf in model predictions (shape={predictions.shape})."
@@ -555,10 +555,10 @@ class DartsForecaster:
             * ``pred_starts``: list of prediction start times (one per entity)
         """
         # Extract predict kwargs.
-        num_samples = predict_kwargs.pop("num_samples", 1)
-        mc_dropout = predict_kwargs.pop("mc_dropout", False)
-        batch_size = predict_kwargs.pop("batch_size", None)
-        verbose = predict_kwargs.pop("verbose", True)
+        num_samples = predict_kwargs.get("num_samples")
+        mc_dropout = predict_kwargs.get("mc_dropout")
+        batch_size = predict_kwargs.get("batch_size")
+        verbose = predict_kwargs.get("verbose", True)
         # Any remaining kwargs are ignored (Darts doesn't accept them).
 
         # Build the inference dataset from the TimeSeries list.
@@ -605,7 +605,7 @@ class DartsForecaster:
     #: in-memory path is still used for small deterministic forecasts,
     #: small enough that probabilistic PGM forecasts (259k × 36 × 3 × 500
     #: ≈ 14B cells) always stream.
-    STREAMING_CELL_THRESHOLD: int = 50_000_000
+    STREAMING_CELL_THRESHOLD: int = 1
 
     #: Default entity batch size for the streaming path. Each batch runs
     #: one ``predict_from_dataset`` call, so smaller batches mean lower
@@ -657,7 +657,7 @@ class DartsForecaster:
 
         target_names = list(self.dataset.targets)
         n_entities = len(target_series)
-        entity_batch_size = self.STREAMING_ENTITY_BATCH
+        entity_batch_size = self.STREAMING_ENTITY_BATCH // 2
 
         # Create the zarr-backed scaffold sized for the full grid.
         scaffold = ViewsDataset.create_prediction_scaffold(

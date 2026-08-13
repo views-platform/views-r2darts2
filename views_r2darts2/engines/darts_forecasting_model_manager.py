@@ -176,15 +176,17 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
     def _build_dataset(self, active_config: Mapping[str, Any]) -> ViewsDataset:
         """Build a :class:`ViewsDataset` from the config's parquet path.
 
-        The data factory saves parquet files with either the legacy
-        ``{run_type}_viewser_df.parquet`` suffix or the newer
-        ``{run_type}_datafactory_df.parquet`` suffix. Try both.
+        The data factory saves parquet files with the suffix
+        ``{run_type}_datafactory_df.parquet``. Older runs used the
+        ``{run_type}_viewser_df.parquet`` suffix. We try the current
+        ``datafactory_df`` name first so stale ``viewser_df`` files from
+        previous runs don't shadow the fresh data.
         """
         path_raw = self._model_path.data_raw
         run_type = active_config["run_type"]
         candidates = [
-            Path(path_raw) / f"{run_type}_viewser_df.parquet",
             Path(path_raw) / f"{run_type}_datafactory_df.parquet",
+            Path(path_raw) / f"{run_type}_viewser_df.parquet",
         ]
         parquet_path = None
         for c in candidates:

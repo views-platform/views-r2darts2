@@ -85,6 +85,8 @@ class LossCatalog:
             "HuberLoss": torch.nn.HuberLoss,
             "SmoothL1Loss": torch.nn.SmoothL1Loss,
             "PoissonNLLLoss": torch.nn.PoissonNLLLoss,
+            "HuberLoss": HuberLoss,
+            "LogCoshLoss": LogCoshLoss,
         }
 
         if self.loss_name not in loss_classes:

@@ -16,7 +16,6 @@ from typing import Any
 
 import numpy as np
 import xarray as xr
-import zarr
 
 from views_r2darts2.dataset import converters, readers
 from views_r2darts2.dataset.zarr_store import ZarrStore
@@ -1469,35 +1468,67 @@ class ViewsDataset:
         return ViewsDataset.for_loa(level_lower, ds)
 
     def write_prediction_batch(
-    self,
-    *,
-    target_values: np.ndarray,
-    entity_ids_batch: np.ndarray,
-    time_ids: np.ndarray,
-    target_names: list[str],
-    apply_inverse: bool = True,
-    clip_negatives: bool = True,
-) -> None:
+        self,
+        *,
+        target_values: np.ndarray,
+        entity_ids_batch: np.ndarray,
+        time_ids: np.ndarray,
+        target_names: list[str],
+        apply_inverse: bool = True,
+        clip_negatives: bool = True,
+    ) -> None:
         """Write one batch of predictions into the zarr-backed scaffold.
 
-        FIX: entity_coord must be the scaffold's FULL entity axis (not the
-        batch's), and the zarr group must be opened in read-write mode
-        (``"r+"``) so successive batches accumulate rather than truncate.
+        Applies the same inverse-transform + clip path as
+        :meth:`ingest_numpy_predictions`, then writes the batch directly
+        to the zarr store on disk via ``zarr.open_group``. The scaffold
+        was pre-allocated with the full grid, so every (time, entity)
+        cell already exists — we just fill it. Successive batch writes
+        accumulate on disk; the full predictions array is never held in
+        memory.
+
+        Args:
+            target_values: Shape
+                ``(n_batch, n_time, n_targets, n_samples)`` float32 —
+                the raw output of one ``predict_from_dataset`` batch.
+            entity_ids_batch: 1-D int64 array of entity ids in this batch
+                (length ``n_batch``).
+            time_ids: 1-D int64 array of time ids (length ``n_time``).
+                Must match the scaffold's time dimension.
+            target_names: Target column names in the same order as
+                ``target_values``'s third axis.
+            apply_inverse: When ``True``, apply the inverse target scaler
+                and inverse log transform (numpy-direct).
+            clip_negatives: When ``True``, clip negative predictions to 0.
         """
-        # ── FIX 1: use the scaffold's full entity coordinate ──────────────
-        entity_coord = np.asarray(
-            self._ds[self._entity_id].values, dtype=np.int64
-        )
+        import zarr
 
-        # ── FIX 2: open in read-write mode, never "w" (truncate) ─────────
-        group = zarr.open_group(str(self._zarr_path), mode="r+")
+        if not self.is_prediction:
+            raise ValueError(
+                "write_prediction_batch requires a prediction-mode scaffold"
+            )
 
-        # Apply inverse transform / clip (same path as ingest_numpy_predictions)
-        vals = target_values.astype(np.float32, copy=False)
-        if apply_inverse and self._scalers_fitted:
-            vals = self._apply_inverse_transform(vals)
+        target_values = np.asarray(target_values, dtype=np.float32)
+        n_batch, n_time, n_targets, n_samples = target_values.shape
+
+        # Apply inverse transforms (numpy-direct, vectorised — same path
+        # as ingest_numpy_predictions).
+        if apply_inverse and self.scalers_fitted:
+            target_values = self._inverse_transform_numpy_predictions(
+                target_values
+            )
         if clip_negatives:
-            np.maximum(vals, 0.0, out=vals)
+            np.maximum(target_values, 0.0, out=target_values)
+
+        # Open the existing zarr group for direct writes.
+        # Use r+ to avoid accidentally creating/replacing groups.
+        zarr_path = str(self._zarr_path)
+        group = zarr.open_group(zarr_path, mode="r+")
+        time_coord = self._ds[self._time_id].values
+        entity_coord = self._ds[self._entity_id].values
+
+        # Locate the time slice — all time_ids are contiguous in the scaffold.
+        t_start = int(np.searchsorted(time_coord, time_ids[0]))
 
         for t_idx, target_name in enumerate(target_names):
             pred_var = f"pred_{target_name}"
@@ -1506,24 +1537,20 @@ class ViewsDataset:
                     f"Scaffold is missing prediction variable '{pred_var}'. "
                     f"Available: {list(group.array_keys())}."
                 )
-            # (n_batch, n_time, n_samples)
-            batch_vals = vals[:, :, t_idx, :]
+            # Extract this target: (n_batch, n_time, n_samples).
+            vals = target_values[:, :, t_idx, :]
             zarr_arr = group[pred_var]
-
+            # Write each entity's predictions directly to the zarr array.
+            # zarr arrays support numpy-style slice assignment, which writes
+            # to disk without materialising the full array in memory.
             for e_i, entity_id in enumerate(entity_ids_batch):
-                # ── FIX 3: searchsorted against the FULL coordinate ──────
                 ep = int(np.searchsorted(entity_coord, entity_id))
-
-                # Sanity: verify the entity actually lives at this slot
-                if ep >= len(entity_coord) or entity_coord[ep] != entity_id:
+                if ep >= len(entity_coord) or int(entity_coord[ep]) != int(entity_id):
                     raise ValueError(
-                        f"Entity {entity_id} not found in scaffold coordinate "
-                        f"(searchsorted returned {ep}). The batch contains an "
-                        f"entity the scaffold was not pre-allocated for."
+                        f"Entity {entity_id} not found in scaffold entity axis. "
+                        f"searchsorted returned ep={ep}."
                     )
-
-                # Write to the GLOBAL position ep, not the batch-local e_i
-                zarr_arr[:, ep, :] = batch_vals[e_i]
+                zarr_arr[t_start:t_start + n_time, ep, :] = vals[e_i]
 
     def to_predictionframe_per_target(
         self, *, metadata: Any = None

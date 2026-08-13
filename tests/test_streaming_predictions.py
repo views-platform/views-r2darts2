@@ -152,6 +152,58 @@ def _seed_mock_predictions(
     return full_preds
 
 
+def _seed_mock_predictions_with_extra_components(
+    mock_model: Mock,
+    *,
+    n_entities: int,
+    n_time: int,
+    n_targets: int,
+    n_extra_components: int,
+    n_samples: int,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return mock outputs with feature-like components preceding targets.
+
+    Darts values_only predictions can include all components in the same
+    order as the input series (features + targets). This helper builds a
+    tensor where the first components are feature-like and the last
+    ``n_targets`` are target-like so streaming parity can verify correct
+    target slicing.
+    """
+    rng = np.random.default_rng(seed)
+    n_components = n_extra_components + n_targets
+    full_preds = rng.uniform(
+        0.1, 2.0, size=(n_entities, n_time, n_components, n_samples)
+    ).astype(np.float32)
+    target_tail = full_preds[:, :, -n_targets:, :].copy()
+
+    batch_sizes: list[int] = []
+    entity_offset = [0]
+
+    def _build_side_effect(*args, **kwargs):
+        series = kwargs.get("series", args[1] if len(args) > 1 else [])
+        batch_sizes.append(len(series))
+        return Mock()
+
+    def _predict_side_effect(*args, **kwargs):
+        if not batch_sizes:
+            batch_len = n_entities
+        else:
+            batch_len = batch_sizes.pop(0)
+        batch_len = min(batch_len, n_entities)
+        offset = entity_offset[0]
+        entity_offset[0] += batch_len
+        return (
+            full_preds[offset:offset + batch_len].copy(),
+            [{}] * batch_len,
+            list(range(batch_len)),
+        )
+
+    mock_model._build_inference_dataset.side_effect = _build_side_effect
+    mock_model.predict_from_dataset.side_effect = _predict_side_effect
+    return full_preds, target_tail
+
+
 # ----------------------------------------------------------------------
 # Streaming-vs-in-memory parity
 # ----------------------------------------------------------------------
@@ -188,6 +240,80 @@ class TestStreamingParity:
             tmp_path, num_samples=1, target_scaler="MinMaxScaler"
         )
         self._assert_parity(frames_inmem, frames_stream)
+
+    def test_parity_with_extra_feature_components(self, tmp_path: Path) -> None:
+        """Streaming parity holds when predictions include non-target components."""
+        dataset = _build_dataset(tmp_path)
+        n_entities = len(ENTITY_IDS)
+        n_time = 6
+        n_targets = len(TARGETS)
+        n_extra = len(FEATURES)
+
+        # In-memory path.
+        model_mem = _make_mock_model()
+        _seed_mock_predictions_with_extra_components(
+            model_mem,
+            n_entities=n_entities,
+            n_time=n_time,
+            n_targets=n_targets,
+            n_extra_components=n_extra,
+            n_samples=1,
+        )
+        fc_mem = DartsForecaster(
+            dataset=dataset,
+            model=model_mem,
+            partition_dict=PARTITION,
+            target_scaler=None,
+            random_state=42,
+        )
+        fc_mem.dataset.fit_scalers(
+            target_scaler=None,
+            feature_scaler=None,
+            time_ids=list(range(121, 201)),
+        )
+        fc_mem.scaler_fitted = True
+        fc_mem.STREAMING_CELL_THRESHOLD = 10**18
+        frames_mem = fc_mem.predict(
+            sequence_number=0,
+            output_length=n_time,
+            num_samples=1,
+            mc_dropout=False,
+        )
+
+        # Streaming path.
+        dataset_stream = _build_dataset(tmp_path)
+        model_stream = _make_mock_model()
+        _seed_mock_predictions_with_extra_components(
+            model_stream,
+            n_entities=n_entities,
+            n_time=n_time,
+            n_targets=n_targets,
+            n_extra_components=n_extra,
+            n_samples=1,
+        )
+        fc_stream = DartsForecaster(
+            dataset=dataset_stream,
+            model=model_stream,
+            partition_dict=PARTITION,
+            target_scaler=None,
+            random_state=42,
+        )
+        fc_stream.dataset.fit_scalers(
+            target_scaler=None,
+            feature_scaler=None,
+            time_ids=list(range(121, 201)),
+        )
+        fc_stream.scaler_fitted = True
+        fc_stream.STREAMING_CELL_THRESHOLD = 0
+        fc_stream.STREAMING_ENTITY_BATCH = 1
+        frames_stream = fc_stream.predict(
+            sequence_number=0,
+            output_length=n_time,
+            num_samples=1,
+            mc_dropout=False,
+        )
+
+        self._assert_parity(frames_mem, frames_stream)
 
     # ------------------------------------------------------------------ #
     # Helpers that run each path

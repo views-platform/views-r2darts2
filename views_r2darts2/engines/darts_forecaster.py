@@ -651,6 +651,7 @@ class DartsForecaster:
         verbose = predict_kwargs.get("verbose", True)
 
         target_names = list(self.dataset.targets)
+        n_targets = len(target_names)
         n_entities = len(target_series)
         # Entity batch size = half the torch batch size (when available),
         # falling back to STREAMING_ENTITY_BATCH. This keeps each batch's
@@ -719,15 +720,27 @@ class DartsForecaster:
                     f"(entities {start}:{end}, shape={batch_preds.shape})."
                 )
 
+            # Darts returns all components in the original series order
+            # (features + targets). Align with the in-memory path by
+            # selecting the target components from the tail.
+            n_components = int(batch_preds.shape[2])
+            if n_components < n_targets:
+                raise ValueError(
+                    "Streaming batch has fewer components than targets: "
+                    f"n_components={n_components}, n_targets={n_targets}."
+                )
+            target_indices = list(range(n_components - n_targets, n_components))
+            batch_target_preds = batch_preds[:, :, target_indices, :]
+
             scaffold.write_prediction_batch(
-                target_values=batch_preds,
+                target_values=batch_target_preds,
                 entity_ids_batch=batch_entity_ids,
                 time_ids=pred_time_ids,
                 target_names=target_names,
                 apply_inverse=True,
                 clip_negatives=True,
             )
-            del batch_preds
+            del batch_preds, batch_target_preds
             gc.collect()
             logger.info(
                 "Streaming batch %d/%d written (entities %d:%d).",

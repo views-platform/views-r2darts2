@@ -24,7 +24,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping, Union
 
-import numpy as np
 import torch
 from darts import TimeSeries
 from darts.models.forecasting.torch_forecasting_model import TorchForecastingModel
@@ -361,6 +360,7 @@ class DartsForecaster:
             )
 
         import gc
+        import numpy as np
 
         # Lock entropy for reproducible probabilistic samples.
         ReproducibilityGate.Data.lock_entropy(self.random_state)
@@ -447,46 +447,12 @@ class DartsForecaster:
                     raise NumericalSanityError(
                         f"NaNs in final PredictionFrame for target '{target}'."
                     )
-            self._audit_entity_coverage(entity_ids=entity_ids, frames=frames)
             return frames
 
         # --- Torch predict path: values_only=True -------------------------
         # Device management.
         self._ensure_model_on_device()
 
-        # Decide between the in-memory path (single predict_from_dataset
-        # call, full predictions array in RAM) and the streaming path
-        # (entity-batched predict_from_dataset, each batch written to a
-        # zarr-backed scaffold). The streaming path keeps peak memory
-        # bounded for probabilistic forecasts (num_samples large) and/or
-        # huge entity counts (e.g. 259k PRIO-GRID cells).
-        num_samples = predict_kwargs.get("num_samples", 1)
-        use_streaming = self._should_stream_predictions(
-            n_entities=len(entity_ids),
-            n_time=output_length,
-            num_samples=num_samples,
-        )
-
-        if use_streaming:
-            frames = self._predict_streaming(
-                target_series=target_series,
-                past_covariates=past_covariates,
-                entity_ids=entity_ids,
-                pred_time_ids=pred_time_ids,
-                output_length=output_length,
-                **predict_kwargs,
-            )
-            del target_series, past_covariates
-            gc.collect()
-            for target, frame in frames.items():
-                if np.isnan(frame.values).any():
-                    raise NumericalSanityError(
-                        f"NaNs in final PredictionFrame for target '{target}'."
-                    )
-            self._audit_entity_coverage(entity_ids=entity_ids, frames=frames)
-            return frames
-
-        # In-memory path: single predict_from_dataset call.
         # Bypasses Darts' output TimeSeries construction entirely. The model
         # returns (predictions, series_schemas, pred_starts) as raw numpy.
         # This avoids building 259k TimeSeries + 259k pandas DataFrames on
@@ -538,25 +504,7 @@ class DartsForecaster:
                 raise NumericalSanityError(
                     f"NaNs in final PredictionFrame for target '{target}'."
                 )
-        self._audit_entity_coverage(entity_ids=entity_ids, frames=frames)
         return frames
-
-    def _audit_entity_coverage(
-        self, *, entity_ids: np.ndarray, frames: dict[str, PredictionFrame]
-    ) -> None:
-        """Log/raise when produced frames do not cover expected entities."""
-        expected = set(np.asarray(entity_ids, dtype=np.int64).tolist())
-        for target, frame in frames.items():
-            actual = set(np.asarray(frame.index.unit, dtype=np.int64).tolist())
-            if actual != expected:
-                missing = sorted(expected - actual)
-                extra = sorted(actual - expected)
-                raise ValueError(
-                    "PredictionFrame entity coverage mismatch for "
-                    f"target='{target}': expected={len(expected)}, "
-                    f"actual={len(actual)}, missing_head={missing[:20]}, "
-                    f"extra_head={extra[:20]}."
-                )
 
     def _predict_values_only(
         self,
@@ -610,179 +558,6 @@ class DartsForecaster:
             )
         )
         return predictions, series_schemas, pred_starts
-
-    # ------------------------------------------------------------------ #
-    # Streaming prediction path (in-memory scaffold)
-    # ------------------------------------------------------------------ #
-
-    #: Threshold above which the streaming path is used. Set to 1 so the
-    #: streaming path is always used (regardless of the number of rows).
-    #: The streaming path runs ``predict_from_dataset`` in entity batches
-    #: and writes each batch to an in-memory scaffold, keeping peak memory
-    #: bounded.
-    STREAMING_CELL_THRESHOLD: int = 1
-
-    #: Default entity batch size for the streaming path. Each batch runs
-    #: one ``predict_from_dataset`` call. When the model's ``batch_size``
-    #: is available, the actual entity batch size is set to
-    #: ``batch_size // 2`` (half the torch batch size) so each batch
-    #: processes a manageable number of entities. This value is used as
-    #: a fallback when ``batch_size`` is not set.
-    STREAMING_ENTITY_BATCH: int = 1000
-
-    def _should_stream_predictions(
-        self, *, n_entities: int, n_time: int, num_samples: int
-    ) -> bool:
-        """Return ``True`` when the streaming path should be used.
-
-        With the default :attr:`STREAMING_CELL_THRESHOLD` of 1, the
-        streaming path is always used. Override the threshold to a higher
-        value to fall back to the in-memory path for small forecasts.
-        """
-        n_components = max(1, len(self.dataset.targets))
-        n_cells = n_entities * n_time * n_components * max(1, num_samples)
-        return n_cells > self.STREAMING_CELL_THRESHOLD
-
-    def _predict_streaming(
-        self,
-        *,
-        target_series: list,
-        past_covariates: list | None,
-        entity_ids: np.ndarray,
-        pred_time_ids: np.ndarray,
-        output_length: int,
-        **predict_kwargs: Any,
-    ) -> dict[str, Any]:
-        """Run prediction in entity batches, writing each batch to a scaffold.
-
-        Reuses :meth:`ViewsDataset.create_prediction_scaffold`,
-        :meth:`ViewsDataset.write_prediction_batch`, and
-        :meth:`ViewsDataset.to_predictionframe_per_target`. The inverse
-        transform + clip path is shared with
-        :meth:`ViewsDataset.ingest_numpy_predictions` (both delegate to
-        :meth:`ViewsDataset._inverse_transform_numpy_predictions`), so the
-        streaming and in-memory paths produce bit-identical frames.
-        """
-        import gc
-
-        num_samples = predict_kwargs.get("num_samples", 1)
-        mc_dropout = predict_kwargs.get("mc_dropout", False)
-        batch_size = predict_kwargs.get("batch_size", None)
-        verbose = predict_kwargs.get("verbose", True)
-
-        target_names = list(self.dataset.targets)
-        n_targets = len(target_names)
-        n_entities = len(target_series)
-        # Entity batch size = half the torch batch size (when available),
-        # falling back to STREAMING_ENTITY_BATCH. This keeps each batch's
-        # memory footprint manageable while amortising the per-call overhead.
-        if batch_size is not None and batch_size > 1:
-            entity_batch_size = max(1, batch_size // 2)
-        else:
-            entity_batch_size = self.STREAMING_ENTITY_BATCH
-
-        # Create the in-memory scaffold sized for the full grid.
-        scaffold = ViewsDataset.create_prediction_scaffold(
-            entity_ids=entity_ids,
-            time_ids=pred_time_ids,
-            targets=target_names,
-            sample_size=int(num_samples),
-            level=self._dataset_level_code(),
-            time_id=self.dataset._time_id,
-            entity_id=self.dataset._entity_id,
-        )
-        # Share the fitted scalers with the scaffold so
-        # write_prediction_batch can apply the inverse transform.
-        scaffold._target_scaler = getattr(self.dataset, "_target_scaler", None)
-        scaffold._scalers_fitted = getattr(self.dataset, "_scalers_fitted", False)
-        scaffold._log_targets = getattr(self.dataset, "_log_targets", False)
-
-        logger.info(
-            "Streaming predictions: %d entities × %d steps × %d samples "
-            "(batch=%d) → zarr scaffold",
-            n_entities, output_length, num_samples, entity_batch_size,
-        )
-
-        # Run predict_from_dataset in entity batches.
-        for start in range(0, n_entities, entity_batch_size):
-            end = min(start + entity_batch_size, n_entities)
-            batch_series = target_series[start:end]
-            batch_cov = (
-                past_covariates[start:end] if past_covariates else None
-            )
-            batch_entity_ids = entity_ids[start:end]
-
-            inference_dataset = self.model._build_inference_dataset(
-                n=output_length,
-                series=batch_series,
-                past_covariates=batch_cov,
-                future_covariates=None,
-                stride=0,
-                bounds=None,
-            )
-            del batch_series, batch_cov
-
-            batch_preds, _, _ = self.model.predict_from_dataset(
-                n=output_length,
-                dataset=inference_dataset,
-                batch_size=batch_size,
-                verbose=verbose,
-                num_samples=num_samples,
-                mc_dropout=mc_dropout,
-                values_only=True,
-            )
-            del inference_dataset
-
-            # Audit each batch for numerical sanity before writing.
-            if np.isnan(batch_preds).any() or np.isinf(batch_preds).any():
-                raise NumericalSanityError(
-                    f"NaN/Inf in streaming batch predictions "
-                    f"(entities {start}:{end}, shape={batch_preds.shape})."
-                )
-
-            # Darts returns all components in the original series order
-            # (features + targets). Align with the in-memory path by
-            # selecting the target components from the tail.
-            n_components = int(batch_preds.shape[2])
-            if n_components < n_targets:
-                raise ValueError(
-                    "Streaming batch has fewer components than targets: "
-                    f"n_components={n_components}, n_targets={n_targets}."
-                )
-            target_indices = list(range(n_components - n_targets, n_components))
-            batch_target_preds = batch_preds[:, :, target_indices, :]
-
-            scaffold.write_prediction_batch(
-                target_values=batch_target_preds,
-                entity_ids_batch=batch_entity_ids,
-                time_ids=pred_time_ids,
-                target_names=target_names,
-                apply_inverse=True,
-                clip_negatives=True,
-            )
-            del batch_preds, batch_target_preds
-            gc.collect()
-            logger.info(
-                "Streaming batch %d/%d written (entities %d:%d).",
-                start // entity_batch_size + 1,
-                (n_entities + entity_batch_size - 1) // entity_batch_size,
-                start, end,
-            )
-
-        return scaffold.to_predictionframe_per_target()
-
-    def _dataset_level_code(self) -> str:
-        """Return the VIEWS LOA code for the dataset's entity level.
-
-        Maps ``country_id`` → ``"cm"`` and ``priogrid_id`` → ``"pgm"``.
-        """
-        eid = self.dataset._entity_id
-        if eid == "priogrid_id":
-            return "pgm"
-        if eid == "country_id":
-            return "cm"
-        # Fallback: derive from the first letter of the entity id.
-        return f"{eid[0]}m" if eid else "cm"
 
     def _ensure_model_on_device(self) -> None:
         """Ensure the model is on the configured device (restore from CPU drift).

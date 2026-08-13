@@ -9,6 +9,8 @@ Public API:
     * :class:`ScalerSelector` — sklearn / Darts scaler factory.
     * :class:`ModelCatalog`, :class:`LossCatalog`, :class:`OptimizerCatalog`,
       :class:`SchedulerCatalog` — model/loss/optimizer/scheduler registries.
+    * :class:`MarkovModel` — sklearn-backed Markov prediction model (the one
+      non-torch forecasting model in the catalog).
     * :func:`apply_all_patches`, :func:`apply_tide_mc_dropout_patch` — Darts
       monkey-patches.
 
@@ -37,6 +39,7 @@ __all__ = [
     "LossCatalog",
     "OptimizerCatalog",
     "SchedulerCatalog",
+    "MarkovModel",
     "apply_all_patches",
     "apply_tide_mc_dropout_patch",
 ]
@@ -71,6 +74,9 @@ def __getattr__(name: str) -> Any:
         }[name]
         import importlib
         return importlib.import_module(f"views_r2darts2.catalogs.{mod}").__dict__[name]
+    if name == "MarkovModel":
+        from views_r2darts2.models.markov_model import MarkovModel
+        return MarkovModel
     if name in ("apply_all_patches", "apply_tide_mc_dropout_patch"):
         from views_r2darts2.infrastructure import patches
         return getattr(patches, name)

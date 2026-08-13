@@ -1370,6 +1370,256 @@ class ViewsDataset:
             )
         return frames
 
+    # ------------------------------------------------------------------ #
+    # Streaming prediction path (zarr-backed scaffold)
+    # ------------------------------------------------------------------ #
+    #
+    # The streaming path exists to keep peak memory bounded when the
+    # forecast is probabilistic (``num_samples`` large) and/or the entity
+    # count is huge (e.g. 259k PRIO-GRID cells). Instead of materialising
+    # the full ``(n_entities, n_time, n_targets, n_samples)`` predictions
+    # array in RAM, we:
+    #
+    #   1. Create a zarr-backed prediction scaffold sized for the full
+    #      ``(n_time, n_entities, n_samples)`` grid (``create_prediction_scaffold``).
+    #   2. Run the model in entity batches and write each batch directly
+    #      to the scaffold (``write_prediction_batch``), applying the same
+    #      inverse-transform + clip path as ``ingest_numpy_predictions``.
+    #   3. Convert the populated scaffold to ``{target: PredictionFrame}``
+    #      (``to_predictionframe_per_target``).
+    #
+    # Parity: ``write_prediction_batch`` reuses
+    # ``_inverse_transform_numpy_predictions`` and builds the same
+    # ``(time, entity, sample)`` layout as ``ingest_numpy_predictions``,
+    # so the streaming and in-memory paths produce bit-identical frames.
+
+    @staticmethod
+    def create_prediction_scaffold(
+        *,
+        entity_ids: np.ndarray,
+        time_ids: np.ndarray,
+        targets: list[str],
+        sample_size: int,
+        level: str,
+        time_id: str = "month_id",
+        entity_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "ViewsDataset":
+        """Create a zarr-backed prediction scaffold sized for the full grid.
+
+        The scaffold is a prediction-mode :class:`ViewsDataset` with one
+        ``pred_<target>`` variable per target, pre-allocated to shape
+        ``(n_time, n_entities, sample_size)`` and filled with NaN. Rows are
+        populated incrementally via :meth:`write_prediction_batch`.
+
+        Args:
+            entity_ids: 1-D int64 array of entity ids (the full set).
+            time_ids: 1-D int64 array of time ids (the full set).
+            targets: Target column names (one ``pred_<target>`` variable is
+                created per target).
+            sample_size: Number of probabilistic samples per cell.
+            level: VIEWS LOA code (``"cm"``, ``"pgm"``).
+            time_id: Time dimension name (default ``"month_id"``).
+            entity_id: Entity dimension name. Inferred from ``level`` when
+                ``None``.
+            metadata: Optional attrs dict (model name, run_type, etc.).
+
+        Returns:
+            An empty prediction-mode :class:`ViewsDataset` ready for
+            :meth:`write_prediction_batch` calls.
+        """
+        level_lower = (level or "").lower()
+        if entity_id is None:
+            entity_id = "priogrid_id" if level_lower.startswith("pg") else "country_id"
+
+        times = np.unique(np.asarray(time_ids, dtype=np.int64))
+        entities = np.unique(np.asarray(entity_ids, dtype=np.int64))
+        s = int(sample_size)
+        pred_vars = [f"pred_{t}" for t in targets]
+
+        coords = {
+            time_id: times,
+            entity_id: entities,
+            "sample": np.arange(s, dtype=np.int64),
+        }
+        data_vars: dict[str, Any] = {}
+        for name in pred_vars:
+            data_vars[name] = (
+                (time_id, entity_id, "sample"),
+                np.full((len(times), len(entities), s), np.nan, dtype=np.float32),
+            )
+        ds = xr.Dataset(data_vars, coords=coords)
+        ds.attrs.update({
+            "is_prediction": True,
+            "sample_size": s,
+            "targets": list(targets),
+            "features": [],
+            "pred_vars": pred_vars,
+            "text_cols": [],
+            "time_id": time_id,
+            "entity_id": entity_id,
+            "broadcast_features": False,
+            **(metadata or {}),
+        })
+        return ViewsDataset.for_loa(level_lower, ds)
+
+    def write_prediction_batch(
+        self,
+        *,
+        target_values: np.ndarray,
+        entity_ids_batch: np.ndarray,
+        time_ids: np.ndarray,
+        target_names: list[str],
+        apply_inverse: bool = True,
+        clip_negatives: bool = True,
+    ) -> None:
+        """Write one batch of predictions into the scaffold.
+
+        Applies the same inverse-transform + clip path as
+        :meth:`ingest_numpy_predictions`, then writes the batch directly
+        into the scaffold's in-memory xarray Dataset via coordinate
+        selection. The dataset is persisted to zarr once at the end (via
+        :meth:`to_predictionframe_per_target`), avoiding the expensive
+        ``add_batch`` → ``_append_fallback`` round-trip per batch.
+
+        Args:
+            target_values: Shape
+                ``(n_batch, n_time, n_targets, n_samples)`` float32 —
+                the raw output of one ``predict_from_dataset`` batch.
+            entity_ids_batch: 1-D int64 array of entity ids in this batch
+                (length ``n_batch``).
+            time_ids: 1-D int64 array of time ids (length ``n_time``).
+                Must match the scaffold's time dimension.
+            target_names: Target column names in the same order as
+                ``target_values``'s third axis.
+            apply_inverse: When ``True``, apply the inverse target scaler
+                and inverse log transform (numpy-direct).
+            clip_negatives: When ``True``, clip negative predictions to 0.
+        """
+        if not self.is_prediction:
+            raise ValueError(
+                "write_prediction_batch requires a prediction-mode scaffold"
+            )
+
+        target_values = np.asarray(target_values, dtype=np.float32)
+        n_batch, n_time, n_targets, n_samples = target_values.shape
+
+        # Apply inverse transforms (numpy-direct, vectorised — same path
+        # as ingest_numpy_predictions).
+        if apply_inverse and self.scalers_fitted:
+            target_values = self._inverse_transform_numpy_predictions(
+                target_values
+            )
+        if clip_negatives:
+            np.maximum(target_values, 0.0, out=target_values)
+
+        # Write directly into the in-memory xarray Dataset via coordinate
+        # selection. The scaffold was pre-allocated with the full grid, so
+        # every (time, entity) cell already exists — we just fill it.
+        time_coord = self._ds[self._time_id].values
+        entity_coord = self._ds[self._entity_id].values
+
+        # Locate the time slice — all time_ids are contiguous in the scaffold.
+        t_start = int(np.searchsorted(time_coord, time_ids[0]))
+
+        for t_idx, target_name in enumerate(target_names):
+            pred_var = f"pred_{target_name}"
+            if pred_var not in self._ds.data_vars:
+                raise KeyError(
+                    f"Scaffold is missing prediction variable '{pred_var}'. "
+                    f"Available: {list(self._ds.data_vars)}."
+                )
+            # Extract this target: (n_batch, n_time, n_samples).
+            vals = target_values[:, :, t_idx, :]
+            # Get a writable copy of the variable's values.
+            arr = self._ds[pred_var].values
+            for e_i, entity_id in enumerate(entity_ids_batch):
+                ep = int(np.searchsorted(entity_coord, entity_id))
+                arr[t_start:t_start + n_time, ep, :] = vals[e_i]
+            # Write back to the Dataset.
+            self._ds[pred_var] = (
+                (self._time_id, self._entity_id, "sample"),
+                arr,
+            )
+
+    def to_predictionframe_per_target(
+        self, *, metadata: Any = None
+    ) -> dict[str, Any]:
+        """Convert a populated prediction scaffold to a per-target dict.
+
+        One :class:`PredictionFrame` is built per target. The frames share
+        the same :class:`SpatioTemporalIndex` (time-major, entity varies
+        fastest) — matching the layout produced by
+        :meth:`ingest_numpy_predictions`.
+
+        Args:
+            metadata: Optional :class:`FrameMetadata` to attach to each
+                frame. When ``None``, a default ``FrameMetadata(model="darts")``
+                is used.
+
+        Returns:
+            ``{target_name: PredictionFrame}`` dict.
+        """
+        from views_frames import (
+            PredictionFrame, SpatioTemporalIndex, SpatialLevel, FrameMetadata,
+        )
+
+        if not self.is_prediction:
+            raise ValueError(
+                "to_predictionframe_per_target requires prediction mode"
+            )
+
+        target_names = list(self.targets)
+        if not target_names:
+            # Fall back to pred_vars minus the "pred_" prefix.
+            target_names = [
+                p[len("pred_"):] for p in self.pred_vars
+            ]
+        if not target_names:
+            raise ValueError("Scaffold has no targets / pred_vars.")
+
+        # Build the shared SpatioTemporalIndex (time-major).
+        index = self._build_prediction_index()
+        meta = metadata if metadata is not None else FrameMetadata(model="darts")
+
+        frames: dict[str, Any] = {}
+        for target_name in target_names:
+            pred_var = f"pred_{target_name}"
+            if pred_var not in self._ds.data_vars:
+                raise KeyError(
+                    f"Scaffold is missing prediction variable '{pred_var}'."
+                )
+            # Materialise the (time, entity, sample) array and flatten
+            # time-major to (time * entity, sample).
+            arr = self._ds[pred_var].transpose(
+                self._time_id, self._entity_id, "sample"
+            ).values.astype(np.float32)
+            t, e, s = arr.shape
+            y_pred = np.ascontiguousarray(arr.reshape(t * e, s))
+            frames[target_name] = PredictionFrame(y_pred, index=index, metadata=meta)
+        return frames
+
+    def _build_prediction_index(self) -> Any:
+        """Build a time-major :class:`SpatioTemporalIndex` for the scaffold.
+
+        Mirrors the index layout produced by
+        :meth:`ingest_numpy_predictions` (time varies slowest, entity
+        varies fastest) so the two paths produce identical frames.
+        """
+        from views_frames import SpatioTemporalIndex
+
+        times = self._ds[self._time_id].values.astype("int64")
+        entities = self._ds[self._entity_id].values.astype("int64")
+        t_grid, e_grid = np.meshgrid(times, entities, indexing="ij")
+        # time-major: time varies slowest.
+        time_flat = t_grid.ravel()
+        entity_flat = e_grid.ravel()
+        return SpatioTemporalIndex(
+            time=time_flat,
+            unit=entity_flat,
+            level=self._build_spatial_level(),
+        )
+
     def _inverse_transform_numpy_predictions(
         self, target_values: np.ndarray
     ) -> np.ndarray:

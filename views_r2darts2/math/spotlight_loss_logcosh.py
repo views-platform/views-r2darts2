@@ -43,7 +43,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
         # ── Event gate ───────────────────────────────────────────────
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
-        gate = torch.sigmoid(10.0 * (abs_max - self.tau))
+        gate = torch.sigmoid(10.0 * (abs_max - self.tau)) # per cell
+        # gate = (y_true.abs() > self.tau).any(dim=1).float() # per series
 
         # ── True event mask (for gap routing + dead anchor) ──────────
         y_true_mask = (y_true.abs() > self.tau).float()

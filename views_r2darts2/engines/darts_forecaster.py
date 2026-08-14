@@ -336,8 +336,31 @@ class DartsForecaster:
 
         # Get scaled input window for this sequence.
         icl = self.model.input_chunk_length
-        start = self._test_start + sequence_number - icl
-        end = self._test_start - 1 + sequence_number
+
+        # In forecasting mode, the test partition's first month (test_start)
+        # may be the month after the last observed month — i.e. test_start - 1
+        # is not in the dataset. The partition convention from
+        # views_pipeline_core sets train_end = test_start - 1, but the actual
+        # data may end one month earlier (train_end - 1). When this happens,
+        # we shift the prediction window back by one so we don't skip a month.
+        # Example: data ends at 558, partition is train=(121,559), test=(560,596).
+        # Without the shift: input ends at 559 (zero-filled, wrong), predict 560+.
+        # With the shift: input ends at 558 (real data), predict 559+.
+        available_times = set(
+            int(t) for t in self.dataset._ds[self.dataset._time_id].values
+        )
+        effective_test_start = self._test_start
+        if (self._test_start - 1) not in available_times:
+            # The month before test_start is missing — shift back by one.
+            effective_test_start = self._test_start - 1
+            logger.info(
+                "Forecasting mode: test_start %d shifted to %d (month %d not "
+                "in data, predicting from the first missing month).",
+                self._test_start, effective_test_start, self._test_start - 1,
+            )
+
+        start = effective_test_start + sequence_number - icl
+        end = effective_test_start - 1 + sequence_number
         target_series, past_covariates = self.dataset.get_scaled_darts_timeseries(
             time_ids=list(range(start, end + 1)),
             use_cyclic_encoders=self._use_cyclic_encoders,

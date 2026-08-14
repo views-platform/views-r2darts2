@@ -609,10 +609,146 @@ def apply_tide_mc_dropout_patch():
     )
 
 
+def _layer_norm_last_dim(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Applies functional LayerNorm over the last dimension without new parameters."""
+    if x.ndim < 2 or x.shape[-1] <= 1:
+        return x
+    return F.layer_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
+
+
+# --- 6. N-HiTS LayerNorm Patch ---
+
+
+def _patched_nhits_block_forward(self, x):
+    """N-HiTS block forward with pre-fork LayerNorm for activation control."""
+    batch_size = x.shape[0]
+
+    x = x.unsqueeze(1)
+    x = self.pooling_layer(x)
+    x = x.squeeze(1)
+
+    x = self.layers(x)
+    x = _layer_norm_last_dim(x)
+
+    theta_backcast = self.backcast_linear_layer(x)
+    theta_forecast = self.forecast_linear_layer(x)
+    theta_forecast = theta_forecast.view(batch_size, self.nr_params, -1)
+
+    theta_backcast = theta_backcast.unsqueeze(1)
+    x_hat = F.interpolate(theta_backcast, size=self.input_chunk_length, mode="linear")
+    y_hat = F.interpolate(theta_forecast, size=self.output_chunk_length, mode="linear")
+
+    x_hat = x_hat.squeeze(1)
+    y_hat = y_hat.reshape(x.shape[0], self.output_chunk_length, self.nr_params)
+    return x_hat, y_hat
+
+
+def _patched_nhits_stack_forward(self, x):
+    """N-HiTS stack forward with residual LayerNorm after each block subtraction."""
+    stack_forecast = torch.zeros(
+        x.shape[0],
+        self.output_chunk_length,
+        self.nr_params,
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    for block in self.blocks_list:
+        x_hat, y_hat = block(x)
+        stack_forecast = stack_forecast + y_hat
+        x = _layer_norm_last_dim(x - x_hat)
+
+    return x, stack_forecast
+
+
+def apply_nhits_layernorm_patch():
+    """Patches N-HiTS internals with functional LayerNorm in block and stack forwards."""
+    from darts.models.forecasting.nhits import _Block, _Stack
+
+    if getattr(_Block, "_views_ln_patch", False):
+        logger.debug("[N-HiTS LayerNorm patch] already applied, skipping.")
+        return
+
+    _Block.forward = _patched_nhits_block_forward
+    _Stack.forward = _patched_nhits_stack_forward
+    _Block._views_ln_patch = True
+
+    logger.info(
+        "[N-HiTS LayerNorm patch] installed: pre-fork LayerNorm in _Block.forward "
+        "and residual LayerNorm in _Stack.forward."
+    )
+
+
+# --- 7. N-BEATS LayerNorm Patch ---
+
+
+def _patched_nbeats_block_forward(self, x):
+    """N-BEATS block forward with LayerNorm after each linear transformation."""
+    batch_size = x.shape[0]
+
+    for layer in self.linear_layer_stack_list:
+        if isinstance(layer, nn.Linear):
+            x = layer(x)
+            x = _layer_norm_last_dim(x)
+            x = self.activation(x)
+        else:
+            x = layer(x)
+
+    x = _layer_norm_last_dim(x)
+
+    theta_backcast = self.backcast_linear_layer(x)
+    theta_forecast = self.forecast_linear_layer(x)
+    theta_forecast = theta_forecast.view(batch_size, self.nr_params, -1)
+
+    x_hat = self.backcast_g(theta_backcast)
+    y_hat = self.forecast_g(theta_forecast)
+    y_hat = y_hat.reshape(x.shape[0], self.target_length, self.nr_params)
+    return x_hat, y_hat
+
+
+def _patched_nbeats_stack_forward(self, x):
+    """N-BEATS stack forward with residual LayerNorm after each block subtraction."""
+    stack_forecast = torch.zeros(
+        x.shape[0],
+        self.target_length,
+        self.nr_params,
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    for block in self.blocks_list:
+        x_hat, y_hat = block(x)
+        stack_forecast = stack_forecast + y_hat
+        x = _layer_norm_last_dim(x - x_hat)
+
+    return x, stack_forecast
+
+
+def apply_nbeats_layernorm_patch():
+    """Patches N-BEATS internals with functional LayerNorm in block and stack forwards."""
+    from darts.models.forecasting.nbeats import _Block, _Stack
+
+    if getattr(_Block, "_views_ln_patch", False):
+        logger.debug("[N-BEATS LayerNorm patch] already applied, skipping.")
+        return
+
+    _Block.forward = _patched_nbeats_block_forward
+    _Stack.forward = _patched_nbeats_stack_forward
+    _Block._views_ln_patch = True
+
+    logger.info(
+        "[N-BEATS LayerNorm patch] installed: per-linear LayerNorm in _Block.forward "
+        "and residual LayerNorm in _Stack.forward."
+    )
+
+
 # --- Initialize All Patches ---
+
 
 def apply_all_patches():
     apply_torch_load_patch()
     apply_rinorm_compression_patch()
     apply_tcn_tanh_patch()
     apply_tide_mc_dropout_patch()
+    apply_nhits_layernorm_patch()
+    apply_nbeats_layernorm_patch()

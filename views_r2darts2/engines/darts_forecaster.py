@@ -413,7 +413,7 @@ class DartsForecaster:
         # Entity batch size = half the torch batch size (when available),
         # falling back to STREAMING_ENTITY_BATCH.
         if batch_size is not None and batch_size > 1:
-            entity_batch_size = max(1, batch_size // 2)
+            entity_batch_size = max(1, batch_size)
         else:
             entity_batch_size = self.STREAMING_ENTITY_BATCH
 

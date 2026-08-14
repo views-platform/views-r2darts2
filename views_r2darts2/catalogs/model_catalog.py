@@ -332,7 +332,6 @@ class ModelCatalog:
             activation=self.config.get("activation"),
             dropout=self.config.get("dropout"),
             use_reversible_instance_norm=self.config.get("use_reversible_instance_norm"),
-            batch_norm=self.config.get("batch_norm", False)
         )
 
     def _get_nhits(self):

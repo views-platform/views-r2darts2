@@ -22,6 +22,7 @@ model lifecycle (device, fit, predict, save/load) and the partition windows.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
@@ -34,6 +35,9 @@ from views_r2darts2.dataset.base import ViewsDataset
 from views_r2darts2.infrastructure.device import get_device as _get_device
 from views_r2darts2.infrastructure.exceptions import NumericalSanityError
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
+from views_r2darts2.transformers.frame_builder import (
+    build_prediction_frames_from_dataset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -368,12 +372,9 @@ class DartsForecaster:
         del target_series, past_covariates
         gc.collect()
 
-        # Final NaN guard on the PredictionFrame values.
-        for target, frame in frames.items():
-            if np.isnan(frame.values).any():
-                raise NumericalSanityError(
-                    f"NaNs in final PredictionFrame for target '{target}'."
-                )
+        # No final NaN guard here — checking would materialize the full
+        # memmap. Each batch was already NaN-audited in _predict_streaming
+        # before writing to the scaffold.
         return frames
 
     #: Default entity batch size for the streaming path. Each batch runs
@@ -526,21 +527,20 @@ class DartsForecaster:
 
             ds = b.build()
 
-        # Convert the built dataset to per-target PredictionFrames.
-        frames: dict[str, PredictionFrame] = {}
-        from views_frames import (
-            PredictionFrame as _PF, SpatioTemporalIndex, FrameMetadata,
+        # Stream the zarr-backed dataset into memmap-backed PredictionFrames.
+        # This writes a row-major (N, S) float32 values.npy per target in
+        # entity-aligned blocks, then wraps each in a PredictionFrame whose
+        # values is a read-only np.memmap. Peak memory is one entity block
+        # — never the full (n_entities, n_time, n_samples) grid.
+        import tempfile
+
+        frames_dir = Path(tempfile.mkdtemp(prefix="pred_frames_"))
+        frames = build_prediction_frames_from_dataset(
+            ds,
+            target_names,
+            frames_dir,
+            entity_block=max(1, entity_batch_size),
         )
-        index = ds._build_index()
-        meta = FrameMetadata(model="darts")
-        for target_name in target_names:
-            pred_var = f"pred_{target_name}"
-            arr = ds.to_xarray()[pred_var].transpose(
-                ds._time_id, ds._entity_id, "sample"
-            ).values.astype(np.float32)
-            t, e, s = arr.shape
-            y_pred = np.ascontiguousarray(arr.reshape(t * e, s))
-            frames[target_name] = _PF(y_pred, index=index, metadata=meta)
         ds.close()
         return frames
 

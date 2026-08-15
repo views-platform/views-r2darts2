@@ -37,7 +37,7 @@ def test_loss_catalog_genome_enforcement():
 def test_model_catalog_delegation():
     """Green Team: Verify ModelCatalog delegation."""
     with patch("views_r2darts2.catalogs.model_catalog.WandbLogger"), \
-         patch("views_r2darts2.catalogs.model_catalog.DartsForecaster.get_device", return_value="cpu"), \
+         patch("views_r2darts2.infrastructure.device.get_device", return_value="cpu"), \
          patch("torch.serialization.add_safe_globals"):
         config = {
             "algorithm": "NLinearModel", "name": "test_model", "random_state": 42,

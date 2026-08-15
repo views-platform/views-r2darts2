@@ -10,6 +10,7 @@ from darts.models.forecasting.tide_model import TiDEModel
 from darts.models.forecasting.dlinear import DLinearModel
 from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 import torch
 import logging
@@ -27,7 +28,7 @@ from darts.utils.likelihood_models import (
     WeibullLikelihood,
     QuantileRegression,
 )
-from views_r2darts2.engines.darts_forecaster import DartsForecaster
+from views_r2darts2.infrastructure.device import get_device
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
 
 # Darts likelihood objects keyed by config string.
@@ -50,6 +51,8 @@ from views_r2darts2.catalogs.scheduler_catalog import SchedulerCatalog
 from views_r2darts2.infrastructure.encoders import CYCLIC_ENCODERS_BY_RESOLUTION
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 from views_r2darts2.infrastructure.callbacks import (
+    LossGradientDiagnosticsCallbackV2,
+    RichLossDiagnosticsCallback,
     TrainingStepPatchCallback,
     GradientHealthCallback,
     NaNDetectionCallback,
@@ -62,6 +65,10 @@ from views_r2darts2.infrastructure.callbacks import (
     ValMetricsCallback,
     InputBatchMonitorCallback,
     LossComponentCallback,
+    LossGradientDiagnosticsCallback,
+    RichLossDiagnosticsCallback,
+    LossGradientDiagnosticsCallbackV2
+
 )
 
 
@@ -105,7 +112,7 @@ class ModelCatalog:
             "TSMixerModel": self._get_tsmixer_model,
         }
         self.config = config
-        self.device = DartsForecaster.get_device()
+        self.device = get_device()
 
         # DELEGATION: Specialized catalogs handle genomic translation.
         # Darts Likelihood objects are mutually exclusive with loss_fn —
@@ -140,11 +147,16 @@ class ModelCatalog:
             ValMetricsCallback(),
             InputBatchMonitorCallback(),
             LossComponentCallback(),
+            # LossGradientDiagnosticsCallback(),
+            RichLossDiagnosticsCallback(log_every_n_epochs=1),  # visual table
+            LossGradientDiagnosticsCallbackV2(log_every_n_epochs=1),  # wandb + console
         ]
         # Wire EarlyStopping if patience is set in config
         early_stopping_patience = self.config.get("early_stopping_patience", None)
         early_stopping_min_delta = self.config.get("early_stopping_min_delta", 0.0)
-        early_stopping_monitor = self.config.get("early_stopping_monitor", "val_loss")
+        early_stopping_monitor = self.config.get(
+            "early_stopping_monitor", "val_metrics/BALANCE_GM_RATIO"
+        )
         if early_stopping_patience is not None:
             callbacks.append(
                 EarlyStopping(
@@ -154,6 +166,29 @@ class ModelCatalog:
                     mode="min",
                     verbose=True,
                 )
+            )
+
+        # Explicit checkpoint monitor so "best" model follows the same
+        # multi-metric objective as EarlyStopping.
+        #
+        # Darts already installs its own ModelCheckpoint when
+        # save_checkpoints=True. If we also add one here with monitor=val_loss,
+        # Lightning sees two stateful ModelCheckpoint callbacks with the same
+        # state_key and raises at Trainer init.
+        checkpoint_monitor = self.config.get("checkpoint_monitor", early_stopping_monitor)
+        if checkpoint_monitor != "val_loss":
+            callbacks.append(
+                ModelCheckpoint(
+                    monitor=checkpoint_monitor,
+                    mode="min",
+                    save_top_k=1,
+                    save_last=True,
+                    filename="{epoch:03d}-best",
+                )
+            )
+        else:
+            logger.info(
+                "Skipping custom ModelCheckpoint for monitor=val_loss to avoid duplicate callback with Darts."
             )
 
         # LearningRateMonitor makes LR reductions visible in WandB

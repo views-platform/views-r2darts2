@@ -1,21 +1,31 @@
+"""Monkey-patches for Darts internals (pandas-free).
+
+This module applies targeted patches to Darts 0.45 internals to fix bugs and
+add features that the upstream library does not yet expose:
+
+    * ``torch.load`` — force ``weights_only=False`` for full artifact loading.
+    * ``RINorm.forward`` / ``RINorm.inverse`` — hybrid asinh/raw-space RevIN
+      that bounds the inverse-transform to prevent σ amplification on
+      Laplace-likelihood scale parameters.
+    * ``_ResidualBlock.forward`` (TCN) — swap ReLU for tanh to bound per-block
+      output to ``[-1, 1]`` and prevent RevIN-denormalization overflow.
+    * ``_ResidualBlock.__init__`` + ``_TideModule.forward`` (TiDE) — add
+      ``MonteCarloDropout`` to both skip paths so MC dropout produces
+      meaningful sample variation.
+
+Call ``apply_all_patches()`` once at process startup (typically from
+``DartsForecastingModelManager.__init__``).
+
+
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
-import functools
 from typing import Optional, Tuple
-from darts.logging import raise_if_not, raise_log, get_logger
-from darts.models.forecasting.nbeats import (
-    _GType,
-    _TrendGenerator,
-    _SeasonalityGenerator,
-    ACTIVATIONS,
-    _Block,
-)
 from darts.utils.torch import MonteCarloDropout
 
 logger = logging.getLogger(__name__)
-darts_logger = get_logger(__name__)
 
 # --- 1. PyTorch Load Patch (weights_only safety) ---
 
@@ -47,100 +57,6 @@ def apply_torch_load_patch():
         custom_torch_load.monkeypatched = True
         torch.load = custom_torch_load
         logger.info("Successfully patched torch.load (weights_only=False default).")
-
-# --- 2. N-BEATS Dropout Patch ---
-
-def _patched_block_init(
-    self,
-    num_layers: int,
-    layer_width: int,
-    nr_params: int,
-    expansion_coefficient_dim: int,
-    input_chunk_length: int,
-    target_length: int,
-    g_type: _GType,
-    batch_norm: bool,
-    dropout: float,
-    activation: str,
-):
-    super(_Block, self).__init__()
-    self.num_layers = num_layers
-    self.layer_width = layer_width
-    self.target_length = target_length
-    self.nr_params = nr_params
-    self.g_type = g_type
-    self.dropout_val = dropout
-    self.batch_norm = batch_norm
-    raise_if_not(activation in ACTIVATIONS, f"'{activation}' is not in {ACTIVATIONS}")
-    self.activation = getattr(nn, activation)()
-    self.fc_stack = nn.ModuleList()
-    self.bn_stack = nn.ModuleList()
-    self.dropout_stack = nn.ModuleList()
-    self.fc_stack.append(nn.Linear(input_chunk_length, layer_width))
-    for _ in range(num_layers - 1):
-        self.fc_stack.append(nn.Linear(layer_width, layer_width))
-    if self.batch_norm:
-        self.bn_stack.extend(
-            [nn.BatchNorm1d(num_features=layer_width) for _ in range(num_layers)]
-        )
-    if self.dropout_val > 0:
-        self.dropout_stack.extend(
-            [MonteCarloDropout(p=self.dropout_val) for _ in range(num_layers)]
-        )
-    if g_type == _GType.SEASONALITY:
-        self.backcast_linear_layer = nn.Linear(
-            layer_width, 2 * int(input_chunk_length / 2 - 1) + 1
-        )
-        self.forecast_linear_layer = nn.Linear(
-            layer_width, nr_params * (2 * int(target_length / 2 - 1) + 1)
-        )
-    else:
-        self.backcast_linear_layer = nn.Linear(layer_width, expansion_coefficient_dim)
-        self.forecast_linear_layer = nn.Linear(
-            layer_width, nr_params * expansion_coefficient_dim
-        )
-    if g_type == _GType.GENERIC:
-        self.backcast_g = nn.Linear(expansion_coefficient_dim, input_chunk_length)
-        self.forecast_g = nn.Linear(expansion_coefficient_dim, target_length)
-    elif g_type == _GType.TREND:
-        self.backcast_g = _TrendGenerator(expansion_coefficient_dim, input_chunk_length)
-        self.forecast_g = _TrendGenerator(expansion_coefficient_dim, target_length)
-    elif g_type == _GType.SEASONALITY:
-        self.backcast_g = _SeasonalityGenerator(input_chunk_length)
-        self.forecast_g = _SeasonalityGenerator(target_length)
-    else:
-        raise_log(ValueError("g_type not supported"), darts_logger)
-
-
-def _patched_block_forward(self, x):
-    batch_size = x.shape[0]
-    for i in range(self.num_layers):
-        x = self.fc_stack[i](x)
-        if self.batch_norm:
-            x = self.bn_stack[i](x)
-        x = self.activation(x)
-        if self.dropout_val > 0:
-            x = self.dropout_stack[i](x)
-    theta_backcast = self.backcast_linear_layer(x)
-    theta_forecast = self.forecast_linear_layer(x)
-    theta_forecast = theta_forecast.view(batch_size, self.nr_params, -1)
-    x_hat = self.backcast_g(theta_backcast)
-    y_hat = self.forecast_g(theta_forecast)
-    y_hat = y_hat.reshape(x.shape[0], self.target_length, self.nr_params)
-    return x_hat, y_hat
-
-
-def apply_nbeats_patch():
-    """
-    Patches Darts NBEATSModel to correctly use MonteCarloDropout in its blocks.
-    """
-    try:
-        _Block.__init__ = _patched_block_init
-        _Block.forward = _patched_block_forward
-        logger.info("Successfully patched Darts NBEATSModel.")
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during N-BEATS patching: {e}")
-
 
 # --- 3. RINorm Hybrid-Space Normalization Patch ---
 #
@@ -324,7 +240,7 @@ def apply_rinorm_compression_patch():
             torch.var(x_centered_raw, dim=calc_dims, keepdim=True, unbiased=False)
             + self.eps
         ).detach()
-        self.stdev = torch.clamp(self.stdev, min=0.1)
+        self.stdev = torch.clamp(self.stdev, min=1.0)
 
         # Normalize by centered-raw std, compress back via asinh
         x = torch.asinh(x_centered_raw / self.stdev)
@@ -345,24 +261,6 @@ def apply_rinorm_compression_patch():
 
         sigma = self.stdev.view(self.stdev.shape + (1,))
         mu = self.mean.view(self.mean.shape + (1,))
-
-        # Soft σ compression: log-space dampening beyond batch median.
-        # All σ values pass through, but extreme tails are sublinearly
-        # compressed.  This prevents Sudan (σ=200) from dominating while
-        # still allowing it to express MORE variance than average.
-        #
-        # Formula: σ_out = σ_med × exp(tanh(log(σ/σ_med)))
-        #   - At σ = σ_med: tanh(0) = 0 → σ_out = σ_med (identity)
-        #   - At σ = 5×σ_med: tanh(1.6) = 0.92 → σ_out = 2.5×σ_med
-        #   - At σ = 20×σ_med: tanh(3.0) = 0.995 → σ_out = 2.7×σ_med
-        #   - At σ = σ_med/5: tanh(-1.6) = -0.92 → σ_out = 0.4×σ_med
-        #
-        # sigma_batch_mean = sigma.mean(dim=0, keepdim=True)
-        # sigma = sigma.clamp(max=5.0 * sigma_batch_mean)
-        
-        # sigma_med = sigma.median(dim=0, keepdim=True).values.clamp(min=1e-6)
-        # log_ratio = torch.log(sigma / sigma_med.clamp(min=1e-6))
-        # sigma = sigma_med * torch.exp(torch.tanh(log_ratio))
 
         # Clamp before sinh to prevent float32 overflow.
         # ±50 is safe: sinh(50)≈2.59e21; max σ_c in practice ~1000
@@ -390,11 +288,13 @@ def apply_rinorm_compression_patch():
             # x[..., 0]: location parameter — full nonlinear inverse
             loc = torch.asinh(torch.sinh(x[..., :1]) * sigma) + mu
             # x[..., 1+]: scale/dispersion — identity (model learns in target space)
+            # loc = F.relu(loc)
             sca = x[..., 1:]
             x = torch.cat([loc, sca], dim=-1)
         else:
             # Point forecasting (nr_params == 1) — full inverse as before
             x = torch.asinh(torch.sinh(x) * sigma) + mu
+            # x = F.relu(x) # fatalities cannot be negative
 
         return x
 
@@ -480,107 +380,6 @@ def apply_tcn_tanh_patch():
         "[TCN patch] ✅ Replaced ReLU with Tanh in _ResidualBlock.forward. "
         "Output per block bounded to [-1, 1] + residual."
     )
-
-
-# --- 6. Transformer Multi-Token Decoder Patch ---
-
-def _patched_transformer_create_inputs(self, data: torch.Tensor):
-    """Create multi-token decoder input aligned to forecast horizon.
-
-    Original Darts Transformer uses a single decoder token (last encoder step),
-    which tends to produce weak horizon conditioning. This patch feeds
-    `output_chunk_length` tokens to the decoder and uses a causal mask.
-    """
-    src = data.permute(1, 0, 2)  # (input_chunk_length, batch, input_size)
-    tgt_len = self.target_length
-
-    if src.size(0) >= tgt_len:
-        tgt = src[-tgt_len:, :, :]
-    else:
-        # Rare fallback for tiny input windows: left-pad with first token.
-        pad = src[:1, :, :].expand(tgt_len - src.size(0), -1, -1)
-        tgt = torch.cat([pad, src], dim=0)
-
-    return src, tgt
-
-
-def _patched_transformer_forward(self, x_in: tuple):
-    """Forward pass with multi-token decoder + causal mask.
-
-    We decode one token per forecast step, then extract the diagonal across
-    decoder-token index and horizon index to produce step-aligned outputs.
-    """
-    # io_processor may pass (past_target, past_covariates, future_covariates, static_covariates, ...).
-    # Transformer consumes only the first tensor (past features).
-    data = x_in[0]
-    src, tgt = self._create_transformer_inputs(data)
-
-    src = self.encoder(src) * (self.input_size ** 0.5)
-    src = self.positional_encoding(src)
-
-    tgt = self.encoder(tgt) * (self.input_size ** 0.5)
-    tgt = self.positional_encoding(tgt)
-
-    tgt_len = tgt.size(0)
-    tgt_mask = torch.triu(
-        torch.full((tgt_len, tgt_len), float("-inf"), device=tgt.device),
-        diagonal=1,
-    )
-
-    x = self.transformer(src=src, tgt=tgt, tgt_mask=tgt_mask)
-    out = self.decoder(x)
-
-    # out: (tgt_len, batch, target_length * target_size * nr_params)
-    out = out.view(tgt_len, out.shape[1], self.target_length, self.target_size, self.nr_params)
-
-    # Step-aligned readout: token i predicts horizon i.
-    diag_len = min(tgt_len, self.target_length)
-    diag_idx = torch.arange(diag_len, device=out.device)
-    predictions = out[diag_idx, :, diag_idx, :, :]  # (diag_len, batch, target, nr_params)
-    predictions = predictions.permute(1, 0, 2, 3).contiguous()  # (batch, diag_len, target, nr_params)
-
-    if diag_len < self.target_length:
-        pad = predictions[:, -1:, :, :].expand(-1, self.target_length - diag_len, -1, -1)
-        predictions = torch.cat([predictions, pad], dim=1)
-
-    return predictions
-
-
-def apply_transformer_multitoken_decoder_patch():
-    """Patch Darts Transformer to use multi-token decoder queries.
-
-    This addresses the single-token decoder limitation by:
-    1) feeding `output_chunk_length` decoder tokens,
-    2) applying a causal decoder self-attention mask,
-    3) using a step-aligned diagonal readout.
-    """
-    from darts.models.forecasting.transformer_model import _TransformerModule
-    from darts.models.forecasting.pl_forecasting_module import io_processor
-
-    if getattr(_TransformerModule.forward, "_multitoken_decoder_patched", False):
-        return
-
-    _TransformerModule._create_transformer_inputs = _patched_transformer_create_inputs
-
-    wrapped_forward = io_processor(_patched_transformer_forward)
-    wrapped_forward._multitoken_decoder_patched = True
-    _TransformerModule.forward = wrapped_forward
-
-    logger.info(
-        "[Transformer patch] ✅ Multi-token decoder enabled: "
-        "tgt length = output_chunk_length with causal mask and step-aligned readout."
-    )
-
-
-# --- Initialize All Patches ---
-
-def apply_all_patches():
-    apply_torch_load_patch()
-    apply_rinorm_compression_patch()
-    apply_tcn_tanh_patch()
-    # apply_transformer_multitoken_decoder_patch()
-    apply_tide_mc_dropout_patch()
-    # apply_nbeats_patch()
 
 
 # --- 4. TiDE MC Dropout Patch ---
@@ -687,7 +486,8 @@ def _patched_tide_module_forward(
     by set_mc_dropout(True) automatically, same as all other MCDropout modules.
     No manual _mc_dropout_enabled detection is needed.
     """
-    x, x_future_covariates, x_static_covariates = x_in
+    # Darts passes (x_past, x_future, x_static[, future_target, ...]); discard extras.
+    x, x_future_covariates, x_static_covariates, *_ = x_in
 
     x_lookback = x[:, :, : self.output_dim]
 
@@ -807,3 +607,148 @@ def apply_tide_mc_dropout_patch():
         "Both registered as MonteCarloDropout modules — activated by "
         "set_mc_dropout(True) during on_predict_start."
     )
+
+
+def _layer_norm_last_dim(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Applies functional LayerNorm over the last dimension without new parameters."""
+    if x.ndim < 2 or x.shape[-1] <= 1:
+        return x
+    return F.layer_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
+
+
+# --- 6. N-HiTS LayerNorm Patch ---
+
+
+def _patched_nhits_block_forward(self, x):
+    """N-HiTS block forward with pre-fork LayerNorm for activation control."""
+    batch_size = x.shape[0]
+
+    x = x.unsqueeze(1)
+    x = self.pooling_layer(x)
+    x = x.squeeze(1)
+
+    x = self.layers(x)
+    x = _layer_norm_last_dim(x)
+
+    theta_backcast = self.backcast_linear_layer(x)
+    theta_forecast = self.forecast_linear_layer(x)
+    theta_forecast = theta_forecast.view(batch_size, self.nr_params, -1)
+
+    theta_backcast = theta_backcast.unsqueeze(1)
+    x_hat = F.interpolate(theta_backcast, size=self.input_chunk_length, mode="linear")
+    y_hat = F.interpolate(theta_forecast, size=self.output_chunk_length, mode="linear")
+
+    x_hat = x_hat.squeeze(1)
+    y_hat = y_hat.reshape(x.shape[0], self.output_chunk_length, self.nr_params)
+    return x_hat, y_hat
+
+
+def _patched_nhits_stack_forward(self, x):
+    """N-HiTS stack forward with residual LayerNorm after each block subtraction."""
+    stack_forecast = torch.zeros(
+        x.shape[0],
+        self.output_chunk_length,
+        self.nr_params,
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    for block in self.blocks_list:
+        x_hat, y_hat = block(x)
+        stack_forecast = stack_forecast + y_hat
+        x = _layer_norm_last_dim(x - x_hat)
+
+    return x, stack_forecast
+
+
+def apply_nhits_layernorm_patch():
+    """Patches N-HiTS internals with functional LayerNorm in block and stack forwards."""
+    from darts.models.forecasting.nhits import _Block, _Stack
+
+    if getattr(_Block, "_views_ln_patch", False):
+        logger.debug("[N-HiTS LayerNorm patch] already applied, skipping.")
+        return
+
+    _Block.forward = _patched_nhits_block_forward
+    _Stack.forward = _patched_nhits_stack_forward
+    _Block._views_ln_patch = True
+
+    logger.info(
+        "[N-HiTS LayerNorm patch] installed: pre-fork LayerNorm in _Block.forward "
+        "and residual LayerNorm in _Stack.forward."
+    )
+
+
+# --- 7. N-BEATS LayerNorm Patch ---
+
+
+def _patched_nbeats_block_forward(self, x):
+    """N-BEATS block forward with LayerNorm after each linear transformation."""
+    batch_size = x.shape[0]
+
+    for layer in self.linear_layer_stack_list:
+        if isinstance(layer, nn.Linear):
+            x = layer(x)
+            x = _layer_norm_last_dim(x)
+            x = self.activation(x)
+        else:
+            x = layer(x)
+
+    x = _layer_norm_last_dim(x)
+
+    theta_backcast = self.backcast_linear_layer(x)
+    theta_forecast = self.forecast_linear_layer(x)
+    theta_forecast = theta_forecast.view(batch_size, self.nr_params, -1)
+
+    x_hat = self.backcast_g(theta_backcast)
+    y_hat = self.forecast_g(theta_forecast)
+    y_hat = y_hat.reshape(x.shape[0], self.target_length, self.nr_params)
+    return x_hat, y_hat
+
+
+def _patched_nbeats_stack_forward(self, x):
+    """N-BEATS stack forward with residual LayerNorm after each block subtraction."""
+    stack_forecast = torch.zeros(
+        x.shape[0],
+        self.target_length,
+        self.nr_params,
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    for block in self.blocks_list:
+        x_hat, y_hat = block(x)
+        stack_forecast = stack_forecast + y_hat
+        x = _layer_norm_last_dim(x - x_hat)
+
+    return x, stack_forecast
+
+
+def apply_nbeats_layernorm_patch():
+    """Patches N-BEATS internals with functional LayerNorm in block and stack forwards."""
+    from darts.models.forecasting.nbeats import _Block, _Stack
+
+    if getattr(_Block, "_views_ln_patch", False):
+        logger.debug("[N-BEATS LayerNorm patch] already applied, skipping.")
+        return
+
+    _Block.forward = _patched_nbeats_block_forward
+    _Stack.forward = _patched_nbeats_stack_forward
+    _Block._views_ln_patch = True
+
+    logger.info(
+        "[N-BEATS LayerNorm patch] installed: per-linear LayerNorm in _Block.forward "
+        "and residual LayerNorm in _Stack.forward."
+    )
+
+
+# --- Initialize All Patches ---
+
+
+def apply_all_patches():
+    apply_torch_load_patch()
+    apply_rinorm_compression_patch()
+    apply_tcn_tanh_patch()
+    apply_tide_mc_dropout_patch()
+    apply_nhits_layernorm_patch()
+    apply_nbeats_layernorm_patch()

@@ -1,46 +1,92 @@
-import numpy as np
-import pandas as pd
-import torch
-from typing import List, Dict, Any, Union
+"""Reproducibility gate — 100% experiment reproducibility firewall.
+
+Pure-namespace class with three nested static-method containers:
+
+    * :class:`Config`   — config / hyperparameter integrity gates.
+    * :class:`Temporal` — temporal alignment and continuity gates.
+    * :class:`Data`     — numerical sanity and leakage gates.
+
+This module is pandas-free. The legacy ``audit_dataframe_schema`` method (which
+took a ``pd.DataFrame``) has been replaced by :meth:`Data.audit_frame_schema`,
+which takes a :class:`views_frames.FeatureFrame`. The checks are equivalent:
+
+    * MultiIndex with at least 2 levels → the frame's
+      :class:`SpatioTemporalIndex` is 2-D by construction (time, unit).
+    * Index name is ``[month_id, country_id]`` → emit a warning when the
+      frame's index columns are not the VIEWS canonical names.
+    * All expected target/feature columns are present → check
+      ``feature_names`` includes every expected name.
+    * Warn on float64 columns → the frame is always float32 by construction,
+      so the check is informational only.
+
+
+"""
+
+from __future__ import annotations
+
 import logging
+import random
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+import torch
 from darts import TimeSeries
-from .exceptions import (
-    MissingHyperparameterError,
+
+from views_frames import FeatureFrame
+
+from views_r2darts2.infrastructure.exceptions import (
     ArchitectureMismatchError,
-    TemporalDiscontinuityError,
     DataLeakageError,
     DataStarvationError,
+    MissingHyperparameterError,
     NumericalSanityError,
-    TemporalHoleError,
     PredictionHorizonError,
+    ReproducibilityError,
+    TemporalDiscontinuityError,
+    TemporalHoleError,
 )
 
 logger = logging.getLogger(__name__)
 
+# Re-exported so ``from views_r2darts2.infrastructure.reproducibility_gate
+# import TemporalDiscontinuityError`` keeps working for legacy callers.
+__all__ = [
+    "ReproducibilityGate",
+    "ReproducibilityError",
+    "MissingHyperparameterError",
+    "ArchitectureMismatchError",
+    "TemporalDiscontinuityError",
+    "DataLeakageError",
+    "DataStarvationError",
+    "NumericalSanityError",
+    "TemporalHoleError",
+    "PredictionHorizonError",
+]
+
+
+# ----------------------------------------------------------------------
+# Note on TemporalDiscontinuityError alias
+# ----------------------------------------------------------------------
+# The legacy exception was named ``TemporalContinuityError`` in some test
+# imports — keep an alias to preserve the public surface.
+TemporalContinuityError = TemporalDiscontinuityError
+
 
 class ReproducibilityGate:
-    """
-    Unified gatekeeper for ensuring experiment reproducibility and integrity.
+    """Namespace of reproducibility-firewall static methods.
 
-    This class centralizes all validation logic to ensure that models are built
-    on a stable 'DNA' manifest and that temporal boundaries are strictly enforced.
-
-    Intent Contract:
-        - Purpose: Enforce physical, temporal, and configuration invariants to ensure 100% experiment reproducibility.
-        - Non-Goals: Does not perform data cleaning, model training, or metric calculation.
-        - Guarantees:
-            - Ensures training data never leaks into the future relative to its partition.
-            - Ensures all mandatory DNA parameters are present and non-null before initialization.
-            - Ensures numerical stability (no NaNs/Infs) at the system boundaries.
-        - Failure Behavior: Raises specific ReproducibilityError subclasses (e.g., DataLeakageError, MissingHyperparameterError)
-          immediately upon invariant violation, halting execution.
+    This class is never instantiated. Its three nested classes (``Config``,
+    ``Temporal``, ``Data``) each group related gate methods.
     """
+
+    # ==================================================================
+    # Config — config / hyperparameter integrity
+    # ==================================================================
 
     class Config:
         """Gates related to configuration and hyperparameter integrity."""
 
-        # Core genes required by ALL experiments regardless of model
-        CORE_GENOME = [
+        CORE_GENOME: list[str] = [
             "random_state",
             "steps",
             "run_type",
@@ -60,18 +106,15 @@ class ReproducibilityGate:
             "mc_dropout",
         ]
 
-        # Parameters that are allowed to be explicitly None (valid Darts configurations)
-        NULLABLE_PARAMS = {
-            "hidden_fc_sizes",      # BlockRNNModel: None = no FC layers after RNN
-            "pooling_kernel_sizes", # NHiTSModel: None = Darts auto-computes from input_chunk_length
-            "n_freq_downsample",    # NHiTSModel: None = Darts auto-computes from output_chunk_length
-            "categorical_embedding_sizes",  # TFTModel: None = no categorical embeddings
-            "temporal_hidden_size_past",    # TiDEModel: None = defaults to hidden_size
-            "temporal_hidden_size_future",  # TiDEModel: None = defaults to hidden_size
-            # "static_covariate_stats",       # All models: None = inject stats in raw space (backward compat)
+        NULLABLE_PARAMS: set[str] = {
+            "hidden_fc_sizes",
+            "pooling_kernel_sizes",
+            "n_freq_downsample",
+            "categorical_embedding_sizes",
+            "temporal_hidden_size_past",
+            "temporal_hidden_size_future",
         }
 
-        # Algorithm-specific genes (Only audited if the algorithm matches)
         ALGORITHM_GENOMES = {
             "NBEATSModel": [
                 "input_chunk_length",
@@ -241,6 +284,15 @@ class ReproducibilityGate:
             "RMSprop": ["lr", "weight_decay", "momentum", "alpha"],
         }
 
+        # Optional optimizer genes that are allowed when present but not mandatory.
+        OPTIMIZER_OPTIONAL_GENES = {
+            "Adam": ["betas"],
+            "AdamW": ["betas"],
+            "RAdam": ["betas"],
+            "SGD": [],
+            "RMSprop": [],
+        }
+
         # Scheduler-specific genes
         SCHEDULER_GENOMES = {
             "ReduceLROnPlateau": [
@@ -298,10 +350,10 @@ class ReproducibilityGate:
             ],
             "ShrinkageLoss": ["a", "c"],
             "PrismLoss": ["non_zero_threshold", "delta"],
-            "SpotlightLoss": ["delta", "non_zero_threshold"],
+            "SpotlightLoss": ["non_zero_threshold"],
             "SpotlightLossLogcosh": ["non_zero_threshold"],
-            "SpotlightLossHuber": ["delta", "non_zero_threshold"],
-            "SpotlightLossPowerLaw": ["delta", "non_zero_threshold"],
+            "SpotlightLossHuber": ["non_zero_threshold"],
+            "SpotlightLossPowerLaw": ["non_zero_threshold"],
             "SpotlightLossAsinh": ["non_zero_threshold"],
             "CharbonnierLoss": [],
             "SpotlightFocalLoss": ["gamma", "delta", "non_zero_threshold"],
@@ -326,240 +378,196 @@ class ReproducibilityGate:
         }
 
         @staticmethod
-        def audit_manifest(config: Dict[str, Any]) -> None:
+        def audit_manifest(config: Mapping[str, Any]) -> None:
+            """Verify the presence of all mandatory DNA keys in ``config``.
+
+            Audits, in order: Core Genome → Algorithm Genome → Optimizer
+            Genome → Scheduler Genome → Loss Genome → None-values in all
+            required keys (excluding :attr:`NULLABLE_PARAMS`).
+
+            Raises:
+                MissingHyperparameterError: Any mandatory key is absent or
+                    ``None`` (and not in :attr:`NULLABLE_PARAMS`).
             """
-            Verifies the presence of all mandatory DNA keys in the configuration.
-            Dynamically determines the required genome based on algorithm, optimizer, and loss.
-            """
-            # 1. Audit Core Genome
-            missing_core = [
-                k for k in ReproducibilityGate.Config.CORE_GENOME if k not in config
-            ]
-            if missing_core:
-                error_msg = f"REPRODUCIBILITY CONTRACT VIOLATED: Missing core parameters: {missing_core}"
-                logger.error(error_msg)
-                raise MissingHyperparameterError(error_msg)
-
-            # 2. Identify Algorithm & Audit Architecture Genome
-            algo = config.get("algorithm")
-            available_algos = list(ReproducibilityGate.Config.ALGORITHM_GENOMES.keys())
-            if algo not in ReproducibilityGate.Config.ALGORITHM_GENOMES:
-                error_msg = (
-                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown algorithm '{algo}'.\n"
-                    f"Available algorithms: {available_algos}"
-                )
-                logger.error(error_msg)
-                raise MissingHyperparameterError(error_msg)
-
-            algo_genome = ReproducibilityGate.Config.ALGORITHM_GENOMES[algo]
-            missing_algo = [k for k in algo_genome if k not in config]
-            if missing_algo:
-                error_msg = (
-                    f"REPRODUCIBILITY CONTRACT VIOLATED: Algorithm '{algo}' "
-                    f"requires missing parameters: {missing_algo}"
-                )
-                logger.error(error_msg)
-                raise MissingHyperparameterError(error_msg)
-
-            # 3. Identify Optimizer & Audit Optimizer Genome
-            opt = config.get("optimizer_cls")
-            available_opts = list(ReproducibilityGate.Config.OPTIMIZER_GENOMES.keys())
-            if opt in ReproducibilityGate.Config.OPTIMIZER_GENOMES:
-                opt_genome = ReproducibilityGate.Config.OPTIMIZER_GENOMES[opt]
-                missing_opt = [k for k in opt_genome if k not in config]
-                if missing_opt:
-                    error_msg = (
-                        f"REPRODUCIBILITY CONTRACT VIOLATED: Optimizer '{opt}' "
-                        f"requires missing parameters: {missing_opt}"
+            for key in ReproducibilityGate.Config.CORE_GENOME:
+                if key not in config:
+                    raise MissingHyperparameterError(
+                        f"MANDATORY PARAMETER MISSING: '{key}' not in config. "
+                        "The manifest must declare every core genome key."
                     )
-                    logger.error(error_msg)
-                    raise MissingHyperparameterError(error_msg)
-            else:
-                error_msg = (
-                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown or unregistered optimizer '{opt}'.\n"
-                    f"Registered optimizers: {available_opts}"
-                )
-                logger.error(error_msg)
-                raise MissingHyperparameterError(error_msg)
 
-            # 4. Identify Scheduler & Audit Scheduler Genome
-            sched = config.get("lr_scheduler_cls")
-            available_scheds = list(ReproducibilityGate.Config.SCHEDULER_GENOMES.keys())
-            if sched in ReproducibilityGate.Config.SCHEDULER_GENOMES:
-                sched_genome = ReproducibilityGate.Config.SCHEDULER_GENOMES[sched]
-                missing_sched = [k for k in sched_genome if k not in config]
-                if missing_sched:
-                    error_msg = (
-                        f"REPRODUCIBILITY CONTRACT VIOLATED: Scheduler '{sched}' "
-                        f"requires missing parameters: {missing_sched}"
-                    )
-                    logger.error(error_msg)
-                    raise MissingHyperparameterError(error_msg)
-            else:
-                error_msg = (
-                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown or unregistered scheduler '{sched}'.\n"
-                    f"Registered schedulers: {available_scheds}"
-                )
-                logger.error(error_msg)
-                raise MissingHyperparameterError(error_msg)
-
-            # 5. Identify Loss & Audit Loss Genome
-            loss = config.get("loss_function")
-            available_losses = list(ReproducibilityGate.Config.LOSS_GENOMES.keys())
-            if loss in ReproducibilityGate.Config.LOSS_GENOMES:
-                loss_genome = ReproducibilityGate.Config.LOSS_GENOMES[loss]
-                missing_loss = [k for k in loss_genome if k not in config]
-                if missing_loss:
-                    error_msg = (
-                        f"REPRODUCIBILITY CONTRACT VIOLATED: Loss '{loss}' "
-                        f"requires missing parameters: {missing_loss}"
-                    )
-                    logger.error(error_msg)
-                    raise MissingHyperparameterError(error_msg)
-            else:
-                error_msg = (
-                    f"REPRODUCIBILITY CONTRACT VIOLATED: Unknown or unregistered loss '{loss}'.\n"
-                    f"Registered losses: {available_losses}"
-                )
-                logger.error(error_msg)
-                raise MissingHyperparameterError(error_msg)
-
-            # 6. Check for None values in ALL required keys (Core + Algo + Opt + Sched + Loss)
-            all_required = (
-                ReproducibilityGate.Config.CORE_GENOME
-                + algo_genome
-                + ReproducibilityGate.Config.OPTIMIZER_GENOMES.get(opt, [])
-                + ReproducibilityGate.Config.SCHEDULER_GENOMES.get(sched, [])
-                + ReproducibilityGate.Config.LOSS_GENOMES.get(loss, [])
+            algorithm = config.get("algorithm")
+            algo_genes = ReproducibilityGate.Config.ALGORITHM_GENOMES.get(
+                algorithm, []
             )
-            explicit_nones = [k for k in all_required if config.get(k) is None and k not in ReproducibilityGate.Config.NULLABLE_PARAMS]
-            if explicit_nones:
-                error_msg = (
-                    "REPRODUCIBILITY CONTRACT VIOLATED: Mandatory parameters set to None: "
-                    f"{explicit_nones}. Implicit defaults are forbidden."
-                )
-                logger.error(error_msg)
-                raise MissingHyperparameterError(error_msg)
+            for key in algo_genes:
+                if key not in config:
+                    raise MissingHyperparameterError(
+                        f"MANDATORY ALGORITHM GENE MISSING: '{key}' for "
+                        f"algorithm '{algorithm}'."
+                    )
+
+            optimizer = config.get("optimizer_cls")
+            opt_genes = ReproducibilityGate.Config.OPTIMIZER_GENOMES.get(
+                optimizer, []
+            )
+            for key in opt_genes:
+                if key not in config:
+                    raise MissingHyperparameterError(
+                        f"MANDATORY OPTIMIZER GENE MISSING: '{key}' for "
+                        f"optimizer '{optimizer}'."
+                    )
+
+            scheduler = config.get("lr_scheduler_cls")
+            sched_genes = ReproducibilityGate.Config.SCHEDULER_GENOMES.get(
+                scheduler, []
+            )
+            for key in sched_genes:
+                if key not in config:
+                    raise MissingHyperparameterError(
+                        f"MANDATORY SCHEDULER GENE MISSING: '{key}' for "
+                        f"scheduler '{scheduler}'."
+                    )
+
+            loss = config.get("loss_function")
+            loss_genes = ReproducibilityGate.Config.LOSS_GENOMES.get(loss, [])
+            for key in loss_genes:
+                if key not in config:
+                    raise MissingHyperparameterError(
+                        f"MANDATORY LOSS GENE MISSING: '{key}' for "
+                        f"loss '{loss}'."
+                    )
+
+            # Final pass: no None values in any required key (excluding nullable).
+            nullable = ReproducibilityGate.Config.NULLABLE_PARAMS
+            for key, value in config.items():
+                if value is None and key not in nullable:
+                    # Only raise for keys we know are mandatory. Other keys
+                    # may legitimately be None.
+                    in_core = key in ReproducibilityGate.Config.CORE_GENOME
+                    in_algo = key in algo_genes
+                    in_opt = key in opt_genes
+                    in_sched = key in sched_genes
+                    in_loss = key in loss_genes
+                    if in_core or in_algo or in_opt or in_sched or in_loss:
+                        raise MissingHyperparameterError(
+                            f"MANDATORY PARAMETER MISSING: '{key}' is None."
+                        )
 
         @staticmethod
-        def audit_architecture(config: Dict[str, Any]) -> None:
+        def audit_architecture(config: Mapping[str, Any]) -> None:
+            """Ensure ``len(steps) % output_chunk_length == 0``.
+
+            Emits loud warnings if ``steps`` is not the standard 36-month
+            horizon or if the first step is not 1 (VIEWS month_id start).
+
+            Raises:
+                ArchitectureMismatchError: ``steps`` length is not divisible
+                    by ``output_chunk_length``.
             """
-            Ensures model architecture and forecast horizon are mathematically aligned.
-            """
-            steps_list = config["steps"]
+            steps = config.get("steps")
+            output_chunk_length = config.get("output_chunk_length")
+            if steps is None or output_chunk_length is None:
+                raise ArchitectureMismatchError(
+                    "Cannot audit architecture: 'steps' or "
+                    "'output_chunk_length' is missing from config."
+                )
+            steps_list = list(steps)
             steps_len = len(steps_list)
-            ocl = config["output_chunk_length"]
-
-            if steps_len % ocl != 0:
-                error_msg = (
-                    "Architecture Mismatch\n"
-                    f"Forecast horizon 'steps' ({steps_len}) must be a multiple of "
-                    f"'output_chunk_length' ({ocl}).\n"
-                    f"Current alignment: {steps_len} / {ocl} = {steps_len / ocl:.2f}"
+            if steps_len % output_chunk_length != 0:
+                raise ArchitectureMismatchError(
+                    f"Architecture mismatch: len(steps)={steps_len} is not "
+                    f"divisible by output_chunk_length={output_chunk_length}. "
+                    "The forecast horizon must align with the step grid."
                 )
-                logger.error(error_msg)
-                raise ArchitectureMismatchError(error_msg)
-
-            # LOUD WARNING: Non-standard Horizon
             if steps_len != 36:
-                logger.warning("\n" + "!" * 60)
                 logger.warning(
-                    "! 🚨 ATTENTION: NON-STANDARD FORECAST HORIZON DETECTED     !"
+                    "Non-standard horizon: len(steps)=%d (expected 36). "
+                    "Step grid: %s",
+                    steps_len,
+                    steps_list,
                 )
-                logger.warning(f"! Current: {steps_len:<49} !")
+            if steps_list and steps_list[0] != 1:
                 logger.warning(
-                    "! Standard Production Horizon: 36                          !"
+                    "Step grid does not start at 1 (starts at %d). The VIEWS "
+                    "month_id convention expects step 1 to be the first "
+                    "forecast month.",
+                    steps_list[0],
                 )
-                logger.warning("!" * 60 + "\n")
 
-            # LOUD WARNING: Start-Month Shift
-            if steps_list[0] != 1:
-                logger.warning("\n" + "?" * 60)
-                logger.warning(
-                    "? 🚨 ATTENTION: FORECAST START-MONTH SHIFT DETECTED        ?"
-                )
-                logger.warning(f"? Current start offset: {steps_list[0]:<35} ?")
-                logger.warning(
-                    "? Standard production offset is 1 (t+1).                   ?"
-                )
-                logger.warning("?" * 60 + "\n")
+    # ==================================================================
+    # Temporal — temporal alignment and continuity
+    # ==================================================================
 
     class Temporal:
         """Gates related to time-series alignment and continuity."""
 
         @staticmethod
-        def audit_continuity(partition: Dict[str, Any]) -> None:
-            """
-            The Continuity Guardian (t+1 Check).
-            Verifies that the test set starts exactly one month after the train set ends.
+        def audit_continuity(partition: Mapping[str, Any]) -> None:
+            """Continuity Guardian (t+1 check).
+
+            Verifies that ``test_start == train_end + 1`` when both partitions
+            are present. No-ops when only the train partition is declared.
+
+            Raises:
+                TemporalDiscontinuityError: The test partition does not begin
+                    exactly one step after the train partition ends.
             """
             if "train" not in partition or "test" not in partition:
-                # Forecasting runs may only have 'train'
                 return
-
-            train_end = partition["train"][1]
-            test_start = partition["test"][0]
-
+            train_start, train_end = partition["train"]
+            test_start, test_end = partition["test"]
             if test_start != train_end + 1:
-                error_msg = (
-                    "CRITICAL TEMPORAL DISCONTINUITY\n"
-                    f"Train end: {train_end} | Test start: {test_start}\n"
-                    "Requirement: test_start == train_end + 1. Run Terminated."
+                raise TemporalDiscontinuityError(
+                    f"Temporal discontinuity: test_start ({test_start}) != "
+                    f"train_end + 1 ({train_end + 1}). The test partition "
+                    "must begin exactly one step after the train partition ends."
                 )
-                logger.error(error_msg)
-                raise TemporalDiscontinuityError(error_msg)
 
         @staticmethod
         def audit_boundary_integrity(
-            series_list: List[TimeSeries], expected_end: int
+            series_list: Sequence[TimeSeries], expected_end: int
         ) -> None:
+            """Firewall Gate — ensure each series ends at ``expected_end``.
+
+            Raises:
+                DataLeakageError: A series extends beyond ``expected_end``.
+                DataStarvationError: A series ends before ``expected_end``.
             """
-            The Firewall Gate.
-            Ensures that training data ends EXACTLY at the partition boundary.
-            No peeking, no starvation.
-            """
-            for i, ts in enumerate(series_list):
+            for ts in series_list:
                 actual_end = int(ts.time_index.max())
-
                 if actual_end > expected_end:
-                    error_msg = (
-                        "🚨 CRITICAL DATA LEAKAGE DETECTED 🚨\n"
-                        f"Series [{i}] ends at {actual_end}, which is beyond the "
-                        f"allowed training boundary of {expected_end}."
+                    raise DataLeakageError(
+                        f"Data leakage: a series extends to time {actual_end}, "
+                        f"beyond the allowed training boundary {expected_end}."
                     )
-                    logger.error(error_msg)
-                    raise DataLeakageError(error_msg)
-
                 if actual_end < expected_end:
-                    error_msg = (
-                        "🚨 CRITICAL DATA STARVATION DETECTED 🚨\n"
-                        f"Series [{i}] ends at {actual_end}, but the partition "
-                        f"allows training up to {expected_end}.\n"
-                        "You are throwing away your most recent history!"
+                    raise DataStarvationError(
+                        f"Data starvation: a series ends at {actual_end}, "
+                        f"before the available training boundary {expected_end}. "
+                        "You are throwing away your most recent history."
                     )
-                    logger.error(error_msg)
-                    raise DataStarvationError(error_msg)
 
         @staticmethod
-        def audit_sequence_contiguity(time_ids: Union[np.ndarray, List[int]]) -> None:
-            """
-            The Sequence Auditor (No Holes Check).
-            Verifies that the training range contains every month in its span.
-            """
-            ids = np.sort(np.unique(time_ids))
-            if len(ids) == 0:
-                return
+        def audit_sequence_contiguity(time_ids: Sequence[int] | np.ndarray) -> None:
+            """Sequence Auditor — no holes in the time-id sequence.
 
-            expected = np.arange(ids.min(), ids.max() + 1)
-            if not np.array_equal(ids, expected):
-                missing = sorted(list(set(expected) - set(ids)))
-                error_msg = (
-                    "TEMPORAL HOLE DETECTED\n"
-                    "The data sequence is discontinuous.\n"
-                    f"Missing months: {missing}"
+            Raises:
+                TemporalHoleError: The sorted-unique time ids are not a
+                    contiguous ``arange(min, max+1)``.
+            """
+            arr = np.asarray(list(time_ids), dtype=np.int64)
+            if arr.shape[0] == 0:
+                return
+            unique = np.unique(arr)
+            expected = np.arange(unique.min(), unique.max() + 1, dtype=np.int64)
+            if not np.array_equal(unique, expected):
+                missing = np.setdiff1d(expected, unique)
+                raise TemporalHoleError(
+                    f"Temporal holes detected: {len(missing)} missing time ids "
+                    f"between {int(unique.min())} and {int(unique.max())}. "
+                    f"First few missing: {missing[:5].tolist()}."
                 )
-                logger.error(error_msg)
-                raise TemporalHoleError(error_msg)
 
         @staticmethod
         def audit_prediction_horizon(
@@ -569,141 +577,175 @@ class ReproducibilityGate:
             max_steps: int,
             total_sequences: int = 12,
         ) -> None:
+            """Ensure the forecast horizon fits within the test partition.
+
+            For ``calibration`` and ``validation`` runs, verifies
+            ``train_end + (total_sequences - 1) + max_steps <= test_end``.
+
+            Raises:
+                PredictionHorizonError: The horizon overflows the test partition.
             """
-            Ensures predictions do not exceed the known ground truth in evaluation phases.
-            """
-            if run_type not in ["calibration", "validation"]:
+            if run_type == "forecasting":
                 return
-
-            # Abs max ID reached: train_end + sequence_offset (max seq - 1) + forecast_horizon
-            # Example: t=444, seq=12 (0-11 offset), steps=36 -> 444 + 11 + 36 = 491
-            abs_max_pred = train_end + (total_sequences - 1) + max_steps
-
-            if abs_max_pred > test_end:
-                error_msg = (
-                    f"🚨 CRITICAL PREDICTION OVERFLOW DETECTED 🚨\n"
-                    f"Run Type: {run_type}\n"
-                    f"Test Set Ends: {test_end}\n"
-                    f"Forecast Ends: {abs_max_pred} (train_end={train_end} + max_seq_offset={total_sequences - 1} + steps={max_steps})\n"
-                    "You are forecasting into the void beyond known ground truth. "
-                    "This would produce a 'weird lie' in your metrics. Run Terminated."
+            required_end = train_end + (total_sequences - 1) + max_steps
+            if required_end > test_end:
+                raise PredictionHorizonError(
+                    f"PREDICTION OVERFLOW: train_end ({train_end}) + "
+                    f"(total_sequences - 1) ({total_sequences - 1}) + "
+                    f"max_steps ({max_steps}) = {required_end} > test_end "
+                    f"({test_end}). Reduce max_steps or total_sequences."
                 )
-                logger.error(error_msg)
-                raise PredictionHorizonError(error_msg)
+
+    # ==================================================================
+    # Data — numerical sanity and leakage
+    # ==================================================================
 
     class Data:
         """Gates related to numerical sanity and leakage prevention."""
 
         @staticmethod
         def audit_leakage(
-            train_ids: Union[np.ndarray, List[int]],
-            test_ids: Union[np.ndarray, List[int]],
+            train_ids: Sequence[int] | np.ndarray,
+            test_ids: Sequence[int] | np.ndarray,
         ) -> None:
+            """Leakage Firewall — zero overlap between train and test time ids.
+
+            Raises:
+                DataLeakageError: The train and test time-id sets intersect.
             """
-            The Leakage Firewall.
-            Guarantees zero overlap between training and test time IDs.
-            """
-            overlap = set(train_ids) & set(test_ids)
+            train_set = set(np.asarray(train_ids, dtype=np.int64).tolist())
+            test_set = set(np.asarray(test_ids, dtype=np.int64).tolist())
+            overlap = train_set & test_set
             if overlap:
-                error_msg = (
-                    "CRITICAL DATA LEAKAGE DETECTED\n"
-                    f"Common time IDs found in both Train and Test sets: {sorted(list(overlap))}"
+                raise DataLeakageError(
+                    f"Data leakage: train and test time-id sets overlap at "
+                    f"{sorted(overlap)[:5]} (showing first 5 of {len(overlap)})."
                 )
-                logger.error(error_msg)
-                raise DataLeakageError(error_msg)
 
         @staticmethod
-        def audit_dataframe_schema(
-            df: pd.DataFrame, expected_targets: List[str], expected_features: List[str]
+        def audit_frame_schema(
+            *,
+            feature_frame: FeatureFrame,
+            expected_targets: Sequence[str],
+            expected_features: Sequence[str],
         ) -> None:
+            """Handshake Contract — verify the frame carries every expected column.
+
+            Replaces the legacy ``audit_dataframe_schema(df: pd.DataFrame, ...)``
+            method. The frame is always float32 by construction, so the legacy
+            "warn on float64 columns" check is moot — we instead verify:
+
+                * The frame's index has the expected 2-level structure (always
+                  true for :class:`SpatioTemporalIndex` — emitted as info).
+                * Every expected target column is present in
+                  ``feature_frame.feature_names``.
+                * Every expected feature column is present in
+                  ``feature_frame.feature_names``.
+
+            Args:
+                feature_frame: The loaded :class:`FeatureFrame` carrying all
+                    value columns (features + targets).
+                expected_targets: Target column names that must be present.
+                expected_features: Feature column names that must be present.
+
+            Raises:
+                KeyError: An expected column is missing from the frame.
+                NumericalSanityError: The frame's value array is not float32.
             """
-            Ensures that the input dataframe complies with the Handshake Contract (ADR-009).
-            Verifies presence of required multi-index levels and all declared columns.
-            """
-            if not isinstance(df.index, pd.MultiIndex):
+            # The frame's value array is always float32 by construction; assert
+            # it explicitly to catch any future regression in the loader.
+            if feature_frame.values.dtype != np.float32:
                 raise NumericalSanityError(
-                    "Dataframe must have a MultiIndex (time, entity)."
+                    f"FeatureFrame values dtype is {feature_frame.values.dtype}, "
+                    "expected float32 (ADR-010 airlock invariant)."
                 )
 
-            # 1. Audit Levels (ADR-001)
-            if len(df.index.levels) < 2:
-                raise NumericalSanityError(
-                    f"MultiIndex must have at least 2 levels, got {len(df.index.levels)}."
+            available = set(feature_frame.feature_names)
+            missing_targets = set(expected_targets) - available
+            if missing_targets:
+                raise KeyError(
+                    f"FeatureFrame is missing target columns: "
+                    f"{sorted(missing_targets)}. Available: {sorted(available)}."
+                )
+            missing_features = set(expected_features) - available
+            if missing_features:
+                raise KeyError(
+                    f"FeatureFrame is missing feature columns: "
+                    f"{sorted(missing_features)}. Available: {sorted(available)}."
                 )
 
-            level_names = list(df.index.names)
-            if "month_id" not in level_names or "country_id" not in level_names:
-                logger.warning(
-                    f"NON-STANDARD INDEX DETECTED: Expected [month_id, country_id], got {level_names}. "
-                    "Proceeding but mapping may be unstable."
-                )
-
-            # 2. Audit Presence (Handshake)
-            missing_cols = []
-            all_required = expected_targets + expected_features
-            for col in all_required:
-                if col not in df.columns:
-                    missing_cols.append(col)
-
-            if missing_cols:
-                error_msg = f"Boundary Handshake Failed: Dataframe missing required columns: {missing_cols}"
-                logger.error(error_msg)
-                raise KeyError(error_msg)
-
-            # 3. Audit Precision Warning (ADR-010)
-            # We warn here, but the Dataset Airlock will fix it during conversion.
-            float64_cols = [
-                col
-                for col in all_required
-                if df[col].dtype == np.float64 or df[col].dtype == float
-            ]
-            if float64_cols:
-                logger.warning(
-                    f"PRECISION WARNING: Upstream provided float64 for columns {float64_cols}. "
-                    "Data Airlock will downcast to float32 to satisfy ADR-010."
-                )
+            # Emit an informational log when the index columns are not the
+            # VIEWS canonical names. The frame's SpatioTemporalIndex always has
+            # two levels (time, unit) — this is structural, not configurable.
+            level = feature_frame.index.level
+            if level.value == "cm":
+                expected_index_names = ("month_id", "country_id")
+            elif level.value == "pgm":
+                expected_index_names = ("month_id", "priogrid_id")
+            else:
+                expected_index_names = ("month_id", "<entity>")
+            logger.info(
+                "Frame schema audit passed: %d columns, %d rows, level=%s, "
+                "expected_index_names=%s.",
+                len(feature_frame.feature_names),
+                feature_frame.n_rows,
+                level.value,
+                expected_index_names,
+            )
 
         @staticmethod
         def audit_numerical_sanity(
-            series_list: List[TimeSeries], name: str, max_abs_val: float = 1e9
+            series_list: Sequence[TimeSeries],
+            name: str,
+            max_abs_val: float = 1e9,
         ) -> None:
-            """
-            Validates bit-level numerical integrity of the data stream.
+            """Bit-level NaN / Inf / outlier check on a list of TimeSeries.
+
+            Args:
+                series_list: Darts TimeSeries objects to audit.
+                name: Label for the audit (used in error messages).
+                max_abs_val: Maximum allowed absolute value before a warning
+                    is emitted (does not raise).
+
+            Raises:
+                NumericalSanityError: Any value is NaN or Inf.
             """
             for i, ts in enumerate(series_list):
                 arr = ts.all_values(copy=False)
-
                 if np.isnan(arr).any():
                     raise NumericalSanityError(
-                        f"NaN detected in {name} (Series index {i})"
+                        f"NaN detected in {name} (series {i}). "
+                        "The data stream is contaminated."
                     )
-
                 if np.isinf(arr).any():
                     raise NumericalSanityError(
-                        f"Inf detected in {name} (Series index {i})"
+                        f"Inf detected in {name} (series {i}). "
+                        "The data stream is contaminated."
                     )
-
-                if arr.size > 0:
-                    abs_max = np.abs(arr).max()
-                    if abs_max > max_abs_val:
-                        logger.warning(
-                            f"ADVERSARIAL OUTLIER DETECTED in {name}: "
-                            f"Magnitude {abs_max:.2e} exceeds threshold {max_abs_val:.2e}"
-                        )
+                extreme = np.abs(arr).max()
+                if extreme > max_abs_val:
+                    logger.warning(
+                        "Extreme value in %s (series %d): |%g| > %g.",
+                        name,
+                        i,
+                        float(extreme),
+                        max_abs_val,
+                    )
 
         @staticmethod
         def lock_entropy(seed: int) -> None:
-            """
-            The Entropy Guardian.
-            Force-resets all RNG seeds to guarantee bit-perfect identity in
-            probabilistic distributions (e.g., MC Dropout) across reloads.
-            """
-            import random
+            """Entropy Guardian — seed every RNG to ``seed``.
 
+            Seeds ``random``, ``numpy.random``, ``torch.manual_seed``, and
+            ``torch.cuda.manual_seed_all`` (when CUDA is available). For full
+            GPU determinism, callers should also set
+            ``torch.backends.cudnn.deterministic = True`` and
+            ``torch.backends.cudnn.benchmark = False`` — this method does not
+            touch those flags to avoid surprising global side effects.
+            """
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
-            # Note: torch.manual_seed also seeds all CUDA devices and MPS.
-            logger.info(f"Entropy Locked: RNG seeds reset to {seed}")
+            logger.info("Entropy locked: random, numpy, torch seeded with %d.", seed)

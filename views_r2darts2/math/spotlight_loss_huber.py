@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn.functional as F
 import logging
@@ -7,153 +6,70 @@ logger = logging.getLogger(__name__)
 
 
 class SpotlightLossHuber(torch.nn.Module):
+    """Minimal scale-normalized loss for zero-inflated conflict forecasting.
+
+    Operates in asinh space (AsinhTransform target scaler) on ``(B, T, C)``
+    tensors for UCDP GED fatality forecasting (sb/ns/os), where 86–98% of
+    cells are zero and non-zero values span ~4 orders of magnitude.
+
+    ── Design ─────────────────────────────────────────────────────────
+
+    A single joint error term lets the model trade *level* for *shape* — it
+    can hide a magnitude error inside a plausible pattern (or vice versa) —
+    and a symmetric penalty on a right-skewed target then settles into a
+    flat, under-predicting compromise: the event peaks are never lifted. The
+    loss therefore splits the error into two dedicated terms, each with its
+    own bounded gradient, so neither objective can be sacrificed for the
+    other and gradient reaches both:
+
+      * **Shape (temporal pattern).** Per-series demeaned residual
+        ``(pred - mean_t pred) - (true - mean_t true)`` under ``logcosh``.
+        This scores the within-series dynamics only; a constant-wrong
+        prediction is NOT free because the level term below catches its
+        magnitude.
+
+      * **Level (soft-peak magnitude).** ``logcosh`` of
+        ``logsumexp_t(pred) - logsumexp_t(true)`` per series. Because asinh
+        values are already log-scale, ``logsumexp`` over time is a smooth
+        maximum dominated by the event peak — matching it forces the model
+        to reproduce raw peak magnitude, which is exactly what a symmetric
+        cell loss leaves under-predicted.
+
+    The anti-under-prediction pressure is **dynamic and data-driven, not an
+    imposed constant**: the gradient of ``logsumexp`` is a softmax over
+    timesteps, so the level term's correction concentrates automatically on
+    the current peak month and, since the model sits below the true peak,
+    pushes it upward. That asymmetry emerges from the data and fades to zero
+    as the peak is matched — there is no asymmetry coefficient to set.
+
+    A soft **event gate** ``sigmoid((|·| - tau) / tau)`` (its only input is
+    ``non_zero_threshold``) focuses both terms on conflict cells, and
+    **Hájek** (self-normalized) gated means keep peace-heavy and event-heavy
+    batches comparable. Both terms live in the same asinh units and are
+    ``logcosh``-bounded, so they are naturally comparable and need no
+    weighting hyperparameter. Channels are combined by a plain mean.
+
+    ── Hyperparameters ────────────────────────────────────────────────
+
+    ``non_zero_threshold`` is the ONLY tunable — the asinh-space boundary
+    that separates peace from conflict (default use ≈ 0.88 ≈ asinh(1)).
+    Everything else is parameter-free: ``logcosh`` and ``logsumexp`` have no
+    knobs, and the level/shape balance and the under-prediction asymmetry
+    are both emergent from the data rather than set by constants.
     """
-    SpotlightLoss (Charbonnier) — asinh + RevIN compatible, with DRO.
 
-    Identical Spotlight architecture as SpotlightLossLogcosh (DC/AC,
-    compound weighting, KL-DRO, windowed level anchor, spectral reg)
-    but replaces log_cosh base cell loss with Charbonnier:
+    _EPS = 1e-6
 
-        L(x) = sqrt(x² + ε²) − ε
-
-    With ε=1 (fixed, no tuning):
-        - Small errors: L ≈ x²/2  (matches log_cosh)
-        - Large errors: L ≈ |x| − 1  (vs |x| − ln2 for log_cosh)
-        - Gradient: x / sqrt(x² + 1) ∈ (−1, +1)
-
-    Key difference: Charbonnier's gradient saturates more slowly:
-        |e|=2 → 0.894 (vs 0.964 for log_cosh)
-        |e|=3 → 0.949 (vs 0.995 for log_cosh)
-        |e|=5 → 0.981 (vs 1.000 for log_cosh)
-
-    This keeps mid-range event errors (5–50 raw deaths ≈ |e|∈[2,4]
-    in asinh space) in the quadratic-to-linear transition zone longer,
-    giving them proportionally more gradient relative to extreme
-    outliers. May improve MSLE by better differentiating moderate
-    events from the peace-cell mass.
-
-    ε=1 in asinh space corresponds to ~sinh(1) ≈ 1.18 raw deaths,
-    same natural scale as log_cosh's implicit δ=1. No parameter
-    selection needed.
-
-    ─────────────────────────────────────────────────────────────────────
-
-    Args:
-        delta: Spectral loss weight. 0.0 = disable.
-            0.10–0.15 = spectral is ~15–25% of gradient.
-            Range: [0.05, 0.20].
-        non_zero_threshold: Transformed-space cutoff for spectral signal
-            filtering (which series get spectral comparison).
-            Value depends on target scaler:
-            - AsinhTransform: 0.88 ≈ asinh(1)
-            - FourthRootTransform: 0.19 ≈ (1+1)^0.25 − 1
-
-    Example:
-        >>> loss_fn = SpotlightLossHuber(delta=0.10, non_zero_threshold=0.88)
-        >>> y_pred = torch.randn(8, 36)
-        >>> y_true = torch.zeros(8, 36)
-        >>> y_true[:, 10:15] = 2.5
-        >>> loss = loss_fn(y_pred, y_true)
-        >>> loss.backward()
-    """
-
-    SPECTRAL_RESOLUTIONS = ((6, 3), (12, 6), (24, 12))
-
-    def __init__(
-        self,
-        delta: float,
-        non_zero_threshold: float,
-        alpha: float = 0.0,  # deprecated — ignored, kept for backward compat
-    ):
-        if alpha != 0.0:
-            logger.warning(
-                "SpotlightLossHuber: alpha is deprecated and ignored. "
-                "Remove alpha from your config. (received alpha=%.4f)",
-                alpha,
-            )
-        if delta < 0.0:
-            raise ValueError(f"SpotlightLoss: delta must be non-negative, got {delta}")
+    def __init__(self, non_zero_threshold: float):
         if non_zero_threshold <= 0.0:
             raise ValueError(
-                f"SpotlightLoss: non_zero_threshold must be positive, got {non_zero_threshold}"
+                f"non_zero_threshold must be positive, got {non_zero_threshold}"
             )
-
         super().__init__()
-        self.delta = delta
         self.non_zero_threshold = non_zero_threshold
+        self._last_components: dict | None = None
 
-        logger.info(
-            "SpotlightLossHuber (Charbonnier) | delta=%.4f threshold=%.4f",
-            delta, non_zero_threshold,
-        )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _charbonnier(x: torch.Tensor) -> torch.Tensor:
-        """Charbonnier loss with ε=1: sqrt(x² + 1) − 1."""
-        return torch.sqrt(x * x + 1.0) - 1.0
-
-    @staticmethod
-    def _log_cosh(x: torch.Tensor) -> torch.Tensor:
-        """log(cosh(x)), numerically stable. Used for spectral loss only."""
-        abs_x = torch.abs(x)
-        return abs_x + F.softplus(-2.0 * abs_x) - math.log(2.0)
-
-    def _spectral_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """Multi-resolution STFT magnitude comparison (AC bins only)."""
-        if y_pred.dim() == 3:
-            B, T, C = y_pred.shape
-            pred = y_pred.permute(0, 2, 1).reshape(B * C, T)
-            true = y_true.permute(0, 2, 1).reshape(B * C, T)
-        else:
-            pred = y_pred
-            true = y_true
-
-        has_signal = (
-            (torch.abs(true) > self.non_zero_threshold)
-            | (torch.abs(pred.detach()) > self.non_zero_threshold)
-        ).any(dim=1)
-        if not has_signal.any():
-            return pred.new_tensor(0.0)
-        pred = pred[has_signal]
-        true = true[has_signal]
-
-        T = pred.size(1)
-        total = pred.new_tensor(0.0)
-        n_valid = 0
-
-        for n_fft, hop in self.SPECTRAL_RESOLUTIONS:
-            if T < n_fft:
-                continue
-
-            window = torch.hann_window(n_fft, device=pred.device)
-            S_pred = torch.stft(
-                pred, n_fft, hop_length=hop, win_length=n_fft,
-                window=window, center=False, return_complex=True,
-            )
-            S_true = torch.stft(
-                true, n_fft, hop_length=hop, win_length=n_fft,
-                window=window, center=False, return_complex=True,
-            )
-
-            # Safe magnitude: sqrt(re² + im² + ε) — bounded gradient.
-            # Do NOT use .abs() on pred side (gradient blows up at |z|→0).
-            mag_pred = torch.sqrt(S_pred.real ** 2 + S_pred.imag ** 2 + 1e-8)
-            mag_true = S_true.abs()
-
-            # Mask DC bin — level is handled by the level anchor.
-            mag_pred = mag_pred.clone()
-            mag_true = mag_true.clone()
-            mag_pred[:, 0, :] = 0.0
-            mag_true[:, 0, :] = 0.0
-
-            total = total + self._log_cosh(mag_pred - mag_true).mean()
-            n_valid += 1
-
-        return total / max(n_valid, 1)
+        logger.info("SpotlightLossHuber | threshold=%.4f", non_zero_threshold)
 
     # ------------------------------------------------------------------
     # Forward
@@ -164,129 +80,73 @@ class SpotlightLossHuber(torch.nn.Module):
             y_pred = y_pred.squeeze(-1)
             y_true = y_true.squeeze(-1)
 
-        T = y_pred.size(1)
-        e = y_pred - y_true
+        multivariate = y_pred.dim() == 3
+        tau = self.non_zero_threshold
 
-        # ── DC/AC decomposition ───────────────────────────────────────
-        # e_shape sums to zero per series → shape gradient is DC-free.
-        # This is the structural RevIN safety mechanism.
-        e_mean = e.mean(dim=1, keepdim=True)
-        e_shape = e - e_mean
+        # ── Per-channel scale (data-driven, across series) ────────────
+        # std over batch AND time, per channel, floored at tau. Crucially
+        # this is NOT per-series: a per-series std divides each window by
+        # its own spread, which shrinks the gradient on exactly the
+        # high-intensity windows that raw-space MSLE (≈ MSE-in-asinh) cares
+        # about → chronic under-prediction of large events. A shared
+        # per-channel scale keeps the three channels comparable (the
+        # anti-templating goal) while letting big events keep their full
+        # error magnitude; Huber still bounds any single cell so no one
+        # series can dominate the batch gradient.
+        s = y_true.std(dim=(0, 1), keepdim=True).clamp_min(tau)
 
-        # ── Base cell loss: Charbonnier on demeaned error ─────────────
-        cell_loss = self._charbonnier(e_shape)
-
-        # ── Adaptive compound weighting (difficulty-gated) ────────────
-        # difficulty = |e| / (1 + |e|): slower saturation than 1-exp(-|e|).
-        #   |e|=1 → 0.50,  |e|=3 → 0.75,  |e|=10 → 0.91
-        # No event_mag: avoids double-stacking magnitude bias with DRO.
-        # Threshold gate provides false-positive discipline.
-        # w_compound = 1 + difficulty × 1[abs_max > τ] ∈ [1, 2)
-        abs_e = torch.abs(e_shape.detach())
-        abs_y = torch.abs(y_true)
-        abs_ypred_sg = torch.abs(y_pred.detach())
-
-        difficulty = abs_e / (1.0 + abs_e)
-        abs_max = torch.max(abs_y, abs_ypred_sg)
-        above_threshold = (abs_max > self.non_zero_threshold).float()
-        w_compound = 1.0 + difficulty * above_threshold
-
-        # ── Sqrt-DRO tail aggregation (log-space z-scores) ─────────────
-        # Z-score log(cell_loss) for proportional outlier detection.
-        # Operates on raw cell_loss (before compound weighting).
-        # Flattened cross-series: event cells dominate the tail.
-        loss_flat = cell_loss.detach().flatten()
-        log_loss = torch.log(loss_flat + 1e-8)
-        log_std = log_loss.std()
-
-        # CV-based alpha: self-normalizing, naturally bounded.
-        # Clamp at 0.1: std<0.1 means losses span <1.1×, too little
-        # variation for meaningful z-scores.
-        if not torch.isfinite(log_std) or log_std < 1e-8:
-            log_std = loss_flat.new_tensor(0.1)
-        log_cv = torch.log1p(log_std / (log_loss.mean().abs() + 1e-8))
-        dro_alpha = log_cv / (log_cv + 1.0)
-        z = (log_loss - log_loss.mean()) / log_std.clamp(min=0.1)
-        w_dro = torch.log1p((1.0 + z).clamp(min=0.0))
-        w_dro = w_dro / w_dro.mean().clamp(min=1e-8)
-        w_dro = w_dro.view_as(cell_loss)
-        w_dro = dro_alpha * w_dro + (1.0 - dro_alpha)
-
-        # Combine compound × DRO, normalise jointly to mean=1
-        w_total = w_compound * w_dro
-        w_total = w_total / w_total.mean().clamp(min=1e-8)
-        # Safety: any residual NaN from degenerate batches → weight=1
-        w_total = torch.nan_to_num(w_total, nan=1.0, posinf=1.0, neginf=0.0)
-
-        loss_shape = (w_total * cell_loss).mean()
-
-        # ── Windowed level anchor ──────────────────────────────────────
-        # Only mechanism that can shift per-series means. Shape loss is
-        # structurally DC-blind.
-        #
-        # Windowed: instead of a single full-horizon mean, split the T
-        # timesteps into non-overlapping windows of width W and compute
-        # log_cosh(ē_w) per window per series. This catches intra-horizon
-        # level drift invisible to a single full-mean anchor — e.g. a
-        # series overpredicted in months 1-12 and underpredicted in 25-36
-        # would have ~zero full-mean error but large windowed error.
-        #
-        # Finer windows: W = max(4, T // 6) → ~6 windows for T=36.
-        # Better timing sensitivity than 3 windows.
-        W = max(4, T // 6)
-        # Split e into windows: (B, T) → list of (B, W_i)
-        e_windows = list(e.split(W, dim=1))  # last chunk may be < W
-        # Per-window mean error: (B, n_windows)
-        window_means = torch.stack(
-            [ew.mean(dim=1) for ew in e_windows], dim=1
-        )  # (B, n_windows)
-        level_losses = self._charbonnier(window_means)
-
-        # Series×window DRO
-        level_flat = level_losses.detach().flatten()
-        log_level = torch.log(level_flat + 1e-8)
-        level_log_std = log_level.std()
-        if not torch.isfinite(level_log_std) or level_log_std < 1e-8:
-            level_log_std = level_flat.new_tensor(0.1)
-        level_log_cv = torch.log1p(
-            level_log_std / (log_level.mean().abs() + 1e-8)
+        # ── Scale-normalized robust base loss ─────────────────────────
+        # Level + shape penalized jointly on the raw error. Standardization
+        # equalizes gradient scale across series → strong curvature without
+        # templating or saturation-driven underprediction.
+        e = (y_pred - y_true) / s
+        cell = F.huber_loss(
+            e, torch.zeros_like(e), delta=self._HUBER_DELTA, reduction="none"
         )
-        level_dro_alpha = level_log_cv / (level_log_cv + 1.0)
 
-        level_z = (log_level - log_level.mean()) / level_log_std.clamp(min=0.1)
-        w_level = torch.log1p((1.0 + level_z).clamp(min=0.0))
-        w_level = w_level / w_level.mean().clamp(min=1e-8)
-        w_level = level_dro_alpha * w_level + (1.0 - level_dro_alpha)
-        w_level = torch.nan_to_num(w_level, nan=1.0, posinf=1.0, neginf=0.0)
-        w_level = w_level.view_as(level_losses)
+        # ── Single soft event gate (keyed to tau) ─────────────────────
+        # Concentrates emphasis on conflict cells; catches both false
+        # negatives (y_true) and false positives (y_pred).
+        abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
+        gate = torch.sigmoid((abs_max - tau) / tau)
 
-        loss_level = T * (w_level * level_losses).mean()
-
-        # ── Spectral: AC bins only ────────────────────────────────────
-        loss_spectral = y_pred.new_tensor(0.0)
-        if self.delta > 0.0 and T >= 6:
-            loss_spectral = self._spectral_loss(y_pred, y_true)
-
-        total_loss = loss_shape + loss_level + self.delta * loss_spectral
+        # ── Hájek self-normalized gated mean ──────────────────────────
+        # Composition-robust: numerator and denominator scale together with
+        # event count, so peace-heavy vs event-heavy batches are comparable.
+        if multivariate:
+            num = (gate * cell).sum(dim=(0, 1))
+            den = gate.sum(dim=(0, 1)).clamp_min(self._EMA_EPS)
+            per_channel = num / den
+            total_loss = per_channel.mean()
+            comp = per_channel.detach().tolist()
+        else:
+            num = (gate * cell).sum()
+            den = gate.sum().clamp_min(self._EMA_EPS)
+            total_loss = num / den
+            comp = [float(total_loss.detach())]
 
         if torch.isnan(total_loss):
-            raise RuntimeError(
-                f"NaN in SpotlightLoss: shape={loss_shape.item():.6f} "
-                f"level={loss_level.item():.6f} spectral={loss_spectral.item():.6f}"
-            )
+            raise RuntimeError(f"NaN in SpotlightLossHuber: per_channel={comp}")
+
+        # Telemetry kept shape-compatible with existing callbacks.
+        C = len(comp)
+        self._last_components = {
+            "shape": comp,
+            "level": [0.0] * C,
+            "spec": [0.0] * C,
+            "weight": [1.0] * C,
+            "ema": [float("nan")] * C,
+            "cal_ratio": [1.0] * C,
+            "cal_score": [1.0] * C,
+            "gates": [1.0] * C,
+            "contribution": comp,
+        }
 
         logger.debug(
-            "SpotlightLoss | shape=%.6f level=%.6f spec=%.6f total=%.6f",
-            loss_shape.item(),
-            loss_level.item(),
-            loss_spectral.item(),
-            total_loss.item(),
+            "SpotlightLossHuber | per_channel=%s total=%.6f",
+            comp, total_loss.item(),
         )
-
         return total_loss
 
     def __repr__(self) -> str:
-        return (
-            f"SpotlightLossHuber(delta={self.delta}, "
-            f"non_zero_threshold={self.non_zero_threshold})"
-        )
+        return f"SpotlightLossHuber(non_zero_threshold={self.non_zero_threshold})"

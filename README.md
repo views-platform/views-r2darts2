@@ -398,7 +398,7 @@ def get_hp_config():
         "target_scaler": "AsinhTransform",
         "feature_scaler": None,
         "feature_scaler_map": {
-            "AsinhTransform->MaxAbsScaler": [
+            "AsinhTransform": [
                 # All conflict counts, macro indicators, and lagged features
             ],
         },
@@ -414,7 +414,8 @@ def get_hp_config():
         "lr": 0.0005,
         "weight_decay": 0.0002,
         "gradient_clip_val": 3,
-        "optimizer_kwargs": {"lr": 0.0005, "weight_decay": 0.0002},
+        "optimizer_kwargs": {
+            "betas": (0.9, 0.95), "lr": 0.0005, "weight_decay": 0.0002},
 
         # Scheduler
         "lr_scheduler_cls": "ReduceLROnPlateau",
@@ -436,7 +437,7 @@ def get_hp_config():
 
         # Normalization
         "use_reversible_instance_norm": True,
-        "use_cyclic_encoders": True,
+        "use_cyclic_encoders": False,
         "use_static_covariates": True,  # Set False for N-BEATS, N-HiTS, Transformer
 
         # Reproducibility

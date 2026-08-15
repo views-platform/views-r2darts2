@@ -1,87 +1,122 @@
+"""Factory for sklearn scalers and Darts ``Scaler`` / ``Pipeline`` objects.
+
+This module is pandas-free. It exposes:
+
+    * ``ScalerSelector.get_scaler(name, **kwargs)`` — returns a raw sklearn
+      transformer.
+    * ``ScalerSelector.instantiate_darts_scaler(cfg)`` — returns a Darts
+      ``Scaler`` (single) or ``Pipeline`` (chained), or ``None``.
+
+The legacy ``get_chained_scaler``, ``get_scaler_or_chain``, and ``is_chain_spec``
+helpers have been removed — they were dead code (never called by the production
+path; ``instantiate_darts_scaler`` is the sole entry point).
+
+
+"""
+
+from __future__ import annotations
+
+from functools import partial
+from typing import Any
+
 import numpy as np
 from sklearn.base import BaseEstimator
-from sklearn.preprocessing import StandardScaler
-from typing import Any
-from darts.dataprocessing.transformers import Scaler
 from sklearn.preprocessing import (
-    RobustScaler,
-    MinMaxScaler,
-    MaxAbsScaler,
-    PowerTransformer,
     FunctionTransformer,
+    MaxAbsScaler,
+    MinMaxScaler,
+    PowerTransformer,
     QuantileTransformer,
+    RobustScaler,
+    StandardScaler,
 )
-from functools import partial
+
+from darts.dataprocessing.transformers import Scaler
+from darts.dataprocessing import Pipeline
 
 
-def _log_transform(x):
-    """Log transform function: log(1 + x)"""
+# ----------------------------------------------------------------------
+# Elementwise transform functions (used by FunctionTransformer)
+# ----------------------------------------------------------------------
+
+
+def _log_transform(x: NDArray) -> NDArray:
+    """Elementwise ``log(1 + x)``."""
     return np.log1p(x)
 
 
-def _inverse_log_transform(x):
-    """Inverse log transform function: exp(x) - 1"""
+def _inverse_log_transform(x: NDArray) -> NDArray:
+    """Inverse of :func:`_log_transform`: ``exp(x) - 1``."""
     return np.expm1(x)
 
 
-def _sqrt_transform(x):
-    """Square root transform: sqrt(max(x, 0))"""
+def _sqrt_transform(x: NDArray) -> NDArray:
+    """Elementwise ``sqrt(max(x, 0))``."""
     return np.sqrt(np.maximum(x, 0))
 
 
-def _inverse_sqrt_transform(x):
-    """Inverse square root transform: x^2"""
+def _inverse_sqrt_transform(x: NDArray) -> NDArray:
+    """Inverse of :func:`_sqrt_transform`: ``x**2`` (valid for ``x >= 0``)."""
     return np.square(x)
 
 
-def _asinh_transform(x):
-    """Inverse hyperbolic sine transform."""
+def _asinh_transform(x: NDArray) -> NDArray:
+    """Elementwise ``arcsinh(x)``."""
     return np.arcsinh(x)
 
 
-def _inverse_asinh_transform(x):
-    """Inverse of asinh transform: sinh(x)"""
+def _inverse_asinh_transform(x: NDArray) -> NDArray:
+    """Inverse of :func:`_asinh_transform`: ``sinh(x)``."""
     return np.sinh(x)
 
 
-def _fourthroot_transform(x):
-    """Fourth-root power transform: (1+x)^0.25 - 1.
+def _fourthroot_transform(x: NDArray) -> NDArray:
+    """Elementwise ``(1 + max(x, 0))^0.25 - 1``.
 
     Same compression range as asinh (~[0,10] for [0,10000]) but with a
-    polynomial (quartic) inverse instead of exponential (sinh).
-
-    Comparison at model overshoot of 15 in transformed space:
-        sinh(15)              = 1,634,508  (exponential)
-        (1+15)^4 - 1         = 65,535     (polynomial)
-
-    25x less explosive. For in-range values the behavior is similar:
-        asinh(100)  = 5.3     fourthroot(100) = 2.16
-        asinh(1000) = 7.6     fourthroot(1000) = 4.62
-        asinh(5000) = 9.2     fourthroot(5000) = 7.41
+    polynomial (quartic) inverse instead of exponential (sinh). 25× less
+    explosive than asinh on model overshoot.
     """
     return np.power(1.0 + np.maximum(x, 0.0), 0.25) - 1.0
 
 
-def _inverse_fourthroot_transform(x):
-    """Inverse fourth-root: (1+x)^4 - 1. Polynomial, not exponential."""
+def _inverse_fourthroot_transform(x: NDArray) -> NDArray:
+    """Inverse of :func:`_fourthroot_transform`: ``(1 + max(x, 0))^4 - 1``."""
     return np.power(1.0 + np.maximum(x, 0.0), 4.0) - 1.0
 
 
+# ----------------------------------------------------------------------
+# ScalerSelector
+# ----------------------------------------------------------------------
+
+
 class ScalerSelector:
-    """
-    Factory for selecting and instantiating data scalers.
-    """
+    """Factory for selecting and instantiating data scalers."""
+
+    # ------------------------------------------------------------------
+    # sklearn-level factory
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def get_scaler(scaler_name: str, **kwargs) -> BaseEstimator:
-        """
-        Returns a scaler instance based on the provided scaler name.
+    def get_scaler(scaler_name: str, **kwargs: Any) -> BaseEstimator:
+        """Return an sklearn scaler instance by name.
+
+        Args:
+            scaler_name: Name of the scaler. See ``_SCALERS`` below for the
+                supported vocabulary.
+            **kwargs: Forwarded to the scaler constructor.
+
+        Raises:
+            ValueError: ``scaler_name`` is not in the vocabulary.
         """
         scalers = {
             "StandardScaler": StandardScaler,
             "RobustScaler": RobustScaler,
             "MinMaxScaler": MinMaxScaler,
             "MaxAbsScaler": MaxAbsScaler,
-            "PassThrough": partial(FunctionTransformer, func=None, inverse_func=None, validate=False),
+            "PassThrough": partial(
+                FunctionTransformer, func=None, inverse_func=None, validate=False
+            ),
             "YeoJohnsonTransform": partial(PowerTransformer, method="yeo-johnson"),
             "LogTransform": partial(
                 FunctionTransformer,
@@ -123,68 +158,39 @@ class ScalerSelector:
 
         if scaler_name not in scalers:
             raise ValueError(
-                f"Scaler '{scaler_name}' is not recognized. Available scalers: {list(scalers.keys())}"
+                f"Scaler '{scaler_name}' is not recognized. "
+                f"Available scalers: {list(scalers.keys())}"
             )
-
         return scalers[scaler_name](**kwargs)
 
-    @staticmethod
-    def get_chained_scaler(scaler_chain: str) -> Any:
-        """
-        Create a Darts Pipeline from a chain specification string.
-        """
-        from darts.dataprocessing import Pipeline
-
-        scaler_names = [s.strip() for s in scaler_chain.split("->")]
-        if len(scaler_names) < 2:
-            raise ValueError(
-                f"Chain specification '{scaler_chain}' must contain at least 2 scalers."
-            )
-
-        darts_scalers = [
-            Scaler(ScalerSelector.get_scaler(name), global_fit=True)
-            for name in scaler_names
-        ]
-        return Pipeline(darts_scalers)
+    # ------------------------------------------------------------------
+    # Darts-level factory
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def is_chain_spec(scaler_name: str) -> bool:
-        """Check if a scaler name is a chain specification."""
-        return "->" in scaler_name
-
-    @staticmethod
-    def get_scaler_or_chain(scaler_spec: str, **kwargs) -> Any:
-        """
-        Get either a single sklearn scaler or a Darts Pipeline.
-        """
-        if ScalerSelector.is_chain_spec(scaler_spec):
-            return ScalerSelector.get_chained_scaler(scaler_spec)
-        return ScalerSelector.get_scaler(scaler_spec, **kwargs)
-
-    @staticmethod
-    def instantiate_darts_scaler(scaler_cfg):
-        """
-        Instantiate a Darts Scaler or Pipeline from a flexible config format.
+    def instantiate_darts_scaler(scaler_cfg: Any) -> Scaler | Pipeline | None:
+        """Instantiate a Darts ``Scaler`` or ``Pipeline`` from a flexible config.
 
         All four chain-spec forms below produce structurally identical objects:
-          - "A->B"                — string with arrow
-          - ["A", "B"]            — list
-          - {"chain": "A->B"}     — dict with string chain
-          - {"chain": ["A", "B"]} — dict with list chain
-        Single-element forms (`"A"`, `["A"]`, `{"chain": ["A"]}`) all return a
-        bare `Scaler`, not a one-element `Pipeline`. Empty lists / empty chain
-        strings raise `ValueError` instead of silently producing empty Pipelines.
+            - ``"A->B"``               — string with arrow
+            - ``["A", "B"]``           — list
+            - ``{"chain": "A->B"}``    — dict with string chain
+            - ``{"chain": ["A", "B"]}``— dict with list chain
 
-        Accepts:
-          - None → returns None
-          - String: 'StandardScaler' or 'AsinhTransform->StandardScaler' (chained)
-          - List: ['AsinhTransform', 'StandardScaler'] (chained)
-          - Dict: {'name': <str>, 'kwargs': <dict>}
-          - Dict with chain: {'chain': ['AsinhTransform', 'StandardScaler']}
-            or {'chain': 'AsinhTransform->StandardScaler'}
+        Single-element forms (``"A"``, ``["A"]``, ``{"chain": ["A"]}``) all
+        return a bare ``Scaler``, not a one-element ``Pipeline``. Empty lists
+        and empty chain strings raise ``ValueError``.
+
+        Args:
+            scaler_cfg: ``None``, ``str``, ``list[str]``, or ``dict`` with a
+                ``"chain"`` or ``"name"`` key.
 
         Returns:
-          Darts Scaler (single) or Pipeline (chained) or None.
+            A Darts :class:`Scaler`, :class:`Pipeline`, or ``None``.
+
+        Raises:
+            TypeError: ``scaler_cfg`` is not a supported type.
+            ValueError: A chain list is empty or contains a non-string element.
         """
         if scaler_cfg is None:
             return None
@@ -209,7 +215,8 @@ class ScalerSelector:
                 if isinstance(chain_list, list):
                     return ScalerSelector._build_chain_or_single(chain_list)
                 raise TypeError(
-                    f"'chain' must be a string or list, got {type(chain_list).__name__}"
+                    f"'chain' must be a string or list, "
+                    f"got {type(chain_list).__name__}"
                 )
             name = scaler_cfg.get("name")
             kwargs = scaler_cfg.get("kwargs", {})
@@ -221,30 +228,29 @@ class ScalerSelector:
                 return ScalerSelector._build_chain_or_single(
                     [s.strip() for s in name.split("->")]
                 )
-            return Scaler(ScalerSelector.get_scaler(name, **kwargs), global_fit=True)
+            return Scaler(
+                ScalerSelector.get_scaler(name, **kwargs), global_fit=True
+            )
 
         raise TypeError(
-            f"Scaler config must be None, str, list, or dict. Got {type(scaler_cfg).__name__}."
+            f"Scaler config must be None, str, list, or dict. "
+            f"Got {type(scaler_cfg).__name__}."
         )
 
     @staticmethod
-    def _build_chain_or_single(scaler_names: list):
+    def _build_chain_or_single(scaler_names: list[str]) -> Scaler | Pipeline:
+        """Sole chain-construction helper.
+
+        Single-element chains return a bare ``Scaler`` to match the legacy
+        single-scaler path; multi-element chains return a Darts ``Pipeline``.
+
+        Args:
+            scaler_names: Non-empty list of scaler name strings.
+
+        Raises:
+            ValueError: The list is empty.
+            TypeError: An element is not a non-empty string.
         """
-        Sole chain-construction helper used by `instantiate_darts_scaler`.
-
-        Collapses the previously-divergent list / dict-chain-list / dict-chain-str
-        code paths (flagged by Copilot on PR #10 and tracked as C-03) into a
-        single definition. All chain specs — regardless of input form — go
-        through here, so adding a new scaler step or changing chain semantics
-        only requires one edit.
-
-        Single-element chains return a bare `Scaler` to match the legacy
-        single-scaler path; multi-element chains return a `darts.Pipeline`.
-        Empty lists and non-string elements raise instead of silently producing
-        malformed pipelines.
-        """
-        from darts.dataprocessing import Pipeline
-
         if not isinstance(scaler_names, list) or len(scaler_names) == 0:
             raise ValueError(
                 "Scaler chain must be a non-empty list of scaler name strings."
@@ -255,7 +261,9 @@ class ScalerSelector:
                 f"got {scaler_names!r}."
             )
         if len(scaler_names) == 1:
-            return Scaler(ScalerSelector.get_scaler(scaler_names[0]), global_fit=True)
+            return Scaler(
+                ScalerSelector.get_scaler(scaler_names[0]), global_fit=True
+            )
         darts_scalers = [
             Scaler(ScalerSelector.get_scaler(name), global_fit=True)
             for name in scaler_names

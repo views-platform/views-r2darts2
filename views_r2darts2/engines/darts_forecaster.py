@@ -42,6 +42,19 @@ from views_r2darts2.transformers.frame_builder import (
 logger = logging.getLogger(__name__)
 
 
+class _FramesWithCleanup(dict):
+    """A dict subclass that carries a ``_frames_dir`` for cleanup.
+
+    ``_predict_streaming`` returns this instead of a plain dict so the
+    manager can find and clean up the memmap temp dir after converting
+    the frames to a DataFrame.
+    """
+
+    def __init__(self, frames: dict, frames_dir: Path) -> None:
+        super().__init__(frames)
+        self._frames_dir = frames_dir
+
+
 class DartsForecaster:
     """Slim orchestration layer: model + partition + dataset.
 
@@ -338,7 +351,7 @@ class DartsForecaster:
         icl = self.model.input_chunk_length
 
         # In forecasting mode, the test partition's first month (test_start)
-        # may be the month after the last observed month — i.e. test_start - 1
+        # may be the month AFTER the last observed month — i.e. test_start - 1
         # is not in the dataset. The partition convention from
         # views_pipeline_core sets train_end = test_start - 1, but the actual
         # data may end one month earlier (train_end - 1). When this happens,
@@ -433,7 +446,7 @@ class DartsForecaster:
 
         target_names = list(self.dataset.targets)
         n_entities = len(target_series)
-        # Entity batch size = half the torch batch size (when available),
+        # Entity batch size = torch batch size (when available),
         # falling back to STREAMING_ENTITY_BATCH.
         if batch_size is not None and batch_size > 1:
             entity_batch_size = max(1, batch_size)
@@ -451,6 +464,11 @@ class DartsForecaster:
         )
 
         # Create the builder scaffold (disk-backed Zarr, metadata only).
+        # Use the config's scratch_dir if set, else default to /tmp.
+        # Use larger chunks aligned to the entity batch size to reduce
+        # file count (prevents inode exhaustion on large grids).
+        scratch_dir = predict_kwargs.get("scratch_dir")
+        chunks = (output_length, max(1, entity_batch_size), int(num_samples))
         with ViewsDataset.builder(
             loa=loa,
             times=pred_time_ids,
@@ -458,6 +476,8 @@ class DartsForecaster:
             variables=pred_vars,
             sample_size=int(num_samples),
             targets=pred_vars.keys(),
+            base_dir=scratch_dir,
+            chunks=chunks,
         ) as b:
             # Run predict_from_dataset in entity batches.
             for start in range(0, n_entities, entity_batch_size):
@@ -557,13 +577,22 @@ class DartsForecaster:
         # — never the full (n_entities, n_time, n_samples) grid.
         import tempfile
 
-        frames_dir = Path(tempfile.mkdtemp(prefix="pred_frames_"))
+        # Use the config's scratch_dir if set, else default to /tmp.
+        scratch_dir = predict_kwargs.get("scratch_dir")
+        frames_dir = Path(tempfile.mkdtemp(
+            prefix="pred_frames_",
+            dir=scratch_dir,
+        ))
         frames = build_prediction_frames_from_dataset(
             ds,
             target_names,
             frames_dir,
             entity_block=max(1, entity_batch_size),
         )
+        # Tag the dict with the temp dir so the manager can clean it up
+        # after converting to a DataFrame. We use a wrapper class since
+        # plain dicts don't allow attribute assignment.
+        frames = _FramesWithCleanup(frames, frames_dir)
         ds.close()
         return frames
 
@@ -592,10 +621,10 @@ class DartsForecaster:
             * ``pred_starts``: list of prediction start times (one per entity)
         """
         # Extract predict kwargs.
-        num_samples = predict_kwargs.pop("num_samples", 1)
-        mc_dropout = predict_kwargs.pop("mc_dropout", False)
-        batch_size = predict_kwargs.pop("batch_size", None)
-        verbose = predict_kwargs.pop("verbose", True)
+        num_samples = predict_kwargs.get("num_samples")
+        mc_dropout = predict_kwargs.get("mc_dropout")
+        batch_size = predict_kwargs.get("batch_size")
+        verbose = predict_kwargs.get("verbose", True)
         # Any remaining kwargs are ignored (Darts doesn't accept them).
 
         # Build the inference dataset from the TimeSeries list.

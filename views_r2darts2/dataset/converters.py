@@ -394,6 +394,7 @@ class GridWriter:
         sample_size: int,
         specs: dict[str, str],
         attrs: dict[str, Any],
+        chunks: tuple[int, ...] | None = None,
     ) -> None:
         self.times = times
         self.entities = entities
@@ -404,13 +405,15 @@ class GridWriter:
         for name, spec in specs.items():
             if spec == "num3":
                 shape, dims = (t, e, s), (time_id, entity_id, "sample")
-                chunks = (min(t, 256), min(e, 256), s)
+                default_chunks = (min(t, 256), min(e, 256), s)
             else:
                 shape, dims = (t, e), (time_id, entity_id)
-                chunks = (min(t, 256), min(e, 256))
+                default_chunks = (min(t, 256), min(e, 256))
+            # Use the caller's chunk override if provided, else default.
+            chunk_spec = chunks if chunks is not None else default_chunks
             skeleton_vars[name] = (
                 dims,
-                da.full(shape, np.nan, dtype=_FLOAT, chunks=chunks),
+                da.full(shape, np.nan, dtype=_FLOAT, chunks=chunk_spec),
             )
         skeleton = assemble_dataset(
             times, entities, sample_size, {}, {}, time_id, entity_id, attrs

@@ -134,13 +134,26 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
         """Return the configured prediction output format."""
         return self.configs.get("prediction_format", "dataframe")
 
-    def _predictions_to_dataframe(self, predictions: dict) -> Any:
-        """Convert ``dict[str, PredictionFrame]`` → pandas DataFrame."""
+    def _predictions_to_dataframe(self, predictions: Any) -> Any:
+        """Convert predictions to a pandas DataFrame.
+
+        Handles two return types:
+        * ``dict[str, PredictionFrame]`` — the legacy path (small forecasts).
+        * ``_FramesWithCleanup`` (dict subclass with memmap-backed values) —
+          the streaming path. After conversion, the memmap temp dir is
+          cleaned up to free disk space.
+        """
         time_id = self.configs.get("time_id", "month_id")
         entity_id = self.configs.get("entity_id", "country_id")
-        return prediction_frames_to_dataframe(
+        df = prediction_frames_to_dataframe(
             predictions=predictions, time_id=time_id, entity_id=entity_id,
         )
+        # Clean up the memmap temp dir if the predictions carry one.
+        frames_dir = getattr(predictions, "_frames_dir", None)
+        if frames_dir is not None:
+            import shutil
+            shutil.rmtree(str(frames_dir), ignore_errors=True)
+        return df
 
     @staticmethod
     def _transpose_predictions(
@@ -292,13 +305,29 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
             active_config.get("parallel_workers", 1)
             if forecaster.device == "cpu" else 1
         )
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(predict_sequence, s): s for s in range(total_seq)}
-            results: list = [None] * total_seq
-            for future in concurrent.futures.as_completed(futures):
-                seq_num = futures[future]
-                results[seq_num] = future.result()
-                logger.info("Completed %d/%d", seq_num + 1, total_seq)
+        # Process sequences in chunks of max_workers. Each prediction
+        # returns a _FramesWithCleanup (dict subclass of PredictionFrames
+        # with memmap-backed values). The frames stay as PredictionFrames —
+        # no DataFrame conversion here. The memmap temp dirs persist until
+        # _format_eval_predictions / _predictions_to_dataframe is called
+        # (which cleans them up after conversion).
+        results: list = [None] * total_seq
+        if max_workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for chunk_start in range(0, total_seq, max_workers):
+                    chunk_end = min(chunk_start + max_workers, total_seq)
+                    futures = {
+                        executor.submit(predict_sequence, s): s
+                        for s in range(chunk_start, chunk_end)
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        seq_num = futures[future]
+                        results[seq_num] = future.result()
+                        logger.info("Completed %d/%d", seq_num + 1, total_seq)
+        else:
+            for s in range(total_seq):
+                results[s] = predict_sequence(s)
+                logger.info("Completed %d/%d", s + 1, total_seq)
 
         return self._format_eval_predictions(results)
 

@@ -164,6 +164,8 @@ class DatasetBuilder:
         path: str | Path | None = None,
         strict: bool = False,
         track_coverage: bool = False,
+        base_dir: str | Path | None = None,
+        chunks: tuple[int, ...] | None = None,
     ) -> None:
         code = (loa or "").strip().lower()
         if code in ("pg", "c"):
@@ -214,9 +216,10 @@ class DatasetBuilder:
         )
 
         # The ZarrStore owns lifecycle. With ``path=None`` the scaffold lives
-        # in its scratch dir; with an absolute ``path`` the scratch dir stays
-        # empty and closing it never touches the durable store.
-        self._store = ZarrStore(prefix="views_builder_")
+        # in its scratch dir (optionally under ``base_dir`` for a persistent
+        # volume); with an absolute ``path`` the scratch dir stays empty and
+        # closing it never touches the durable store.
+        self._store = ZarrStore(prefix="views_builder_", base_dir=base_dir)
         self._path = (
             Path(path) if path is not None
             else self._store.path / "dataset.zarr"
@@ -230,6 +233,7 @@ class DatasetBuilder:
             self._sample_size,
             self._specs,
             attrs,
+            chunks=chunks,
         )
         self._strict = bool(strict)
         self._written: np.ndarray | None = (

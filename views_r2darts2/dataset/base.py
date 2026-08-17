@@ -780,6 +780,8 @@ class ViewsDataset:
         path: str | Path | None = None,
         strict: bool = False,
         track_coverage: bool = False,
+        base_dir: str | Path | None = None,
+        chunks: tuple[int, ...] | None = None,
     ) -> "DatasetBuilder":  # type: ignore[name-defined]
         """Scaffold a dataset from scratch and stream batches into it.
 
@@ -806,6 +808,7 @@ class ViewsDataset:
             sample_size=sample_size, targets=targets,
             broadcast_features=broadcast_features, metadata=metadata,
             path=path, strict=strict, track_coverage=track_coverage,
+            base_dir=base_dir, chunks=chunks,
         )
 
     @classmethod

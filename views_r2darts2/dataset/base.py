@@ -1620,7 +1620,14 @@ class ViewsDataset:
         # rather than raising KeyError. Missing time IDs mean no events recorded.
         if time_ids is not None:
             available_times = tensor[self._time_id].values
-            requested = np.array(_as_list(time_ids), dtype=available_times.dtype)
+            # Keep reindex inputs strictly 1D. In true-forecast mode we pass
+            # `range(...)`; if wrapped as a single element, numpy builds a
+            # 2D array (shape (1, N)) and pandas rejects it as an index.
+            if isinstance(time_ids, range):
+                requested_vals = list(time_ids)
+            else:
+                requested_vals = _as_list(time_ids)
+            requested = np.asarray(requested_vals, dtype=available_times.dtype).reshape(-1)
             missing = np.setdiff1d(requested, available_times)
             if len(missing) > 0:
                 n_entities = int(tensor[self._entity_id].shape[0]) if self._entity_id in tensor.dims else "?"

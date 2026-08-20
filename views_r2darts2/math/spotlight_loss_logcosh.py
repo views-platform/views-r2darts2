@@ -5,7 +5,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 class SpotlightLossLogcosh(torch.nn.Module):
     """
     """
@@ -53,15 +52,16 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean.detach()
 
-        # Gate the e_shape gradient so dead cells (gate≈0) get ~50× less
-        # Shape gradient. Stops Shape from pushing dead cells UP.
-        e_shape = gate * e_shape + (1.0 - gate) * e_shape.detach()
-
-        shape_cell = self._log_cosh(e_shape)
+        # Shape gradient only through true-event cells; false positives get no shape pull
+        shape_cell = self._log_cosh(y_true_mask * e_shape + (1.0 - y_true_mask) * e_shape.detach())
 
         # DRO weighting
         event_mask = (abs_max > self.tau).float()
-        raw_abs = e_shape.abs().detach()
+
+        # raw_abs = e_shape.abs().detach()
+        # Ground DRO in absolute error: upweights the most-wrong cells regardless of
+        # sign, so severely over-predicted event cells get amplified downward push.
+        raw_abs = e.abs().detach()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
         w_dro = torch.sqrt(raw_abs / dro_mu.clamp_min(1e-6))
@@ -86,14 +86,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         # gap = y_pred_for_gap.mean(dim=1) - y_true.mean(dim=1)
 
         n_ev_safe = y_true_mask.sum(dim=1).clamp_min(1.0)
-        # Event-only gap with fallback to global gap for dead-only series.
-        # For series WITH events: gap = mean(event_pred) - mean(event_true) — clean.
-        # For series WITHOUT events: gap = y_pred.mean() - y_true.mean() — prevents
-        #   Level from providing zero gradient.
-        gap_event = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
-        gap_global = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        has_events = (y_true_mask.sum(dim=1) > 0.5).float()
-        gap = has_events * gap_event + (1.0 - has_events) * gap_global
+        gap = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
 
         # Series-level: amplify gap for sparse-event series
         # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
@@ -104,12 +97,8 @@ class SpotlightLossLogcosh(torch.nn.Module):
         level_cell = self._log_cosh(gap)
 
         # Batch-level: weight by signal strength, gated by has_gated
-        # FIX: Use event_mask instead of gate for has_gated. The old gate-based has_gated
-        # zeroed out dead-only series (gate≈0), defeating the gap fallback above.
-        # event_mask includes false alarms (y_pred > tau), so any series where the model
-        # is predicting something gets a non-zero Level weight.
         event_frac = event_mask.mean().clamp_min(self._EPS)
-        has_gated = (event_mask.sum(dim=1) > self._EPS).float()
+        has_gated = (gate.sum(dim=1) > self._EPS).float()
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
 
         if multivariate:
@@ -117,28 +106,13 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
-        # ── Dead-cell anchor — per-cell adaptive, T-scaled ───────────────
-        #
-        # Old aggregate form:  log_cosh( sum_t dead_pred_t )
-        #   → gradient wrt cell_i = tanh(dead_sum), which saturates at 1.0
-        #     once dead_sum > ~2 (i.e. avg cell pred > 0.06). Past that
-        #     threshold the per-cell push is CONSTANT regardless of severity,
-        #     so the anchor cannot scale up to fight Level's indirect push
-        #     through shared weights.
-        #
-        # New per-cell form:  T * sum_t log_cosh( dead_pred_t )
-        #   → gradient wrt cell_i = T * tanh(dead_pred_i)
-        #     - Adaptive per cell: cells at 0.1 get push 3.6, cells at 1.0
-        #       get push 27, cells at 5.0 get push 36 (saturated cap).
-        #     - T multiplier puts anchor at Level's scale (Level = T*gap),
-        #       so it can actually compete with the Level→shared-weights→
-        #       dead-cell inflation path that dominates dense-MLP models
-        #       at high batch size.
-        #     - T is reused from B,T = y_pred.shape[:2]; not a new HP.
+        # ── Dead-cell anchor at Shape scale ─────────────────
+        # Pushes dead cells toward 0, eliminating gap contamination source.
+        # Uses y_true_mask inverse (true dead + false alarms).
+        # Sum-based: tanh saturates → bounded strong gradient without T.
         dead_mask = 1.0 - y_true_mask
-        dead_cells = dead_mask * y_pred                       # (B, T)
-        per_cell_lc = self._log_cosh(dead_cells)              # (B, T) adaptive
-        anchor_cell = T * per_cell_lc.sum(dim=1)              # (B,)   T-scaled
+        dead_sum = (dead_mask * y_pred).sum(dim=1)
+        anchor_cell = self._log_cosh(dead_sum)
 
         if multivariate:
             loss_anchor = (w_level * anchor_cell).sum(dim=0) / w_level.sum(dim=0).clamp_min(self._EPS)
@@ -169,18 +143,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
             _w_dro_cpu      = w_dro.cpu()
             _gate_cpu       = gate.cpu()
             _e_shape_cpu    = e_shape.cpu()
-            # FIX: Telemetry gap now matches actual Level gap (event-only with fallback).
-            _gap_cpu        = gap.detach().cpu()
+            _gap_cpu        = (y_pred.mean(dim=1) - y_true.mean(dim=1)).cpu()
             # _density_scale_cpu = density_scale.cpu()
             # _gap_scaled_cpu = (_gap_cpu * _density_scale_cpu).abs()
             _w_level_cpu    = w_level.cpu()
             _has_gated_cpu  = has_gated.cpu()
-            # V68: track per-cell dead-pred stats (replaces aggregate dead_sum)
-            _dead_cells_cpu = dead_cells.detach().cpu()
-            _dead_sum_cpu   = _dead_cells_cpu.sum(dim=1)                # legacy field kept for parity
-            _dead_mean_cpu  = _dead_cells_cpu.mean(dim=1)               # per-sample mean dead pred
-            _dead_max_cpu   = _dead_cells_cpu.amax(dim=1)               # per-sample worst dead cell
-            _dead_frac_pos_cpu = (_dead_cells_cpu > 0).float().mean(dim=1)  # fraction of dead cells with positive pred
+            _dead_sum_cpu   = dead_sum.cpu()
 
             # Gradient direction diagnostics (event vs non-event)
             grad = self._last_input_grad
@@ -225,9 +193,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 w_level_mean_l       = self._tolist(_w_level_cpu.mean(dim=0))
                 batch_active_frac_l  = self._tolist(_has_gated_cpu.mean(dim=0))
                 dead_sum_mean_l      = self._tolist(_dead_sum_cpu.mean(dim=0))
-                dead_mean_l         = self._tolist(_dead_mean_cpu.mean(dim=0))
-                dead_max_l           = self._tolist(_dead_max_cpu.mean(dim=0))
-                dead_frac_pos_l      = self._tolist(_dead_frac_pos_cpu.mean(dim=0))
             else:
                 _n_ev = _event_mask_cpu.sum().clamp_min(1.0)
                 _w_ev = _w_dro_cpu * _event_mask_cpu
@@ -255,9 +220,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 w_level_mean_l       = [_w_level_cpu.mean().item()]
                 batch_active_frac_l  = [_has_gated_cpu.mean().item()]
                 dead_sum_mean_l      = [_dead_sum_cpu.mean().item()]
-                dead_mean_l         = [_dead_mean_cpu.mean().item()]
-                dead_max_l           = [_dead_max_cpu.mean().item()]
-                dead_frac_pos_l      = [_dead_frac_pos_cpu.mean().item()]
 
         if torch.isnan(total_loss):
             raise RuntimeError(f"NaN in SpotlightLossLogcosh: per_channel={comp}")
@@ -291,9 +253,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "w_level_mean": w_level_mean_l,
             "batch_active_frac": batch_active_frac_l,
             "dead_sum_mean": dead_sum_mean_l,
-            "dead_mean":       dead_mean_l,
-            "dead_max":         dead_max_l,
-            "dead_frac_pos":    dead_frac_pos_l,
         }
 
         logger.debug(

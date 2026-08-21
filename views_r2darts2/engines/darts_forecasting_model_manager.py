@@ -186,15 +186,59 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
     # ------------------------------------------------------------------ factory
 
+    def _infer_cache_source_label(self) -> str:
+        """Infer cache source label used by dataloaders file naming."""
+        queryset = self._model_path.get_queryset()
+        if isinstance(queryset, dict):
+            source = str(queryset.get("source", "")).strip().lower()
+            if source == "views-datafactory":
+                return "datafactory"
+            if source == "synthetic":
+                return "synthetic"
+            if source == "viewser":
+                return "viewser"
+        return "viewser"
+
+    def _resolve_raw_parquet_path(self, run_type: str) -> Path:
+        """Resolve raw parquet path across source-aware cache spellings."""
+        path_raw = Path(self._model_path.data_raw)
+        preferred = self._infer_cache_source_label()
+
+        candidate_labels = [preferred, "viewser", "datafactory", "synthetic"]
+        seen: set[str] = set()
+        candidates: list[Path] = []
+        for label in candidate_labels:
+            if label in seen:
+                continue
+            seen.add(label)
+            candidates.append(path_raw / f"{run_type}_{label}_df.parquet")
+
+        for candidate in candidates:
+            if candidate.exists():
+                if candidate.name != f"{run_type}_{preferred}_df.parquet":
+                    logger.warning(
+                        "Raw parquet fallback used: preferred=%s selected=%s",
+                        f"{run_type}_{preferred}_df.parquet",
+                        candidate.name,
+                    )
+                return candidate
+
+        raise FileNotFoundError(
+            "No raw parquet found for run_type='{}' in {}. Tried: {}".format(
+                run_type,
+                path_raw,
+                [p.name for p in candidates],
+            )
+        )
+
     def _build_dataset(self, active_config: Mapping[str, Any]) -> ViewsDataset:
         """Build a :class:`ViewsDataset` from the config's parquet path."""
-        path_raw = self._model_path.data_raw
         run_type = active_config["run_type"]
-        parquet_path = Path(path_raw) / f"{run_type}_viewser_df.parquet"
+        parquet_path = self._resolve_raw_parquet_path(run_type)
         targets = list(active_config.get("targets") or active_config.get("regression_targets") or [])
         level = active_config.get("level", "cm")
         ds = ViewsDataset(parquet_path, targets=targets, broadcast_features=True)
-        logger.info("Dataset loaded: %s (%s)", ds, level)
+        logger.info("Dataset loaded: %s (%s) from %s", ds, level, parquet_path.name)
         return ds
 
     def _build_forecaster(

@@ -8,8 +8,8 @@ add features that the upstream library does not yet expose:
       that bounds the inverse-transform to prevent σ amplification on
       Laplace-likelihood scale parameters.
         * ``_ResidualBlock.forward`` / ``_TCNModule.forward`` (TCN) — add
-            functional LayerNorm to hidden convolution activations and the forecast
-            location window to prevent activation and raw-count forecast blow-up.
+            functional LayerNorm to hidden convolution activations and make the TCN
+            forecast a bounded residual around the recent normalized target level.
     * ``_ResidualBlock.__init__`` + ``_TideModule.forward`` (TiDE) — add
       ``MonteCarloDropout`` to both skip paths so MC dropout produces
       meaningful sample variation.
@@ -551,20 +551,33 @@ def _layer_norm_channels(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return x.transpose(1, 2)
 
 
-def _layer_norm_forecast_location(
-    x: torch.Tensor, output_chunk_length: int, eps: float = 1e-5
+def _recent_target_level(x: torch.Tensor, target_size: int) -> torch.Tensor:
+    """Returns a robust recent normalized target level for horizon anchoring."""
+    target = x[:, :, :target_size]
+    return target.median(dim=1, keepdim=True).values
+
+
+def _anchor_tcn_forecast_location(
+    x: torch.Tensor,
+    input_target: torch.Tensor,
+    output_chunk_length: int,
+    target_size: int,
 ) -> torch.Tensor:
-    """Applies LayerNorm over the forecast window for location parameters only."""
-    if x.ndim != 4 or output_chunk_length <= 1:
+    """Turns the TCN location head into a bounded residual forecast."""
+    if x.ndim != 4 or output_chunk_length <= 0:
         return x
 
-    forecast = x[:, -output_chunk_length:, :, :1]
-    mean = forecast.mean(dim=1, keepdim=True)
-    variance = forecast.var(dim=1, keepdim=True, unbiased=False)
-    normalized_forecast = (forecast - mean) / torch.sqrt(variance + eps)
+    horizon = min(output_chunk_length, x.shape[1])
+    location = x[:, -horizon:, :, :1]
+
+    residual = location - location.median(dim=1, keepdim=True).values
+    residual = torch.tanh(residual)
+
+    level = _recent_target_level(input_target, target_size).unsqueeze(-1)
+    level = level.expand(-1, horizon, -1, 1)
 
     x = x.clone()
-    x[:, -output_chunk_length:, :, :1] = normalized_forecast
+    x[:, -horizon:, :, :1] = level + residual
     return x
 
 
@@ -603,9 +616,10 @@ def _patched_tcn_residual_block_forward(self, x):
 
 
 def _patched_tcn_module_forward(self, x_in):
-    """TCN module forward with forecast-window LayerNorm on location output."""
+    """TCN module forward with a level anchor."""
     x, _, _, _ = x_in
     batch_size = x.size(0)
+    input_target = x[:, :, : self.target_size]
     x = x.transpose(1, 2)
 
     for res_block in self.res_blocks_list:
@@ -615,7 +629,12 @@ def _patched_tcn_module_forward(self, x_in):
     x = x.view(
         batch_size, self.input_chunk_length, self.target_size, self.nr_params
     )
-    x = _layer_norm_forecast_location(x, self.output_chunk_length)
+    x = _anchor_tcn_forecast_location(
+        x,
+        input_target=input_target,
+        output_chunk_length=self.output_chunk_length,
+        target_size=self.target_size,
+    )
 
     return x
 
@@ -636,7 +655,7 @@ def apply_tcn_layernorm_patch():
 
     logger.info(
         "[TCN LayerNorm patch] installed: LayerNorm after conv1, hidden conv2, "
-        "hidden residual additions, and the final forecast location window."
+        "hidden residual additions, and bounded residual forecast anchoring."
     )
 
 

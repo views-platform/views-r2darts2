@@ -7,8 +7,8 @@ add features that the upstream library does not yet expose:
     * ``RINorm.forward`` / ``RINorm.inverse`` — hybrid asinh/raw-space RevIN
       that bounds the inverse-transform to prevent σ amplification on
       Laplace-likelihood scale parameters.
-    * ``_ResidualBlock.forward`` (TCN) — swap ReLU for tanh to bound per-block
-      output to ``[-1, 1]`` and prevent RevIN-denormalization overflow.
+        * ``_ResidualBlock.forward`` (TCN) — add functional LayerNorm to hidden
+            convolution activations and residual states to prevent activation blow-up.
     * ``_ResidualBlock.__init__`` + ``_TideModule.forward`` (TiDE) — add
       ``MonteCarloDropout`` to both skip paths so MC dropout produces
       meaningful sample variation.
@@ -307,81 +307,6 @@ def apply_rinorm_compression_patch():
     )
 
 
-# --- 5. TCN Tanh Activation Patch ---
-#
-# TCN's _ResidualBlock uses hardcoded F.relu (not configurable via any parameter).
-# With 4 residual blocks stacking additively, outputs accumulate to ~20+ in
-# normalized space. RevIN inverse then multiplies by σ_c (up to 458 for
-# extreme-conflict entities), and sinh() explodes to infinity.
-#
-# Fix: replace F.relu with torch.tanh in the forward pass.
-# - Tanh bounds each conv path to [-1, 1]
-# - After 4 blocks with residual: max output ≈ |input| + 4 ≈ 6-7
-# - vs ReLU: |input| + 4*5 ≈ 22 (observed: pred_sanity/max = 23.6)
-#
-# Tanh is appropriate here because:
-# 1. The data is already centered (RevIN forward subtracts μ_asinh)
-# 2. Negative predictions are meaningful (below-mean states)
-# 3. The bounded [-1,1] per-layer prevents accumulation explosion
-# 4. Weight norm ensures gradients don't vanish at saturation
-#
-# Note: the LAST block already skips the second ReLU in the original code
-# (only applies activation to intermediate blocks). We apply tanh uniformly
-# to both positions — the last block's conv2 output passes through tanh too,
-# giving a bounded final output before the residual add.
-
-
-def _patched_tcn_residual_forward(self, x):
-    """TCN _ResidualBlock.forward with Tanh replacing ReLU."""
-    residual = x
-
-    # first step
-    left_padding = (self.dilation_base ** self.nr_blocks_below) * (
-        self.kernel_size - 1
-    )
-    x = F.pad(x, (left_padding, 0))
-    x = self.dropout1(torch.tanh(self.conv1(x)))
-
-    # second step
-    x = F.pad(x, (left_padding, 0))
-    x = self.conv2(x)
-    if self.nr_blocks_below < self.num_layers - 1:
-        x = torch.tanh(x)
-    x = self.dropout2(x)
-
-    # add residual
-    if self.conv1.in_channels != self.conv2.out_channels:
-        residual = self.conv3(residual)
-    x = x + residual
-
-    return x
-
-
-def apply_tcn_tanh_patch():
-    """
-    Patches Darts TCN _ResidualBlock to use Tanh instead of ReLU.
-
-    Bounds each block's conv path output to [-1, 1], preventing the
-    additive residual accumulation from reaching values that overflow
-    when RevIN denormalizes by σ_c (which can be 400+ for extreme entities).
-
-    With 4 blocks: max normalized output ≈ 7 (vs 23+ with ReLU).
-    sinh(7) × σ_c=458 ≈ 251K → asinh(251K) ≈ 12.8 (recoverable)
-    vs sinh(23) × 458 ≈ 4.8 × 10¹² (overflow → infinity).
-    """
-    from darts.models.forecasting.tcn_model import _ResidualBlock
-
-    if getattr(_ResidualBlock.forward, '_tcn_tanh_patched', False):
-        return
-
-    _patched_tcn_residual_forward._tcn_tanh_patched = True
-    _ResidualBlock.forward = _patched_tcn_residual_forward
-    logger.info(
-        "[TCN patch] ✅ Replaced ReLU with Tanh in _ResidualBlock.forward. "
-        "Output per block bounded to [-1, 1] + residual."
-    )
-
-
 # --- 4. TiDE MC Dropout Patch ---
 #
 # TiDE architecture has two deterministic skip paths that dominate the output:
@@ -616,7 +541,67 @@ def _layer_norm_last_dim(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return F.layer_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
 
-# --- 6. N-HiTS LayerNorm Patch ---
+def _layer_norm_channels(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Applies functional LayerNorm over Conv1d channels without new parameters."""
+    if x.ndim != 3 or x.shape[1] <= 1:
+        return x
+    x = x.transpose(1, 2)
+    x = F.layer_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
+    return x.transpose(1, 2)
+
+
+# --- 6. TCN LayerNorm Patch ---
+
+
+def _patched_tcn_residual_block_forward(self, x):
+    """TCN residual block forward with LayerNorm on hidden convolution states."""
+    residual = x
+    is_final_block = self.nr_blocks_below == self.num_layers - 1
+
+    left_padding = (self.dilation_base**self.nr_blocks_below) * (
+        self.kernel_size - 1
+    )
+
+    x = F.pad(x, (left_padding, 0))
+    x = self.conv1(x)
+    x = _layer_norm_channels(x)
+    x = self.dropout1(F.relu(x))
+
+    x = F.pad(x, (left_padding, 0))
+    x = self.conv2(x)
+    if not is_final_block:
+        x = _layer_norm_channels(x)
+        x = F.relu(x)
+    x = self.dropout2(x)
+
+    if self.conv1.in_channels != self.conv2.out_channels:
+        residual = self.conv3(residual)
+    x = x + residual
+
+    if not is_final_block:
+        x = _layer_norm_channels(x)
+
+    return x
+
+
+def apply_tcn_layernorm_patch():
+    """Patches TCN residual blocks with functional LayerNorm on hidden states."""
+    from darts.models.forecasting.tcn_model import _ResidualBlock
+
+    if getattr(_ResidualBlock, "_views_ln_patch", False):
+        logger.debug("[TCN LayerNorm patch] already applied, skipping.")
+        return
+
+    _ResidualBlock.forward = _patched_tcn_residual_block_forward
+    _ResidualBlock._views_ln_patch = True
+
+    logger.info(
+        "[TCN LayerNorm patch] installed: LayerNorm after conv1, hidden conv2, "
+        "and hidden residual additions. Final prediction head remains unnormalized."
+    )
+
+
+# --- 7. N-HiTS LayerNorm Patch ---
 
 
 def _patched_nhits_block_forward(self, x):
@@ -679,7 +664,7 @@ def apply_nhits_layernorm_patch():
     )
 
 
-# --- 7. N-BEATS LayerNorm Patch ---
+# --- 8. N-BEATS LayerNorm Patch ---
 
 
 def _patched_nbeats_block_forward(self, x):
@@ -748,7 +733,7 @@ def apply_nbeats_layernorm_patch():
 def apply_all_patches():
     apply_torch_load_patch()
     apply_rinorm_compression_patch()
-    apply_tcn_tanh_patch()
     apply_tide_mc_dropout_patch()
+    apply_tcn_layernorm_patch()
     apply_nhits_layernorm_patch()
     apply_nbeats_layernorm_patch()

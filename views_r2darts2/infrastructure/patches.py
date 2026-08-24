@@ -7,8 +7,9 @@ add features that the upstream library does not yet expose:
     * ``RINorm.forward`` / ``RINorm.inverse`` — hybrid asinh/raw-space RevIN
       that bounds the inverse-transform to prevent σ amplification on
       Laplace-likelihood scale parameters.
-        * ``_ResidualBlock.forward`` (TCN) — add functional LayerNorm to hidden
-            convolution activations and residual states to prevent activation blow-up.
+        * ``_ResidualBlock.forward`` / ``_TCNModule.forward`` (TCN) — add
+            functional LayerNorm to hidden convolution activations and the forecast
+            location window to prevent activation and raw-count forecast blow-up.
     * ``_ResidualBlock.__init__`` + ``_TideModule.forward`` (TiDE) — add
       ``MonteCarloDropout`` to both skip paths so MC dropout produces
       meaningful sample variation.
@@ -550,6 +551,23 @@ def _layer_norm_channels(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return x.transpose(1, 2)
 
 
+def _layer_norm_forecast_location(
+    x: torch.Tensor, output_chunk_length: int, eps: float = 1e-5
+) -> torch.Tensor:
+    """Applies LayerNorm over the forecast window for location parameters only."""
+    if x.ndim != 4 or output_chunk_length <= 1:
+        return x
+
+    forecast = x[:, -output_chunk_length:, :, :1]
+    mean = forecast.mean(dim=1, keepdim=True)
+    variance = forecast.var(dim=1, keepdim=True, unbiased=False)
+    normalized_forecast = (forecast - mean) / torch.sqrt(variance + eps)
+
+    x = x.clone()
+    x[:, -output_chunk_length:, :, :1] = normalized_forecast
+    return x
+
+
 # --- 6. TCN LayerNorm Patch ---
 
 
@@ -584,20 +602,41 @@ def _patched_tcn_residual_block_forward(self, x):
     return x
 
 
-def apply_tcn_layernorm_patch():
-    """Patches TCN residual blocks with functional LayerNorm on hidden states."""
-    from darts.models.forecasting.tcn_model import _ResidualBlock
+def _patched_tcn_module_forward(self, x_in):
+    """TCN module forward with forecast-window LayerNorm on location output."""
+    x, _, _, _ = x_in
+    batch_size = x.size(0)
+    x = x.transpose(1, 2)
 
-    if getattr(_ResidualBlock, "_views_ln_patch", False):
+    for res_block in self.res_blocks_list:
+        x = res_block(x)
+
+    x = x.transpose(1, 2)
+    x = x.view(
+        batch_size, self.input_chunk_length, self.target_size, self.nr_params
+    )
+    x = _layer_norm_forecast_location(x, self.output_chunk_length)
+
+    return x
+
+
+def apply_tcn_layernorm_patch():
+    """Patches TCN residual blocks and forecast outputs with functional LayerNorm."""
+    from darts.models.forecasting.pl_forecasting_module import io_processor
+    from darts.models.forecasting.tcn_model import _ResidualBlock, _TCNModule
+
+    if getattr(_TCNModule, "_views_ln_patch", False):
         logger.debug("[TCN LayerNorm patch] already applied, skipping.")
         return
 
     _ResidualBlock.forward = _patched_tcn_residual_block_forward
+    _TCNModule.forward = io_processor(_patched_tcn_module_forward)
     _ResidualBlock._views_ln_patch = True
+    _TCNModule._views_ln_patch = True
 
     logger.info(
         "[TCN LayerNorm patch] installed: LayerNorm after conv1, hidden conv2, "
-        "and hidden residual additions. Final prediction head remains unnormalized."
+        "hidden residual additions, and the final forecast location window."
     )
 
 

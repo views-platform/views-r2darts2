@@ -7,8 +7,9 @@ add features that the upstream library does not yet expose:
     * ``RINorm.forward`` / ``RINorm.inverse`` — hybrid asinh/raw-space RevIN
       that bounds the inverse-transform to prevent σ amplification on
       Laplace-likelihood scale parameters.
-        * ``_ResidualBlock.forward`` (TCN) — add functional LayerNorm to hidden
-            convolution activations and residual states to prevent positive drift.
+        * ``_ResidualBlock.__init__`` / ``_ResidualBlock.forward`` (TCN) — remove
+            convolution biases and add zero-centered activations plus LayerNorm to
+            prevent positive residual drift.
     * ``_ResidualBlock.__init__`` + ``_TideModule.forward`` (TiDE) — add
       ``MonteCarloDropout`` to both skip paths so MC dropout produces
       meaningful sample variation.
@@ -553,8 +554,58 @@ def _layer_norm_channels(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
 # --- 6. TCN LayerNorm Patch ---
 
 
+def _patched_tcn_residual_block_init(
+    self,
+    num_filters: int,
+    kernel_size: int,
+    dilation_base: int,
+    dropout: float,
+    weight_norm: bool,
+    nr_blocks_below: int,
+    num_layers: int,
+    input_size: int,
+    target_size: int,
+):
+    """TCN residual block init with bias-free convolutions."""
+    nn.Module.__init__(self)
+
+    self.dilation_base = dilation_base
+    self.kernel_size = kernel_size
+    self.dropout1 = MonteCarloDropout(dropout)
+    self.dropout2 = MonteCarloDropout(dropout)
+    self.num_layers = num_layers
+    self.nr_blocks_below = nr_blocks_below
+
+    input_dim = input_size if nr_blocks_below == 0 else num_filters
+    output_dim = target_size if nr_blocks_below == num_layers - 1 else num_filters
+    dilation = dilation_base**nr_blocks_below
+
+    self.conv1 = nn.Conv1d(
+        input_dim,
+        num_filters,
+        kernel_size,
+        dilation=dilation,
+        bias=False,
+    )
+    self.conv2 = nn.Conv1d(
+        num_filters,
+        output_dim,
+        kernel_size,
+        dilation=dilation,
+        bias=False,
+    )
+    if weight_norm:
+        self.conv1, self.conv2 = (
+            nn.utils.parametrizations.weight_norm(self.conv1),
+            nn.utils.parametrizations.weight_norm(self.conv2),
+        )
+
+    if input_dim != output_dim:
+        self.conv3 = nn.Conv1d(input_dim, output_dim, 1, bias=False)
+
+
 def _patched_tcn_residual_block_forward(self, x):
-    """TCN residual block forward with channel-wise LayerNorm."""
+    """TCN residual block forward with zero-centered activations and LayerNorm."""
     residual = x
     is_final_block = self.nr_blocks_below == self.num_layers - 1
 
@@ -565,13 +616,13 @@ def _patched_tcn_residual_block_forward(self, x):
     x = F.pad(x, (left_padding, 0))
     x = self.conv1(x)
     x = _layer_norm_channels(x)
-    x = self.dropout1(F.relu(x))
+    x = self.dropout1(torch.tanh(x))
 
     x = F.pad(x, (left_padding, 0))
     x = self.conv2(x)
     x = _layer_norm_channels(x)
     if not is_final_block:
-        x = F.relu(x)
+        x = torch.tanh(x)
     x = self.dropout2(x)
 
     if self.conv1.in_channels != self.conv2.out_channels:
@@ -585,19 +636,20 @@ def _patched_tcn_residual_block_forward(self, x):
 
 
 def apply_tcn_layernorm_patch():
-    """Patches TCN residual blocks with channel-wise LayerNorm."""
+    """Patches TCN residual blocks to prevent positive residual drift."""
     from darts.models.forecasting.tcn_model import _ResidualBlock
 
     if getattr(_ResidualBlock, "_views_ln_patch", False):
         logger.debug("[TCN LayerNorm patch] already applied, skipping.")
         return
 
+    _ResidualBlock.__init__ = _patched_tcn_residual_block_init
     _ResidualBlock.forward = _patched_tcn_residual_block_forward
     _ResidualBlock._views_ln_patch = True
 
     logger.info(
-        "[TCN LayerNorm patch] installed: Channel-wise LayerNorm "
-        "(pre-activation and post-residual)."
+        "[TCN LayerNorm patch] installed: bias-free convolutions, "
+        "zero-centered tanh activations, and residual LayerNorm."
     )
 
 

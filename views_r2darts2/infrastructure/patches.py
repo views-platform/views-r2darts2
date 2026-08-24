@@ -7,9 +7,8 @@ add features that the upstream library does not yet expose:
     * ``RINorm.forward`` / ``RINorm.inverse`` — hybrid asinh/raw-space RevIN
       that bounds the inverse-transform to prevent σ amplification on
       Laplace-likelihood scale parameters.
-        * ``_ResidualBlock.forward`` / ``_TCNModule.forward`` (TCN) — add
-            functional LayerNorm to hidden convolution activations and make the TCN
-            forecast a bounded residual around the recent normalized target level.
+        * ``_ResidualBlock.forward`` (TCN) — add functional LayerNorm to hidden
+            convolution activations and residual states to prevent positive drift.
     * ``_ResidualBlock.__init__`` + ``_TideModule.forward`` (TiDE) — add
       ``MonteCarloDropout`` to both skip paths so MC dropout produces
       meaningful sample variation.
@@ -551,41 +550,11 @@ def _layer_norm_channels(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     return x.transpose(1, 2)
 
 
-def _recent_target_level(x: torch.Tensor, target_size: int) -> torch.Tensor:
-    """Returns a robust recent normalized target level for horizon anchoring."""
-    target = x[:, :, :target_size]
-    return target.median(dim=1, keepdim=True).values
-
-
-def _anchor_tcn_forecast_location(
-    x: torch.Tensor,
-    input_target: torch.Tensor,
-    output_chunk_length: int,
-    target_size: int,
-) -> torch.Tensor:
-    """Turns the TCN location head into a bounded residual forecast."""
-    if x.ndim != 4 or output_chunk_length <= 0:
-        return x
-
-    horizon = min(output_chunk_length, x.shape[1])
-    location = x[:, -horizon:, :, :1]
-
-    residual = location - location.median(dim=1, keepdim=True).values
-    residual = torch.tanh(residual)
-
-    level = _recent_target_level(input_target, target_size).unsqueeze(-1)
-    level = level.expand(-1, horizon, -1, 1)
-
-    x = x.clone()
-    x[:, -horizon:, :, :1] = level + residual
-    return x
-
-
 # --- 6. TCN LayerNorm Patch ---
 
 
 def _patched_tcn_residual_block_forward(self, x):
-    """TCN residual block forward with LayerNorm on hidden convolution states."""
+    """TCN residual block forward with channel-wise LayerNorm."""
     residual = x
     is_final_block = self.nr_blocks_below == self.num_layers - 1
 
@@ -600,8 +569,8 @@ def _patched_tcn_residual_block_forward(self, x):
 
     x = F.pad(x, (left_padding, 0))
     x = self.conv2(x)
+    x = _layer_norm_channels(x)
     if not is_final_block:
-        x = _layer_norm_channels(x)
         x = F.relu(x)
     x = self.dropout2(x)
 
@@ -615,47 +584,20 @@ def _patched_tcn_residual_block_forward(self, x):
     return x
 
 
-def _patched_tcn_module_forward(self, x_in):
-    """TCN module forward with a level anchor."""
-    x, _, _, _ = x_in
-    batch_size = x.size(0)
-    input_target = x[:, :, : self.target_size]
-    x = x.transpose(1, 2)
-
-    for res_block in self.res_blocks_list:
-        x = res_block(x)
-
-    x = x.transpose(1, 2)
-    x = x.view(
-        batch_size, self.input_chunk_length, self.target_size, self.nr_params
-    )
-    x = _anchor_tcn_forecast_location(
-        x,
-        input_target=input_target,
-        output_chunk_length=self.output_chunk_length,
-        target_size=self.target_size,
-    )
-
-    return x
-
-
 def apply_tcn_layernorm_patch():
-    """Patches TCN residual blocks and forecast outputs with functional LayerNorm."""
-    from darts.models.forecasting.pl_forecasting_module import io_processor
-    from darts.models.forecasting.tcn_model import _ResidualBlock, _TCNModule
+    """Patches TCN residual blocks with channel-wise LayerNorm."""
+    from darts.models.forecasting.tcn_model import _ResidualBlock
 
-    if getattr(_TCNModule, "_views_ln_patch", False):
+    if getattr(_ResidualBlock, "_views_ln_patch", False):
         logger.debug("[TCN LayerNorm patch] already applied, skipping.")
         return
 
     _ResidualBlock.forward = _patched_tcn_residual_block_forward
-    _TCNModule.forward = io_processor(_patched_tcn_module_forward)
     _ResidualBlock._views_ln_patch = True
-    _TCNModule._views_ln_patch = True
 
     logger.info(
-        "[TCN LayerNorm patch] installed: LayerNorm after conv1, hidden conv2, "
-        "hidden residual additions, and bounded residual forecast anchoring."
+        "[TCN LayerNorm patch] installed: Channel-wise LayerNorm "
+        "(pre-activation and post-residual)."
     )
 
 

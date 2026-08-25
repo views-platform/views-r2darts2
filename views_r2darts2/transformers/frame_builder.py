@@ -41,6 +41,7 @@ def build_prediction_frames_from_dataset(
     *,
     entity_block: int = _DEFAULT_ENTITY_BLOCK,
     model_name: str = "darts",
+    entity_order: np.ndarray | None = None,
 ) -> dict[str, PredictionFrame]:
     """Stream a zarr-backed dataset into memmap-backed PredictionFrames.
 
@@ -58,6 +59,11 @@ def build_prediction_frames_from_dataset(
         entity_block: Entities read per block. Keep a multiple of the Zarr
             entity-chunk size (256) for aligned reads.
         model_name: Recorded in the frame metadata.
+        entity_order: Optional entity_id array specifying the desired row
+            order of the output frame. When ``None`` (default), the
+            scaffold's sorted entity order is used. When provided, the
+            values are reordered to match this order (the scaffold's entities
+            are a sorted superset, so this is a permutation, not a subset).
 
     Returns:
         ``{target_name: PredictionFrame}`` with memmap-backed values.
@@ -75,8 +81,20 @@ def build_prediction_frames_from_dataset(
     S = int(ds.sample_size)
     N = T * E
 
-    # Shared time-major index: row r == (times[r // E], entities[r % E]).
-    t_grid, e_grid = np.meshgrid(times, entities, indexing="ij")
+    # If entity_order is provided, compute the permutation that maps the
+    # scaffold's sorted entities to the desired order. This ensures the
+    # PredictionFrame's rows match the original dataset's entity order
+    # (not the builder's sorted order).
+    if entity_order is not None:
+        entity_order = np.asarray(entity_order, dtype=np.int64)
+        # permutation[i] = position of entity_order[i] in the sorted entities
+        permutation = np.searchsorted(entities, entity_order)
+    else:
+        permutation = np.arange(E)
+        entity_order = entities
+
+    # Shared time-major index: row r == (times[r // E], entity_order[r % E]).
+    t_grid, e_grid = np.meshgrid(times, entity_order, indexing="ij")
     time_flat = np.ascontiguousarray(t_grid.ravel())
     unit_flat = np.ascontiguousarray(e_grid.ravel())
     index = SpatioTemporalIndex(time_flat, unit_flat, level=ds._build_spatial_level())
@@ -98,6 +116,8 @@ def build_prediction_frames_from_dataset(
         )
         # Stream entity-aligned blocks (all time steps per block). Each block
         # covers whole Zarr entity-chunks, so every chunk is read exactly once.
+        # The scaffold stores entities in sorted order; we read them in that
+        # order and then reorder the rows via the permutation.
         for e0 in range(0, E, entity_block):
             e1 = min(e0 + entity_block, E)
             block = var.isel({entity_id: slice(e0, e1)}).values  # (T, e1-e0, S)
@@ -109,8 +129,17 @@ def build_prediction_frames_from_dataset(
         mmap.flush()
         del mmap
 
-        # Reopen read-only; PredictionFrame keeps the memmap (no copy).
+        # Reopen read-only and reorder rows to match entity_order.
+        # The scaffold stores entities in sorted order; the permutation
+        # maps each output row to the correct scaffold row.
         values = np.load(str(values_path), mmap_mode="r")
+        if not np.array_equal(permutation, np.arange(E)):
+            # Reorder: for each time step, reorder the entity rows.
+            # Row r in the output = scaffold row (r // E) * E + permutation[r % E]
+            output_rows = np.empty(N, dtype=np.int64)
+            for t in range(T):
+                output_rows[t * E:(t + 1) * E] = t * E + permutation
+            values = values[output_rows]
         frames[target_name] = PredictionFrame(values, index=index, metadata=meta)
 
     return frames

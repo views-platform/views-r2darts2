@@ -588,6 +588,7 @@ class DartsForecaster:
             target_names,
             frames_dir,
             entity_block=max(1, entity_batch_size),
+            entity_order=entity_ids,
         )
         # Tag the dict with the temp dir so the manager can clean it up
         # after converting to a DataFrame. We use a wrapper class since

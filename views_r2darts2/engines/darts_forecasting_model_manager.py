@@ -171,18 +171,24 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
     def _format_eval_predictions(
         self, per_sequence_preds: list[dict[str, PredictionFrame]]
     ) -> Any:
-        """Format per-sequence predictions for the parent manager."""
-        if self._get_prediction_format() == "prediction_frame":
-            return self._transpose_predictions(per_sequence_preds)
-        return [self._predictions_to_dataframe(p) for p in per_sequence_preds]
+        """Format per-sequence predictions for the parent manager.
+
+        Always returns ``dict[str, list[PredictionFrame]]`` (transposed):
+        one key per target, each value a list of PredictionFrames (one per
+        sequence). The parent manager handles PredictionFrames directly —
+        no DataFrame conversion.
+        """
+        return self._transpose_predictions(per_sequence_preds)
 
     def _format_forecast_predictions(
         self, predictions: dict[str, PredictionFrame]
     ) -> Any:
-        """Format a single forecast's predictions."""
-        if self._get_prediction_format() == "prediction_frame":
-            return predictions
-        return self._predictions_to_dataframe(predictions)
+        """Format a single forecast's predictions.
+
+        Always returns the PredictionFrame dict as-is — no DataFrame
+        conversion.
+        """
+        return predictions
 
     # ------------------------------------------------------------------ factory
 

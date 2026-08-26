@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "views_r2darts2"
 version = "0.2.0"
-description = "Darts-based forecasting for the VIEWS platform"
+description = "Neural network based forecasting models for the VIEWS platform"
 authors = [
     "Dylan Pinheiro <dylpin@prio.org>",
     "Xiaolong Sun <xiaolong.sun@pcr.uu.se>",
@@ -11,22 +11,14 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.15"
-# views-frames is the new data-contract layer (numpy-only, memmap-backed).
-# Replaces the legacy pandas DataFrame held by _ViewsDataset.
-views-frames = ">=0.1.0"
-# views-pipeline-core is required only for DartsForecastingModelManager
-# (the experiment orchestrator). The rest of the package is importable
-# without it — the manager lazy-imports its parent class.
-views-pipeline-core = { version = ">=3.0.0,<4.0.0", optional = true }
 darts = "==0.46.1"
-scikit-learn = ">=1.6.0, <1.10.0"
-pyarrow = ">=14.0.0"
-numpy = ">=2.2.6, <3.0.0"
-pandas = ">=3.0.0,<4.0.0"
 dask = ">=2026.7.1"
+pyarrow = ">=14.0.0"
+scikit-learn = ">=1.6.0,<1.10.0"
 xarray = ">=2026.7.0"
+views-frames = ">=0.1.0"
 wandb = ">=0.28.2"
-
+views-pipeline-core = { version = ">=3.0.0,<4.0.0", optional = true }
 
 [tool.poetry.extras]
 # Install with `poetry install --extras manager` to enable the model manager.

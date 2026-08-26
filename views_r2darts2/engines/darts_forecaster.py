@@ -552,9 +552,9 @@ class DartsForecaster:
 
         # Stream the zarr-backed dataset into memmap-backed PredictionFrames.
         # This writes a row-major (N, S) float32 values.npy per target in
-        # entity-aligned blocks, then wraps each in a PredictionFrame whose
-        # values is a read-only np.memmap. Peak memory is one entity block
-        # — never the full (n_entities, n_time, n_samples) grid.
+        # entity-aligned blocks, verifies each (shape, readback, no NaN),
+        # then DELETES the Zarr store to avoid keeping duplicate prediction
+        # data on disk. Peak memory is one entity block — never the full grid.
         import tempfile
 
         frames_dir = Path(tempfile.mkdtemp(prefix="pred_frames_"))
@@ -563,8 +563,9 @@ class DartsForecaster:
             target_names,
             frames_dir,
             entity_block=max(1, entity_batch_size),
+            zarr_cleanup=True,  # delete Zarr after verified memmap
         )
-        ds.close()
+        # ds is now closed and its Zarr store deleted by the helper above.
         return frames
 
     def _dataset_level_code(self) -> str:

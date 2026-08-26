@@ -1,35 +1,43 @@
+"""Exception hierarchy for the reproducibility gate.
+
+Pure-Python module: no external dependencies. The class names are part of the
+public API — tests and downstream code import them by name.
+"""
+
+from __future__ import annotations
+
+
 class ReproducibilityError(Exception):
-    """Base class for all reproducibility gate failures."""
-    pass
+    """Base for all reproducibility gate failures."""
+
 
 class MissingHyperparameterError(ReproducibilityError):
-    """Raised when a mandatory hyperparameter is missing from the config."""
-    pass
+    """A mandatory hyperparameter is missing from the config manifest."""
+
 
 class ArchitectureMismatchError(ReproducibilityError, ValueError):
-    """Raised when model architecture and forecast horizon are misaligned."""
-    pass
+    """The model architecture and the forecast horizon are misaligned."""
+
 
 class TemporalDiscontinuityError(ReproducibilityError):
-    """Raised when training and testing sets are not contiguous (t+1 failure)."""
-    pass
+    """Train and test partitions are not temporally contiguous."""
+
 
 class DataLeakageError(ReproducibilityError):
-    """Raised when test data is detected within a training tensor."""
-    pass
+    """Test data was detected within a training tensor."""
+
 
 class DataStarvationError(ReproducibilityError):
-    """Raised when training data fails to utilize the full available history."""
-    pass
+    """Training data fails to use the full available history."""
+
 
 class NumericalSanityError(ReproducibilityError):
-    """Raised when NaNs, Infs, or extreme outliers are detected in the data stream."""
-    pass
+    """NaN, Inf, or extreme outliers detected in the data stream."""
+
 
 class TemporalHoleError(ReproducibilityError):
-    """Raised when missing months are detected in a historical sequence."""
-    pass
+    """A temporal sequence has missing intermediate steps."""
+
 
 class PredictionHorizonError(ReproducibilityError):
-    """Raised when a forecast exceeds the ground-truth boundary of a test set."""
-    pass
+    """The forecast horizon exceeds the ground-truth boundary of the test set."""

@@ -14,12 +14,14 @@ class OptimizerCatalog:
     def __init__(self, config: dict):
         self.config = config
         self.opt_name = self.config["optimizer_cls"]
+        opt_overrides = self.config.get("optimizer_kwargs", {}) or {}
         
         self._all_potential_args = {
-            "lr": self.config.get("lr"),
-            "weight_decay": self.config.get("weight_decay"),
-            "momentum": self.config.get("momentum"),
-            "alpha": self.config.get("alpha"),
+            "lr": opt_overrides.get("lr", self.config.get("lr")),
+            "weight_decay": opt_overrides.get("weight_decay", self.config.get("weight_decay")),
+            "momentum": opt_overrides.get("momentum", self.config.get("momentum")),
+            "alpha": opt_overrides.get("alpha", self.config.get("alpha")),
+            "betas": opt_overrides.get("betas", self.config.get("betas")),
         }
 
     def get_optimizer_cls(self) -> Type[torch.optim.Optimizer]:
@@ -47,7 +49,13 @@ class OptimizerCatalog:
             raise ValueError(error_msg)
         
         opt_genome = ReproducibilityGate.Config.OPTIMIZER_GENOMES[self.opt_name]
-        valid_kwargs = {k: v for k, v in self._all_potential_args.items() if k in opt_genome}
+        optional_genes = ReproducibilityGate.Config.OPTIMIZER_OPTIONAL_GENES.get(self.opt_name, [])
+        allowed_genes = set(opt_genome) | set(optional_genes)
+        valid_kwargs = {
+            k: v
+            for k, v in self._all_potential_args.items()
+            if (k in allowed_genes and v is not None)
+        }
         
         missing = [k for k in opt_genome if valid_kwargs.get(k) is None]
         if missing:

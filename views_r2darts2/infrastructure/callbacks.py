@@ -1,8 +1,9 @@
 import time
+import math
 import torch
 import numpy as np
 import logging
-from collections import deque
+from collections import deque, defaultdict
 from pytorch_lightning.callbacks import Callback
 
 logger = logging.getLogger(__name__)
@@ -36,10 +37,10 @@ class _PatchedTrainingStep:
 
     def __call__(self, train_batch, batch_idx):
         pl_module = self.pl_module
-        # Darts convention: batch[-1] = future target, batch[-2] = sample weights
-        output = pl_module._produce_train_output(train_batch[:-2])
+        # Darts batch: (...inputs..., sample_weight, future_target); skip sample_weight for _produce_train_output.
         sample_weight = train_batch[-2]
         target = train_batch[-1]
+        output = pl_module._produce_train_output((*train_batch[:-2], target))
         loss = pl_module._compute_loss(
             output, target, pl_module.train_criterion, sample_weight
         )
@@ -60,7 +61,7 @@ class _PatchedTrainingStep:
         pl_module.last_predictions = preds
         pl_module.last_targets = target.detach()
 
-        return loss
+        return {"loss": loss, "preds": preds}
 
 
 class TrainingStepPatchCallback(Callback):
@@ -151,7 +152,7 @@ class GradientHealthCallback(Callback):
         How often to run the audit.
     warn_threshold : float, default 1e-7
         Maximum gradient norm below which gradients are flagged as vanishing.
-    explode_threshold : float, default 100.0
+    explode_threshold : float, default 500.0
         Minimum gradient norm above which gradients are flagged as exploding.
     """
 
@@ -323,6 +324,14 @@ class WeightNormCallback(Callback):
         for name, param in pl_module.named_parameters():
             if not param.requires_grad:
                 continue
+            # Skip loss-criterion parameters (e.g. SpotlightLoss channel_log_var):
+            # these are learnable loss hyperparameters, not model weights. They are
+            # zero-initialized by design (e.g. log-variance 0 = equal channel
+            # weighting) and only the training-criterion copy receives gradients,
+            # so a zero norm on the criterion/val_criterion copies is expected and
+            # is not a layer collapse.
+            if "criterion" in name:
+                continue
             norm = param.data.detach().norm().item()
             weight_norms.append(norm)
 
@@ -423,8 +432,8 @@ class RevINMonitorCallback(Callback):
         mean = getattr(rin, "mean", None)
         stdev = getattr(rin, "stdev", None)
         if mean is not None and stdev is not None:
-            self._last_mean = mean.detach()
-            self._last_stdev = stdev.detach()
+            self._last_mean = mean.detach().cpu()
+            self._last_stdev = stdev.detach().cpu()
 
     def on_train_epoch_end(self, trainer, pl_module):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
@@ -455,7 +464,6 @@ class RevINMonitorCallback(Callback):
         # the z-space prediction variance (MC dropout, ~0.3). This is
         # independent of σ_raw/μ_raw — structurally eliminated.
         # Log sigma_raw/mu_raw ratio as a diagnostic for data distribution.
-        import math
         ratio_max = sigma_max / max(abs(mu_max), 1.0)
 
         metrics = {
@@ -525,7 +533,7 @@ class PredictionSanityCallback(Callback):
     def __init__(
         self,
         check_every_n_epochs: int = 1,
-        variance_floor: float = 1e-4,
+        variance_floor: float = 0.2,
         collapse_band: float = 1e-3,
         patience: int = 5,
     ):
@@ -878,12 +886,17 @@ class YHatBarCallback(Callback):
         target_scaler: str | None = None,
         non_zero_threshold: float = 0.88,
         log_every_n_epochs: int = 1,
+        max_stored_batches: int = 500,
     ):
         super().__init__()
         self.log_every_n_epochs = log_every_n_epochs
         self.non_zero_threshold = non_zero_threshold
-        self._preds: list[torch.Tensor] = []
-        self._truths: list[torch.Tensor] = []
+        # Cap accumulation to avoid unbounded RAM growth on large datasets
+        # (e.g. PGM: 33k batches × 2048 × 36 × 3 × 4B ≈ 28 GB without a cap).
+        # A deque with maxlen keeps the *most recent* N batches; statistics
+        # over 500 batches × 2048 samples are representative for calibration.
+        self._preds: deque[torch.Tensor] = deque(maxlen=max_stored_batches)
+        self._truths: deque[torch.Tensor] = deque(maxlen=max_stored_batches)
         if target_scaler == "AsinhTransform":
             self._inverse_fn = torch.sinh
         else:
@@ -916,12 +929,15 @@ class YHatBarCallback(Callback):
             # Normalise to (B, T, C): unsqueeze trailing dim if missing
             if preds.dim() == 2:
                 preds = preds.unsqueeze(-1)
-            self._preds.append(preds)
+            # Move to CPU immediately — these lists accumulate across all
+            # batches in the epoch. Keeping GPU tensors here causes
+            # linear GPU memory growth.
+            self._preds.append(preds.cpu())
 
         if truth is not None:
             if truth.dim() == 2:
                 truth = truth.unsqueeze(-1)
-            self._truths.append(truth)
+            self._truths.append(truth.cpu())
 
     def on_train_epoch_end(self, trainer, pl_module):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
@@ -933,9 +949,11 @@ class YHatBarCallback(Callback):
             return
 
         # Shape: (N, T, C) on CPU
-        all_preds = torch.cat(self._preds, dim=0).cpu()
+        all_preds = torch.cat(list(self._preds), dim=0).cpu()
         has_truth = len(self._truths) == len(self._preds)
-        all_truths = torch.cat(self._truths, dim=0).cpu() if has_truth else None
+        all_truths = (
+            torch.cat(list(self._truths), dim=0).cpu() if has_truth else None
+        )
 
         # Convert from transformed space to raw space — keep (N, T, C)
         raw_preds = self._inverse_fn(all_preds)
@@ -1034,6 +1052,8 @@ class YHatBarCallback(Callback):
 
         self._preds.clear()
         self._truths.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -1049,13 +1069,15 @@ class ValMetricsCallback(Callback):
         - Purpose: Provide calibration-quality metrics (MSLE, RMSLE, MSE) on the
           held-out validation fold so that overprediction bias visible in training
           calibration is also tracked on unseen windows.
-        - Mechanism: ``on_validation_batch_end`` runs a fresh ``no_grad`` forward
-          pass using the batch that was just processed.  The model is already in
-          ``eval()`` mode, so RevIN and dropout behave identically to what the
-          ``validation_step`` already computed — the extra overhead is one
-          forward pass per val batch with no gradient tape.
-        - Guarantees: Logs ``val_metrics/MSLE``, ``val_metrics/RMSLE``,
-          ``val_metrics/MSE`` to WandB at the end of each validation epoch.
+                - Mechanism: ``on_validation_batch_end`` runs a fresh ``no_grad`` forward
+                    pass using the batch that was just processed.  The model is already in
+                    ``eval()`` mode, so RevIN and dropout behave identically to what the
+                    ``validation_step`` already computed — the extra overhead is one
+                    forward pass per val batch with no gradient tape.
+                - Guarantees: Logs ``val_metrics/MSLE``, ``val_metrics/RMSLE``,
+                    ``val_metrics/MSE``, ``val_metrics/GM_MSLE_MSE``,
+                    ``val_metrics/PARETO_GATE`` (strict both-must-improve), and
+                    ``val_metrics/BALANCE_GM_RATIO`` (trade-off balance) at epoch end.
         - Non-Goals: Does not recompute val_loss or interfere with early stopping.
 
     Parameters
@@ -1079,6 +1101,8 @@ class ValMetricsCallback(Callback):
         self._inverse_fn = (
             torch.sinh if target_scaler == "AsinhTransform" else torch.expm1
         )
+        self._best_msle = float("inf")
+        self._best_mse = float("inf")
 
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
@@ -1086,16 +1110,10 @@ class ValMetricsCallback(Callback):
         if batch is None:
             return
         try:
-            # Resolve input slice: use model's own input_tuple_size when available,
-            # else mirror the training_step patch which excludes sample_weight (-2)
-            # and future_target (-1).
-            n_inputs = getattr(pl_module, "input_tuple_size", None)
-            if n_inputs is not None:
-                input_batch = batch[:n_inputs]
-            else:
-                input_batch = batch[:-2]
-
+            # Darts batch: (...inputs..., sample_weight, future_target)
+            # _produce_train_output needs all fields EXCEPT sample_weight.
             target = batch[-1]
+            input_batch = (*batch[:-2], target)
 
             with torch.no_grad():
                 output = pl_module._produce_train_output(input_batch)
@@ -1144,17 +1162,832 @@ class ValMetricsCallback(Callback):
         # MSE in raw space
         mse = ((raw_preds - raw_truths) ** 2).mean().item()
 
+        # Composite objective in raw/log space trade-off.
+        gm_msle_mse = (msle * mse) ** 0.5
+
+        # Ratios are computed against BEST PREVIOUS values (before update).
+        msle_ref = max(self._best_msle, 1e-12)
+        mse_ref = max(self._best_mse, 1e-12)
+        ratio_msle = msle / msle_ref if msle_ref < float("inf") else 1.0
+        ratio_mse = mse / mse_ref if mse_ref < float("inf") else 1.0
+
+        # Strict "both must not regress" gate: < 1 only when both are better.
+        pareto_gate = max(ratio_msle, ratio_mse)
+        # Balanced trade-off gate: allows one-up one-down if joint GM improves.
+        balance_gm_ratio = (ratio_msle * ratio_mse) ** 0.5
+
         metrics = {
             "val_metrics/MSLE": msle,
             "val_metrics/RMSLE": rmsle,
             "val_metrics/MSE": mse,
+            "val_metrics/GM_MSLE_MSE": gm_msle_mse,
+            "val_metrics/PARETO_GATE": pareto_gate,
+            "val_metrics/BALANCE_GM_RATIO": balance_gm_ratio,
         }
+
+        # Update per-metric bests after ratio computation.
+        self._best_msle = min(self._best_msle, msle)
+        self._best_mse = min(self._best_mse, mse)
+
+        # Log to PyTorch Lightning callback_metrics so EarlyStopping/checkpointing can monitor them
+        for k, v in metrics.items():
+            pl_module.log(k, v, on_epoch=True, prog_bar=True, logger=False)
 
         if trainer.logger is not None:
             trainer.logger.log_metrics(metrics, step=trainer.global_step)
 
         logger.info(
             f"[Epoch {trainer.current_epoch}] Val Metrics | "
-            f"MSLE={msle:.5f}  RMSLE={rmsle:.4f}  MSE={mse:.2f}"
+            f"MSLE={msle:.5f}  RMSLE={rmsle:.4f}  MSE={mse:.2f}  "
+            f"GM={gm_msle_mse:.4f}  Pareto={pareto_gate:.4f}  Balance={balance_gm_ratio:.4f}"
         )
 
+
+# ---------------------------------------------------------------------------
+# Input Batch Monitor
+# ---------------------------------------------------------------------------
+
+
+class InputBatchMonitorCallback(Callback):
+    """
+    Logs key statistics about the input batch data.
+
+    This helps correlate training dynamics (e.g., loss spikes) with the
+    composition of the data being processed.
+    """
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        """Log statistics of the training batch."""
+        if not hasattr(pl_module, "log"):
+            return
+
+        # For Darts PL modules, the batch is a tuple/list.
+        # (past_target, past_covariates, ..., future_target)
+        past_target = batch[0]
+        if past_target is None:
+            return
+
+        # Assuming past_target is a tensor of shape (batch_size, sequence_length, features)
+        # Flatten over sequence_length and features for batch-wide stats
+        flat_targets = past_target.view(past_target.size(0), -1)
+
+        # --- Key Metrics ---
+        # Sparsity: fraction of zero values
+        sparsity = (flat_targets == 0).float().mean()
+
+        # Magnitude stats
+        mean_val = flat_targets.mean()
+        max_val = flat_targets.max()
+        
+        # Number of "event" series (at least one non-zero value)
+        event_series_mask = torch.any(flat_targets != 0, dim=1)
+        n_event_series = event_series_mask.sum()
+        
+        # Log metrics to WandB
+        pl_module.log(
+            "input_batch/sparsity",
+            sparsity,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+        pl_module.log(
+            "input_batch/mean",
+            mean_val,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+        pl_module.log(
+            "input_batch/max",
+            max_val,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+        pl_module.log(
+            "input_batch/n_event_series",
+            n_event_series,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Loss Component Monitor
+# ---------------------------------------------------------------------------
+
+
+class LossComponentCallback(Callback):
+    """
+    Per-channel composite-loss component auditor (SpotlightLossLogcosh).
+
+    Intent Contract:
+                - Purpose: Make the internal structure of the multi-task loss visible —
+                    for each target channel, how big its shape / level / spectral terms
+                    are, what fraction of that channel each term contributes, the
+                    per-channel active weight(s), and each channel's weighted
+                    contribution to the total loss. This surfaces both the within-channel
+                    term mix and whether cross-channel budgeting is behaving as intended.
+        - Guarantees: Reads only detached, parameter-free telemetry stashed on
+          ``pl_module.train_criterion._last_components`` (never touches the
+          graph), accumulates per batch, and pushes per-epoch means to wandb.
+          No-op for losses that do not expose ``_last_components``.
+        - Non-Goals: Does not modify the loss or training.
+
+    wandb keys (per channel c, 0-indexed = sb/ns/os):
+        loss_components/ch_{c}/{shape,level,spec}            raw term magnitudes
+        loss_components/ch_{c}/frac_{shape,level,spec}       within-channel share
+        loss_components/ch_{c}/weight                         primary active weight
+        loss_components/ch_{c}/cal_score                      secondary active weight
+        loss_components/ch_{c}/cal_ratio                      calibration ratio (loss-defined)
+        loss_components/ch_{c}/contribution                   weighted channel contribution
+        loss_components/ch_{c}/budget_won                     contribution share in [0,1]
+        loss_components/contribution_spread                   max/min contribution
+
+    Notes:
+        - Field names are intentionally generic to stay backward-compatible
+          across loss revisions.
+        - For uncertainty-weighted SpotlightLossLogcosh:
+            * ``weight`` = shape precision term (0.5 * exp(-s_shape))
+            * ``cal_score`` = level precision term (0.5 * exp(-s_level))
+            * ``cal_ratio`` = event calibration ratio (sum |y_hat| / sum |y|)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._buf = defaultdict(list)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        crit = getattr(pl_module, "train_criterion", None)
+        comp = getattr(crit, "_last_components", None) if crit is not None else None
+        if not comp:
+            return
+
+        shape = comp.get("shape", [])
+        level = comp.get("level", [])
+        spec = comp.get("spec", [])
+        C = len(shape)
+        if C == 0:
+            return
+        weight = comp.get("weight", [1.0] * C)
+        ema = comp.get("ema", [float("nan")] * C)
+        contribution = comp.get("contribution")
+        cal_ratio = comp.get("cal_ratio", [1.0] * C)
+        cal_score = comp.get("cal_score", [1.0] * C)
+        gates = comp.get("gates", [1.0] * C)
+
+        contrib_sum = None
+        if contribution is not None and len(contribution) == C:
+            contrib_sum = sum(abs(x) for x in contribution) + 1e-12
+
+        for c in range(C):
+            tot_c = shape[c] + level[c] + spec[c]
+            denom = tot_c if abs(tot_c) > 1e-12 else 1e-12
+            self._buf[f"loss_components/ch_{c}/shape"].append(shape[c])
+            self._buf[f"loss_components/ch_{c}/level"].append(level[c])
+            self._buf[f"loss_components/ch_{c}/spec"].append(spec[c])
+            self._buf[f"loss_components/ch_{c}/frac_shape"].append(shape[c] / denom)
+            self._buf[f"loss_components/ch_{c}/frac_level"].append(level[c] / denom)
+            self._buf[f"loss_components/ch_{c}/frac_spec"].append(spec[c] / denom)
+            self._buf[f"loss_components/ch_{c}/weight"].append(weight[c])
+            self._buf[f"loss_components/ch_{c}/cal_ratio"].append(cal_ratio[c])
+            self._buf[f"loss_components/ch_{c}/cal_score"].append(cal_score[c])
+            self._buf[f"loss_components/ch_{c}/gate_weight"].append(gates[c])
+            if contrib_sum is not None:
+                self._buf[f"loss_components/ch_{c}/budget_won"].append(
+                    abs(contribution[c]) / contrib_sum
+                )
+            else:
+                # Backward-compatible fallback when only gate-like telemetry exists.
+                self._buf[f"loss_components/ch_{c}/budget_won"].append(gates[c] / C)
+            if not math.isnan(ema[c]):
+                self._buf[f"loss_components/ch_{c}/ema"].append(ema[c])
+            if contribution is not None:
+                self._buf[f"loss_components/ch_{c}/contribution"].append(contribution[c])
+
+        # How equal are the channel contributions after balancing? ~1.0 means
+        # balanced; ≫1 means one channel dominates the joint objective.
+        if contribution is not None and len(contribution) > 1:
+            cmax = max(contribution)
+            cmin = min(contribution)
+            self._buf["loss_components/contribution_spread"].append(
+                cmax / (abs(cmin) + 1e-12)
+            )
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if not self._buf:
+            return
+
+        metrics = {k: float(np.mean(v)) for k, v in self._buf.items() if v}
+
+        # Mean shape-vs-level active weight ratio across channels. This is a
+        # compact monitor for uncertainty-weight drift: >1 means shape gets
+        # more budget than level; <1 means level dominates.
+        n_ch = sum(1 for k in metrics if k.endswith("/shape"))
+        if n_ch > 0:
+            ratios = []
+            for c in range(n_ch):
+                w_shape = metrics.get(f"loss_components/ch_{c}/weight")
+                w_level = metrics.get(f"loss_components/ch_{c}/cal_score")
+                if w_shape is None or w_level is None:
+                    continue
+                ratios.append(w_shape / (abs(w_level) + 1e-12))
+            if ratios:
+                metrics["loss_components/shape_level_weight_ratio"] = float(np.mean(ratios))
+
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        # Concise per-channel summary line for the console.
+        parts = []
+        for c in range(n_ch):
+            sh = metrics.get(f"loss_components/ch_{c}/shape", float("nan"))
+            lv = metrics.get(f"loss_components/ch_{c}/level", float("nan"))
+            sp = metrics.get(f"loss_components/ch_{c}/spec", float("nan"))
+            w_shape = metrics.get(f"loss_components/ch_{c}/weight", float("nan"))
+            w_level = metrics.get(f"loss_components/ch_{c}/cal_score", float("nan"))
+            cal = metrics.get(f"loss_components/ch_{c}/cal_ratio", float("nan"))
+            won = metrics.get(f"loss_components/ch_{c}/budget_won", float("nan"))
+            parts.append(
+                f"ch{c}[sh={sh:.2f} lv={lv:.2f} sp={sp:.2f} w_sh={w_shape:.2f} w_lv={w_level:.2f} cal={cal:.2f} won_frac={won:.2%}]"
+            )
+        spread = metrics.get("loss_components/contribution_spread")
+        spread_str = f" | spread={spread:.2f}" if spread is not None else ""
+        ratio = metrics.get("loss_components/shape_level_weight_ratio")
+        ratio_str = f" | w_sh/w_lv={ratio:.2f}" if ratio is not None else ""
+        logger.info(
+            f"[Epoch {trainer.current_epoch}] LossComponents | "
+            + " ".join(parts)
+            + spread_str
+            + ratio_str
+        )
+
+        self._buf.clear()
+
+
+# ---------------------------------------------------------------------------
+# Loss Gradient Diagnostics
+# ---------------------------------------------------------------------------
+
+
+class LossGradientDiagnosticsCallback(Callback):
+    """
+    Detailed per-term gradient diagnostics for SpotlightLossLogcosh.
+
+    Combines three diagnostic sources each batch/epoch:
+
+    1. **Loss telemetry** — reads extended ``_last_components`` keys written by
+       ``SpotlightLossLogcosh.forward``:
+       - DRO weight distribution per channel (mean, std, max, fraction > 1).
+         A high max (> 5) or high frac_up means DRO is concentrating gradient
+         on a few cells; a low mean (≪ 1) after renorm means DRO is mostly idle.
+       - Level gap magnitude per channel.  Decreasing gap_mean = level converging.
+         Stuck gap_mean = level not learning (gradient budget stolen or LR too low).
+       - Shape DC leak per channel.  ``shape_dc`` is the batch-mean of the
+         per-series gated mean of e_shape.  Should be ≈ 0 for a DC-neutral shape
+         term; a large value indicates gate weighting is reintroducing a DC bias
+         that fights the level anchor.
+       - Event cell fraction per channel (sparsity diagnostic).
+
+    2. **Input-gradient decomposition** — reads ``_last_input_grad`` tensor
+       (``d(loss)/d(y_pred)``), set by a backward hook registered in
+       ``SpotlightLossLogcosh.forward``:
+       - DC fraction: ``|mean_t(grad)| / (|mean_t(grad)| + RMS_AC(grad))``.
+         Should be ≈ 0 for a pure shape loss; will be > 0 when level dominates.
+         Target for this loss design: dc_frac ≈ 0.30–0.60 (neither starves).
+       - AC fraction: complement of DC fraction.
+       - Sign fraction: fraction of gradient entries > 0.  < 0.5 means the loss
+         is predominantly pushing predictions DOWN (under-prediction correction).
+       - DC and AC gradient magnitudes per channel (absolute scale).
+
+    3. **Output-layer gradient** — captures ``fc_out.weight.grad`` in
+       ``on_before_optimizer_step``:
+       - Row-norm mean/max/std over the output projection's weight matrix.
+       - Sign fraction of the fc_out gradient (direction of output update).
+
+    wandb keys:
+        ``grad_diag/ch_{c}/{dro_w_mean, dro_w_std, dro_w_max, dro_frac_up,
+        event_frac, level_gap_mean, level_gap_max, shape_dc, grad_dc_frac,
+        grad_ac_frac, grad_sign_frac, grad_dc_mag, grad_ac_mag, grad_total_norm}``
+        ``grad_diag/{fcout_grad_norm_mean, fcout_grad_norm_max, fcout_grad_norm_std,
+        fcout_grad_sign_frac}``
+    """
+
+    def __init__(self, log_every_n_epochs: int = 1):
+        super().__init__()
+        self.log_every_n_epochs = log_every_n_epochs
+        self._buf: dict = defaultdict(list)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        crit = getattr(pl_module, "train_criterion", None)
+        comp = getattr(crit, "_last_components", None) if crit is not None else None
+        if not comp:
+            return
+
+        C = len(comp.get("shape", []))
+        if C == 0:
+            return
+
+        # ── 1. Loss telemetry from _last_components ─────────────────────
+        for key in (
+            "dro_w_mean", "dro_w_std", "dro_w_max", "dro_frac_up",
+            "event_frac", "level_gap_mean", "level_gap_max", "shape_dc",
+            "level_gap_ev_mean", "level_gap_ev_max", "level_gap_sat",
+            "shape_level_ratio",
+            "gap_v13_mean", "gap_v13_max", "dilution",
+            "hit_frac", "false_alarm_of_mask", "missed_frac",
+            "mean_pred_lm", "mean_true_lm", "lm_per_series",
+            "e_fa_mean", "e_me_mean",
+        ):
+            vals = comp.get(key)
+            if vals is None:
+                continue
+            for c, v in enumerate(vals):
+                self._buf[f"grad_diag/ch_{c}/{key}"].append(v)
+
+        # ── 2. Input-gradient decomposition ─────────────────────────────
+        # _last_input_grad = d(loss)/d(y_pred), shape (B,T) or (B,T,C).
+        # Decompose per-channel into:
+        #   DC = mean_over_time component  → driven by level (uniform gradient)
+        #   AC = demeaned component        → driven by shape (zero-mean gradient)
+        grad = getattr(crit, "_last_input_grad", None)
+        if grad is not None:
+            g = grad.float().cpu()
+            if g.dim() == 2:
+                g = g.unsqueeze(-1)              # → (B, T, 1)
+
+            dc = g.mean(dim=1, keepdim=True)     # (B, 1, C) — DC per series
+            ac = g - dc                          # (B, T, C) — AC per series
+
+            # Per-series norm magnitudes
+            dc_norm  = dc.squeeze(1).abs()                        # (B, C)
+            ac_norm  = ac.norm(dim=1) / (g.shape[1] ** 0.5 + 1e-8)  # (B, C) RMS
+            tot_norm = dc_norm + ac_norm + 1e-12
+
+            dc_frac   = (dc_norm / tot_norm).mean(dim=0)          # (C,)
+            ac_frac   = (ac_norm / tot_norm).mean(dim=0)          # (C,)
+            sign_frac = (g > 0).float().mean(dim=(0, 1))          # (C,)
+            dc_mag    = dc_norm.mean(dim=0)                       # (C,)
+            ac_mag    = ac_norm.mean(dim=0)                       # (C,)
+            total_g   = g.norm(dim=1).mean(dim=0)                 # (C,)
+
+            for c in range(min(g.shape[-1], C)):
+                self._buf[f"grad_diag/ch_{c}/grad_dc_frac"].append(dc_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_ac_frac"].append(ac_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_sign_frac"].append(sign_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_dc_mag"].append(dc_mag[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_ac_mag"].append(ac_mag[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_total_norm"].append(total_g[c].item())
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        """Capture output-layer (fc_out) gradient statistics before weight update."""
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+
+        # Try fc_out directly (TSMixer), then fall back to last Linear with a gradient.
+        out_layer = getattr(pl_module, "fc_out", None)
+        if (
+            out_layer is None
+            or not hasattr(out_layer, "weight")
+            or out_layer.weight.grad is None
+        ):
+            out_layer = None
+            for _, mod in reversed(list(pl_module.named_modules())):
+                if (
+                    isinstance(mod, torch.nn.Linear)
+                    and hasattr(mod, "weight")
+                    and mod.weight.grad is not None
+                ):
+                    out_layer = mod
+                    break
+
+        if out_layer is None:
+            return
+
+        g = out_layer.weight.grad.detach().float()   # (out_features, in_features)
+        row_norms = g.norm(dim=1)                    # (out_features,)
+        self._buf["grad_diag/fcout_grad_norm_mean"].append(row_norms.mean().item())
+        self._buf["grad_diag/fcout_grad_norm_max"].append(row_norms.max().item())
+        self._buf["grad_diag/fcout_grad_norm_std"].append(row_norms.std().item())
+        self._buf["grad_diag/fcout_grad_sign_frac"].append((g > 0).float().mean().item())
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            self._buf.clear()
+            return
+        if not self._buf:
+            return
+
+        metrics = {k: float(np.mean(v)) for k, v in self._buf.items() if v}
+
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        # Determine number of channels from keys
+        C = max(
+            (int(k.split("/ch_")[1].split("/")[0]) for k in metrics if "/ch_" in k),
+            default=-1,
+        ) + 1
+
+        if C > 0:
+            parts = []
+            for c in range(C):
+                pfx = f"grad_diag/ch_{c}"
+                dc_frac   = metrics.get(f"{pfx}/grad_dc_frac",    float("nan"))
+                ac_frac   = metrics.get(f"{pfx}/grad_ac_frac",    float("nan"))
+                sign_frac = metrics.get(f"{pfx}/grad_sign_frac",  float("nan"))
+                dc_mag    = metrics.get(f"{pfx}/grad_dc_mag",     float("nan"))
+                ac_mag    = metrics.get(f"{pfx}/grad_ac_mag",     float("nan"))
+                dro_mean  = metrics.get(f"{pfx}/dro_w_mean",      float("nan"))
+                dro_max   = metrics.get(f"{pfx}/dro_w_max",       float("nan"))
+                dro_fup   = metrics.get(f"{pfx}/dro_frac_up",     float("nan"))
+                gap_mean  = metrics.get(f"{pfx}/level_gap_mean",  float("nan"))
+                gap_ev    = metrics.get(f"{pfx}/level_gap_ev_mean", float("nan"))
+                gap_sat   = metrics.get(f"{pfx}/level_gap_sat",    float("nan"))
+                gap_v13   = metrics.get(f"{pfx}/gap_v13_mean",     float("nan"))
+                dilution  = metrics.get(f"{pfx}/dilution",         float("nan"))
+                sl_ratio  = metrics.get(f"{pfx}/shape_level_ratio", float("nan"))
+                hit_frac  = metrics.get(f"{pfx}/hit_frac",         float("nan"))
+                fa_mask   = metrics.get(f"{pfx}/false_alarm_of_mask", float("nan"))
+                miss_frac = metrics.get(f"{pfx}/missed_frac",      float("nan"))
+                e_fa      = metrics.get(f"{pfx}/e_fa_mean",        float("nan"))
+                e_me      = metrics.get(f"{pfx}/e_me_mean",        float("nan"))
+                shape_dc  = metrics.get(f"{pfx}/shape_dc",        float("nan"))
+                ev_frac   = metrics.get(f"{pfx}/event_frac",      float("nan"))
+                parts.append(
+                    f"ch{c}["
+                    f"dc%={dc_frac:.0%} ac%={ac_frac:.0%} sign↑={sign_frac:.2f} "
+                    f"dcMag={dc_mag:.4f} acMag={ac_mag:.4f} | "
+                    f"dro={dro_mean:.2f}±{dro_max:.1f}× ↑{dro_fup:.0%} | "
+                    f"gap={gap_mean:.3f}/{gap_ev:.3f} sat={gap_sat:.0%} v13={gap_v13:.3f} dil={dilution:.2f} sl={sl_ratio:.2f} | "
+                    f"hit={hit_frac:.0%} faM={fa_mask:.0%} miss={miss_frac:.0%} e_fa={e_fa:.3f} e_me={e_me:.3f} | "
+                    f"shDC={shape_dc:.4f} ev={ev_frac:.2f}]"
+                )
+            fcout_norm = metrics.get("grad_diag/fcout_grad_norm_mean", float("nan"))
+            fcout_sign = metrics.get("grad_diag/fcout_grad_sign_frac", float("nan"))
+            logger.info(
+                f"[Epoch {trainer.current_epoch}] GradDiag | "
+                + " ".join(parts)
+                + f" | fc_out[norm={fcout_norm:.4f} sign↑={fcout_sign:.2f}]"
+            )
+
+        self._buf.clear()
+
+# ---------------------------------------------------------------------------
+# Rich Loss Diagnostics (Visual Console Output)
+# ---------------------------------------------------------------------------
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    _HAS_RICH = True
+except ImportError:
+    _HAS_RICH = False
+
+if _HAS_RICH:
+    _console = Console()
+
+
+class RichLossDiagnosticsCallback(Callback):
+    """
+    Visual, color-coded console diagnostics for SpotlightLossLogcosh.
+
+    Prints a rich table every N epochs with:
+    - Shape vs Level balance (green/yellow/red)
+    - Gap diagnostics (raw vs density-scaled)
+    - Hájek weights and batch active fraction
+    - Gradient direction on events vs non-events (green=up, red=down)
+    - DRO weight distribution
+    - Prediction statistics
+
+    Install: pip install rich
+    """
+
+    def __init__(self, log_every_n_epochs: int = 1):
+        super().__init__()
+        self.log_every_n_epochs = log_every_n_epochs
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+
+        crit = getattr(pl_module, "train_criterion", None)
+        comp = getattr(crit, "_last_components", None) if crit is not None else None
+        if not comp:
+            return
+
+        epoch = trainer.current_epoch
+        n_ch = len(comp.get("shape", []))
+
+        # Build the table
+        table = Table(
+            title=f"[bold cyan]🔬 SpotlightLoss Diagnostics — Epoch {epoch}[/]",
+            show_header=True,
+            header_style="bold cyan",
+            border_style="blue",
+        )
+        table.add_column("Channel", style="bold", width=6)
+        table.add_column("Shape", justify="right", width=8)
+        table.add_column("Level", justify="right", width=8)
+        table.add_column("S/L Ratio", justify="right", width=9)
+        table.add_column("Gap (raw)", justify="right", width=9)
+        table.add_column("Gap (scaled)", justify="right", width=11)
+        table.add_column("Density", justify="right", width=8)
+        table.add_column("W_level", justify="right", width=8)
+        table.add_column("Active%", justify="right", width=8)
+        table.add_column("Grad Ev", justify="right", width=10)
+        table.add_column("Grad NEv", justify="right", width=10)
+        table.add_column("DRO μ/max", justify="right", width=10)
+
+        for c in range(n_ch):
+            sh = comp.get("shape", [0])[c] if c < len(comp.get("shape", [])) else 0
+            lv = comp.get("level", [0])[c] if c < len(comp.get("level", [])) else 0
+            ratio = sh / max(lv, 1e-6)
+
+            gap_raw = comp.get("level_gap_mean", [0])[c] if c < len(comp.get("level_gap_mean", [])) else 0
+            gap_scaled = comp.get("gap_scaled_mean", [0])[c] if c < len(comp.get("gap_scaled_mean", [])) else 0
+            density = comp.get("density_scale_mean", [0])[c] if c < len(comp.get("density_scale_mean", [])) else 0
+            w_lvl = comp.get("w_level_mean", [0])[c] if c < len(comp.get("w_level_mean", [])) else 0
+            active = comp.get("batch_active_frac", [0])[c] if c < len(comp.get("batch_active_frac", [])) else 0
+
+            grad_ev = comp.get("grad_event", [0])[0]
+            grad_nev = comp.get("grad_nonevent", [0])[0]
+
+            dro_mu_val = comp.get("dro_w_mean", [0])[c] if c < len(comp.get("dro_w_mean", [])) else 0
+            dro_max_val = comp.get("dro_w_max", [0])[c] if c < len(comp.get("dro_w_max", [])) else 0
+
+            # Color coding
+            def _ratio_color(v):
+                if 0.3 <= v <= 3.0:
+                    return "green"
+                elif 0.1 <= v <= 10.0:
+                    return "yellow"
+                else:
+                    return "red"
+
+            def _gap_color(v):
+                if v > 0.1:
+                    return "green"
+                elif v > 0.01:
+                    return "yellow"
+                else:
+                    return "red"
+
+            def _grad_color(v):
+                if abs(v) < 1e-6:
+                    return "dim"
+                elif v < 0:
+                    return "green"  # pushing UP (negative gradient = increase)
+                else:
+                    return "red"    # pushing DOWN
+
+            def _active_color(v):
+                if v > 0.01:
+                    return "green"
+                elif v > 0.001:
+                    return "yellow"
+                else:
+                    return "red"
+
+            ratio_str = Text(f"{ratio:.2f}", style=_ratio_color(ratio))
+            gap_scaled_str = Text(f"{gap_scaled:.4f}", style=_gap_color(gap_scaled))
+            grad_ev_str = Text(f"{grad_ev:+.6f}", style=_grad_color(grad_ev))
+            grad_nev_str = Text(f"{grad_nev:+.6f}", style=_grad_color(grad_nev))
+            active_str = Text(f"{active*100:.1f}%", style=_active_color(active))
+
+            table.add_row(
+                f"ch{c}",
+                f"{sh:.3f}",
+                f"{lv:.3f}",
+                ratio_str,
+                f"{gap_raw:.4f}",
+                gap_scaled_str,
+                f"{density:.2f}x",
+                f"{w_lvl:.3f}",
+                active_str,
+                grad_ev_str,
+                grad_nev_str,
+                f"{dro_mu_val:.2f}/{dro_max_val:.1f}",
+            )
+
+        _console.print(table)
+
+        # Summary panel
+        summary_lines = []
+        for c in range(n_ch):
+            grad_ev = comp.get("grad_event", [0])[0]
+            grad_nev = comp.get("grad_nonevent", [0])[0]
+            if grad_ev > 0:
+                summary_lines.append(f"[red]⚠ ch{c}: Event gradient is POSITIVE (pushing DOWN) — collapse risk![/]")
+            # elif abs(grad_ev) < 1e-6:
+            #     summary_lines.append(f"[yellow]⚠ ch{c}: Event gradient is near ZERO — shape loss may be dead[/]")
+            else:
+                summary_lines.append(f"[green]✓ ch{c}: Event gradient is NEGATIVE (pushing UP) — healthy[/]")
+
+        if summary_lines:
+            _console.print(Panel(
+                "\n".join(summary_lines),
+                title="[bold]Gradient Health[/]",
+                border_style="blue",
+            ))
+
+
+# ---------------------------------------------------------------------------
+# Extended Loss Gradient Diagnostics (updated for new telemetry keys)
+# ---------------------------------------------------------------------------
+class LossGradientDiagnosticsCallbackV2(Callback):
+    """
+    Updated gradient diagnostics that include the new density-scaled gap,
+    Hájek weights, and gradient direction telemetry.
+
+    wandb keys (new):
+        grad_diag/ch_{c}/density_scale_mean
+        grad_diag/ch_{c}/gap_scaled_mean
+        grad_diag/ch_{c}/w_level_mean
+        grad_diag/ch_{c}/batch_active_frac
+        grad_diag/grad_event
+        grad_diag/grad_nonevent
+    """
+
+    def __init__(self, log_every_n_epochs: int = 1, tau: float = 0.88):
+        super().__init__()
+        self.log_every_n_epochs = log_every_n_epochs
+        self.tau = tau
+        self._buf: dict = defaultdict(list)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        crit = getattr(pl_module, "train_criterion", None)
+        comp = getattr(crit, "_last_components", None) if crit is not None else None
+        if not comp:
+            return
+
+        C = len(comp.get("shape", []))
+        if C == 0:
+            return
+
+        # ── 1. Loss telemetry from _last_components ─────────────────────
+        for key in (
+            "dro_w_mean", "dro_w_std", "dro_w_max", "dro_frac_up",
+            "event_frac", "level_gap_mean", "level_gap_max", "shape_dc",
+            "level_gap_ev_mean", "level_gap_ev_max", "level_gap_sat",
+            "shape_level_ratio",
+            # NEW keys
+            "density_scale_mean", "gap_scaled_mean",
+            "w_level_mean", "batch_active_frac",
+        ):
+            vals = comp.get(key)
+            if vals is None:
+                continue
+            for c, v in enumerate(vals):
+                self._buf[f"grad_diag/ch_{c}/{key}"].append(v)
+
+        # ── 2. Input-gradient decomposition + direction ────────────────
+        grad = getattr(crit, "_last_input_grad", None)
+        if grad is not None:
+            g = grad.float().cpu()
+            if g.dim() == 2:
+                g = g.unsqueeze(-1)
+
+            # DC/AC decomposition (existing)
+            dc = g.mean(dim=1, keepdim=True)
+            ac = g - dc
+
+            dc_norm = dc.squeeze(1).abs()
+            ac_norm = ac.norm(dim=1) / (g.shape[1] ** 0.5 + 1e-8)
+            tot_norm = dc_norm + ac_norm + 1e-12
+
+            dc_frac = (dc_norm / tot_norm).mean(dim=0)
+            ac_frac = (ac_norm / tot_norm).mean(dim=0)
+            sign_frac = (g > 0).float().mean(dim=(0, 1))
+            dc_mag = dc_norm.mean(dim=0)
+            ac_mag = ac_norm.mean(dim=0)
+            total_g = g.norm(dim=1).mean(dim=0)
+
+            for c in range(min(g.shape[-1], C)):
+                self._buf[f"grad_diag/ch_{c}/grad_dc_frac"].append(dc_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_ac_frac"].append(ac_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_sign_frac"].append(sign_frac[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_dc_mag"].append(dc_mag[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_ac_mag"].append(ac_mag[c].item())
+                self._buf[f"grad_diag/ch_{c}/grad_total_norm"].append(total_g[c].item())
+
+            # NEW: Gradient direction (event vs non-event)
+            # Reconstruct event_mask from the batch target
+            target = batch[-1] if isinstance(batch, (list, tuple)) else batch["target"]
+            if target.dim() == 3 and target.size(-1) == 1:
+                target = target.squeeze(-1)
+            
+            event_mask = (target.abs() > self.tau).float().cpu()
+            if event_mask.dim() == 2:
+                ev_mask = event_mask.unsqueeze(-1)
+            else:
+                ev_mask = event_mask
+
+            n_ev_total = ev_mask.sum().clamp_min(1.0)
+            n_nev_total = (1.0 - ev_mask).sum().clamp_min(1.0)
+            grad_ev = (g * ev_mask).sum().item() / n_ev_total.item()
+            grad_nev = (g * (1.0 - ev_mask)).sum().item() / n_nev_total.item()
+            self._buf["grad_diag/grad_event"].append(grad_ev)
+            self._buf["grad_diag/grad_nonevent"].append(grad_nev)
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+
+        out_layer = getattr(pl_module, "fc_out", None)
+        if (
+            out_layer is None
+            or not hasattr(out_layer, "weight")
+            or out_layer.weight.grad is None
+        ):
+            out_layer = None
+            for _, mod in reversed(list(pl_module.named_modules())):
+                if (
+                    isinstance(mod, torch.nn.Linear)
+                    and hasattr(mod, "weight")
+                    and mod.weight.grad is not None
+                ):
+                    out_layer = mod
+                    break
+
+        if out_layer is None:
+            return
+
+        g = out_layer.weight.grad.detach().float()
+        row_norms = g.norm(dim=1)
+        self._buf["grad_diag/fcout_grad_norm_mean"].append(row_norms.mean().item())
+        self._buf["grad_diag/fcout_grad_norm_max"].append(row_norms.max().item())
+        self._buf["grad_diag/fcout_grad_norm_std"].append(row_norms.std().item())
+        self._buf["grad_diag/fcout_grad_sign_frac"].append((g > 0).float().mean().item())
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            self._buf.clear()
+            return
+        if not self._buf:
+            return
+
+        metrics = {k: float(np.mean(v)) for k, v in self._buf.items() if v}
+
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
+
+        C = max(
+            (int(k.split("/ch_")[1].split("/")[0]) for k in metrics if "/ch_" in k),
+            default=-1,
+        ) + 1
+
+        if C > 0:
+            parts = []
+            for c in range(C):
+                pfx = f"grad_diag/ch_{c}"
+                dc_frac = metrics.get(f"{pfx}/grad_dc_frac", float("nan"))
+                ac_frac = metrics.get(f"{pfx}/grad_ac_frac", float("nan"))
+                sign_frac = metrics.get(f"{pfx}/grad_sign_frac", float("nan"))
+                dc_mag = metrics.get(f"{pfx}/grad_dc_mag", float("nan"))
+                ac_mag = metrics.get(f"{pfx}/grad_ac_mag", float("nan"))
+                dro_mean = metrics.get(f"{pfx}/dro_w_mean", float("nan"))
+                dro_max = metrics.get(f"{pfx}/dro_w_max", float("nan"))
+                dro_fup = metrics.get(f"{pfx}/dro_frac_up", float("nan"))
+                gap_mean = metrics.get(f"{pfx}/level_gap_mean", float("nan"))
+                gap_ev = metrics.get(f"{pfx}/level_gap_ev_mean", float("nan"))
+                gap_sat = metrics.get(f"{pfx}/level_gap_sat", float("nan"))
+                sl_ratio = metrics.get(f"{pfx}/shape_level_ratio", float("nan"))
+                shape_dc = metrics.get(f"{pfx}/shape_dc", float("nan"))
+                ev_frac = metrics.get(f"{pfx}/event_frac", float("nan"))
+                # NEW
+                density = metrics.get(f"{pfx}/density_scale_mean", float("nan"))
+                gap_scaled = metrics.get(f"{pfx}/gap_scaled_mean", float("nan"))
+                w_lvl = metrics.get(f"{pfx}/w_level_mean", float("nan"))
+                active = metrics.get(f"{pfx}/batch_active_frac", float("nan"))
+                parts.append(
+                    f"ch{c}["
+                    f"dc%={dc_frac:.0%} ac%={ac_frac:.0%} sign↑={sign_frac:.2f} "
+                    f"dcMag={dc_mag:.4f} acMag={ac_mag:.4f} | "
+                    f"dro={dro_mean:.2f}±{dro_max:.1f}× ↑{dro_fup:.0%} | "
+                    f"gap={gap_mean:.3f}/{gap_ev:.3f} sat={gap_sat:.0%} "
+                    f"sl={sl_ratio:.2f} | "
+                    f"density={density:.2f}x gap_s={gap_scaled:.4f} "
+                    f"w_lvl={w_lvl:.3f} act={active:.1%} | "
+                    f"shDC={shape_dc:.4f} ev={ev_frac:.2f}]"
+                )
+            fcout_norm = metrics.get("grad_diag/fcout_grad_norm_mean", float("nan"))
+            fcout_sign = metrics.get("grad_diag/fcout_grad_sign_frac", float("nan"))
+            grad_ev = metrics.get("grad_diag/grad_event", 0.0)
+            grad_nev = metrics.get("grad_diag/grad_nonevent", 0.0)
+            logger.info(
+                f"[Epoch {trainer.current_epoch}] GradDiag | "
+                + " ".join(parts)
+                + f" | fc_out[norm={fcout_norm:.4f} sign↑={fcout_sign:.2f}]"
+                + f" | grad_ev={grad_ev:+.6f} grad_nev={grad_nev:+.6f}"
+            )
+
+        self._buf.clear()

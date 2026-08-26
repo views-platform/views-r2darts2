@@ -17,6 +17,9 @@ from views_r2darts2.math.spotlight_loss_power_law import SpotlightLossPowerLaw
 from views_r2darts2.math.spotlight_focal_loss import SpotlightFocalLoss
 from views_r2darts2.math.sentinel_loss import SentinelLoss
 from views_r2darts2.math.charbonnier_loss import CharbonnierLoss
+from views_r2darts2.math.mse_loss import MSELoss
+from views_r2darts2.math.huber_loss import HuberLoss
+from views_r2darts2.math.logcosh_loss import LogCoshLoss
 
 
 logger = logging.getLogger(__name__)

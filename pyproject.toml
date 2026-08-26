@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "views_r2darts2"
-version = "0.2.0"
+version = "0.2.1"
 description = "Neural network based forecasting models for the VIEWS platform"
 authors = [
     "Dylan Pinheiro <dylpin@prio.org>",

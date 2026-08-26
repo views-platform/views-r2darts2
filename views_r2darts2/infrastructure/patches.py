@@ -795,8 +795,7 @@ def apply_tide_skip_layernorm_patch():
     logger.info(
         "[TiDE Skip LayerNorm patch] ✅ installed: "
         "_TideModule.skip_layer_norm (LayerNorm over nr_params). "
-        "Normalizes lookback_skip output before addition to temporal_decoded, "
-        "preventing magnitude imbalance on 99% sparse data."
+        "Normalizes lookback_skip output before addition to temporal_decoded."
     )
 
 

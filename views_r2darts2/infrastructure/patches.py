@@ -671,10 +671,9 @@ def _patched_tide_module_init(
         **kwargs,
     )
     
-    # Add LayerNorm for skip connection
-    # skip shape after reshape: (batch, output_chunk_length, output_dim, nr_params)
-    # We normalize over the last dimension (nr_params) to match temporal_decoder output
-    self.skip_layer_norm = nn.LayerNorm(nr_params)
+    # Normalize over the full flattened feature dimension (output_dim * nr_params)
+    # skip shape after reshape_as(temporal_decoded) is (batch, output_chunk_length, output_dim * nr_params)
+    self.skip_layer_norm = nn.LayerNorm(output_dim * nr_params)
 
 
 def _patched_tide_module_forward_with_layernorm(

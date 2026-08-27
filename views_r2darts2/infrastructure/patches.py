@@ -12,14 +12,12 @@ add features that the upstream library does not yet expose:
     * ``_ResidualBlock.__init__`` + ``_TideModule.forward`` (TiDE) — add
       ``MonteCarloDropout`` to both skip paths so MC dropout produces
       meaningful sample variation.
-    * ``_TideModule.__init__`` + ``_TideModule.forward`` (TiDE) — add
-      LayerNorm to ``lookback_skip`` output before addition to prevent
-      magnitude imbalance between skip and temporal decoder paths.
 
 Call ``apply_all_patches()`` once at process startup (typically from
 ``DartsForecastingModelManager.__init__``).
-"""
 
+
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,7 +26,6 @@ from typing import Optional, Tuple
 from darts.utils.torch import MonteCarloDropout
 
 logger = logging.getLogger(__name__)
-
 
 # --- 1. PyTorch Load Patch (weights_only safety) ---
 
@@ -50,7 +47,7 @@ def apply_torch_load_patch():
                 if "Mock" not in str(type(orig)):
                     torch.__original_load__ = orig
                 else:
-                    return  # Already contaminated, skip
+                    return # Already contaminated, skip
 
         def custom_torch_load(*args, **kwargs):
             if "weights_only" not in kwargs:
@@ -61,8 +58,7 @@ def apply_torch_load_patch():
         torch.load = custom_torch_load
         logger.info("Successfully patched torch.load (weights_only=False default).")
 
-
-# --- 2. RINorm Hybrid-Space Normalization Patch ---
+# --- 3. RINorm Hybrid-Space Normalization Patch ---
 #
 # ═══════════════════════════════════════════════════════════════════════
 # PROBLEM (v1: standard RevIN in asinh-space)
@@ -292,11 +288,13 @@ def apply_rinorm_compression_patch():
             # x[..., 0]: location parameter — full nonlinear inverse
             loc = torch.asinh(torch.sinh(x[..., :1]) * sigma) + mu
             # x[..., 1+]: scale/dispersion — identity (model learns in target space)
+            # loc = F.relu(loc)
             sca = x[..., 1:]
             x = torch.cat([loc, sca], dim=-1)
         else:
             # Point forecasting (nr_params == 1) — full inverse as before
             x = torch.asinh(torch.sinh(x) * sigma) + mu
+            # x = F.relu(x) # fatalities cannot be negative
 
         return x
 
@@ -309,7 +307,7 @@ def apply_rinorm_compression_patch():
     )
 
 
-# --- 3. TCN Tanh Activation Patch ---
+# --- 5. TCN Tanh Activation Patch ---
 #
 # TCN's _ResidualBlock uses hardcoded F.relu (not configurable via any parameter).
 # With 4 residual blocks stacking additively, outputs accumulate to ~20+ in
@@ -611,194 +609,6 @@ def apply_tide_mc_dropout_patch():
     )
 
 
-# --- 5. TiDE Lookback Skip LayerNorm Patch ---
-#
-# TiDE's lookback_skip is a raw nn.Linear mapping input_chunk_length → output_chunk_length
-# with no normalization. The temporal_decoder path has LayerNorm (via _ResidualBlock),
-# but lookback_skip does not. This creates a magnitude imbalance:
-#
-#   - temporal_decoded: normalized via LayerNorm in _ResidualBlock
-#   - skip: unbounded, can output arbitrary magnitudes
-# Implementation:
-#   - Patch _TideModule.__init__ to register skip_layer_norm
-#   - Patch _TideModule.forward to apply it before addition
-#   - Use output_chunk_length * nr_params as normalized_shape (last dim of skip)
-
-
-_original_tide_module_init = None  # set in apply_tide_skip_layernorm_patch
-
-
-def _patched_tide_module_init(
-    self,
-    input_dim: int,
-    output_dim: int,
-    future_cov_dim: int,
-    static_cov_dim: int,
-    nr_params: int,
-    num_encoder_layers: int,
-    num_decoder_layers: int,
-    decoder_output_dim: int,
-    hidden_size: int,
-    temporal_decoder_hidden: int,
-    temporal_width_past: int,
-    temporal_width_future: int,
-    use_layer_norm: bool,
-    dropout: float,
-    temporal_hidden_size_past: int | None = None,
-    temporal_hidden_size_future: int | None = None,
-    **kwargs,
-):
-    """Patched _TideModule.__init__: adds skip_layer_norm for lookback_skip output."""
-    # Call original __init__
-    _original_tide_module_init(
-        self,
-        input_dim=input_dim,
-        output_dim=output_dim,
-        future_cov_dim=future_cov_dim,
-        static_cov_dim=static_cov_dim,
-        nr_params=nr_params,
-        num_encoder_layers=num_encoder_layers,
-        num_decoder_layers=num_decoder_layers,
-        decoder_output_dim=decoder_output_dim,
-        hidden_size=hidden_size,
-        temporal_decoder_hidden=temporal_decoder_hidden,
-        temporal_width_past=temporal_width_past,
-        temporal_width_future=temporal_width_future,
-        use_layer_norm=use_layer_norm,
-        dropout=dropout,
-        temporal_hidden_size_past=temporal_hidden_size_past,
-        temporal_hidden_size_future=temporal_hidden_size_future,
-        **kwargs,
-    )
-    
-    # Normalize over the full flattened feature dimension (output_dim * nr_params)
-    # skip shape after reshape_as(temporal_decoded) is (batch, output_chunk_length, output_dim * nr_params)
-    self.skip_layer_norm = nn.LayerNorm(output_dim * nr_params)
-
-
-def _patched_tide_module_forward_with_layernorm(
-    self, x_in: Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
-) -> torch.Tensor:
-    """Patched _TideModule.forward: applies LayerNorm to skip before addition."""
-    # Darts passes (x_past, x_future, x_static[, future_target, ...]); discard extras.
-    x, x_future_covariates, x_static_covariates, *_ = x_in
-
-    x_lookback = x[:, :, : self.output_dim]
-
-    # future covariates
-    if self.future_cov_dim:
-        x_dynamic_future_covariates = torch.cat(
-            [
-                x[:, :, None if self.future_cov_dim == 0 else -self.future_cov_dim :],
-                x_future_covariates,
-            ],
-            dim=1,
-        )
-        if self.temporal_width_future:
-            x_dynamic_future_covariates = self.future_cov_projection(
-                x_dynamic_future_covariates
-            )
-    else:
-        x_dynamic_future_covariates = None
-
-    # past covariates
-    if self.past_cov_dim:
-        x_dynamic_past_covariates = x[
-            :, :, self.output_dim : self.output_dim + self.past_cov_dim
-        ]
-        if self.temporal_width_past:
-            x_dynamic_past_covariates = self.past_cov_projection(
-                x_dynamic_past_covariates
-            )
-    else:
-        x_dynamic_past_covariates = None
-
-    # encoder input
-    encoded = [
-        x_lookback,
-        x_dynamic_past_covariates,
-        x_dynamic_future_covariates,
-        x_static_covariates,
-    ]
-    encoded = [t.flatten(start_dim=1) for t in encoded if t is not None]
-    encoded = torch.cat(encoded, dim=1)
-
-    # encode + decode
-    encoded = self.encoders(encoded)
-    decoded = self.decoders(encoded)
-    decoded = decoded.view(x.shape[0], self.output_chunk_length, -1)
-
-    # temporal decoder
-    temporal_decoder_input = [
-        decoded,
-        (
-            x_dynamic_future_covariates[:, -self.output_chunk_length :, :]
-            if self.future_cov_dim > 0
-            else None
-        ),
-    ]
-    temporal_decoder_input = [t for t in temporal_decoder_input if t is not None]
-    temporal_decoder_input = torch.cat(temporal_decoder_input, dim=2)
-    temporal_decoded = self.temporal_decoder(temporal_decoder_input)
-
-    # lookback skip with LayerNorm
-    skip = self.lookback_skip(x_lookback.transpose(1, 2)).transpose(1, 2)
-    skip = skip.reshape_as(temporal_decoded)
-    
-    # Apply LayerNorm to skip before addition (if skip_layer_norm exists)
-    if hasattr(self, 'skip_layer_norm'):
-        skip = self.skip_layer_norm(skip)
-    
-    # Apply MC dropout if registered (from apply_tide_mc_dropout_patch)
-    if hasattr(self, "lookback_skip_dropout"):
-        skip = self.lookback_skip_dropout(skip)
-
-    y = temporal_decoded + skip
-    y = y.view(-1, self.output_chunk_length, self.output_dim, self.nr_params)
-    return y
-
-
-def apply_tide_skip_layernorm_patch():
-    """
-    Patches TiDE _TideModule to add LayerNorm on lookback_skip output.
-
-    Root cause: lookback_skip is unnormalized while temporal_decoder path has
-    LayerNorm via _ResidualBlock. This magnitude imbalance allows the skip
-    connection to dominate output when it encounters spikes, causing calibration
-    overprediction and forecast underprediction on 99% sparse data.
-
-    Fix: Add nn.LayerNorm(nr_params) to normalize skip output before addition,
-    matching TSMixer's approach where all signal paths are normalized.
-
-    Implementation:
-      - Patch _TideModule.__init__ to register skip_layer_norm
-      - Patch _TideModule.forward to apply it before addition
-      - Backwards compatible: checks hasattr before applying
-    """
-    global _original_tide_module_init
-
-    from darts.models.forecasting.tide_model import _TideModule
-    from darts.models.forecasting.pl_forecasting_module import io_processor
-
-    if getattr(_TideModule.__init__, '_skip_ln_patched', False):
-        logger.debug("[TiDE Skip LayerNorm patch] already applied, skipping.")
-        return
-
-    # --- Patch _TideModule.__init__ ---
-    _original_tide_module_init = _TideModule.__init__
-    _TideModule.__init__ = _patched_tide_module_init
-    _TideModule.__init__._skip_ln_patched = True
-
-    # --- Patch _TideModule.forward ---
-    _TideModule.forward = io_processor(_patched_tide_module_forward_with_layernorm)
-
-    logger.info(
-        "[TiDE Skip LayerNorm patch] ✅ installed: "
-        "_TideModule.skip_layer_norm (LayerNorm over nr_params). "
-        "Normalizes lookback_skip output before addition to temporal_decoded."
-    )
-
-
 def _layer_norm_last_dim(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """Applies functional LayerNorm over the last dimension without new parameters."""
     if x.ndim < 2 or x.shape[-1] <= 1:
@@ -940,6 +750,5 @@ def apply_all_patches():
     apply_rinorm_compression_patch()
     apply_tcn_tanh_patch()
     apply_tide_mc_dropout_patch()
-    apply_tide_skip_layernorm_patch()
     apply_nhits_layernorm_patch()
     apply_nbeats_layernorm_patch()

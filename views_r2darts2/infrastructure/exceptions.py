@@ -1,7 +1,4 @@
 """Exception hierarchy for the reproducibility gate.
-
-Pure-Python module: no external dependencies. The class names are part of the
-public API — tests and downstream code import them by name.
 """
 
 from __future__ import annotations

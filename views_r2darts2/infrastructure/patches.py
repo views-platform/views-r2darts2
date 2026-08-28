@@ -940,6 +940,6 @@ def apply_all_patches():
     apply_rinorm_compression_patch()
     apply_tcn_tanh_patch()
     apply_tide_mc_dropout_patch()
-    apply_tide_skip_layernorm_patch()
+    # apply_tide_skip_layernorm_patch()
     apply_nhits_layernorm_patch()
     apply_nbeats_layernorm_patch()

@@ -1,3 +1,7 @@
+"""
+SpotlightLossLogcosh — event-gated Shape variant
+"""
+
 import math
 import torch
 import torch.nn.functional as F
@@ -5,9 +9,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class SpotlightLossLogcosh(torch.nn.Module):
     """
+    Three-component loss for sparse-event forecasting in asinh space.
+
+    Components
+    ----------
+    shape  : log_cosh on demeaned per-cell errors, gated by `event_mask`
+             (covers true events and false-positive predictions), DRO-weighted.
+    level  : T-scaled log_cosh of event-only mean gap (y_pred - y_true on
+             y_true>tau cells). Drives series-level calibration.
+    anchor : log_cosh of dead-cell sum. Pushes false positives and true dead
+             cells toward 0 at the aggregate level.
     """
+
     _EPS = 1e-6
 
     def __init__(self, non_zero_threshold: float = 0.88):
@@ -19,6 +35,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
 
     @staticmethod
     def _log_cosh(x: torch.Tensor) -> torch.Tensor:
+        # Numerically stable log(cosh(x)) = |x| + softplus(-2|x|) - log(2)
         a = x.abs()
         return a + F.softplus(-2.0 * a) - math.log(2.0)
 
@@ -42,23 +59,38 @@ class SpotlightLossLogcosh(torch.nn.Module):
         e = y_pred - y_true
 
         # ── Event gate ───────────────────────────────────────────────
+        # `abs_max` uses y_pred.detach() so the gate value does not flow gradient
+        # back through y_pred (gate is treated as a fixed weighting, not a
+        # differentiable function of the prediction).
         abs_max = torch.max(y_true.abs(), y_pred.detach().abs())
         gate = torch.sigmoid(10.0 * (abs_max - self.tau))
 
-        # ── True event mask (for gap routing + dead anchor) ──────────
+        # `event_mask`: hard mask, true where EITHER y_true OR y_pred exceeds tau.
+        # Used for: DRO normalization, w_level gating, AND (NEW) Shape gradient routing.
+        event_mask = (abs_max > self.tau).float()
+
+        # `y_true_mask`: hard mask, true only where y_true exceeds tau.
+        # Used for: gap routing (event-only mean) and dead-cell anchor.
         y_true_mask = (y_true.abs() > self.tau).float()
 
-        # ── SHAPE: log_cosh on demeaned errors ────────
+        # ── SHAPE: log_cosh on demeaned errors ───────────────────────
+        # Demean so Shape isolates positional contrast from series-level bias.
+        # `.detach()` on e_mean: prevents Shape gradient from leaking into the
+        # mean (which would make Shape fight Level on the bias term).
         e_mean = e.mean(dim=1, keepdim=True)
         e_shape = e - e_mean.detach()
 
-        # Shape gradient only through true-event cells; false positives get no shape pull
-        shape_cell = self._log_cosh(y_true_mask * e_shape + (1.0 - y_true_mask) * e_shape.detach())
+        # gate Shape gradient on `event_mask` (covers y_pred spikes),
+        # not `y_true_mask` (y_true only). False-positive spikes now receive
+        # full-magnitude Shape pull at their exact position.
+        #
+        # Mechanism: for masked-out cells, `e_shape.detach()` returns the value
+        # for the loss but stops gradient. Only event cells (true or predicted)
+        # contribute to d(loss)/d(y_pred).
+        shape_cell = self._log_cosh(event_mask * e_shape + (1.0 - event_mask) * e_shape.detach())
 
-        # DRO weighting
-        event_mask = (abs_max > self.tau).float()
-
-        # Ground DRO in shape error magnitude so weighting follows demeaned residuals.
+        # DRO weighting — amplify Shape pull on the most-wrong event cells.
+        # Grounded in |e_shape| so weighting follows demeaned residuals.
         raw_abs = e_shape.abs().detach()
         n_ev = event_mask.sum(dim=1, keepdim=True).clamp_min(1e-6)
         dro_mu = (raw_abs * event_mask).sum(dim=1, keepdim=True) / n_ev
@@ -74,27 +106,18 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_shape = (shape_w * shape_cell).sum() / shape_w.sum().clamp_min(self._EPS)
 
-        # ── LEVEL: Clean Gap + Density-Scaled + Hájek + T ────────────
-        # Route gap gradient to event cells only.
-        # VALUE: gap = y_pred.mean(dim=1) - y_true.mean(dim=1)
-        # GRADIENT: only event cells (y_true_mask=1) get Level gradient
-        # → density_scale amplifies cleaan event-cell error, not dead-cell leakage
-        # y_pred_for_gap = y_true_mask * y_pred + (1.0 - y_true_mask) * y_pred.detach()
-        # # y_pred_for_gap = event_mask * y_pred + (1.0 - event_mask) * y_pred.detach() # no
-        # gap = y_pred_for_gap.mean(dim=1) - y_true.mean(dim=1)
-
+        # ── LEVEL: event-only mean gap, T-scaled ─────────────────────
+        # gap = mean(y_pred on y_true>tau) - mean(y_true on y_true>tau)
+        # Per-series, only over true-event cells. False positives do NOT push
+        # the mean — that's the anchor's job.
         n_ev_safe = y_true_mask.sum(dim=1).clamp_min(1.0)
         gap = (y_true_mask * y_pred).sum(dim=1) / n_ev_safe - (y_true_mask * y_true).sum(dim=1) / n_ev_safe
 
-        # Series-level: amplify gap for sparse-event series
-        # clamp_min(1.0) instead of clamp_min(T) (was a no-op)
-        n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
-        # Pure logcosh(gap). LEVEL dominance comes from the `T *` factor below, not from
-        # per-series density weighting (which amplified LEVEL on sparse series, over-driving
-        # the shared per-series mean and collapsing all countries to one RevIN-scaled template).
+        # Pure log_cosh(gap). LEVEL dominance comes from the `T *` factor below.
         level_cell = self._log_cosh(gap)
 
-        # Batch-level: weight by signal strength, gated by has_gated
+        # Batch-level weight: signal strength gated by has_gated.
+        n_ev_flat = event_mask.sum(dim=1).squeeze(1) if event_mask.dim() == 3 else event_mask.sum(dim=1)
         event_frac = event_mask.mean().clamp_min(self._EPS)
         has_gated = (gate.sum(dim=1) > self._EPS).float()
         w_level = (torch.sqrt(n_ev_flat.float()) + event_frac) * has_gated
@@ -104,10 +127,10 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_level = T * (w_level * level_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
-        # ── Dead-cell anchor at Shape scale ─────────────────
-        # Pushes dead cells toward 0, eliminating gap contamination source.
-        # Uses y_true_mask inverse (true dead + false alarms).
-        # Sum-based: tanh saturates → bounded strong gradient without T.
+        # ── Dead-cell anchor at Shape scale ──────────────────────────
+        # Pushes dead cells (y_true=0) toward 0, including false positives.
+        # Aggregate form: log_cosh(sum_t dead_pred_t). Tanh saturates above
+        # ~2, giving bounded per-cell gradient without T scaling.
         dead_mask = 1.0 - y_true_mask
         dead_sum = (dead_mask * y_pred).sum(dim=1)
         anchor_cell = self._log_cosh(dead_sum)
@@ -117,7 +140,7 @@ class SpotlightLossLogcosh(torch.nn.Module):
         else:
             loss_anchor = (w_level * anchor_cell).sum() / w_level.sum().clamp_min(self._EPS)
 
-        # ── Combine ───────────────────────────────────────────────────
+        # ── Combine ──────────────────────────────────────────────────
         if multivariate:
             per_channel = loss_shape + loss_level + loss_anchor
             total_loss = per_channel.sum()
@@ -132,18 +155,15 @@ class SpotlightLossLogcosh(torch.nn.Module):
             anchor_c = [float(loss_anchor.detach())]
             comp = [float(total_loss.detach())]
 
-        # ── Diagnostic telemetry ──────────────────────────────────────
+        # ── Diagnostic telemetry ─────────────────────────────────────
         # All telemetry is computed on CPU to avoid allocating large temporary
         # tensors on the GPU when device memory is already near capacity.
         with torch.no_grad():
-            # Move large batch tensors to CPU first; scalars stay as Python floats.
             _event_mask_cpu = event_mask.cpu()
             _w_dro_cpu      = w_dro.cpu()
             _gate_cpu       = gate.cpu()
             _e_shape_cpu    = e_shape.cpu()
             _gap_cpu        = (y_pred.mean(dim=1) - y_true.mean(dim=1)).cpu()
-            # _density_scale_cpu = density_scale.cpu()
-            # _gap_scaled_cpu = (_gap_cpu * _density_scale_cpu).abs()
             _w_level_cpu    = w_level.cpu()
             _has_gated_cpu  = has_gated.cpu()
             _dead_sum_cpu   = dead_sum.cpu()
@@ -186,8 +206,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 shape_dc_l = (_gate_cpu * _e_shape_cpu).mean(dim=1).abs().mean(dim=0).tolist()
 
                 sl_ratio_l = (loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).tolist()
-                # density_scale_mean_l = self._tolist(_density_scale_cpu.mean(dim=0))
-                # gap_scaled_mean_l    = self._tolist(_gap_scaled_cpu.mean(dim=0))
                 w_level_mean_l       = self._tolist(_w_level_cpu.mean(dim=0))
                 batch_active_frac_l  = self._tolist(_has_gated_cpu.mean(dim=0))
                 dead_sum_mean_l      = self._tolist(_dead_sum_cpu.mean(dim=0))
@@ -213,8 +231,6 @@ class SpotlightLossLogcosh(torch.nn.Module):
                 shape_dc_l = [(_gate_cpu * _e_shape_cpu).mean(dim=1).abs().mean().item()]
 
                 sl_ratio_l = [float((loss_shape.detach() / loss_level.detach().clamp_min(self._EPS)).item())]
-                # density_scale_mean_l = [_density_scale_cpu.mean().item()]
-                # gap_scaled_mean_l    = [_gap_scaled_cpu.mean().item()]
                 w_level_mean_l       = [_w_level_cpu.mean().item()]
                 batch_active_frac_l  = [_has_gated_cpu.mean().item()]
                 dead_sum_mean_l      = [_dead_sum_cpu.mean().item()]
@@ -246,11 +262,12 @@ class SpotlightLossLogcosh(torch.nn.Module):
             "level_gap_sat": gap_sat_l,
             "shape_dc": shape_dc_l,
             "shape_level_ratio": sl_ratio_l,
-            # "density_scale_mean": density_scale_mean_l,
-            # "gap_scaled_mean": gap_scaled_mean_l,
             "w_level_mean": w_level_mean_l,
             "batch_active_frac": batch_active_frac_l,
             "dead_sum_mean": dead_sum_mean_l,
+            # Gradient direction telemetry (mean grad on event vs non-event cells)
+            "grad_ev": [grad_ev] if not multivariate else [grad_ev] * n,
+            "grad_nev": [grad_nev] if not multivariate else [grad_nev] * n,
         }
 
         logger.debug(

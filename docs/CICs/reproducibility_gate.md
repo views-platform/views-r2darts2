@@ -2,8 +2,8 @@
 
 **Status:** Active  
 **Owner:** Core Engineering  
-**Last reviewed:** 2026-02-11  
-**Related ADRs:** ADR-001, ADR-003, ADR-005, ADR-008, ADR-009, ADR-010  
+**Last reviewed:** 2026-09-10  
+**Related ADRs:** ADR-001, ADR-003, ADR-005, ADR-008, ADR-009, ADR-016  
 
 ---
 
@@ -31,6 +31,11 @@ The `ReproducibilityGate` is "The Law" of the repository. It is a stateless util
 - **Prevents Data Leakage:** Ensures that no month IDs from the test partition are physically present in the training tensors.
 - **Enforces Sequential Integrity:** Scans for "Temporal Holes" (missing months) in historical data to prevent distorted time-series dynamics.
 - **Numerical Sanity Firewall:** Detects NaNs, Infs, and extreme adversarial outliers at the data entry points.
+- **Architecture Alignment:** `Config.audit_architecture` requires `len(steps) % output_chunk_length == 0` and warns loudly on a non-36 horizon or a non-1 start offset.
+- **Boundary Integrity:** `Temporal.audit_boundary_integrity` requires training series to end exactly at the partition boundary — no leak, no starvation.
+- **Horizon Lockdown:** `Temporal.audit_prediction_horizon` forbids forecasting past known ground truth for `calibration`/`validation` runs.
+- **Frame Schema:** `Data.audit_frame_schema` validates a `views_frames.FeatureFrame` at ingest (the pandas `audit_dataframe_schema` of 0.1.x is gone).
+- **Entropy Lock:** `Data.lock_entropy(seed)` reseeds `random`, `numpy` and `torch` so probabilistic draws are bit-identical across reloads.
 
 ---
 
@@ -61,8 +66,9 @@ The `ReproducibilityGate` is "The Law" of the repository. It is a stateless util
 ## 7. Boundaries and Interactions
 
 - **Universal Utility:** Accessible and consumed by all layers (Data, Model, and Manager).
-- **Independent:** Must remain stateless and dependency-free (ADR-002 Layer 0).
-- **Physical Zen:** Lives in `views_r2darts2/utils/reproducibility_gate.py`.
+- **Independent:** Stateless. Imports only `infrastructure/exceptions.py` from this package (ADR-002 Layer 0) — but it is *not* dependency-free: it imports `darts.TimeSeries`, `torch`, and `views_frames.FeatureFrame`.
+- **Physical Zen:** Lives in `views_r2darts2/infrastructure/reproducibility_gate.py`.
+- **Registries:** Owns `CORE_GENOME`, `ALGORITHM_GENOMES`, `OPTIMIZER_GENOMES`, `SCHEDULER_GENOMES`, `LOSS_GENOMES` on `Config`. The four catalogs hold parallel registries; the two must be edited together (C-11).
 - **Master Auditor:** Validates the handshake between `views_pipeline_core` and the local codebase.
 
 ---
@@ -89,16 +95,15 @@ ReproducibilityGate.Temporal.audit_continuity(partition_dict)
 
 ## 10. Test Alignment
 
-- **Red Team:** `tests/test_reproducibility_infra.py` (Adversarial injection of holes and leaks).
-- **Beige Team:** `tests/test_reproducibility_infra.py` (DNA manifest omission tests).
-- **Infrastructure:** `tests/repro_phase1_gate.py` (Verification of polymorphic genome auditing).
+- **Red + Beige Team:** `tests/test_reproducibility_gate.py` (33 tests: hole and leak injection, DNA omission, `None`-value rejection, horizon overflow, entropy lock).
 
 ---
 
 ## 11. Evolution Notes
 
 ### Known Deviations / Technical Debt
-- **Precision Auditing:** Currently, the gate does not strictly check for `float32` vs `float64` at the tensor level. This should be added to the Data gate to enforce ADR-010.
+- **`MultiQueryTransformerModel` is registered in `ALGORITHM_GENOMES` with no catalog factory** — `audit_manifest` accepts it and `ModelCatalog.get_model` then crashes opaquely (C-11).
+- **`float64` check is informational only** in `audit_frame_schema`; the converters guarantee `float32` by construction, so this is moot rather than a gap (ADR-016 open question).
 
 ---
 

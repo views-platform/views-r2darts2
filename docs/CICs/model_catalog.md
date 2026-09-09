@@ -2,7 +2,7 @@
 
 **Status:** Active  
 **Owner:** Core Engineering  
-**Last reviewed:** 2026-02-11  
+**Last reviewed:** 2026-09-10  
 **Related ADRs:** ADR-001, ADR-002, ADR-003, ADR-006, ADR-009  
 
 ---
@@ -17,7 +17,7 @@ The `ModelCatalog` acts as the central factory for translating abstract DNA mani
 
 ## 2. Non-Goals (Explicit Exclusions)
 
-- This class does **not** manage the data pipeline or scaling logic (delegated to the Forecaster).
+- This class does **not** manage the data pipeline or scaling logic (delegated to `ViewsDataset`).
 - This class does **not** execute training or inference (delegated to the Forecaster).
 - This class does **not** persist or load model artifacts (delegated to the Manager/Forecaster).
 - This class does **not** handle Weights & Biases synchronization.
@@ -28,7 +28,7 @@ The `ModelCatalog` acts as the central factory for translating abstract DNA mani
 
 - **Guarantees Architectural Alignment:** Validates that the model's `output_chunk_length` is mathematically compatible with the forecast `steps` (ADR-009).
 - **Ensures Fail-Loud Initialization:** Guarantees that models are never initialized with "magic defaults." Every architecture-defining parameter must come from the DNA.
-- **Delegates Configuration Auditing:** Orchestrates `LossCatalog` and `OptimizerCatalog` to ensure total genomic compliance for optimization and objective functions.
+- **Delegates Configuration Auditing:** Orchestrates `LossCatalog`, `OptimizerCatalog` and `SchedulerCatalog` to ensure total genomic compliance. When `loss_function` names a Darts likelihood (`_LIKELIHOOD_REGISTRY`, 11 entries), `loss_fn` is set to `None` and the likelihood instance is passed to the model instead.
 - **Configures Fortress Callbacks:** Automatically attaches mandatory monitoring callbacks (e.g., `GradientHealth`) to every PyTorch Lightning trainer.
 
 ---
@@ -56,8 +56,8 @@ The `ModelCatalog` acts as the central factory for translating abstract DNA mani
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Managed by `DartsForecastingModelManager`.
-- **Physical Zen:** Lives in `views_r2darts2/model/model_catalog.py`.
-- **Specialized Factories:** Depends on `LossCatalog` and `OptimizerCatalog`.
+- **Physical Zen:** Lives in `views_r2darts2/catalogs/model_catalog.py`.
+- **Specialized Factories:** Depends on `LossCatalog`, `OptimizerCatalog`, `SchedulerCatalog`, and `infrastructure/device.py` (not `engines/`, to avoid a cycle).
 
 ---
 
@@ -82,16 +82,19 @@ model = catalog.get_model("TiDEModel")
 
 ## 10. Test Alignment
 
-- **Beige Team:** `tests/test_catalog.py` (Exhaustive verification of parameter mapping for all 10 models).
-- **Green Team:** `tests/test_loss.py` (Integration with LossSelector).
+- **Beige Team:** `tests/test_model_catalog.py` (parameter mapping for all 10 models; `WandbLogger` patched out).
+- **Green Team:** `tests/test_genomic_handshake.py`, `tests/test_loss.py`.
+- **Known dead guard:** `test_init_with_invalid_loss_raises_error` in `tests/test_model_catalog.py` is nested inside another test and never collected (C-17).
 
 ---
 
 ## 11. Evolution Notes
 
 ### Known Deviations / Technical Debt
-- **Shared Weights Logic:** Currently, `input_chunk_length` and `output_chunk_length` logic is repeated across multiple `_get_X` methods. This should be refactored into a shared base builder method.
-- **Norm Type Defaults:** Some models still have hardcoded string defaults for `norm_type` (e.g., "RMSNorm" in TFT). These should be moved to the DNA genome.
+- **`"accelerator": "gpu"` is hardcoded** in `_get_common_pl_trainer_kwargs`; training cannot start on a CPU/MPS host and CI can never run a real `fit()` (C-21).
+- **Silent static-covariate drop:** N-BEATS, N-HiTS, TCN and Transformer factories do not pass `use_static_covariates`; the flag is accepted and ignored (C-07).
+- **`self.device` is assigned and never read** (C-32).
+- **`MultiQueryTransformerModel`** is in the gate's genome registry but has no factory here (C-11).
 
 ---
 

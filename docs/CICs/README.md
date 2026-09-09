@@ -52,21 +52,35 @@ Contracts must be clear enough that:
 
 ### Orchestration & Management
 - `darts_forecasting_model_manager.md`
+- `darts_forecaster.md`
 
-### Modeling & Transformation
+### Catalogs (Genome Translators)
 - `model_catalog.md`
 - `loss_catalog.md`
 - `optimizer_catalog.md`
-- `darts_forecaster.md`
-- `feature_scaler_manager.md`
-- `scaler_selector.md`
+- `scheduler_catalog.md`
 
 ### Data Infrastructure
-- `views_dataset_darts.md`
+- `views_dataset.md`
+- `dataset_builder.md`
+- `zarr_store.md`
+- `dataset_converters.md`
+- `dataset_subclasses.md`
+
+### Transformation
+- `feature_scaler_manager.md`
+- `scaler_selector.md`
+- `inverse.md`
+- `darts_bridge.md`
+- `frame_builder.md`
+- `static_covariates.md`
 
 ### Governance & Observability
 - `reproducibility_gate.md`
 - `fortress_monitoring_callbacks.md`
+
+### Retired
+- *views_dataset_darts* → moved to `docs/archive/CIC_views_dataset_darts.md` (class deleted in 0.2.x; replaced by `views_dataset.md`)
 
 ---
 

@@ -2,7 +2,7 @@
 
 **Status:** Active  
 **Owner:** Core Engineering  
-**Last reviewed:** 2026-02-16  
+**Last reviewed:** 2026-09-10  
 **Related ADRs:** ADR-001, ADR-002, ADR-012, ADR-013  
 
 ---
@@ -26,7 +26,7 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 ## 3. Responsibilities and Guarantees
 
 - **Enforces Transformation Registry:** Maintains the authoritative mapping of string keys to concrete Python classes or `FunctionTransformer` instances.
-- **Supports Chained Specifications:** Correctly parses and instantiates complex "->"-delimited chains (e.g., "AsinhTransform->StandardScaler") into Darts native `Pipeline` objects.
+- **Supports Chained Specifications:** Parses "->"-delimited chains (e.g., "AsinhTransform->StandardScaler") into Darts native `Pipeline` objects; a single-element chain returns a bare `Scaler`, never a one-element `Pipeline` (C-03).
 - **Ensures Global Calibration Defaults:** Guarantees that all Darts-wrapped scalers produced via chains are instantiated with `global_fit=True` (ADR-012).
 - **Provides Custom Transformation Logic:** Implements domain-specific transforms like `AsinhTransform` and `SqrtTransform` that are optimized for zero-inflated conflict counts.
 - **Provides Unified Config-to-Darts Factory:** `instantiate_darts_scaler()` translates flexible configuration formats (string, list, dict with chain/kwargs) into Darts `Scaler` or `Pipeline` objects, ensuring `global_fit=True` on all produced scalers (ADR-012).
@@ -44,7 +44,6 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 ## 5. Outputs and Side Effects
 
 - **Estimator:** Produces an uninstantiated class type or a `partial` function for single scalers.
-- **Pipeline:** Produces an instantiated `darts.dataprocessing.Pipeline` for chained scalers.
 - **Darts Scaler/Pipeline:** `instantiate_darts_scaler` produces Darts-wrapped `Scaler` or `Pipeline` objects (not raw sklearn estimators).
 - **Side Effects:** None. This is a stateless factory.
 
@@ -61,7 +60,7 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 
 ## 7. Boundaries and Interactions
 
-- **Upstream:** Primarily consumed by `FeatureScalerManager` and `DartsForecaster`.
+- **Upstream:** Consumed by `ViewsDataset.fit_scalers` and `FeatureScalerManager`.
 - **Physical Zen:** Lives in `views_r2darts2/transformers/scaler_selector.py`.
 - **Dependency:** Depends on Sklearn, Numpy, and Darts (`dataprocessing.transformers.Scaler`, `dataprocessing.Pipeline`).
 
@@ -76,10 +75,9 @@ scaler = ScalerSelector.get_scaler("StandardScaler")
 # Get a domain-specific custom transform
 asinh = ScalerSelector.get_scaler("AsinhTransform")
 
-# Get a Darts Pipeline chain
-pipeline = ScalerSelector.get_chained_scaler("AsinhTransform->RobustScaler")
-
-# Instantiate from flexible config (used by DartsForecaster and FeatureScalerManager)
+# Instantiate from flexible config (used by ViewsDataset and FeatureScalerManager).
+# This is the ONLY chain entry point; the legacy get_chained_scaler / get_scaler_or_chain /
+# is_chain_spec helpers were removed as dead code.
 scaler = ScalerSelector.instantiate_darts_scaler("AsinhTransform->StandardScaler")
 scaler = ScalerSelector.instantiate_darts_scaler({"chain": ["AsinhTransform", "RobustScaler"]})
 scaler = ScalerSelector.instantiate_darts_scaler(None)  # returns None
@@ -90,14 +88,13 @@ scaler = ScalerSelector.instantiate_darts_scaler(None)  # returns None
 ## 9. Examples of Incorrect Usage
 
 - **Direct Sklearn Import:** Importing `StandardScaler` from `sklearn.preprocessing` bypassing the selector (violates ADR-001).
-- **Manual String Parsing:** Manually splitting "->" in the Manager instead of calling `get_chained_scaler`.
+- **Manual String Parsing:** Manually splitting "->" anywhere instead of calling `instantiate_darts_scaler`.
 
 ---
 
 ## 10. Test Alignment
 
-- **Green Team:** `tests/test_scaling.py` (Verification of transform registry).
-- **Infrastructure:** `tests/test_scaling_robustness.py` (Validation of pipeline chaining).
+- **Green Team:** `tests/test_scaler_selector.py` (registry, all four chain-spec forms, single-element collapse, empty/invalid-element errors, `global_fit=True`).
 
 ---
 

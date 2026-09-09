@@ -2,7 +2,7 @@
 
 **Status:** Active  
 **Owner:** Core Engineering  
-**Last reviewed:** 2026-02-11  
+**Last reviewed:** 2026-09-10  
 **Related ADRs:** ADR-001, ADR-002, ADR-003, ADR-009, ADR-011  
 
 ---
@@ -18,8 +18,8 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 ## 2. Non-Goals (Explicit Exclusions)
 
 - This class does **not** implement model architectures or loss functions (delegated to `ModelCatalog`).
-- This class does **not** manage low-level data transformations or scaling (delegated to `DartsForecaster`).
-- This class does **not** contain scientific business logic or heuristic "clipping" (ADR-010).
+- This class does **not** manage low-level data transformations or scaling (delegated to `ViewsDataset`).
+- This class does **not** contain scientific business logic or thresholds (ADR-016).
 - This class does **not** directly interface with databases or external APIs (except via `ModelPathManager`).
 
 ---
@@ -38,14 +38,15 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 
 - **Config Snapshot:** Assumes a merged configuration dictionary containing both `CORE` and `ALGORITHM` genomes.
 - **Path Manager:** Requires a `ModelPathManager` to resolve standardized directory structures.
-- **Data Availability:** Assumes raw VIEWS dataframes exist at the paths provided by the Path Manager.
+- **Data Availability:** Assumes a raw parquet (or cached frame) exists at the path resolved by `_resolve_raw_parquet_path` from the Path Manager.
+- **Parent Class:** Requires `views_pipeline_core` (the optional `manager` extra). Without it the module still imports — the class inherits from `object` — but `__init__` raises `ImportError`.
 
 ---
 
 ## 5. Outputs and Side Effects
 
 - **Artifacts:** Produces persistent `.pt` model artifacts containing weights and coupled scaler states.
-- **Predictions:** Produces lists of `pd.DataFrame` results for evaluation or forecasting.
+- **Predictions:** Produces `dict[str, PredictionFrame]` per sequence (evaluation) or per run (forecast); DataFrame conversion only on demand via `_predictions_to_dataframe`.
 - **Logging:** Emits structured logs via `WandbLogger` and standard logging for lifecycle events.
 - **Monkeypatching:** Performs a controlled override of `torch.load` to handle Darts serialization requirements.
 
@@ -55,7 +56,7 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 
 - **Configuration Gap:** Raises `MissingHyperparameterError` if the DNA is incomplete.
 - **Temporal Gap:** Raises `TemporalDiscontinuityError` if the test set is not contiguous with training.
-- **Hardware Drift:** Raises `RuntimeError` if GPU restoration fails during prediction.
+- **Hardware Drift:** *Does not raise* — the forecaster warns and continues on CPU (register D-01).
 - **Horizon Violation:** Raises `PredictionHorizonError` if a forecast is attempted beyond ground truth.
 
 ---
@@ -92,17 +93,23 @@ predictions = manager._evaluate_model_artifact(eval_type="standard")
 
 ## 10. Test Alignment
 
-- **Red Team:** `tests/test_reproducibility_infra.py` (Temporal injections, DNA poisoning).
-- **Green Team:** `tests/test_model.py` (Lifecycle verification).
-- **Beige Team:** Verified via `ModelCatalog` integration tests.
+- **Green Team:** `tests/test_darts_forecasting_model_manager.py` (`_resolve_total_sequence_number` boundary and failure cases, lazy-import path, lifecycle wiring).
+- **Red Team:** `tests/test_reproducibility_gate.py` (the gates this class invokes at the handshake).
+- **Beige Team:** `tests/test_model_catalog.py` (catalog integration).
+- **Not covered:** no test executes a real `model.fit()` — CI runs on a host without CUDA and `"accelerator": "gpu"` is hardcoded (C-21).
 
 ---
 
 ## 11. Evolution Notes
 
 ### Known Deviations / Technical Debt
-- **Direct Data Loading:** Currently uses `read_dataframe` directly. This should eventually be delegated to a dedicated data-orchestration utility to keep the manager purely about lifecycle.
-- **Fixed Seq Numbers:** Some methods still hardcode `total_sequence_number = 12`. This should be moved to the DNA manifest.
+- **Timestamp by fixed slice:** `path_artifact.stem[-15:]` with no validation (C-29; ADR-015 governs the contract).
+- **`parallel_workers > 1` races on the global RNG** that `lock_entropy` reseeds (C-24).
+- **`torch.load` is patched process-wide** on construction via `apply_all_patches()` (C-28).
+
+### Resolved in 0.2.x
+- Sequence count is derived by `_resolve_total_sequence_number(partition, max_steps)` with a fail-loud guard (C-01/C-02).
+- Data loading goes through `ViewsDataset`, not a direct `read_dataframe` call.
 
 ---
 

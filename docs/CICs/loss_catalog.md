@@ -2,7 +2,7 @@
 
 **Status:** Active  
 **Owner:** Core Engineering  
-**Last reviewed:** 2026-02-16  
+**Last reviewed:** 2026-09-10  
 **Related ADRs:** ADR-001, ADR-003, ADR-006, ADR-009, ADR-013  
 
 ---
@@ -51,14 +51,15 @@ The `LossCatalog` is a specialized factory responsible for translating abstract 
 
 - **Unknown Loss:** Raises `ValueError` if the `loss_name` is not in the whitelist.
 - **Missing Genes:** Raises `ValueError` if mandatory hyperparameters for the specific loss are missing or `None`.
-- **Numerical Insanity:** Produced loss objects raise `NumericalSanityError` if NaNs are detected during the forward pass (Handshake Principle).
+- **Numerical Insanity:** Custom Fortress losses raise `NumericalSanityError` if NaNs are detected during the forward pass. The `torch.nn` passthroughs (`MSELoss`, `L1Loss`, `HuberLoss`, `SmoothL1Loss`, `PoissonNLLLoss`) do not.
 
 ---
 
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Orchestrated by `ModelCatalog`.
-- **Physical Zen:** Lives in `views_r2darts2/utils/loss/loss_catalog.py`.
+- **Physical Zen:** Lives in `views_r2darts2/catalogs/loss_catalog.py`.
+- **Likelihoods:** Darts likelihood names (`GaussianLikelihood` etc.) are registered in `LOSS_GENOMES` but are *not* in this catalog's registry — `ModelCatalog` intercepts them and sets `loss_fn=None`. Calling `LossCatalog.get_loss()` directly with a likelihood name raises `ValueError`.
 - **Execution:** Produced objects are consumed by the Darts model's internal trainer.
 
 ---

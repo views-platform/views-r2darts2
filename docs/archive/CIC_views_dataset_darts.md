@@ -1,6 +1,6 @@
 # Class Intent Contract: _ViewsDatasetDarts
 
-**Status:** Active  
+**Status:** RETIRED (2026-09-10) — `_ViewsDatasetDarts` no longer exists. Replaced by `ViewsDataset` (`views_r2darts2/dataset/base.py`); see `docs/CICs/views_dataset.md`. The premise below is inverted on 0.2.x: the dataset now *owns* slicing, scaling and inverse transforms rather than delegating them.  
 **Owner:** Core Engineering  
 **Last reviewed:** 2026-02-11  
 **Related ADRs:** ADR-001, ADR-002, ADR-009, ADR-010  

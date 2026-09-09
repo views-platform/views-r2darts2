@@ -2,7 +2,7 @@
 
 **Status:** Active  
 **Owner:** Core Engineering  
-**Last reviewed:** 2026-02-16  
+**Last reviewed:** 2026-09-10  
 **Related ADRs:** ADR-001, ADR-003, ADR-006, ADR-009, ADR-013  
 
 ---
@@ -20,7 +20,7 @@ The `OptimizerCatalog` is a specialized factory responsible for translating abst
 - This class does **not** perform optimization steps or manage gradients.
 - This class does **not** manage the training loop (delegated to PyTorch Lightning).
 - This class does **not** implement new optimization algorithms (uses `torch.optim`).
-- This class does **not** manage Learning Rate Schedulers (delegated to `ModelCatalog`).
+- This class does **not** manage Learning Rate Schedulers (delegated to `SchedulerCatalog`).
 
 ---
 
@@ -59,7 +59,7 @@ The `OptimizerCatalog` is a specialized factory responsible for translating abst
 ## 7. Boundaries and Interactions
 
 - **Upstream:** Orchestrated by `ModelCatalog`.
-- **Physical Zen:** Lives in `views_r2darts2/utils/optimizer_catalog.py`.
+- **Physical Zen:** Lives in `views_r2darts2/catalogs/optimizer_catalog.py`.
 - **Downstream:** Produced configurations are consumed by Darts models during their `configure_optimizers` phase.
 
 ---

@@ -2,7 +2,7 @@
 
 **Status:** Active  
 **Owner:** Core Engineering  
-**Last reviewed:** 2026-02-11  
+**Last reviewed:** 2026-09-10  
 **Related ADRs:** ADR-001, ADR-002, ADR-012  
 
 ---
@@ -17,7 +17,7 @@ The `FeatureScalerManager` is a specialized orchestrator responsible for applyin
 
 ## 2. Non-Goals (Explicit Exclusions)
 
-- This class does **not** manage target scaling (delegated directly to `DartsForecaster`).
+- This class does **not** manage target scaling (delegated to `ViewsDataset.fit_scalers`).
 - This class does **not** implement individual scaler logic (delegated to `ScalerSelector` and Sklearn).
 - This class does **not** perform data cleaning or missing value imputation.
 - This class does **not** handle file I/O or artifact persistence.
@@ -61,9 +61,10 @@ The `FeatureScalerManager` is a specialized orchestrator responsible for applyin
 
 ## 7. Boundaries and Interactions
 
-- **Upstream:** Orchestrated by `DartsForecaster`.
+- **Upstream:** Constructed and driven by `ViewsDataset.fit_scalers`.
 - **Physical Zen:** Lives in `views_r2darts2/transformers/feature_scaler_manager.py`.
-- **Factory:** Depends on `ScalerSelector` for individual estimator instantiation.
+- **Factory:** Depends on `ScalerSelector` for individual estimator instantiation; rejects `None` scaler configs at parse time (C-04).
+- **Inverse Path:** Delegates all probabilistic/deterministic inverse transforms to `views_r2darts2/transformers/inverse.py`, which confines Darts private-attribute access to one module.
 - **Framework:** Tight coupling with `darts.dataprocessing.transformers.Scaler` and `Pipeline`.
 
 ---
@@ -92,15 +93,15 @@ scaled_data = manager.transform(test_data)
 
 ## 10. Test Alignment
 
-- **Green Team:** `tests/test_scaling.py` (Verification of simple and named group formats).
-- **Green Team:** `tests/test_scaling_robustness.py` (Verification of global_fit and sample dimension preservation).
+- **Green Team:** `tests/test_feature_scaler_manager.py` (simple and named-group formats, chaining, `global_fit`, sample-dimension preservation, `None`-config rejection).
+- **Not covered directly:** `transformers/inverse.py`'s silent passthrough when fitted params are missing (C-10).
 
 ---
 
 ## 11. Evolution Notes
 
-### Known Deviations / Technical Debt
-- **Global Fit Enforcement:** While ADR-012 mandates `global_fit=True`, the current implementation still relies on the `ScalerSelector` to pass this correctly. The manager should explicitly enforce `global_fit=True` during its own `_instantiate_scaler` pass to ensure "Fortress" compliance even if the factory defaults change.
+### Resolved
+- **Global Fit Enforcement:** `_instantiate_scaler` delegates to `ScalerSelector.instantiate_darts_scaler`, whose every construction site hardcodes `global_fit=True`. There is one factory and one place to change it; the earlier debt note is closed.
 
 ---
 

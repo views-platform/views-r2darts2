@@ -2,7 +2,7 @@
 
 **Status:** Active
 **Owner:** Core Engineering
-**Last reviewed:** 2026-03-15
+**Last reviewed:** 2026-09-10
 **Related ADRs:** ADR-003, ADR-008
 
 ---
@@ -12,6 +12,8 @@
 The `GradientHealthCallback` provides the **Observability Layer** for model training. Its primary purpose is to detect numerical decay in gradients before it compromises the scientific integrity of an experiment.
 
 > **It acts as the "Internal Sensor" of the Fortress, ensuring that gradient failure is never silent.**
+
+*Scope note (2026-09-10):* `views_r2darts2/infrastructure/callbacks.py` defines sixteen callbacks; this contract covers `GradientHealthCallback` in detail and names the others. Eleven of them carry their own `Intent Contract:` docstring in code. `NaNDetectionCallback` (halts after `patience` consecutive NaN losses) and `GradientHealthCallback` are the two fail-loud kill-switches; both are attached to every trainer by `ModelCatalog._get_common_pl_trainer_kwargs`, alongside `TrainingStepPatchCallback` (must be first), `WeightNormCallback`, `RevINMonitorCallback`, `PredictionSanityCallback`, `LossStabilityCallback`, `EpochTimingCallback`, `YHatBarCallback`, `ValMetricsCallback`, `InputBatchMonitorCallback`, and `LossGradientDiagnosticsCallbackV2`.
 
 ---
 
@@ -27,7 +29,7 @@ The `GradientHealthCallback` provides the **Observability Layer** for model trai
 ## 3. Responsibilities and Guarantees
 
 ### GradientHealthCallback
-- **Guarantees Per-Epoch Auditing:** Audits the gradient norms of every trainable parameter at the end of each epoch.
+- **Guarantees Per-Step Auditing:** Audits the global gradient norm in `on_before_optimizer_step`, gated by `log_every_n_epochs`; sets `trainer.should_stop = True` on a non-finite or exploding norm.
 - **Detects Vanishing/Exploding Gradients:** Provides high-visibility status messages (`✅ healthy` vs `🚨 exploding`) based on configurable thresholds.
 - **Exposes Sparsity:** Reports the ratio of zero gradients, identifying potentially "dead" neurons or bottlenecks.
 
@@ -84,18 +86,18 @@ trainer = pl.Trainer(callbacks=callbacks)
 
 ## 10. Test Alignment
 
-- **Red Team:** `tests/test_reproducibility_infra.py` (Numerical poisoning tests).
-- **Green Team:** Verified via standard training integration tests in `tests/test_catalog.py`.
+- **None.** No test under `tests/` references `callbacks`, `NaNDetectionCallback`, or `GradientHealthCallback` — the `should_stop` kill-switches have zero coverage (C-13). `tests/test_model_catalog.py` verifies only that they are attached.
 
 ---
 
 ## 11. Evolution Notes
 
 ### Known Deviations / Technical Debt
-- **Shared Thresholds:** Thresholds for "exploding" gradients (currently `100.0`) are hardcoded. These should ideally be moved to the DNA manifest to allow architecture-specific sensitivity tuning.
+- **Shared Thresholds:** The exploding-gradient threshold (`explode_threshold`, default `500.0`) is a constructor default, not a DNA gene.
+- **Zero test coverage** of the halt paths (C-13).
 
-### Historical Changes
-- **`NaNDetectionCallback` removed:** Previously defined alongside `GradientHealthCallback` but was never used in production. NaN detection in loss is handled by custom loss functions via `NumericalSanityError` guards.
+### Correction (2026-09-10)
+An earlier revision of this contract stated that `NaNDetectionCallback` had been removed. That was false: it is defined at `callbacks.py:96` and attached to every trainer. The paragraph has been deleted.
 
 ---
 

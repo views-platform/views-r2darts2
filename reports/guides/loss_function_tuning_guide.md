@@ -12,10 +12,12 @@ Detailed behavioral profiles for each custom loss can be found in the **[Loss Ca
 
 ---
 
-## 2. Standard Symmetrical Paths
-For reference, all custom objective functions live in `views_r2darts2/utils/loss/` and follow the 1-Class-1-File Zen standard (e.g., `tweedie_loss.py`).
+> **Scope (2026-09-10):** this guide predates the Spotlight / Prism / Sentinel loss family that is now in production use and does not cover them (register C-06, C-41). It remains accurate for the eight losses it names.
 
-## 2. Common Data Transformation Pipelines
+## 2. Standard Symmetrical Paths
+For reference, all custom objective functions live in `views_r2darts2/math/` and follow the 1-Class-1-File Zen standard (e.g., `views_r2darts2/math/tweedie_loss.py`).
+
+## 3. Common Data Transformation Pipelines
 
 The following table defines common pipelines and the typical data range they produce.
 
@@ -30,7 +32,7 @@ The following table defines common pipelines and the typical data range they pro
 | G | `pure_minmax(0,1)` | `[0, 1]` | Direct scaling without log-transform. Skewness is preserved. |
 | H | `pure_minmax(-1,1)` | `[-1, 1]` | Direct scaling to `[-1, 1]`. Skewness is preserved. |
 
-## 3. Tuning Recommendations for Huber-Based Losses
+## 4. Tuning Recommendations for Huber-Based Losses
 
 This applies to **`WeightedHuberLoss`, `TimeAwareWeightedHuberLoss`, `WeightedPenaltyHuberLoss`,** and the Pseudo-Huber component of **`ZeroInflatedLoss`**.
 
@@ -42,7 +44,7 @@ This applies to **`WeightedHuberLoss`, `TimeAwareWeightedHuberLoss`, `WeightedPe
 | D, H | `[0.1, 0.4]` | **Likely Unstable.** Too large; acts like MSE. |
 | E, F | `[0.2, 1.0]` | **Good Default.** A reasonable starting point. |
 
-## 4. Tuning Recommendations for Threshold-Based Losses
+## 5. Tuning Recommendations for Threshold-Based Losses
 
 ### `SpikeFocalLoss` (`spike_threshold`)
 

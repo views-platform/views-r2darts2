@@ -24,7 +24,7 @@ The loss is calculated as:
 
 ### Parameters:
 
-| Symbol | Code Variable | Default | Description |
+| Symbol | Code Variable | Typical value (must be declared in DNA) | Description |
 | :--- | :--- | :--- | :--- |
 | `a` | `self.a` | 10.0 | Controls the rate of shrinkage. Higher `a` means faster shrinkage for easy samples. |
 | `c` | `self.c` | 0.2 | The error threshold. Errors below `c` are considered "easy" and are shrunk more aggressively. |

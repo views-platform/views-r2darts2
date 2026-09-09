@@ -384,13 +384,13 @@
 
 ---
 
-### C-41 — Thirteen of twenty-two loss modules have no loss card; two spec cards advertise constructor defaults that do not exist
+### C-41 — Twelve of twenty loss modules have no loss card; two spec cards advertised constructor defaults that do not exist
 
 - **Tier:** 3 *(the loss-card layer is the only place the loss family's parameters and behaviour are documented for researchers; more than half of it is missing, and two cards contradict ADR-003 by listing "Default" values for arguments the constructors make mandatory)*
 - **Source:** repo-assimilation (2026-09-10) (docs audit, Phase C)
 - **Trigger:** A researcher configures `SpotlightLoss` (the production loss) or any Spotlight/Prism/Sentinel variant from documentation; or reads `tweedie_loss_spec.md` / `shrinkage_loss_spec.md` and omits a "defaulted" gene from the DNA.
-- **Location:** `docs/loss_cards/` — 9 cards for 22 modules under `views_r2darts2/math/`; missing for `PrismLoss`, `SpotlightLoss`, `SpotlightLossLogcosh`, `SpotlightLossHuber`, `SpotlightLossAsinh`, `SpotlightLossPowerLaw`, `SpotlightFocalLoss`, `SentinelLoss`, `CharbonnierLoss`, and the passthroughs. `docs/loss_cards/tweedie_loss_spec.md` lists `p` Default 1.5 and `eps` Default 1e-6; `docs/loss_cards/shrinkage_loss_spec.md` lists `a` Default 10.0, `c` Default 0.2 — `TweedieLoss.__init__` and `ShrinkageLoss.__init__` have no defaults and `LOSS_GENOMES` mandates every argument.
-- **Narrative:** The "Default" columns were relabelled "Typical value (must be declared in DNA)" in Stage 4 of `governance-0.2.x`, and `loss_cards/README.md` (previously 0 bytes) now indexes the nine cards and names the thirteen gaps. The gaps themselves remain: the production loss has no card. Writing them is blocked on the same knowledge C-06 needs — nobody has verified the advanced family's behaviour.
+- **Location:** `docs/loss_cards/` — 9 card files covering 8 of the 20 loss modules under `views_r2darts2/math/`; missing for `PrismLoss`, `SpotlightLoss`, `SpotlightLossLogcosh`, `SpotlightLossHuber`, `SpotlightLossAsinh`, `SpotlightLossPowerLaw`, `SpotlightFocalLoss`, `SentinelLoss`, `CharbonnierLoss`, and the passthroughs. `docs/loss_cards/tweedie_loss_spec.md` lists `p` Default 1.5 and `eps` Default 1e-6; `docs/loss_cards/shrinkage_loss_spec.md` lists `a` Default 10.0, `c` Default 0.2 — `TweedieLoss.__init__` and `ShrinkageLoss.__init__` have no defaults and `LOSS_GENOMES` mandates every argument.
+- **Narrative:** The "Default" columns were relabelled "Typical value (must be declared in DNA)" in Stage 4 of `governance-0.2.x`, and `loss_cards/README.md` (previously 0 bytes) now indexes the nine cards and names the twelve gaps. The gaps themselves remain: the production loss has no card. Writing them is blocked on the same knowledge C-06 needs — nobody has verified the advanced family's behaviour.
 - **Cross-refs:** C-06 (same modules, untested); C-15 (same modules, duplicated); ADR-003.
 
 ---

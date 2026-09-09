@@ -13,6 +13,10 @@ Statistical deviance loss based on the Tweedie distribution (1 < p < 2), which n
 - `non_zero_weight`: Base weight multiplier.
 - `zero_threshold`: Threshold for internal weighting.
 - `eps`: Stability constant.
+- `false_positive_weight`: Extra weight on zero-target / non-zero-prediction cells.
+- `false_negative_weight`: Extra weight on non-zero-target / sub-threshold-prediction cells.
+
+*(Six genes, all mandatory — `LOSS_GENOMES["TweedieLoss"]`. The two FP/FN weights were missing from this list until 2026-09-10.)*
 
 ## 4. Behavioral Profile (Audit Results)
 - **Cowardice Signal:** **EXCELLENT (BRAVE).** Naturally resistant to mass collapse. Produced the highest mean prediction in the basin research suite.

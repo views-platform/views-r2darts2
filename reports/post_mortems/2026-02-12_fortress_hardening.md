@@ -1,5 +1,8 @@
 # Post-Mortem: The Fortress Hardening Initiative
 
+> **Historical (0.1.x).** Describes the codebase as of its date. Code paths, class names and test files named below may no longer exist on the 0.2.x line — see `reports/technical_risk_register.md` for current state. The ADR/CIC corpus it describes was deleted from the shipping branch in `ec34786` and restored, re-derived, by the `governance-0.2.x` branch.
+
+
 **Date:** 2026-02-12  
 **Status:** CONCLUDED  
 **Author:** Gemini CLI Agent  

@@ -1,5 +1,8 @@
 # Post-Mortem Report: `TweedieLoss` Implementation and Debugging
 
+> **Historical (0.1.x).** Describes the codebase as of its date. Code paths, class names and test files named below may no longer exist on the 0.2.x line — see `reports/technical_risk_register.md` for current state. The loss module named below as `utils/loss.py` is now `views_r2darts2/math/tweedie_loss.py`.
+
+
 ## 1. Objective
 
 The primary objective of this session was to diagnose and resolve performance issues with custom loss functions in the `views-r2darts2` repository. This involved two main goals:

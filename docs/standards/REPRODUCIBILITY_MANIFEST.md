@@ -20,36 +20,49 @@ Required by ALL experiments regardless of model.
 | `lr`, `weight_decay` | Standard optimization hyperparameters. |
 | `batch_size`, `n_epochs` | Global training control. |
 | `num_samples`, `mc_dropout` | Inference behavior (probabilistic vs deterministic). |
+| `name` | Experiment name; used for artifact and run identification. |
+| `lr_scheduler_cls` | Explicitly names the learning-rate scheduler class (e.g., "ReduceLROnPlateau", "WarmupCAWR"). |
+| `early_stopping_patience` | Epochs without `val_loss` improvement before training halts. |
+| `early_stopping_min_delta` | Minimum `val_loss` change that counts as improvement. |
+| `gradient_clip_val` | Gradient-norm clip value passed to the PyTorch Lightning trainer. |
+
+*(Authoritative list: `ReproducibilityGate.Config.CORE_GENOME` in `views_r2darts2/infrastructure/reproducibility_gate.py` — 17 keys as of `development` @ `fe7e681`. This table was missing 5 of them until 2026-09-10.)*
 
 ### 1.2 The Algorithm-Specific Genome
-Each architecture (N-BEATS, TFT, TiDE, etc.) defines its own mandatory "genes" (e.g., `num_stacks`, `use_static_covariates`). Parameters irrelevant to an architecture are forbidden in its manifest to prevent semantic bloat.
+Each architecture (N-BEATS, TFT, TiDE, etc.) defines its own mandatory "genes" (e.g., `num_stacks`, `use_static_covariates`) in `ReproducibilityGate.Config.ALGORITHM_GENOMES`. Optimizer, scheduler and loss genomes live alongside it (`OPTIMIZER_GENOMES`, `SCHEDULER_GENOMES`, `LOSS_GENOMES`). Parameters irrelevant to an architecture are forbidden in its manifest to prevent semantic bloat.
 
 ---
 
 ## 2. Reproducibility Gates (The Fortress)
 
-The following gates are implemented in `views_r2darts2/utils/reproducibility_gate.py` and invoked at critical lifecycle points.
+The following gates are implemented as three nested classes on `ReproducibilityGate` in `views_r2darts2/infrastructure/reproducibility_gate.py` — `Config`, `Temporal`, `Data` — and invoked at critical lifecycle points. There is no fourth `Hardware` class; the hardware invariants in §2.3 are enforced in the engines layer.
 
-### 2.1 The Config Gate (`ConfigAudit`)
+### 2.1 The Config Gate (`ReproducibilityGate.Config`)
 *   **Audit Manifest**: Performs a dynamic, model-aware audit of the DNA.
 *   **Audit Architecture**: Verifies that `len(steps) % output_chunk_length == 0` (ADR-009).
-*   **Triple Catalog Firewall**: 
-    - `ModelCatalog`, `LossCatalog`, and `OptimizerCatalog` perform secondary audits during instantiation.
+*   **Quadruple Catalog Firewall**: 
+    - `ModelCatalog`, `LossCatalog`, `OptimizerCatalog`, and `SchedulerCatalog` perform secondary audits during instantiation.
     - **Refuse-to-Guess Invariant**: Catalogs will raise `MissingHyperparameterError` if any mandatory DNA key is missing or `None`.
 *   **Failure Mode**: `MissingHyperparameterError` or `ArchitectureMismatchError`.
 
-### 2.2 The Temporal Gate (`TemporalAudit`)
-*   **The Continuity Guardian ($t+1$)**: Verifies that the test set starts exactly one month after the training set ends.
-*   **The Horizon Siren**: Logs a high-visibility warning if `len(steps) != 36`.
-*   **The Sequence Auditor**: Scans training IDs to ensure a continuous range with **zero holes**.
+### 2.2 The Temporal Gate (`ReproducibilityGate.Temporal`)
+*   **The Continuity Guardian ($t+1$)**: `audit_continuity` verifies that the test set starts exactly one month after the training set ends.
+*   **The Boundary Firewall**: `audit_boundary_integrity` verifies that training series end *exactly* at the partition boundary — no leak past it, no starvation short of it.
+*   **The Sequence Auditor**: `audit_sequence_contiguity` scans training IDs to ensure a continuous range with **zero holes**.
+*   **The Horizon Lockdown**: `audit_prediction_horizon` forbids forecasting past known ground truth for `calibration`/`validation` runs.
+*   **The Horizon Siren** (in `Config.audit_architecture`): logs a high-visibility warning if `len(steps) != 36` or `steps[0] != 1`.
 
-### 2.3 The Hardware Gate (`HardwareAudit`)
-*   **Device Self-Healing**: Audits the model device before every prediction. If a Darts-induced CPU-drift is detected, the model is restored to its target device (ADR-011).
-*   **Parallelism Lockdown**: Forces `max_workers=1` for GPU prediction to prevent race conditions.
+### 2.3 Hardware Invariants (enforced outside the gate)
+There is no `HardwareAudit` class. These invariants live in the engines layer:
+*   **Device Self-Healing**: `DartsForecaster._ensure_model_on_device()` (`views_r2darts2/engines/darts_forecaster.py`) audits the model device before every prediction and restores it if Darts drifted it to CPU (ADR-011). *On restoration failure the current code warns and continues — see register D-01.*
+*   **Parallelism Lockdown**: `DartsForecastingModelManager._evaluate_model_artifact` forces `max_workers=1` unless `forecaster.device == "cpu"`.
+*   **Device Resolution**: `get_device()` in `views_r2darts2/infrastructure/device.py`.
 
-### 2.4 The Data Gate (`DataAudit`)
-*   **Numerical Integrity**: Enforces `float32` standardization and detects `NaN`/`Inf` at the system boundaries (ADR-010).
-*   **The Leakage Firewall**: Set-intersection check between train and test partitions.
+### 2.4 The Data Gate (`ReproducibilityGate.Data`)
+*   **Numerical Integrity**: `audit_numerical_sanity` detects `NaN`/`Inf` at the system boundaries; `float32` is guaranteed by construction in `views_r2darts2/dataset/converters.py` (ADR-016).
+*   **Frame Schema**: `audit_frame_schema` validates a `views_frames.FeatureFrame` at ingest.
+*   **The Leakage Firewall**: `audit_leakage` — set-intersection check between train and test partitions.
+*   **The Entropy Lock**: `lock_entropy(seed)` reseeds `random`, `numpy` and `torch` before every prediction (see register C-24 for the multi-worker caveat).
 
 ---
 

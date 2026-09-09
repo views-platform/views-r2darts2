@@ -1,5 +1,8 @@
 # Post-Mortem: Gemini Agent Session on `views-r2darts2` Experiment Development
 
+> **Historical.** Describes `reports/investigations/loss_comparison_exp/` as of January 2026 — a self-contained sandbox, not the production package. Some files it names were never committed or have since been removed.
+
+
 **Date:** January 22, 2026
 
 **Objective of the Session:**

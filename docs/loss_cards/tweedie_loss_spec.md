@@ -21,10 +21,16 @@ Minimizing the expected value of this loss function with respect to `μ` recover
 
 ### Parameters:
 
-| Symbol | Code Variable | Default | Description |
+| Symbol | Code Variable | Typical value (must be declared in DNA) | Description |
 | :--- | :--- | :--- | :--- |
 | `p` | `self.p` | 1.5 | The power parameter of the Tweedie distribution, controlling the variance structure `Var(Y) = φμ^p`. Must be in the interval `(1, 2)`. |
 | `eps` | `self.eps` | 1e-6 | A small positive constant added to `μ` to ensure numerical stability (`mu = softplus(eta) + eps`). |
+| `non_zero_weight` | `self.non_zero_weight` | — | Base weight multiplier applied to non-zero targets. Mandatory gene. |
+| `zero_threshold` | `self.zero_threshold` | — | Threshold below which a target counts as zero for weighting. Mandatory gene. |
+| `false_positive_weight` | `self.false_positive_weight` | — | Extra weight when the target is zero and the prediction is not. Mandatory gene. |
+| `false_negative_weight` | `self.false_negative_weight` | — | Extra weight when the target is non-zero and the prediction is below threshold. Mandatory gene. |
+
+*All six are in `LOSS_GENOMES["TweedieLoss"]`; the constructor has no defaults (ADR-003).*
 
 ## 3. Domain Constraints
 

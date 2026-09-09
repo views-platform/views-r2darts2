@@ -1,4 +1,7 @@
 # Post-Mortem: The Scaling Calibration Collapse
+
+> **Historical (0.1.x).** Describes the codebase as of its date. Code paths, class names and test files named below may no longer exist on the 0.2.x line — see `reports/technical_risk_register.md` for current state. The regression guard this post-mortem names was deleted in the rewrite; its successor is `tests/test_feature_scaler_manager.py`.
+
 **Date:** February 11, 2026
 **Status:** Resolved
 **Impact:** Model MSLE deteriorated from 0.36 to 1.7; predicted fatalities ($\bar{\hat{y}}$) collapsed to near-zero (0.01).

@@ -1,3 +1,5 @@
+> **Historical (0.1.x).** Describes the codebase as of its date. Code paths, class names and test files named below may no longer exist on the 0.2.x line — see `reports/technical_risk_register.md` for current state. This file is a fragment (it begins at §6); its first recommendation — continuous ADR/CIC review — was followed by the deletion of both.
+
 
 ### **6. Future Recommendations: Maintaining the Fortress**
 

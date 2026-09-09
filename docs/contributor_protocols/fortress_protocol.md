@@ -17,8 +17,9 @@ All meaningful semantics (architectures, loss functions, scaling strategies, see
 Silent failures, implicit fallbacks, and "best-effort" corrections are forbidden. 
 - **Requirement:** Violations of physical, temporal, or configuration invariants must raise an explicit `ReproducibilityError` or `NumericalSanityError` immediately.
 - **Prohibited:** Using `nan_to_num`, silent clipping, or "sensible defaults" for critical parameters.
+  *Note (2026-09-10):* the data layer currently clips predictions to non-negative by default (`ViewsDataset.ingest_*_predictions`, `clip_negatives=True`). Whether that is a physical constraint or a prohibited semantic floor is register **D-05** / ADR-016.
 
-### C. The Numerical Airlock (ADR-010)
+### C. The Numerical Airlock (ADR-016, superseding ADR-010)
 All data entering the system must pass through a numerical airlock.
 - **Requirement:** Downcast all input to `float32` immediately.
 - **Requirement:** Detect and raise errors on NaNs or Infs at every boundary (Data entry, Loss calculation, Prediction output).
@@ -27,22 +28,23 @@ All data entering the system must pass through a numerical airlock.
 **"1 Class, 1 File, 1 Name."**
 Organizational Zen is a requirement for maintainability.
 - **Requirement:** Every non-trivial class must live in its own file named after the class in `snake_case`.
-- **Requirement:** Heterogeneous logic (callbacks, patches, exceptions) must be consolidated into pre-defined symmetrical hubs (`utils/callbacks.py`, `utils/patches.py`).
+- **Requirement:** Heterogeneous logic (callbacks, patches, exceptions) must be consolidated into pre-defined symmetrical hubs (`views_r2darts2/infrastructure/callbacks.py`, `views_r2darts2/infrastructure/patches.py`, `views_r2darts2/infrastructure/exceptions.py`). Three homogeneous-family files are contested under this rule — register **D-04**.
 
 ---
 
 ## 2. Contributor Requirements
 
 ### Adding a New Model
-1.  **Define the Genome:** Register mandatory hyperparameters in `ReproducibilityGate.Config.ALGORITHM_GENOMES`.
-2.  **Symmetrical Entry:** Create `views_r2darts2/model/my_new_model.py`.
-3.  **Register in Catalog:** Add instantiation logic to `ModelCatalog`.
+Models are Darts classes, not local files. There is nothing to create under `views_r2darts2/`; there are two registries to keep in sync (register C-11):
+1.  **Define the Genome:** Register mandatory hyperparameters in `ReproducibilityGate.Config.ALGORITHM_GENOMES` (`views_r2darts2/infrastructure/reproducibility_gate.py`).
+2.  **Register in Catalog:** Add a `_get_<model>` factory and its registry entry in `ModelCatalog` (`views_r2darts2/catalogs/model_catalog.py`). A genome without a factory passes the manifest audit and then crashes opaquely.
 
 ### Adding a New Loss Function
-1.  **Symmetrical Entry:** Create `views_r2darts2/utils/loss/my_new_loss.py`.
+1.  **Symmetrical Entry:** Create `views_r2darts2/math/<my_new_loss>.py` and export it from `views_r2darts2/math/__init__.py`.
 2.  **Enforce Sanity:** Implement explicit NaN/Inf checks in the `forward()` method.
 3.  **Register Genome:** Add mandatory hyperparameters to `ReproducibilityGate.Config.LOSS_GENOMES`.
-4.  **Update Catalog:** Add the class to `LossCatalog`.
+4.  **Update Catalog:** Add the class to `LossCatalog` (`views_r2darts2/catalogs/loss_catalog.py`).
+5.  **Write the Loss Card:** Add `docs/loss_cards/<name>_spec.md` and index it in `docs/loss_cards/README.md`. Do not list constructor "defaults" — every gene is mandatory (ADR-003).
 
 ---
 

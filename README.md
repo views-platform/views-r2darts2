@@ -22,7 +22,7 @@
 - 🚀 **Production-Ready Integration**: Seamlessly integrates with the VIEWS pipeline ecosystem via the Genomic Firewall and DNA manifest validation
 - ⚡ **Zero-Inflated Data Handling**: Specialized loss functions (SpotlightLoss family) and scalers (AsinhTransform chains) purpose-built for conflict fatality distributions
 - 🧠 **10 Model Architectures**: TFT, N-BEATS, N-HiTS, TiDE, TCN, BlockRNN, Transformer, NLinear, DLinear, TSMixer
-- 📊 **Static Covariate Fingerprints**: Per-entity conflict statistics (µ, σ, max, trend, sparsity)
+- 📊 **Static Covariate Fingerprints**: Per-entity conflict statistics (µ, σ, max, trend, sparsity) — *implemented in `transformers/static_covariates.py` but not currently wired into the dataset; see `reports/technical_risk_register.md` C-36*
 - 🔗 **Chained Scalers**: Arrow-syntax pipelines (`AsinhTransform->MaxAbsScaler`) for multi-stage feature normalization
 - 🛡️ **Fortress Architecture**: ADR-governed reproducibility, NaN detection, gradient health monitoring, and training stability callbacks throughout
 - 🧮 **GPU Acceleration**: Optimized for single- and multi-GPU training via PyTorch Lightning
@@ -291,12 +291,6 @@ Also use `max_pool_1d=True` in the coarse stack to preserve spike maxima during 
 
 ---
 
-## ⚡ Loss Functions
-
-*(See complete catalog above.)*
-
----
-
 ## 🛡️ Fortress Architecture & Governance
 
 This repository adheres to the **Fortress Architecture**: strict engineering and mathematical standards designed to guarantee scientific integrity and reproducibility in conflict forecasting.
@@ -305,6 +299,8 @@ The repository is governed by:
 - **[Architectural Decision Records (ADRs)](docs/ADRs/README.md)**: Sequential, authoritative records of every major design choice.
 - **[Class Intent Contracts (CICs)](docs/CICs/README.md)**: Explicit declarations of purpose and responsibility for every critical class.
 - **[Reproducibility Manifest](docs/standards/REPRODUCIBILITY_MANIFEST.md)**: The mandatory DNA genome that every experiment must declare before execution.
+- **[Technical Risk Register](reports/technical_risk_register.md)**: Every known, unfixed concern, tiered and triggered (ADR-014); and the open ADR-vs-code disagreements D-01..D-05.
+- `bash docs/validate_docs.sh` checks the documentation set against itself *and* against the code tree — every path a live doc names must exist.
 
 ### Training Stability Callbacks
 
@@ -332,7 +328,7 @@ Every core class follows the **1-Class-1-File** standard.
 from views_r2darts2.transformers.scaler_selector import ScalerSelector
 
 scaler = ScalerSelector.get_scaler("AsinhTransform")
-pipeline = ScalerSelector.get_chained_scaler("AsinhTransform->MaxAbsScaler")
+pipeline = ScalerSelector.instantiate_darts_scaler("AsinhTransform->MaxAbsScaler")  # Darts Pipeline; a single name returns a Darts Scaler
 ```
 
 ### FeatureScalerManager
@@ -345,7 +341,7 @@ manager = FeatureScalerManager(
 )
 ```
 
-### Triple Catalogs (Genomic Firewall)
+### Catalogs (Genomic Firewall)
 ```python
 from views_r2darts2.catalogs.model_catalog import ModelCatalog
 from views_r2darts2.catalogs.loss_catalog import LossCatalog
@@ -357,25 +353,30 @@ loss_fn = LossCatalog(config).get_loss()
 model   = ModelCatalog(config).get_model("NHiTSModel")
 ```
 
-### _ViewsDatasetDarts
+### ViewsDataset
 ```python
-from views_r2darts2.transformers.views_dataset_darts import _ViewsDatasetDarts
+from views_r2darts2 import ViewsDataset
 
-dataset = _ViewsDatasetDarts.from_views_path(path_raw, run_type, config)
-
-# Always pass stat_time_range to prevent leakage into static covariate stats
-ts_list = dataset.as_darts_timeseries(
-    stat_time_range=(training_start_id, training_end_id),
-    static_cov_transform="AsinhTransform->MaxAbsScaler",
-)
+# Zarr-backed, lazy; accepts parquet, DataFrame, FeatureFrame, PredictionFrame or Zarr
+with ViewsDataset(source="cm_features.parquet", targets=["ged_sb"]) as ds:
+    # scalers are fitted on the training window and owned by the dataset
+    targets, past_cov = ds.fit_scalers(
+        target_scaler="AsinhTransform",
+        feature_scaler_map={"AsinhTransform->MaxAbsScaler": ["lr_ged_sb"]},
+        time_range=(training_start_id, training_end_id),
+        return_series=True,
+    )
+    ts_list = ds.to_darts_timeseries()
 ```
+The dataset is the single source of truth for all data operations — see `docs/CICs/views_dataset.md`.
+For level-specific validation use `ViewsDataset.for_loa("cm", source=...)`.
 
 ### ReproducibilityGate
 ```python
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 
 ReproducibilityGate.Config.audit_manifest(config)
-ReproducibilityGate.Data.audit_dataframe_schema(df, expected_targets, expected_features)
+ReproducibilityGate.Data.lock_entropy(config["random_state"])   # bit-identical probabilistic samples
 ReproducibilityGate.Temporal.audit_continuity(partition)
 ```
 

@@ -6,8 +6,8 @@
 | Owner             | Simon Polichinel von der Maase       |
 | Last Updated      | 2026-09-10                           |
 | Total Concerns    | 43                                   |
-| Open Concerns     | 31                                   |
-| Resolved Concerns | 12                                   |
+| Open Concerns     | 30                                   |
+| Resolved Concerns | 13                                   |
 | Governed by       | ADR-014                              |
 
 ---
@@ -38,7 +38,7 @@
 > **Re-derived 2026-09-10 against `development` @ `fe7e681` (0.2.x).** Every open entry below was
 > re-verified: 11 still present (line numbers refreshed), 2 moved, 9 changed (C-08 and C-22
 > re-tiered down; C-12, C-18, C-32 retitled), 7 resolved (five by the rewrite, two by the
-> `governance-0.2.x` branch), 9 registered (C-35..C-43), 5 disagreements opened (D-01..D-05).
+> `governance-0.2.x` branch), 9 registered (C-35..C-43, of which C-40 was resolved by Stage 5 of this branch), 5 disagreements opened (D-01..D-05).
 > Two sub-claims are UNVERIFIED pending a `darts==0.46.1` install: C-12 (`_Block` guard collision)
 > and C-18 (patch behaviour against 0.46.1 internals).
 >
@@ -373,17 +373,6 @@
 
 ---
 
-### C-40 — The shipping `README.md` documents a deleted class and a deleted function
-
-- **Tier:** 3 *(the first document a newcomer reads describes an API that does not exist; misleads every reader of the release, though it produces no wrong runtime behaviour)*
-- **Source:** repo-assimilation (2026-09-10) (Phase 8 — docs on `development`)
-- **Trigger:** A user follows the README's API Reference and calls `_ViewsDatasetDarts(...)` or `ScalerSelector.get_chained_scaler(...)`.
-- **Location:** `README.md` on `development` — §API Reference documents `_ViewsDatasetDarts` (L360); the Chained Scalers section calls `get_chained_scaler` (L335); the "⚡ Loss Functions" heading appears twice (L158, L294).
-- **Narrative:** The README survived the `ec34786` documentation purge and was not updated for the `a79f23b` dataset rewrite. It also advertises "Static Covariate Fingerprints" as a feature, which on 0.2.x is not wired (C-36). Fixed by Stage 5 of the `governance-0.2.x` branch; this entry is registered so the resolution is traceable.
-- **Cross-refs:** C-36 (the advertised feature that is dead); C-17 / C-27 (false-signal family).
-
----
-
 ### C-41 — Twelve of twenty loss modules have no loss card; two spec cards advertised constructor defaults that do not exist
 
 - **Tier:** 3 *(the loss-card layer is the only place the loss family's parameters and behaviour are documented for researchers; more than half of it is missing, and two cards contradict ADR-003 by listing "Default" values for arguments the constructors make mandatory)*
@@ -480,6 +469,14 @@
 ---
 
 ## Resolved Concerns
+### C-40 — The shipping `README.md` documents a deleted class and a deleted function *(resolved 2026-09-10, this branch, Stage 5)*
+
+- **Tier:** 3
+- **Source:** repo-assimilation (2026-09-10) (Phase 8 — docs on `development`)
+- **Location:** Previously `README.md` §API Reference (`_ViewsDatasetDarts`, `get_chained_scaler`, `audit_dataframe_schema`), duplicate "⚡ Loss Functions" heading, Key Features fingerprint bullet.
+- **Resolution:** `_ViewsDatasetDarts` subsection replaced with a `ViewsDataset` example pointing at its CIC; `get_chained_scaler` → `instantiate_darts_scaler`; `audit_dataframe_schema` (removed with the pandas path) → `lock_entropy`; duplicate heading removed; "Triple Catalogs" → "Catalogs" (the block already showed four); the Static Covariate Fingerprints feature bullet now says the module is not wired and points at C-36; Governance section gains the register and the validator. The fingerprint *feature* remains dead — that is C-36, not this entry.
+
+---
 
 ### C-27 — `ADR_COMPLIANCE_REPORT.md` asserts total compliance while the register records 14 open concerns *(resolved 2026-09-10 (this branch, Stage 0))*
 

@@ -171,7 +171,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=None,
+            # Use the manager's fetch-phase cache path (source-agnostic: viewser
+            # writes {run_type}_viewser_df, datafactory {run_type}_datafactory_df);
+            # falls back to the legacy viewser filename when absent. Mirrors
+            # hydranet_manager.py and pipeline-core's _get_cached_data_path seam.
+            cached_path=getattr(self, "_cached_data_path", None),
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
@@ -269,7 +273,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=None,
+            # Use the manager's fetch-phase cache path (source-agnostic: viewser
+            # writes {run_type}_viewser_df, datafactory {run_type}_datafactory_df);
+            # falls back to the legacy viewser filename when absent. Mirrors
+            # hydranet_manager.py and pipeline-core's _get_cached_data_path seam.
+            cached_path=getattr(self, "_cached_data_path", None),
         )
 
         model_object = ModelCatalog(config=active_config).get_model(
@@ -402,7 +410,11 @@ class DartsForecastingModelManager(ForecastingModelManager):
 
         dataset = _ViewsDatasetDarts.from_views_path(
             path_raw=path_raw, run_type=run_type, config=active_config,
-            cached_path=None,
+            # Use the manager's fetch-phase cache path (source-agnostic: viewser
+            # writes {run_type}_viewser_df, datafactory {run_type}_datafactory_df);
+            # falls back to the legacy viewser filename when absent. Mirrors
+            # hydranet_manager.py and pipeline-core's _get_cached_data_path seam.
+            cached_path=getattr(self, "_cached_data_path", None),
         )
 
         model_object = ModelCatalog(config=active_config).get_model(

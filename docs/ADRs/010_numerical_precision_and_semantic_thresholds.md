@@ -1,10 +1,12 @@
 # ADR-010: Numerical Precision and Semantic Thresholds
 
-**Status:** Accepted  
+**Status:** Superseded by ADR-016 (2026-09-10)  
 **Date:** 2026-02-11  
 **Deciders:** Simon Polichinel von der Maase  
 
 ---
+
+> **Superseded.** Decisions 1, 2 and 4 below carry forward unchanged into ADR-016. Decision 3 (Prohibition of Semantic Floors) is contradicted by the 0.2.x code and is the subject of register **D-05**. The implementation notes name a method (`_process_predictions`) and a scaling test file that no longer exist. Read ADR-016.
 
 ## Context
 
@@ -53,5 +55,5 @@ Additionally, models trained on count data often produce "noisy" continuous pred
 
 ## Validation & Monitoring
 
-- **Tests:** `tests/test_scaling.py` verifies that transforms maintain ~1e-4 precision.
+- **Tests:** *(historical)* the 0.1.x scaling test verified that transforms maintain ~1e-4 precision; its 0.2.x successors are named in ADR-016.
 - **Audits:** `ReproducibilityGate` verifies that input data is not `float64`.

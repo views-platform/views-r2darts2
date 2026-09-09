@@ -3,6 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-02-11  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-10 — re-derived against the 0.2.x codebase (`development` @ `fe7e681`). Original decision unchanged unless stated.  
 
 ---
 
@@ -44,12 +45,13 @@ This leads to `RuntimeError` (Device Mismatch) or silent, massive performance de
 
 ## Implementation Notes
 
-- **Enforcement:** `DartsForecaster.predict()` must contain the device audit logic.
-- **Orchestration:** `DartsForecastingModelManager` must inspect the `forecaster.device` and set `max_workers=1` if `device.type != "cpu"`.
+- **Enforcement:** `DartsForecaster.predict()` calls `_ensure_model_on_device()` before every forecast; the device itself is resolved once by `get_device()` in `views_r2darts2/infrastructure/device.py`.
+- **Orchestration:** `DartsForecastingModelManager` inspects `forecaster.device` (a `str`: `"cuda"`, `"mps"` or `"cpu"`) and sets `max_workers=1` unless it equals `"cpu"`.
 
 ---
 
 ## Validation & Monitoring
 
 - **Failure Mode:** If self-healing fails to move the model from CPU to GPU, the system must **fail-loud** and abort the prediction (ADR-008).
+  *Compliance note (2026-09-10):* the current code logs a `WARNING` and continues on CPU. See register **D-01** — this line states intent until that ruling is made.
 - **Logs:** Successful restorations should be logged at the `INFO` level.

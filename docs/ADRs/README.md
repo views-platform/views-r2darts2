@@ -53,23 +53,26 @@ These ADRs form the architectural constitution of the repository.
 
 ADRs numbered 010 and above define specific infrastructure, mathematical, and domain-level decisions:
 
-- **ADR-010** — Numerical Precision and Semantic Thresholds  
-  Standardizes `float32` and prohibits hardcoded model floors.
+- **ADR-010** — Numerical Precision and Semantic Thresholds *(superseded by ADR-016)*  
+  Standardized `float32` and prohibited hardcoded model floors; the floor prohibition is contested on 0.2.x.
 
 - **ADR-011** — Hardware Integrity and Parallelism  
   Defines device self-healing and GPU prediction constraints.
 
 - **ADR-012** — Scaling Pipeline and Calibration Integrity  
-  Standardizes on Darts `Pipeline` and mandatory `global_fit`.
+  Standardizes on Darts `Pipeline`/`Scaler` and mandatory `global_fit`; the custom-wrapper prohibition is contested (D-03).
 
 - **ADR-013** — Physical Symmetrical Architecture  
-  Mandates the 1-Class-1-File Zen standard for file organization.
+  Mandates the 1-Class-1-File Zen standard for file organization; three family files are contested (D-04).
 
 - **ADR-014** — Technical Risk Register  
   Adopts a durable risk register as a first-class governance artifact.
 
 - **ADR-015** — Artifact-Prediction Timestamp Contract  
   Documents the correct timestamp extraction pattern (satellite of views-pipeline-core ADR-052).
+
+- **ADR-016** — Numerical Precision, Raw Output, and the Clipping Question  
+  Supersedes ADR-010 for 0.2.x; carries `float32` and raw-output forward, records the `clip_negatives` contradiction as D-05.
 
 These must comply with the constitutional ADRs above.
 
@@ -82,7 +85,7 @@ These must comply with the constitutional ADRs above.
 - **Authority (003)** defines who owns meaning.
 - **Evolution (004)** defines stability tiers.
 - **Boundary Contracts (009)** define interaction rules.
-- **Numerical Laws (010)** ensure precision and raw intentionality.
+- **Numerical Laws (016, superseding 010)** ensure precision and raw intentionality.
 - **Hardware Laws (011)** prevent race conditions and device drift.
 - **Mathematical Laws (012)** preserve probabilistic calibration.
 - **Physical Zen (013)** ensures predictable class-to-file discovery.

@@ -3,6 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-02-11  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-10 — re-derived against the 0.2.x codebase (`development` @ `fe7e681`). Original decision unchanged unless stated.  
 
 ---
 
@@ -20,19 +21,20 @@ This repository adopts the invariant: **All architectural boundaries must declar
 
 ### 1. The Core Handshakes in `views-r2darts2`
 
-#### `views_pipeline_core` (DNA) -> Triple Catalogs
-- **Contract:** The merged manifest must contain all keys in the relevant Core, Algorithm, Loss, and Optimizer Genomes.
+#### `views_pipeline_core` (DNA) -> The Four Catalogs
+- **Contract:** The merged manifest must contain all keys in the relevant Core, Algorithm, Loss, Optimizer, and Scheduler Genomes.
 - **Validation:** `ReproducibilityGate.Config.audit_manifest` is called at the entry point of `ModelCatalog`. 
-- **Delegation:** `ModelCatalog` delegates genomic validation to `LossCatalog` and `OptimizerCatalog`.
+- **Delegation:** `ModelCatalog` delegates genomic validation to `LossCatalog`, `OptimizerCatalog`, and `SchedulerCatalog`.
 - **Fail-Loud:** Missing or `None` values raise `MissingHyperparameterError`.
 
-#### Raw VIEWS DF -> `_ViewsDatasetDarts`
-- **Contract:** Data must match the DNA's `targets` and `features`.
-- **Numerical Airlock:** Incoming data is strictly downcast to `float32` and scanned for NaNs/Infs. (ADR-010).
+#### `views_frames.FeatureFrame` / parquet / Zarr -> `ViewsDataset`
+- **Contract:** Data must match the DNA's `targets` and `features`; the time and entity dimensions must be one of the recognised VIEWS levels of analysis.
+- **Validation:** `ReproducibilityGate.Data.audit_frame_schema` at ingest, via the converter family in `views_r2darts2/dataset/converters.py`. The pandas-based `audit_dataframe_schema` of 0.1.x no longer exists.
+- **Numerical Airlock:** Frames are `float32` by construction; the gate scans for NaNs/Infs. (ADR-016).
 
-#### `DartsForecaster` -> Prediction DF
-- **Contract:** Predictions must be scalar, finite, and scalar-squeezed before returning.
-- **Numerical Airlock:** Every prediction is scanned for NaNs. If found, the system raises `NumericalSanityError`.
+#### `DartsForecaster` -> `dict[str, PredictionFrame]`
+- **Contract:** `predict()` returns one `views_frames.PredictionFrame` per target, finite, on the original data scale, with the sample dimension preserved for probabilistic runs. DataFrame conversion is on demand via `transformers/darts_bridge.py`, never implicit.
+- **Numerical Airlock:** Every prediction is scanned for NaNs on ingest into the dataset. If found, the system raises `NumericalSanityError`.
 
 ### 2. The Handshake Principle
 Validation must occur **before** execution begins. We do not "try and see." We audit the requirements, and if the handshake fails, the run terminates immediately.

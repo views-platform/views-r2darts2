@@ -3,6 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-02-11  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-10 — re-derived against the 0.2.x codebase (`development` @ `fe7e681`). Original decision unchanged unless stated.  
 
 ---
 
@@ -24,31 +25,34 @@ Circular dependencies are forbidden. Cross-layer "shortcuts" are forbidden.
 
 ## The Layered Hierarchy
 
-We define the following four layers (from lowest to highest):
+The package has six sub-packages. Measured against `development` @ `fe7e681` (2026-09-10), their import graph is acyclic and forms four layers (from lowest to highest):
 
-### Layer 0: Core Utilities (`utils/`)
-- **Examples:** `loss_catalog.py`, `scaler_selector.py`, `reproducibility_gate.py`, `exceptions.py`.
-- **Constraint:** Must remain dependency-free (except for standard libraries and framework-agnostic torch/numpy). They must never import from layers above them.
+### Layer 0: Foundations — `views_r2darts2/infrastructure/` and `views_r2darts2/math/`
+- **`infrastructure/`:** `exceptions.py`, `reproducibility_gate.py`, `device.py`, `encoders.py`, `patches.py`, `callbacks.py`. Imports nothing from the rest of the package.
+- **`math/`:** loss functions and the `WarmupCAWR` scheduler. May import `infrastructure/exceptions.py` (for `NumericalSanityError`) and nothing else internal.
+- **Constraint:** Neither may import from any layer above. These are the physical laws and the arithmetic.
 
-### Layer 1: Data Handling (`data/`)
-- **Examples:** `views_dataset_darts.py`.
-- **Constraint:** May depend on Layer 0 (for gates and scaling definitions). Must not depend on models or managers.
+### Layer 1: Translators — `views_r2darts2/transformers/` and `views_r2darts2/catalogs/`
+- **`transformers/`:** `scaler_selector.py`, `feature_scaler_manager.py`, `inverse.py`, `darts_bridge.py`, `frame_builder.py`, `static_covariates.py`. Imports only within itself. `darts_bridge.py` is the package's sole pandas boundary.
+- **`catalogs/`:** the four Genome Translators. Import `infrastructure/` and `math/` only.
+- **Constraint:** May depend on Layer 0. `transformers/` and `catalogs/` do not import each other.
 
-### Layer 2: Model & Forecasting (`model/`)
-- **Examples:** `model_catalog.py`, `darts_forecaster.py`.
-- **Constraint:** May depend on Layer 1 (for data handling) and Layer 0 (for loss and scaling). Must not depend on the Orchestration Layer.
+### Layer 2: The Dataset — `views_r2darts2/dataset/`
+- `base.py` (`ViewsDataset`), `builder.py`, `converters.py`, `readers.py`, `subclasses.py`, `zarr_store.py`.
+- **Constraint:** May depend on Layers 0 and 1 (`transformers/` for scaling and the Darts bridge; `infrastructure/encoders.py`). Must not import `catalogs/` or `engines/`. Intra-package cycles (`base ↔ subclasses`, `base ↔ builder`) are broken by function-body imports and must stay that way.
 
-### Layer 3: Orchestration & Management (`manager/`)
-- **Examples:** `darts_forecasting_model_manager.py`.
-- **Constraint:** The "highest" layer. May depend on all layers below it. This is the only layer allowed to coordinate the lifecycle of artifacts and data flows.
+### Layer 3: Engines — `views_r2darts2/engines/`
+- `darts_forecaster.py`, `darts_forecasting_model_manager.py`.
+- **Constraint:** The highest layer. May depend on everything below. The only layer that coordinates the lifecycle of artifacts and data flows, and the only layer that may import `views_pipeline_core` (lazily, in the manager).
 
 ---
 
 ## Topological Invariants
 
-1.  **Upward Imports are Forbidden:** `utils` must never import `model`. `data` must never import `manager`.
+1.  **Upward Imports are Forbidden:** `infrastructure/` and `math/` must never import `transformers/`, `catalogs/`, `dataset/` or `engines/`. `dataset/` must never import `catalogs/` or `engines/`. `catalogs/` must never import `engines/` — `infrastructure/device.py` exists precisely to break a former `catalogs → engines → catalogs` cycle, and must not be folded back.
 2.  **Stateless Flow:** Information flows down (configurations, requirements) and results flow up (predictions, metrics).
-3.  **The "Ghost" Boundary:** The orchestration layer (`manager`) must interact with models via the `ModelCatalog` or `DartsForecaster` interface, never by reaching into the internal private methods of a PyTorch module.
+3.  **The "Ghost" Boundary:** The engines layer must interact with models via the `ModelCatalog` or `DartsForecaster` interface, never by reaching into the internal private methods of a PyTorch module. The one sanctioned exception is `transformers/inverse.py`, which confines all access to Darts' private scaler attributes to a single module (see ADR-012, D-03).
+4.  **No Mechanical Enforcement Yet:** There is no import-linter contract in `pyproject.toml`. This ADR is enforced by review and by the measurement recorded above. Adding a contract is tracked in the register.
 
 ---
 
@@ -56,7 +60,7 @@ We define the following four layers (from lowest to highest):
 
 - **Circular Logic:** A model calling a method in the `DartsForecastingModelManager`.
 - **Leakage:** Data handlers importing `ReproducibilityGate` is allowed, but `ReproducibilityGate` importing a specific `Forecaster` is a violation.
-- **Convenience shortcuts:** Importing `ModelCatalog` inside `loss.py` to get a parameter.
+- **Convenience shortcuts:** Importing `ModelCatalog` inside a loss module under `views_r2darts2/math/` to get a parameter.
 
 ---
 
@@ -64,8 +68,8 @@ We define the following four layers (from lowest to highest):
 
 ### Positive
 - **Modularity:** Layer 0 and 1 can be tested in isolation.
-- **Cognitive Load:** When working in `utils`, you don't need to understand the `manager`.
-- **Predictable Refactoring:** You can change the `manager` without any risk of affecting the math in `loss.py`.
+- **Cognitive Load:** When working in `infrastructure/` or `math/`, you don't need to understand `engines/`.
+- **Predictable Refactoring:** You can change `engines/` without any risk of affecting the math in `views_r2darts2/math/`.
 
 ### Negative
 - Requires more careful placement of new code.

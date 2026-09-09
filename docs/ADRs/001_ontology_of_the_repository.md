@@ -3,6 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-02-11  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-10 — re-derived against the 0.2.x codebase (`development` @ `fe7e681`). Original decision unchanged unless stated.  
 
 ---
 
@@ -33,17 +34,17 @@ This repository defines a **closed set of conceptual categories** ("entities"). 
 
 ### 2. The Fortress (Gates)
 - **Purpose:** Stateless runtime validators (`ReproducibilityGate`) that enforce physical invariants (temporal continuity, numerical sanity, DNA completeness).
-- **Physical Standard:** Must live in `reproducibility_gate.py`. Definitions of exceptions must be moved to `exceptions.py`.
+- **Physical Standard:** Must live in `views_r2darts2/infrastructure/reproducibility_gate.py`. Exception definitions live in `views_r2darts2/infrastructure/exceptions.py`.
 - **Authority:** Authoritative (The "Law").
 
-### 3. Data Handlers (`_ViewsDatasetDarts`)
-- **Purpose:** Manage the transition from raw VIEWS dataframes to Darts-compatible `TimeSeries`.
-- **Physical Standard:** Must live in `views_dataset_darts.py`.
-- **Authority:** Derived.
+### 3. The Dataset (`ViewsDataset`)
+- **Purpose:** The single source of truth for all data operations — ingest (parquet / `views_frames` / Zarr), slicing, scaler fitting and application, log transforms, inverse transforms, and construction of Darts `TimeSeries`. Zarr-backed, disk-resident, lazily Dask/xarray-loaded. The forecaster and manager hold no data-manipulation logic of their own; they delegate to it.
+- **Physical Standard:** `ViewsDataset` lives in `views_r2darts2/dataset/base.py`. Its supporting entities live in the same package: `DatasetBuilder` (`builder.py`), the converter family (`converters.py`), the level-of-analysis subclasses (`subclasses.py`), `ZarrStore` (`zarr_store.py`), and source detection (`readers.py`). The pandas boundary is confined to `views_r2darts2/transformers/darts_bridge.py`.
+- **Authority:** Derived (from raw data) — but it *owns* scaler state once fitted, which the Forecaster of 0.1.x used to own.
 
 ### 4. Forecasters (`DartsForecaster`)
-- **Purpose:** Stateful wrappers that manage the coupling of a Model, its Scalers, and its Preprocessing state.
-- **Physical Standard:** Must live in `darts_forecaster.py`.
+- **Purpose:** Slim orchestration of one Darts model against one `ViewsDataset` and one partition: train, predict, save, load. Delegates all preprocessing and scaler state to the dataset.
+- **Physical Standard:** Must live in `views_r2darts2/engines/darts_forecaster.py`.
 - **Authority:** Operational.
 
 ### 5. Artifacts
@@ -52,15 +53,16 @@ This repository defines a **closed set of conceptual categories** ("entities"). 
 
 ### 6. The Manager (`DartsForecastingModelManager`)
 - **Purpose:** Orchestration of the lifecycle (Train -> Save -> Evaluate -> Forecast).
-- **Physical Standard:** Must live in `darts_forecasting_model_manager.py`.
+- **Physical Standard:** Must live in `views_r2darts2/engines/darts_forecasting_model_manager.py`. Inherits from `views_pipeline_core`'s `ForecastingModelManager`, resolved lazily so the package imports without the optional `manager` extra.
 - **Authority:** Execution.
 
-### 7. Catalogs (The Triple Catalog Architecture)
+### 7. Catalogs (The Quadruple Catalog Architecture)
 - **Purpose:** Genome Translators that map DNA to concrete instances.
-    - **ModelCatalog:** Orchestrates algorithms.
+    - **ModelCatalog:** Orchestrates algorithms; also resolves Darts likelihood objects.
     - **LossCatalog:** Orchestrates mathematical objectives.
     - **OptimizerCatalog:** Orchestrates PyTorch optimizers.
-- **Physical Standard:** Each must live in its own file matching the class name.
+    - **SchedulerCatalog:** Orchestrates learning-rate schedulers.
+- **Physical Standard:** Each lives in its own file under `views_r2darts2/catalogs/`, matching the class name.
 - **Authority:** Translation.
 
 ---
@@ -75,7 +77,7 @@ This repository defines a **closed set of conceptual categories** ("entities"). 
 
 - **Implicit Semantics:** Behavior inferred from filenames or folder structures is forbidden.
 - **Mixed-Role Scripts:** A single file must not act as both a "Gate" and a "Model." (See ADR-013: Physical Symmetry).
-- **Ghost Imports:** Importing from outside the local `views_r2darts2` package is a violation of ontology.
+- **Ghost Imports:** Importing this package from a stale or sibling copy (e.g. a `temp-views-r2darts2/` checkout, or a path outside the current workspace) is a violation of ontology — see the workspace-integrity check in `tests/conftest.py`. Declared third-party dependencies (`darts`, `torch`, `views_frames`, `views_pipeline_core`) are not ghosts.
 
 ---
 

@@ -1,8 +1,9 @@
 # ADR-006: Intent Contracts for Non-Trivial Classes
 
-**Status:** Accepted  
+**Status:** Accepted — **compliance open**, see register D-02  
 **Date:** 2026-02-11  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-10 — re-derived against the 0.2.x codebase (`development` @ `fe7e681`). Original decision unchanged unless stated.  
 
 ---
 
@@ -31,10 +32,11 @@ An intent contract is a short, human-readable declaration of:
 The following are automatically considered non-trivial and must maintain an intent contract:
 
 - **Managers (`DartsForecastingModelManager`):** Orchestrate the high-level lifecycle.
-- **Forecasters (`DartsForecaster`):** Manage the coupling of models and stateful preprocessing (scalers).
+- **Forecasters (`DartsForecaster`):** Couple one model to one dataset and one partition; delegate preprocessing to the dataset.
 - **Gates (`ReproducibilityGate`):** Enforce physical and temporal invariants.
-- **Catalogs (`ModelCatalog`, `LossCatalog`, `OptimizerCatalog`):** Translate the DNA manifests into concrete instances and enforce the Genomic Firewall.
-- **Data Handlers (`_ViewsDatasetDarts`):** Manage the transformation of raw VIEWS data to Darts types.
+- **Catalogs (`ModelCatalog`, `LossCatalog`, `OptimizerCatalog`, `SchedulerCatalog`):** Translate the DNA manifests into concrete instances and enforce the Genomic Firewall.
+- **The Dataset (`ViewsDataset`, `DatasetBuilder`, `ZarrStore`, the converter family):** Own all data ingest, slicing, scaling, and inverse transforms.
+- **Scaling (`FeatureScalerManager`, `ScalerSelector`):** Construct and apply scaler pipelines.
 
 ---
 
@@ -43,10 +45,13 @@ The following are automatically considered non-trivial and must maintain an inte
 The contract must live in the class docstring or a linked Markdown file. It must be unambiguous and readable by both carbon and silicon agents.
 
 ### Example: `DartsForecaster`
-- **Purpose:** Coupling a Darts model with the exact scalers and log-transforms used during its training.
-- **Non-Goals:** Does not handle database connections or W&B logging.
-- **Guarantees:** Ensures that inverse transforms are applied in the correct order before returning predictions.
-- **Failure Behavior:** Raises `NotFittedError` if prediction is attempted before scalers are fit.
+- **Purpose:** Coupling a Darts model with a `ViewsDataset` and a partition, so that predictions come back on the original data scale.
+- **Non-Goals:** Does not own scalers or log-transforms (the dataset does); does not handle W&B logging.
+- **Guarantees:** Inverse transforms are applied before returning predictions; predictions are clipped to non-negative.
+- **Failure Behavior:** Raises `RuntimeError` if prediction is attempted before the dataset's scalers are fitted.
+
+### Compliance status (2026-09-10)
+On `development` @ `fe7e681`, an `Intent Contract:` block is present on `ModelCatalog`, `DartsForecaster`, and eleven callbacks — and absent on `ViewsDataset`, `DartsForecastingModelManager`, `LossCatalog`, `OptimizerCatalog`, `SchedulerCatalog`, `ReproducibilityGate`, `FeatureScalerManager`, `ScalerSelector`, `DatasetBuilder`, and `ZarrStore`. The Markdown contracts under `docs/CICs/` cover the gap for now. Bringing the docstrings into compliance is a code change, tracked as register D-02 / C-39; this ADR is not marked compliant until then.
 
 ---
 

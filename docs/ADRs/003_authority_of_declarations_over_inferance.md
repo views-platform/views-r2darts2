@@ -29,7 +29,7 @@ The DNA manifest—delivered by `views_pipeline_core` from upstream `views_model
 Silent failure is considered a bug. Warning-only behavior, implicit fallbacks, or "best-effort" inference are **forbidden** for any decision-relevant semantics.
 
 ### The Genomic Firewall
-To enforce this, all Catalogs (Model, Loss, Optimizer) implement a **Genomic Firewall** during initialization. The catalog refuses to instantiate any object if its mandatory hyperparameters are missing or null. It will not "guess" a learning rate or a loss parameter.
+To enforce this, all four Catalogs (Model, Loss, Optimizer, Scheduler) implement a **Genomic Firewall** during initialization. The catalog refuses to instantiate any object if its mandatory hyperparameters are missing or null. It will not "guess" a learning rate or a loss parameter.
 
 ---
 
@@ -65,5 +65,5 @@ To enforce this, all Catalogs (Model, Loss, Optimizer) implement a **Genomic Fir
 
 ## Notes
 
-This ADR establishes *how* we know what to do. The specific contents of the manifest are defined in `docs/standards/REPRODUCIBILITY_MANIFEST.md`. The validation logic is implemented in `views_r2darts2/utils/reproducibility_gate.py`.
+This ADR establishes *how* we know what to do. The specific contents of the manifest are defined in `docs/standards/REPRODUCIBILITY_MANIFEST.md`. The validation logic is implemented in `views_r2darts2/infrastructure/reproducibility_gate.py`.
 

@@ -21,12 +21,12 @@ If everything is stable, research stagnates. If everything is experimental, resu
 We define three **Stability Tiers** for the components of this repository. The stability of a component determines the "cost" of changing it.
 
 ### Tier 1: The Fortress (High Stability)
-- **Scope:** `utils/reproducibility_gate.py`, `utils/patches.py`, and the mathematical definitions of standard losses in `utils/loss/loss_catalog.py`.
+- **Scope:** `views_r2darts2/infrastructure/reproducibility_gate.py`, `views_r2darts2/infrastructure/patches.py`, the loss registry in `views_r2darts2/catalogs/loss_catalog.py`, and the loss definitions under `views_r2darts2/math/`.
 - **Guarantee:** These define the physical laws of the system (e.g., "thou shalt not peek into the future").
 - **Change Rule:** Changes require a new ADR or a superseding of an existing one. Breaking a "Gate" is considered a critical regression.
 
 ### Tier 2: The DNA Schema (Medium Stability)
-- **Scope:** `docs/standards/REPRODUCIBILITY_MANIFEST.md` and the `CORE_GENOME` / `ALGORITHM_GENOMES` lists in `gates.py`.
+- **Scope:** `docs/standards/REPRODUCIBILITY_MANIFEST.md` and the `CORE_GENOME` / `ALGORITHM_GENOMES` / `OPTIMIZER_GENOMES` / `SCHEDULER_GENOMES` / `LOSS_GENOMES` registries on `ReproducibilityGate.Config` in `views_r2darts2/infrastructure/reproducibility_gate.py`.
 - **Guarantee:** Defines what an experiment *must* declare.
 - **Change Rule:** New parameters can be added (evolving the schema), but removing or renaming existing mandatory parameters requires updating all active `sweep_configs` and existing artifacts.
 
@@ -48,7 +48,7 @@ We define three **Stability Tiers** for the components of this repository. The s
 
 ### Positive
 - **Trust:** Researchers can trust that the "Fortress" won't let them accidentally lie with data.
-- **Agility:** Engineers can refactor the `manager` layer without fearing they are violating "Core Laws."
+- **Agility:** Engineers can refactor the `engines/` layer without fearing they are violating "Core Laws."
 - **Clarity:** It's clear which PRs require high-level architectural review (Tier 1) vs. standard code review (Tier 3).
 
 ### Negative
@@ -60,3 +60,5 @@ We define three **Stability Tiers** for the components of this repository. The s
 ## Notes
 
 Stability is a design constraint, not a preference. This ADR ensures that we don't accidentally "innovate" away our reproducibility guarantees.
+
+*(The filename keeps its original `evaluation` spelling so existing links resolve; the title is the correct one.)*

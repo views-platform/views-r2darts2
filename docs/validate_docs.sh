@@ -137,7 +137,10 @@ while IFS= read -r ref; do
     fi
 done < <( {
     grep -rnoP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' --include='*.md' --exclude-dir=archive . 2>/dev/null
-    grep -noP  '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' "$REPO_ROOT/reports/technical_risk_register.md" 2>/dev/null | sed "s|^|../reports/technical_risk_register.md:|"
+    # Register: scan only Open Concerns + Disagreements. "Resolved Concerns" is a historical
+    # record by the register's own conventions ("Do not delete") and legitimately names
+    # files that were later removed.
+    sed '/^## Resolved Concerns/,$d' "$REPO_ROOT/reports/technical_risk_register.md" 2>/dev/null | grep -noP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' | sed "s|^|../reports/technical_risk_register.md:|"
     grep -rnoP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' --include='*.md' "$REPO_ROOT/reports/guides" 2>/dev/null | sed "s|$REPO_ROOT/|../|"
   } | sort -u || true)
 if [ "$path_errors" -eq 0 ]; then

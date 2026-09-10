@@ -4,7 +4,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python Version" />
   &nbsp;&nbsp;
-  <img src="https://img.shields.io/badge/darts-0.40.0-green.svg" alt="Darts Version" />
+  <img src="https://img.shields.io/badge/darts-0.46.1-green.svg" alt="Darts Version" />
   &nbsp;&nbsp;
   <img src="https://img.shields.io/badge/pytorch-2.x-orange.svg" alt="PyTorch" />
   &nbsp;&nbsp;
@@ -37,7 +37,7 @@ cd views-r2darts2
 pip install -e .
 ```
 
-Requires `darts==0.40.0` and `views-pipeline-core>=2.0.0`. For GPU support, install the appropriate PyTorch version for your CUDA setup first. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
+Requires `darts==0.46.1`. `views-pipeline-core>=3.0.0,<4.0.0` is an optional extra needed only for `DartsForecastingModelManager`: `pip install -e ".[manager]"`. For GPU support, install the appropriate PyTorch version for your CUDA setup first. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
 ---
 
@@ -124,7 +124,9 @@ Inverse:  X_scaled → Scaler₂.inverse_transform → Scaler₁.inverse_transfo
 
 ### Static Covariate Fingerprints
 
-For models that consume static covariates (TFT, TSMixer, TiDE, BlockRNN, NLinear, DLinear), five per-entity statistics are computed from the **training partition only** (via `stat_time_range`) and injected as `TimeSeries.static_covariates` metadata:
+> **Designed, not wired (register C-36).** The fingerprint below is implemented in `views_r2darts2/transformers/static_covariates.py` and fully tested, but nothing in the package calls it on 0.2.x — `ViewsDataset.to_darts_timeseries` attaches only the entity id as a static covariate. The table describes what the module computes, not what models currently receive.
+
+For models that consume static covariates (TFT, TSMixer, TiDE, BlockRNN, NLinear, DLinear), five per-entity statistics are computed from the **training partition only** (via `stat_time_range`) and would be injected as `TimeSeries.static_covariates` metadata:
 
 | Statistic | Meaning | Transform Recommendation |
 |-----------|---------|--------------------------|
@@ -134,11 +136,15 @@ For models that consume static covariates (TFT, TSMixer, TiDE, BlockRNN, NLinear
 | `target_trend` | OLS slope over training window | `AsinhTransform->MaxAbsScaler` |
 | `target_sparsity` | Fraction of zero months | No transform (already in [0,1]) |
 
-Always pass `stat_time_range` to `as_darts_timeseries()` to prevent test-period leakage:
+If the module is wired, `stat_time_range` must be the training window to prevent test-period leakage:
 ```python
-ts_list = dataset.as_darts_timeseries(
+from views_r2darts2.transformers.static_covariates import compute_static_covariates, StaticCovariateConfig
+
+stats = compute_static_covariates(
+    time=time_arr, entity=entity_arr, values=values_2d,
+    target_columns=["ged_sb"], column_order=column_names,
     stat_time_range=(training_start_month_id, training_end_month_id),
-    static_cov_transform="AsinhTransform->MaxAbsScaler",
+    config=StaticCovariateConfig(transform="AsinhTransform->MaxAbsScaler"),
 )
 ```
 
@@ -163,7 +169,7 @@ All loss functions target **zero-inflated conflict data**: ~90% zeros, ~10% even
 
 | Loss Function | Status | Base Cell Loss | Key Mechanism | Use When |
 |---------------|--------|---------------|---------------|----------|
-| **SpotlightLossLogcosh** | ⭐ **Production** | log_cosh | DC/AC decomp + compound weights + KL-DRO + level anchor + spectral | Default for all models in production |
+| **SpotlightLossLogcosh** | ⭐ **Production** | log_cosh | Event-gated shape + event-only level + dead-cell anchor (three components) | Default for all models in production |
 | **SpotlightLoss** | ⭐ **Production** | Barron(α=1.5) | Same as above with more robust base cell loss | When log_cosh gradient is too aggressive on large errors |
 | **PrismLoss** | Research | MSE (= MSLE in log space) | KL-DRO + compound weights, no DC/AC decomp, no level anchor | MSLE-aligned optimization without RevIN |
 | **SpotlightFocalLoss** | Research | log_cosh | Focal weighting by difficulty `(1−exp(−\|e\|))^γ`, no DRO | Models without RevIN; exploration |
@@ -181,7 +187,9 @@ All loss functions target **zero-inflated conflict data**: ~90% zeros, ~10% even
 
 The production loss for all current VIEWS models. Operates entirely in **asinh space**; the target scaler must be `AsinhTransform`.
 
-**Five orthogonal components:**
+> **Note (2026-09-10):** the class at `views_r2darts2/math/spotlight_loss_logcosh.py` is a **three-component** loss with a single gene, `non_zero_threshold`. Its docstring: *shape* — log_cosh on demeaned per-cell errors, gated by an event mask, DRO-weighted; *level* — T-scaled log_cosh of the event-only mean gap; *anchor* — log_cosh of the dead-cell sum. The five-component description below is the earlier architecture that `SpotlightLoss` (Barron base) still follows; it is kept for that class. `SpotlightLossLogcosh` has no `delta` and no spectral term — a configured `delta` is silently dropped by the genome filter.
+
+**Five orthogonal components (SpotlightLoss; historical for Logcosh):**
 
 **1. DC/AC decomposition** — prevents RevIN from amplifying bias:
 ```
@@ -216,11 +224,10 @@ The *only* mechanism that can shift series-level means. T-scaling compensates fo
 **5. Spectral regularization** (optional, `δ > 0`):
 Multi-resolution STFT magnitude comparison with the DC bin masked. Enforces temporal structure without caring about phase. Proportional contribution tuned via `delta` (current production values: 0.015–0.12 depending on model).
 
-**Configuration:**
+**Configuration (SpotlightLossLogcosh):**
 ```python
 "loss_function": "SpotlightLossLogcosh",
-"delta": 0.02,               # Spectral weight; 0 disables spectral term
-"non_zero_threshold": 0.88,  # asinh(1) ≈ 0.88 (= 1 battle death in raw space)
+"non_zero_threshold": 0.88,  # asinh(1) ≈ 0.88 (= 1 battle death in raw space) — the only gene
 ```
 
 ### Loss Function Evolution
@@ -304,7 +311,7 @@ The repository is governed by:
 
 ### Training Stability Callbacks
 
-Every training run is monitored by mandatory Fortress callbacks configured in `ModelCatalog`:
+Every training run is monitored by mandatory Fortress callbacks configured in `ModelCatalog` (8 of the 14 attached are shown; the others are `TrainingStepPatchCallback`, `ValMetricsCallback`, `InputBatchMonitorCallback`, `LossComponentCallback`, `RichLossDiagnosticsCallback`, `LossGradientDiagnosticsCallbackV2`, plus Lightning's `EarlyStopping` and `LearningRateMonitor`):
 
 | Callback | Purpose |
 |----------|---------|
@@ -363,7 +370,7 @@ with ViewsDataset(source="cm_features.parquet", targets=["ged_sb"]) as ds:
     targets, past_cov = ds.fit_scalers(
         target_scaler="AsinhTransform",
         feature_scaler_map={"AsinhTransform->MaxAbsScaler": ["lr_ged_sb"]},
-        time_range=(training_start_id, training_end_id),
+        time_ids=range(training_start_id, training_end_id + 1),   # fit on the training window only
         return_series=True,
     )
     ts_list = ds.to_darts_timeseries()
@@ -407,7 +414,6 @@ def get_hp_config():
 
         # Loss — production standard
         "loss_function": "SpotlightLossLogcosh",
-        "delta": 0.02,              # Spectral weight; tune via W&B sweep
         "non_zero_threshold": 0.88, # asinh(1): boundary of 1 battle death
 
         # Optimizer

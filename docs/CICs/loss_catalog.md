@@ -27,7 +27,7 @@ The `LossCatalog` is a specialized factory responsible for translating abstract 
 ## 3. Responsibilities and Guarantees
 
 - **Guarantees Genomic Compliance:** Enforces that every loss request includes all mandatory genes (e.g., `p` for Tweedie, `tau` for Quantile).
-- **Ensures Fail-Loud Initialization:** Refuses to instantiate any loss with "magic defaults." Every parameter must come from the DNA.
+- **Ensures Fail-Loud Initialization:** Refuses to instantiate any custom Fortress loss with "magic defaults" — every genome parameter must come from the DNA. *Exception:* the `torch.nn` passthroughs (`MSELoss`, `L1Loss`, `SmoothL1Loss`, `PoissonNLLLoss`) are constructed with library defaults (`loss_catalog.py:107`); only `HuberLoss` demands `delta`.
 - **Enforces Identifier Mapping:** Maps high-level string identifiers (e.g., "WeightedPenaltyHuberLoss") to concrete, scientifically verified implementation classes.
 - **Provides Instructional Errors:** On failure, guarantees an error message that lists all currently authorized loss functions to improve researcher UX.
 

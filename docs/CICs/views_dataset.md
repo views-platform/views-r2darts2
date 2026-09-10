@@ -20,19 +20,21 @@
 - This class does **not** train or run models.
 - This class does **not** choose scalers — it instantiates what the DNA declares via `ScalerSelector` / `FeatureScalerManager`.
 - This class does **not** validate the DNA manifest (that is `ReproducibilityGate.Config`, called by the catalogs and manager).
-- This class does **not** touch pandas except through the two modules that are allowed to: `dataset/converters.py` (ingest) and `transformers/darts_bridge.py` (Darts boundary).
+- This class does **not** touch pandas except at one function-local import in `to_darts_timeseries` (`base.py:1659`, for `pd.RangeIndex`/`pd.Index`/`pd.Series` that Darts requires) and through the two modules that are allowed to: `dataset/converters.py` (ingest) and `transformers/darts_bridge.py` (Darts boundary).
 
 ---
 
 ## 3. Responsibilities and Guarantees
 
 - **Disk-resident by construction:** the whole dataset lives as chunked Zarr arrays in a `ZarrStore` temp directory; every accessor returns a lazy Dask-backed `xarray` object, so peak memory is bounded by the largest chunk.
-- **One ingest path per source kind:** DataFrame, parquet, `views_frames.PredictionFrame`, `views_frames.FeatureFrame`, or Zarr — dispatched to the matching converter; anything else raises `TypeError`.
+- **One ingest path per source kind:** DataFrame, parquet, `views_frames.PredictionFrame`, `views_frames.FeatureFrame`, Zarr, or an in-memory `xarray.Dataset` — dispatched to the matching converter; anything else raises `TypeError`.
 - **Dimension names are validated** (`validate_indices`), and the level-of-analysis subclasses (`CMDataset`, `PGMDataset`, …) add one invariant each on top.
 - **Scaler state is owned here:** `fit_scalers` fits target and feature scalers on the training window only and returns the aligned `(targets, past_covariates)` lists in one call (`_split_targets_covariates`), so the two can never be misaligned by index.
 - **Inverse transforms preserve the sample dimension** for probabilistic predictions (via `transformers/inverse.py`).
 - **Predictions are ingested with `clip_negatives=True` by default** (`ingest_darts_predictions`, `ingest_numpy_predictions`). This is the current behaviour; whether it should be is register **D-05** / ADR-016.
 - **Streaming construction:** `ViewsDataset.builder(...)` yields a `DatasetBuilder` for datasets too large to hold in RAM.
+- **Incremental construction:** `create_empty` / `add_row` / `add_batch` mutate the store in place — a second write path alongside the builder, which bypasses `build_schema_attrs` (see the converters CIC).
+- **Structural NaN → 0:** on the Darts path, `to_darts_timeseries` applies `np.nan_to_num(nan=0.0)` (`base.py:1645`) on the premise that NaN means "entity absent for those time steps". A genuinely missing observation becomes a zero silently. This is register **D-07** against the fortress protocol's explicit `nan_to_num` prohibition.
 
 ---
 
@@ -58,7 +60,6 @@
 - `ValueError` — missing required dimension; targets not found among columns; `split_data` on a prediction dataset; `to_predictionframe` outside prediction mode.
 - `RuntimeError` — `get_scaled_darts_timeseries` before `fit_scalers`.
 - `LookupError` — `from_*_latest` finds nothing.
-- `NumericalSanityError` — NaN/Inf on ingest (via the gate).
 - **Silent:** the inverse path falls through to unscaled values, with no log line, when a scaler's fitted params cannot be extracted (register C-10).
 
 ---
@@ -92,7 +93,7 @@ with ViewsDataset(source="cm_features.parquet", targets=["ged_sb"]) as ds:
 
 ## 10. Test Alignment
 
-- **Green:** `tests/test_views_dataset.py` (47 tests: ingest kinds, `to_darts_timeseries` incl. single-row and empty entity, scalers, persistence), `tests/test_parquet_loader.py`, `tests/test_parity_e2e.py`, `tests/test_builder.py`, `tests/test_streaming_predict_builder.py`.
+- **Green:** `tests/test_views_dataset.py` (42 tests: ingest kinds, `to_darts_timeseries` incl. single-row and empty entity, scalers, persistence), `tests/test_parquet_loader.py`, `tests/test_parity_e2e.py`, `tests/test_builder.py`, `tests/test_streaming_predict_builder.py`.
 - **Red:** schema failures in `tests/test_views_dataset.py` (missing target column, empty targets, missing file, unsupported source).
 - **Lifecycle:** `tests/test_zarr_cleanup.py`.
 - **Not covered:** an explicit cross-entity-contamination guard (C-14 residual); the C-10 silent passthrough.
@@ -103,7 +104,7 @@ with ViewsDataset(source="cm_features.parquet", targets=["ged_sb"]) as ds:
 
 - `to_darts_timeseries` is 140 lines; `ingest_numpy_predictions` 103 (C-19).
 - Cyclic-encoder columns are computed here and then discarded before `fit` because `_split_targets_covariates` selects only `self.features` (C-22).
-- The module docstring's "pandas-free" claim holds for top-level imports; `converters.py` and `readers.py` import pandas locally.
+- The module docstring's "pandas-free" claim is false as written: `converters.py` imports pandas at module level, and `readers.py` and this module import it locally (register C-45).
 
 ---
 

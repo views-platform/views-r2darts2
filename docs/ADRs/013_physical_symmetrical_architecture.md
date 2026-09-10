@@ -43,6 +43,8 @@ Generic file names like `utils.py`, `model.py`, `handlers.py`, or `gates.py` are
 ### 5. Compliance status (2026-09-10)
 The 1-Class-1-File invariant is **not unconditionally held** on `development` @ `fe7e681`. Three files hold homogeneous families: `views_r2darts2/dataset/converters.py` (five converter classes), `views_r2darts2/dataset/subclasses.py` (six level-of-analysis dataset classes), and `views_r2darts2/transformers/static_covariates.py` (a config and a result dataclass). Whether such families are granted hub status like the three in §3, or must be split, is register **D-04**. This ADR does not assert compliance until that is ruled.
 
+A second, separate departure: `views_r2darts2/__init__.py:45-77` and `dataset/__init__.py` carry a PEP-562 lazy `__getattr__` façade — logic in `__init__.py`, which §Context names as ghost logic. It exists so the package imports without the optional `manager` extra. Register **D-06**: write an ADR sanctioning the façade, or remove it.
+
 ---
 
 ## Consequences

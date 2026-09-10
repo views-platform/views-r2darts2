@@ -41,7 +41,7 @@ For a sequence of length `seq_len`, the weight at time step `i` (from 0 to `seq_
 
 ### Parameters:
 
-| Symbol | Code Variable | Default | Description |
+| Symbol | Code Variable | Typical value (must be declared in DNA) | Description |
 | :--- | :--- | :--- | :--- |
 | `zw` | `self.zero_weight` | N/A | The weight for zero-valued targets. |
 | `nzw`| `self.non_zero_weight`| N/A | The weight for non-zero targets. |
@@ -71,4 +71,4 @@ For a sequence of length `seq_len`, the weight at time step `i` (from 0 to `seq_
 - **CRITICAL: The `delta` parameter is highly sensitive to the scale of the data it receives after all pre-processing transformations.** A `delta` value that is appropriate for raw data will be unstable for data scaled to a `[0, 1]` range, and vice-versa.
 - The `decay_factor` controls how much to penalize older errors. A value close to 1.0 (e.g., 0.99) results in very little decay.
 - For detailed recommendations and a matrix of suggested `delta` ranges for common pipelines, please refer to the central guide:
-  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**
+  - **[Loss Function Pipeline Tuning Guide](../../reports/guides/loss_function_tuning_guide.md)**

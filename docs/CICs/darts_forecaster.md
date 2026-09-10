@@ -21,7 +21,7 @@ The `DartsForecaster` is a slim orchestrator that couples one Darts model to one
 - This class does **not** perform model architecture selection (delegated to the Catalog).
 - This class does **not** handle high-level rolling-origin logic (delegated to the Manager).
 - This class does **not** own scalers or log-transforms — `ViewsDataset` does; the forecaster calls `fit_scalers` and `get_scaled_darts_timeseries`.
-- This class does **not** decide whether predictions are clipped to non-negative. That default (`clip_negatives=True`) lives on `ViewsDataset.ingest_*_predictions` and is register D-05 / ADR-016.
+- This class **does** clip predictions to non-negative on the streaming path — unconditionally, `darts_forecaster.py:515`, with no opt-out — while the ingest path's `clip_negatives=True` default lives on `ViewsDataset`. Both are register D-05 / ADR-016; this contract records the behaviour, not a decision.
 
 ---
 
@@ -59,7 +59,7 @@ The `DartsForecaster` is a slim orchestrator that couples one Darts model to one
 - **Unfitted Predict:** Raises `RuntimeError` if prediction is attempted without fitted scalers.
 - **Device Failure:** *Does not raise.* If `_ensure_model_on_device` cannot move the model off CPU it logs a `WARNING` and continues on CPU. This contradicts ADR-008/ADR-011 and is register **D-01**; recorded here as the current behaviour, not the intended one.
 - **Numerical Insanity:** Fails loudly (`NumericalSanityError`) if NaNs or Infs reach the ingest path.
-- **Scaler Config Mismatch on Load:** Raises `ValueError` if the artifact's `target_scaler` config differs from the current one. The feature-scaler config is *not* checked (register C-09).
+- **Scaler Config Mismatch on Load:** Raises `ValueError` if the artifact recorded a non-null `target_scaler` config that differs from the current one (`:682`; an artifact that recorded `None` is not compared). The feature-scaler config is *not* checked (register C-09).
 
 ---
 
@@ -95,7 +95,7 @@ frames = forecaster.predict(sequence_number=0)
 
 ## 10. Test Alignment
 
-- **Green Team:** `tests/test_darts_forecaster.py` (train/predict lifecycle, rolling-origin conventions, save/load round-trip).
+- **Green Team:** `tests/test_darts_forecaster.py` (construction guards, `predict` at `sequence_number=0`, save/load round-trip). *No test calls `train()`; no rolling-origin sequence > 0 is exercised.*
 - **Green Team:** `tests/test_parity_e2e.py` (end-to-end fit → predict → inverse precision).
 - **Green Team:** `tests/test_streaming_predict_builder.py` (streaming prediction path).
 - **Red Team:** `tests/test_reproducibility_gate.py` (the gates this class invokes).

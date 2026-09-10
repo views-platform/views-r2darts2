@@ -32,7 +32,7 @@
 
 ## 4. Inputs and Assumptions
 
-- Sorted entity array, time array, one value array per target; a `StaticCovariateConfig`.
+- Keyword-only: `time`, `entity`, one stacked `values` array, `target_columns`, `column_order`, `stat_time_range`, `config`.
 
 ---
 
@@ -60,9 +60,12 @@
 ## 8. Examples of Correct Usage
 
 ```python
-stats = compute_static_covariates(entities, times, {"ged_sb": y},
-                                  config=StaticCovariateConfig(transform="AsinhTransform->MaxAbsScaler"),
-                                  stat_time_range=(train_start, train_end))
+stats = compute_static_covariates(
+    time=time_arr, entity=entity_arr, values=values_2d,      # keyword-only
+    target_columns=["ged_sb"], column_order=column_names,
+    stat_time_range=(train_start, train_end),
+    config=StaticCovariateConfig(transform="AsinhTransform->MaxAbsScaler"),
+)
 ```
 
 ---

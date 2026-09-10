@@ -53,5 +53,5 @@ Additionally, using local fitting (where each time series is scaled relative to 
 
 ## Validation & Monitoring
 
-- **Tests:** `tests/test_scaler_selector.py` covers construction and `global_fit`; `tests/test_feature_scaler_manager.py` and `tests/test_parity_e2e.py` cover sample-dimension preservation through the inverse path.
+- **Tests:** `tests/test_scaler_selector.py` covers construction and chain forms — **no test asserts `global_fit=True`** on the returned scaler (decision 2 is honoured by code, unverified by tests); `tests/test_feature_scaler_manager.py::test_probabilistic_inverse_transform` covers sample-dimension preservation; `tests/test_parity_e2e.py` covers deterministic end-to-end inverse parity.
 - **Audit:** Any PR introducing a new scaler must include a Green Team test showing valid probabilistic ranges after transformation.

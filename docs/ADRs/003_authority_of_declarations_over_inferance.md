@@ -3,6 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-02-11  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-10 — compliance note added; decision unchanged.  
 
 ---
 
@@ -39,6 +40,7 @@ To enforce this, all four Catalogs (Model, Loss, Optimizer, Scheduler) implement
 - **Authority of the DNA:** If a manifest says a model uses `AsymmetricQuantileLoss`, it *uses* that loss, regardless of where the script is located or what the model name suggests.
 - **No Parameter Spillover:** Authority is limited to relevance. A declaration in the DNA only has authority if it corresponds to a recognized gene for the chosen algorithm. Forcing a model to declare a parameter it cannot consume (e.g., `use_static_covariates` for N-BEATS) is a violation of the principle of Intentionality.
 - **No Implicit Fallbacks:** "Sensible defaults" are forbidden for parameters affecting model identity.
+  *Compliance note (2026-09-10):* the Darts path fills structurally-absent cells with `0.0` via `np.nan_to_num` (`views_r2darts2/dataset/base.py:1645`), which the fortress protocol names as prohibited. Whether this is a sanctioned missing-value policy or a forbidden fallback is register **D-07**.
 
 ---
 

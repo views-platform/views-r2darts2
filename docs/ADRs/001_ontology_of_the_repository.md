@@ -39,7 +39,7 @@ This repository defines a **closed set of conceptual categories** ("entities"). 
 
 ### 3. The Dataset (`ViewsDataset`)
 - **Purpose:** The single source of truth for all data operations — ingest (parquet / `views_frames` / Zarr), slicing, scaler fitting and application, log transforms, inverse transforms, and construction of Darts `TimeSeries`. Zarr-backed, disk-resident, lazily Dask/xarray-loaded. The forecaster and manager hold no data-manipulation logic of their own; they delegate to it.
-- **Physical Standard:** `ViewsDataset` lives in `views_r2darts2/dataset/base.py`. Its supporting entities live in the same package: `DatasetBuilder` (`builder.py`), the converter family (`converters.py`), the level-of-analysis subclasses (`subclasses.py`), `ZarrStore` (`zarr_store.py`), and source detection (`readers.py`). The pandas boundary is confined to `views_r2darts2/transformers/darts_bridge.py`.
+- **Physical Standard:** `ViewsDataset` lives in `views_r2darts2/dataset/base.py`. Its supporting entities live in the same package: `DatasetBuilder` (`builder.py`), the converter family (`converters.py`), the level-of-analysis subclasses (`subclasses.py`), `ZarrStore` (`zarr_store.py`), and source detection (`readers.py`). Pandas is confined to three declared modules: `views_r2darts2/transformers/darts_bridge.py` (the Darts boundary), `views_r2darts2/dataset/converters.py` (module-level, ingest), and function-local imports in `dataset/readers.py` and `dataset/base.py:1659`. *(The package's own `__init__.py` docstring claims fewer — register C-45.)*
 - **Authority:** Derived (from raw data) — but it *owns* scaler state once fitted, which the Forecaster of 0.1.x used to own.
 
 ### 4. Forecasters (`DartsForecaster`)
@@ -77,7 +77,7 @@ This repository defines a **closed set of conceptual categories** ("entities"). 
 
 - **Implicit Semantics:** Behavior inferred from filenames or folder structures is forbidden.
 - **Mixed-Role Scripts:** A single file must not act as both a "Gate" and a "Model." (See ADR-013: Physical Symmetry).
-- **Ghost Imports:** Importing this package from a stale or sibling copy (e.g. a `temp-views-r2darts2/` checkout, or a path outside the current workspace) is a violation of ontology — see the workspace-integrity check in `tests/conftest.py`. Declared third-party dependencies (`darts`, `torch`, `views_frames`, `views_pipeline_core`) are not ghosts.
+- **Ghost Imports:** Importing this package from a stale or sibling copy (e.g. a `temp-views-r2darts2/` checkout, or a path outside the current workspace) is a violation of ontology. *The workspace-integrity check that once enforced this in `tests/conftest.py` was removed in `de65932`; the rule is now enforced by review only.* Declared third-party dependencies (`darts`, `torch`, `views_frames`, `views_pipeline_core`) are not ghosts.
 
 ---
 

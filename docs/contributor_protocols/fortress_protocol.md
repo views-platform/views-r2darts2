@@ -17,7 +17,7 @@ All meaningful semantics (architectures, loss functions, scaling strategies, see
 Silent failures, implicit fallbacks, and "best-effort" corrections are forbidden. 
 - **Requirement:** Violations of physical, temporal, or configuration invariants must raise an explicit `ReproducibilityError` or `NumericalSanityError` immediately.
 - **Prohibited:** Using `nan_to_num`, silent clipping, or "sensible defaults" for critical parameters.
-  *Note (2026-09-10):* the data layer currently clips predictions to non-negative by default (`ViewsDataset.ingest_*_predictions`, `clip_negatives=True`). Whether that is a physical constraint or a prohibited semantic floor is register **D-05** / ADR-016.
+  *Note (2026-09-10):* the data layer currently clips predictions to non-negative (`ViewsDataset.ingest_*_predictions` default `clip_negatives=True`; `DartsForecaster._predict_streaming` unconditionally) — register **D-05** / ADR-016 — and applies `np.nan_to_num(nan=0.0)` on the Darts path for structural sparsity (`dataset/base.py:1645`) — register **D-07**. Both await a ruling.
 
 ### C. The Numerical Airlock (ADR-016, superseding ADR-010)
 All data entering the system must pass through a numerical airlock.
@@ -40,7 +40,7 @@ Models are Darts classes, not local files. There is nothing to create under `vie
 2.  **Register in Catalog:** Add a `_get_<model>` factory and its registry entry in `ModelCatalog` (`views_r2darts2/catalogs/model_catalog.py`). A genome without a factory passes the manifest audit and then crashes opaquely.
 
 ### Adding a New Loss Function
-1.  **Symmetrical Entry:** Create `views_r2darts2/math/<my_new_loss>.py` and export it from `views_r2darts2/math/__init__.py`.
+1.  **Symmetrical Entry:** Create `views_r2darts2/math/<my_new_loss>.py` and export it from `views_r2darts2/math/__init__.py`. *(Three existing passthrough modules — `huber_loss.py`, `logcosh_loss.py`, `mse_loss.py` — are not exported and are shadowed or unregistered; register C-46.)*
 2.  **Enforce Sanity:** Implement explicit NaN/Inf checks in the `forward()` method.
 3.  **Register Genome:** Add mandatory hyperparameters to `ReproducibilityGate.Config.LOSS_GENOMES`.
 4.  **Update Catalog:** Add the class to `LossCatalog` (`views_r2darts2/catalogs/loss_catalog.py`).

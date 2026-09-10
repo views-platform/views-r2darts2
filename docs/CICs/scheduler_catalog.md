@@ -27,7 +27,7 @@
 - `get_scheduler_cls`: resolves `_CUSTOM_SCHEDULERS` (lazily loaded; currently `WarmupCAWR`) first, then `torch.optim.lr_scheduler`.
 - `get_scheduler_kwargs`: for every key in `ReproducibilityGate.Config.SCHEDULER_GENOMES[name]`, reads the config value and renames it through `_KWARG_MAP` (e.g. `lr_scheduler_factor` → `factor`).
 - Passes through extra keys from a nested `lr_scheduler_kwargs` block, **genome keys taking precedence**.
-- Injects `_STATIC_KWARGS` last — `ReduceLROnPlateau` always gets `mode="min", monitor="val_loss"` — and these override config. This is intentional: they are Darts/Lightning integration requirements, not hyperparameters.
+- Injects `_STATIC_KWARGS` last. For `ReduceLROnPlateau`, `mode="min"` is absolute; `monitor` defaults to `"val_loss"` but is overridable through the DNA key `lr_scheduler_monitor` (`scheduler_catalog.py:125`).
 
 ---
 
@@ -68,14 +68,14 @@ cls, kwargs = sc.get_scheduler_cls(), sc.get_scheduler_kwargs()
 
 ## 9. Examples of Incorrect Usage
 
-- Putting `monitor` in the DNA and expecting it to override the static `val_loss`.
+- Putting `mode` in the DNA and expecting it to override the static `"min"`. (`monitor` *is* overridable via `lr_scheduler_monitor`.)
 - Adding a scheduler to `_KWARG_MAP` without adding its genome to the gate.
 
 ---
 
 ## 10. Test Alignment
 
-- **None.** No test under `tests/` references `scheduler_catalog` or `WarmupCAWR` (register C-30). The kwarg remapping, pass-through precedence, and static-kwargs override are unverified.
+- **Indirect only:** `tests/test_model_catalog.py::test_lr_scheduler_args` (`:356-370`) reaches `get_scheduler_kwargs` through `ModelCatalog` and asserts the `factor`/`patience`/`min_lr` remap and the `mode`/`monitor` statics. Still unverified: `lr_scheduler_kwargs` pass-through precedence, `lr_scheduler_monitor` override, and `WarmupCAWR` entirely (register C-30).
 
 ---
 

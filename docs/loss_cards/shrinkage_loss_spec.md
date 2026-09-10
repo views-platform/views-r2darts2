@@ -52,4 +52,4 @@ The loss is calculated as:
 - **CRITICAL: The `c` (error threshold) parameter is highly sensitive to the scale of the errors (`|preds-targets|`) produced by your specific data pipeline.** An effective `c` should be set relative to the distribution of errors you expect.
 - **The `a` (shrinkage speed) parameter controls the aggressiveness of the shrinkage. A very high `a` can cause vanishing gradients for easy samples.**
 - For detailed recommendations and a matrix of suggested `c` ranges for common pipelines, please refer to the central guide:
-  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**
+  - **[Loss Function Pipeline Tuning Guide](../../reports/guides/loss_function_tuning_guide.md)**

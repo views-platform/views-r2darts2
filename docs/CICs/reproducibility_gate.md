@@ -30,11 +30,12 @@ The `ReproducibilityGate` is "The Law" of the repository. It is a stateless util
 - **Guarantees Temporal Continuity:** Verifies the $t+1$ invariant, ensuring that the test set starts exactly one month after the training set ends.
 - **Prevents Data Leakage:** Ensures that no month IDs from the test partition are physically present in the training tensors.
 - **Enforces Sequential Integrity:** Scans for "Temporal Holes" (missing months) in historical data to prevent distorted time-series dynamics.
-- **Numerical Sanity Firewall:** Detects NaNs, Infs, and extreme adversarial outliers at the data entry points.
+- **Numerical Sanity Firewall:** `audit_numerical_sanity` detects NaNs, Infs, and extreme adversarial outliers — **but is not invoked on any production path on 0.2.x** (C-44).
 - **Architecture Alignment:** `Config.audit_architecture` requires `len(steps) % output_chunk_length == 0` and warns loudly on a non-36 horizon or a non-1 start offset.
 - **Boundary Integrity:** `Temporal.audit_boundary_integrity` requires training series to end exactly at the partition boundary — no leak, no starvation.
 - **Horizon Lockdown:** `Temporal.audit_prediction_horizon` forbids forecasting past known ground truth for `calibration`/`validation` runs.
-- **Frame Schema:** `Data.audit_frame_schema` validates a `views_frames.FeatureFrame` at ingest (the pandas `audit_dataframe_schema` of 0.1.x is gone).
+- **Frame Schema:** `Data.audit_frame_schema` validates a `views_frames.FeatureFrame` and raises on any non-`float32` dtype — **but has no production caller** (C-44); the pandas `audit_dataframe_schema` of 0.1.x is gone.
+- **Wired vs unwired (2026-09-10):** on the production path only `Config.audit_manifest`, `Config.audit_architecture`, `Temporal.audit_continuity`, `Temporal.audit_prediction_horizon` and `Data.lock_entropy` are called. `audit_boundary_integrity`, `audit_sequence_contiguity`, `audit_leakage`, `audit_frame_schema` and `audit_numerical_sanity` exist, are tested, and are called by nothing in `views_r2darts2/`.
 - **Entropy Lock:** `Data.lock_entropy(seed)` reseeds `random`, `numpy` and `torch` so probabilistic draws are bit-identical across reloads.
 
 ---
@@ -57,7 +58,7 @@ The `ReproducibilityGate` is "The Law" of the repository. It is a stateless util
 
 ## 6. Failure Modes and Loudness
 
-- **Fail-Loud Mandate:** This class must **never** swallow an error. All violations must raise a subclass of `ReproducibilityError`.
+- **Fail-Loud Mandate:** This class must **never** swallow an error. All violations must raise a subclass of `ReproducibilityError`. *Exception:* `audit_frame_schema` raises bare `KeyError` for missing columns (`reproducibility_gate.py:666`, `:672`).
 - **Immediate Termination:** Fails at the earliest possible moment (usually during the Handshake phase).
 - **Explicit Rationale:** Every raised exception must include a descriptive message explaining *why* the contract was violated.
 
@@ -103,7 +104,7 @@ ReproducibilityGate.Temporal.audit_continuity(partition_dict)
 
 ### Known Deviations / Technical Debt
 - **`MultiQueryTransformerModel` is registered in `ALGORITHM_GENOMES` with no catalog factory** — `audit_manifest` accepts it and `ModelCatalog.get_model` then crashes opaquely (C-11).
-- **`float64` check is informational only** in `audit_frame_schema`; the converters guarantee `float32` by construction, so this is moot rather than a gap (ADR-016 open question).
+- **`float64` check is fail-loud** in `audit_frame_schema` (`:657-661` raises `NumericalSanityError`), unreachable in practice because the converters emit only `float32`, and never invoked in production regardless (C-44).
 
 ---
 

@@ -31,7 +31,7 @@ The loss is the mean of the element-wise focal-weighted squared error.
 
 ### Parameters:
 
-| Symbol | Code Variable | Default | Description |
+| Symbol | Code Variable | Typical value (must be declared in DNA) | Description |
 | :--- | :--- | :--- | :--- |
 | `alpha` | `self.alpha` | 0.8 | A weighting factor to balance the importance between spike and non-spike classes. Similar to the alpha in the original Focal Loss paper. |
 | `gamma` | `self.gamma` | 2.0 | The focusing parameter. Higher gamma more aggressively down-weights well-classified examples. |
@@ -68,4 +68,4 @@ The loss is the mean of the element-wise focal-weighted squared error.
 - **CRITICAL: The `spike_threshold` parameter is entirely dependent on the scale of the data it receives after all pre-processing transformations.** A `spike_threshold` that is appropriate for raw count data will be non-functional for data scaled to a `[0, 1]` range.
 - **The `is_spike` condition (`targets > spike_threshold`) will never be met if the threshold is set outside the bounds of the transformed data, disabling the core mechanism of this loss function.**
 - For detailed recommendations and a matrix of suggested `spike_threshold` ranges for common pipelines, please refer to the central guide:
-  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**
+  - **[Loss Function Pipeline Tuning Guide](../../reports/guides/loss_function_tuning_guide.md)**

@@ -27,6 +27,7 @@
 
 - Declares time/entity dimension names from the `loa` code (`pgm` → `month_id`/`priogrid_id`, `cm` → `month_id`/`country_id`, `pgy`/`cy` the year variants).
 - Pre-allocates a NaN-filled Zarr skeleton — metadata only, nothing materialised — and scatter-writes via `converters.GridWriter`.
+- Two write entry points: `write_batch(times, entities, columns)` for scattered `(time, entity)` rows, and `write_time_slice(time, columns)` for one full `(E, sample_size)` slice at a time; each has its own shape rules and its own `strict` duplicate check.
 - Coordinates are sorted and unique; every batch is validated against them and **fails loud naming the offending values**.
 - Never-written cells stay NaN. `build(require_complete=True)` fails loud on any unwritten cell (requires `strict=True` or `track_coverage=True`).
 - Overwrites are last-write-wins by default; `strict=True` raises on any duplicate `(time, entity)` write.

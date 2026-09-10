@@ -51,13 +51,14 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 ## CICs
 
 - [x] `CICs/README.md` active-contract list reflects this project's classes
-- [x] Intent contracts written for the non-trivial classes (21 active):
+- [x] Intent contracts written for the non-trivial classes (19 active):
       `darts_forecaster`, `darts_forecasting_model_manager`, `model_catalog`, `loss_catalog`,
       `optimizer_catalog`, `scheduler_catalog`, `views_dataset`, `dataset_builder`, `zarr_store`,
       `dataset_converters`, `dataset_subclasses`, `feature_scaler_manager`, `scaler_selector`,
       `inverse`, `darts_bridge`, `frame_builder`, `static_covariates`, `reproducibility_gate`,
       `fortress_monitoring_callbacks`; `views_dataset_darts` retired to `archive/`
 - [ ] In-code `Intent Contract:` docstrings on the ten classes named in register C-39 (D-02)
+- [ ] CICs for the two public patch exports (`apply_all_patches`, `apply_tide_mc_dropout_patch`) and for `WarmupCAWR` (register C-39)
 
 ---
 
@@ -91,8 +92,8 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 ## Final Verification
 
 - [x] No files carry Status `--template--` except where intentionally deferred
-- [ ] No phantom references to non-existent local files — *re-verified at the end of the
-      `governance-0.2.x` branch by `validate_docs.sh` pass 7; ticked in Stage 6*
+- [x] No phantom references to non-existent local files — verified by `validate_docs.sh` pass 7
+      (code/test paths) and by a three-agent drift audit on 2026-09-10
       (cross-repo ADR refs — views-baseline ADR-016, views-hydranet ADR-026,
       views-pipeline-core ADR-052 — are external satellites, not local gaps)
 - [x] All local cross-ADR references resolve correctly

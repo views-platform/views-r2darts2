@@ -29,7 +29,8 @@ The converter family is the **Data Airlock** of 0.2.x: one converter per input k
 - `ParquetConverter`: the only genuinely out-of-core path; scans in Arrow batches and scatter-writes into a pre-allocated skeleton via `GridWriter`, so peak memory is one batch.
 - `GridWriter`: pre-allocates a Zarr skeleton and scatter-writes dense grid regions; shared by `ParquetConverter` and `DatasetBuilder`.
 - `build_schema_attrs` resolves column roles (`num2`/`num3`/`text`, `pred_*` detection) and is the single place the store's `.attrs` schema is defined.
-- All numeric output is `np.float32` (`_FLOAT`), which is why `ReproducibilityGate.Data.audit_frame_schema`'s `float64` check is informational (ADR-016).
+- All numeric output is `np.float32` (`_FLOAT`). `ReproducibilityGate.Data.audit_frame_schema` raises `NumericalSanityError` on anything else — a defensive guard that is unreachable in practice, and in any case never invoked on the production path (C-44) (ADR-016).
+- **One bypass:** `ViewsDataset.create_empty` (`base.py:938`) hand-builds the `.attrs` dict and enters via the `"dataset"` source kind, skipping `build_schema_attrs`.
 
 ---
 
@@ -48,7 +49,7 @@ The converter family is the **Data Airlock** of 0.2.x: one converter per input k
 ## 6. Failure Modes and Loudness
 
 - `ValueError` — targets not found among columns; unsupported spec; shape conflicts.
-- Pandas is imported here, locally — this and `readers.py` are the exceptions to the package's pandas-free claim.
+- Pandas is imported here at module level (`:18`) — this, `readers.py` and one local import in `dataset/base.py` are the exceptions to the package's pandas-free claim.
 
 ---
 

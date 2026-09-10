@@ -5,8 +5,8 @@
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
 | Last Updated      | 2026-09-10                           |
-| Total Concerns    | 43                                   |
-| Open Concerns     | 30                                   |
+| Total Concerns    | 48                                   |
+| Open Concerns     | 35                                   |
 | Resolved Concerns | 13                                   |
 | Governed by       | ADR-014                              |
 
@@ -38,7 +38,7 @@
 > **Re-derived 2026-09-10 against `development` @ `fe7e681` (0.2.x).** Every open entry below was
 > re-verified: 11 still present (line numbers refreshed), 2 moved, 9 changed (C-08 and C-22
 > re-tiered down; C-12, C-18, C-32 retitled), 7 resolved (five by the rewrite, two by the
-> `governance-0.2.x` branch), 9 registered (C-35..C-43, of which C-40 was resolved by Stage 5 of this branch), 5 disagreements opened (D-01..D-05).
+> `governance-0.2.x` branch), 9 registered (C-35..C-43, of which C-40 was resolved by Stage 5 of this branch), 5 disagreements opened (D-01..D-05). A three-agent drift audit of the re-derived docs (review-base-docs, same date) added C-44..C-48 and D-06..D-07 — including one Tier-2 finding the re-derivation itself had missed (C-44).
 > Two sub-claims are UNVERIFIED pending a `darts==0.46.1` install: C-12 (`_Block` guard collision)
 > and C-18 (patch behaviour against 0.46.1 internals).
 >
@@ -273,7 +273,7 @@
 - **Source:** repo-assimilation (2026-09-09) (Phase 6 — test coverage)
 - **Trigger:** Selecting a non-default `lr_scheduler_cls` (especially `WarmupCAWR`); or adding an entry to `SchedulerCatalog._KWARG_MAP` or `_STATIC_KWARGS`.
 - **Location:** `views_r2darts2/catalogs/scheduler_catalog.py` (128 LOC: `_KWARG_MAP:17`, `_STATIC_KWARGS:44`, `_CUSTOM_SCHEDULERS:53,57-59`, last-wins injection `:123`), `views_r2darts2/math/warmup_cawr.py` (106 LOC; reachable via `reproducibility_gate.py:308-313` + `scheduler_catalog.py:58-59`) — zero references to either under `tests/`.
-- **Narrative:** C-06 and C-13 cover the untested loss family and callbacks; these two modules fall outside both. `SchedulerCatalog` performs non-trivial work that is entirely unverified: config-key→torch-kwarg remapping via `_KWARG_MAP`, pass-through of the nested `lr_scheduler_kwargs` block with genome-key precedence, lazy loading of `_CUSTOM_SCHEDULERS`, and last-wins injection of `_STATIC_KWARGS` that deliberately overrides config values.
+- **Narrative:** C-06 and C-13 cover the untested loss family and callbacks; these two modules fall outside both. `SchedulerCatalog` has *indirect* coverage only — `tests/test_model_catalog.py::test_lr_scheduler_args` (`:356-370`) reaches `get_scheduler_kwargs` through `ModelCatalog` and asserts the `factor`/`patience`/`min_lr` remap and the `mode`/`monitor` statics. Still unverified: `lr_scheduler_kwargs` pass-through precedence, the `lr_scheduler_monitor` override (`scheduler_catalog.py:125`), lazy `_CUSTOM_SCHEDULERS` loading, and `WarmupCAWR` entirely.
 - **graphify (2026-09-09) note:** The harness the archived roadmap specified exists as `tests/losses/harness.py`; it is loss-oriented and does not cover schedulers.
 - **re-derivation (2026-09-10, `development` @ `fe7e681`):** **Changed: 1 of 3 closed.** `encoders.py` is now covered by `tests/test_encoders.py:37-149` (shape/range/dtype, period-12 orbit, `CYCLIC_ENCODERS_BY_RESOLUTION`) — the `(idx - 1) % period` convention is exercised. Scheduler catalog and `warmup_cawr.py` remain at zero.
 - **Cross-refs:** C-06, C-13 (adjacent coverage gaps); C-21 (the structural reason integration coverage is hard here).
@@ -369,7 +369,8 @@
 - **Trigger:** Marking ADR-006 as compliant; or refactoring one of the ten classes with only its docstring open and no CIC to hand.
 - **Location:** `views_r2darts2/dataset/base.py:40` (`ViewsDataset`), `views_r2darts2/engines/darts_forecasting_model_manager.py:58`, `views_r2darts2/catalogs/loss_catalog.py:27`, `views_r2darts2/catalogs/optimizer_catalog.py:7`, `views_r2darts2/catalogs/scheduler_catalog.py:8`, `views_r2darts2/infrastructure/reproducibility_gate.py:75`, `views_r2darts2/transformers/feature_scaler_manager.py:37`, `views_r2darts2/transformers/scaler_selector.py:93`, `views_r2darts2/dataset/builder.py:145` (`DatasetBuilder`), `views_r2darts2/dataset/zarr_store.py:33` (`ZarrStore`). Present on: `ModelCatalog`, `DartsForecaster`, and eleven callbacks.
 - **Narrative:** The ADR's Form-of-the-Contract section allows either a docstring block or a linked Markdown file. Every one of the ten now has a Markdown CIC (Stage 2, 2026-09-10), so the ADR is satisfied by the letter. The spirit — that a reader of the class sees its intent without leaving the file — is not. ADR-006 is marked "compliance open" until D-02 is ruled.
-- **Cross-refs:** D-02 (the ruling: require both, or accept Markdown-only); ADR-006.
+- **Also without any CIC (2026-09-10 gap analysis):** the two public patch exports `apply_all_patches` and `apply_tide_mc_dropout_patch` (`views_r2darts2/__init__.py`, `infrastructure/patches.py`) and `WarmupCAWR` (`views_r2darts2/math/warmup_cawr.py`) — the only `__all__` names and the only registered scheduler with no contract of either kind.
+- **Cross-refs:** D-02 (the ruling: require both, or accept Markdown-only); ADR-006; C-38 (the patches module).
 
 ---
 
@@ -378,7 +379,7 @@
 - **Tier:** 3 *(the loss-card layer is the only place the loss family's parameters and behaviour are documented for researchers; more than half of it is missing, and two cards contradict ADR-003 by listing "Default" values for arguments the constructors make mandatory)*
 - **Source:** repo-assimilation (2026-09-10) (docs audit, Phase C)
 - **Trigger:** A researcher configures `SpotlightLoss` (the production loss) or any Spotlight/Prism/Sentinel variant from documentation; or reads `tweedie_loss_spec.md` / `shrinkage_loss_spec.md` and omits a "defaulted" gene from the DNA.
-- **Location:** `docs/loss_cards/` — 9 card files covering 8 of the 20 loss modules under `views_r2darts2/math/`; missing for `PrismLoss`, `SpotlightLoss`, `SpotlightLossLogcosh`, `SpotlightLossHuber`, `SpotlightLossAsinh`, `SpotlightLossPowerLaw`, `SpotlightFocalLoss`, `SentinelLoss`, `CharbonnierLoss`, and the passthroughs. `docs/loss_cards/tweedie_loss_spec.md` lists `p` Default 1.5 and `eps` Default 1e-6; `docs/loss_cards/shrinkage_loss_spec.md` lists `a` Default 10.0, `c` Default 0.2 — `TweedieLoss.__init__` and `ShrinkageLoss.__init__` have no defaults and `LOSS_GENOMES` mandates every argument.
+- **Location:** `docs/loss_cards/` — 9 card files covering 8 of the 20 loss modules under `views_r2darts2/math/`; eight cards carried a "Default" column against constructors with no defaults (all relabelled 2026-09-10 on `governance-0.2.x`); seven cards linked a tuning guide at a nonexistent path (fixed same date); missing for `PrismLoss`, `SpotlightLoss`, `SpotlightLossLogcosh`, `SpotlightLossHuber`, `SpotlightLossAsinh`, `SpotlightLossPowerLaw`, `SpotlightFocalLoss`, `SentinelLoss`, `CharbonnierLoss`, and the passthroughs. `docs/loss_cards/tweedie_loss_spec.md` lists `p` Default 1.5 and `eps` Default 1e-6; `docs/loss_cards/shrinkage_loss_spec.md` lists `a` Default 10.0, `c` Default 0.2 — `TweedieLoss.__init__` and `ShrinkageLoss.__init__` have no defaults and `LOSS_GENOMES` mandates every argument.
 - **Narrative:** The "Default" columns were relabelled "Typical value (must be declared in DNA)" in Stage 4 of `governance-0.2.x`, and `loss_cards/README.md` (previously 0 bytes) now indexes the nine cards and names the twelve gaps. The gaps themselves remain: the production loss has no card. Writing them is blocked on the same knowledge C-06 needs — nobody has verified the advanced family's behaviour.
 - **Cross-refs:** C-06 (same modules, untested); C-15 (same modules, duplicated); ADR-003.
 
@@ -405,6 +406,62 @@
 - **Cross-refs:** none.
 
 ---
+
+### C-44 — Five of the ten `ReproducibilityGate` methods have no production caller
+
+- **Tier:** 2 *(the manifest, ADR-009 and the gate's CIC presented these as running at the data boundaries; on 0.2.x they run only in tests. The invariants they enforce — boundary integrity, sequence contiguity, train/test leakage, frame schema, NaN/Inf — are therefore unenforced on the live path. Structural: the Fortress is half-wired, and the documentation said otherwise until 2026-09-10.)*
+- **Source:** review-base-docs (2026-09-10) (independent drift audit, three agents concurring)
+- **Trigger:** Relying on any of the five as a guard — e.g. assuming a temporal hole or a test-period leak would be caught — or wiring one in and discovering its assumptions no longer match the Zarr-backed dataset.
+- **Location:** `views_r2darts2/infrastructure/reproducibility_gate.py` — `Temporal.audit_boundary_integrity`, `Temporal.audit_sequence_contiguity`, `Data.audit_leakage`, `Data.audit_frame_schema` (`:626`), `Data.audit_numerical_sanity`: callers only in `tests/test_reproducibility_gate.py:284-481`. No module under `views_r2darts2/dataset/` or `transformers/` imports the gate. Wired: `audit_manifest`, `audit_architecture` (`catalogs/model_catalog.py:100,285-427`), `audit_continuity`, `audit_prediction_horizon` (`engines/darts_forecasting_model_manager.py:117,324`), `lock_entropy` (`engines/darts_forecaster.py:335`).
+- **Narrative:** On 0.1.x these five were called from `_preprocess_timeseries` and `_ViewsDatasetDarts.__init__`, both deleted in the rewrite; the calls were not carried into `ViewsDataset` or the new forecaster. The live NaN scan is a separate check in `DartsForecaster.predict` (`:492-496`); nothing checks boundary integrity, contiguity, or leakage anywhere. `audit_frame_schema`'s fail-loud `float32` guard (`:657-661`) therefore never fires. The docs (manifest §2, ADR-009, `docs/CICs/reproducibility_gate.md`) now mark each as ⚠ unwired.
+- **Cross-refs:** C-35 (the length filter lost the same way); C-14 (resolved — but its residual "cross-entity contamination" guard would have lived here); ADR-009.
+
+---
+
+### C-45 — The package's pandas-boundary claim is false in its own docstrings, and the Darts bridge's inbound half is bypassed
+
+- **Tier:** 3 *(two code-side docstrings state an invariant the code violates, and a boundary module the architecture depends on is imported-but-never-called on the inbound side; misleads maintainers and defeats the stated purpose of the boundary)*
+- **Source:** review-base-docs (2026-09-10)
+- **Trigger:** Attempting the "only this file changes" migration that `darts_bridge.py`'s docstring promises when Darts drops pandas; or adding an import-linter contract from the docstring's claim.
+- **Location:** `views_r2darts2/__init__.py:20-23` ("the only pandas touchpoint is in `views_r2darts2.transformers.darts_bridge` … No other module imports pandas"); `views_r2darts2/transformers/darts_bridge.py:47` ("No other module in the package may import pandas directly"). Actual importers: `dataset/converters.py:18` (module-level), `dataset/readers.py:30`, `dataset/base.py:1659`. Bypass: `base.py:1597` imports `build_entity_timeseries` and never calls it; `base.py:1702` builds `TimeSeries` directly.
+- **Narrative:** The bridge exists so the pandas dependency has one address. Ingest (`converters.py`) needs pandas legitimately and is not the problem; the problem is that `to_darts_timeseries` re-implements the bridge's inbound construction with its own local pandas import, leaving the bridge function dead on that side. One move — the `_TS` construction block from `base.py:1659-1710` into `darts_bridge.build_entity_timeseries` — would make all four docstring/CIC claims true at once. ADR-001/002 and the CICs were corrected on 2026-09-10 to name the three importers.
+- **Cross-refs:** C-36 (another imported-never-called module in the same method); ADR-001, ADR-002.
+
+---
+
+### C-46 — Three passthrough loss modules are shadowed or unregistered
+
+- **Tier:** 4 *(dead or unreachable code; no runtime effect because the registry binds the names to `torch.nn` classes instead)*
+- **Source:** review-base-docs (2026-09-10)
+- **Trigger:** Editing `views_r2darts2/math/huber_loss.py`, `mse_loss.py` or `logcosh_loss.py` expecting the change to reach a model; or configuring `loss_function: "LogCoshLoss"`.
+- **Location:** `views_r2darts2/catalogs/loss_catalog.py:20-22` imports all three; `:82,84` bind `"MSELoss"` / `"HuberLoss"` to `torch.nn.MSELoss` / `torch.nn.HuberLoss`, shadowing the local modules; `"LogCoshLoss"` is absent from the registry (`:65-86`) and from `LOSS_GENOMES`, so it is unselectable. None of the three is exported from `views_r2darts2/math/__init__.py`.
+- **Narrative:** The catalog's own comment says the `torch.nn` names are passthroughs, and they are — but the repo also carries local modules with the same class names that nothing uses. A contributor following the fortress protocol's "create the module, export it, register it" recipe will find three modules that skipped the last two steps.
+- **Cross-refs:** C-15 (loss-family archaeology); C-41 (the cards README now flags all three).
+
+---
+
+### C-47 — Three documented observability mandates have no code behind them
+
+- **Tier:** 3 *(ADR-008, the logging standard and a CIC each mandate a specific emission or raise that does not exist; a reader auditing logs for these events will conclude the system is broken or the docs are lying — the docs were, until noted)*
+- **Source:** review-base-docs (2026-09-10)
+- **Trigger:** Debugging a run by looking for the "DNA Manifest Summary" log, the `max_workers` `INFO` line, or a loud failure when `GradientHealthCallback` finds no gradients.
+- **Location:** ADR-008 §Observability Patterns "Configuration Summary" — no emitter anywhere in `views_r2darts2/` (the manager goes `audit_manifest` → `audit_architecture` → build → train, `darts_forecasting_model_manager.py:267-271`); `docs/standards/logging_and_observability_standard.md` §5.2 `max_workers` `INFO` — the branch at `darts_forecasting_model_manager.py:335-338` is silent; `docs/CICs/fortress_monitoring_callbacks.md` §6 fail-loud-on-no-gradients — `callbacks.py:231` returns early, no `raise` in the class.
+- **Narrative:** Each is a small, clearly specified piece of code. Each document now carries a compliance note. Whether to implement them or downgrade the mandates is a per-item call; none blocks anything today.
+- **Cross-refs:** C-13 (the callback's kill-switches are untested as well as partially unimplemented); ADR-008.
+
+---
+
+### C-48 — `np.nan_to_num(nan=0.0)` on the Darts path silently zeroes any missing observation
+
+- **Tier:** 3 *(deliberate and commented — "NaN = structural sparsity (entity absent for those time steps)" — so not a hidden defect; but it is the exact call the fortress protocol prohibits by name, and it cannot distinguish a structurally absent cell from a genuinely missing value. Latent silent-corruption seam, held at 3 because the design premise is stated.)*
+- **Source:** review-base-docs (2026-09-10)
+- **Trigger:** Ingesting a feature source that carries genuine `NaN` observations (an unreported month, a late-joining covariate) rather than only structural absence — every such value trains as a zero.
+- **Location:** `views_r2darts2/dataset/base.py:1645` (`values_4d = np.nan_to_num(computed.values, nan=0.0)` inside `to_darts_timeseries`); prohibition at `docs/contributor_protocols/fortress_protocol.md` §1.B.
+- **Narrative:** The 0.1.x pipeline raised `NumericalSanityError` on any NaN at the boundary (C-44's now-unwired `audit_numerical_sanity`). The 0.2.x dataset stores a dense `(T, E, S, F)` grid in which absent cells are NaN by construction, and the Darts path must fill them with *something*. Zero is defensible for counts and indefensible for, say, a GDP covariate. The ruling — accept the premise and amend the protocol, or add an explicit missing-value policy — is register D-07.
+- **Cross-refs:** D-07 (the ruling); C-44 (the guard that would have caught the other kind of NaN); C-35 (short-history entities are the structural-sparsity case this is designed for).
+
+---
+
 
 ## Disagreements
 
@@ -463,10 +520,33 @@
 |-------|-------|
 | ID | D-05 |
 | Source | repo-assimilation (2026-09-10) |
-| Perspectives | **ADR-010 §3, carried into ADR-016 as an open question** — clipping in the data layer is a hidden heuristic that masks model behaviour; any floor belongs in evaluation or as a declared gene. **Code** — `ViewsDataset.ingest_darts_predictions` / `ingest_numpy_predictions` default `clip_negatives=True`; `DartsForecaster`'s docstring lists non-negativity as a guarantee; the argument is that fatality counts cannot be negative and this is physics, not modelling. |
-| Resolution | Unresolved. Ruling for the ADR → flip the default to `False` or add a `prediction_floor` gene; update the forecaster docstring and CIC. Ruling for the code → ADR-016 §3 becomes a decision rather than an open question, distinguishing the physical zero floor from modelling thresholds. |
+| Perspectives | **ADR-010 §3, carried into ADR-016 as an open question** — clipping in the data layer is a hidden heuristic that masks model behaviour; any floor belongs in evaluation or as a declared gene. **Code** — two sites: `ViewsDataset.ingest_darts_predictions` / `ingest_numpy_predictions` default `clip_negatives=True`, and an **unconditional** `np.maximum(target_values, 0.0)` at `engines/darts_forecaster.py:515` on the streaming path with no opt-out; `DartsForecaster`'s docstring lists non-negativity as a guarantee; the argument is that fatality counts cannot be negative and this is physics, not modelling. |
+| Resolution | Unresolved. Ruling for the ADR → flip the ingest default, remove or gate the streaming clip, or add a `prediction_floor` gene; update the forecaster docstring and CIC. Ruling for the code → ADR-016 §3 becomes a decision rather than an open question, distinguishing the physical zero floor from modelling thresholds. |
 
 ---
+
+### D-06: Public-API façade — lazy `__getattr__` in `__init__.py` (code) vs "no logic buried in `__init__.py`" (ADR-013)
+
+| Field | Value |
+|-------|-------|
+| ID | D-06 |
+| Source | review-base-docs (2026-09-10) |
+| Perspectives | **ADR-013 §Context** — logic in `__init__.py` files is "ghost logic" that raises cognitive load and defeats predictable discovery. **Code** — `views_r2darts2/__init__.py:45-77` is a 33-line PEP-562 `__getattr__` façade, deliberately built so the package imports without `views-pipeline-core`, `torch`-heavy submodules, or the optional `manager` extra; `dataset/__init__.py` does the same. No ADR records the decision. |
+| Resolution | Unresolved. Ruling for the code → write ADR-017 ("Lazy public-API façade") and carve it out of ADR-013. Ruling for the ADR → replace the façade with eager imports and accept the import-time cost. |
+
+---
+
+### D-07: Missing values — `nan_to_num` for structural sparsity (code) vs the protocol's explicit `nan_to_num` prohibition (ADR-003/008, fortress protocol §1.B)
+
+| Field | Value |
+|-------|-------|
+| ID | D-07 |
+| Source | review-base-docs (2026-09-10) |
+| Perspectives | **Fortress protocol §1.B / ADR-003** — `nan_to_num` is named as prohibited; silent value substitution is a "sensible default" for a decision-relevant quantity. **Code** — `dataset/base.py:1645` applies `nan_to_num(nan=0.0)` with the stated premise that a NaN cell in the dense Zarr grid means "entity absent for those time steps", for which zero is the correct count. The grid cannot distinguish that from a genuinely missing observation (C-48). |
+| Resolution | Unresolved. Ruling for the code → amend the protocol to permit structural-sparsity fill with an explicit missing-value policy documented on `ViewsDataset`. Ruling for the protocol → raise on NaN at ingest (re-wire `audit_numerical_sanity`, C-44) and require sources to be dense. |
+
+---
+
 
 ## Resolved Concerns
 ### C-40 — The shipping `README.md` documents a deleted class and a deleted function *(resolved 2026-09-10, this branch, Stage 5)*
@@ -593,7 +673,7 @@
 ## Register Conventions
 
 - **ID format:** `C-xx` for concerns, `D-xx` for disagreements. IDs are permanent — gaps indicate merged or resolved entries.
-- **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `incident`.
+- **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `review-base-docs`, `incident`.
 - **Disagreements:** `D-xx` entries record an ADR-vs-code contradiction awaiting a ruling. They are not concerns; they point at the concern (if any) that is the code side.
 - **Re-derivation:** when the code moves under an entry, the entry is re-verified and carries a dated `re-derivation` bullet; Location is updated to current line numbers; Tier is changed only with a stated reason.
 - **Resolution:** Move to "Resolved Concerns" with resolution date and one-line summary when addressed. Do not delete.

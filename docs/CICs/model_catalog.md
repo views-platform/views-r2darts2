@@ -48,7 +48,7 @@ The `ModelCatalog` acts as the central factory for translating abstract DNA mani
 
 ## 6. Failure Modes and Loudness
 
-- **Unknown Algorithm:** Raises `ValueError` if the requested model name is not in the whitelist.
+- **Unknown Algorithm:** *Does not raise `ValueError`.* `get_model` executes `self.models.get(name)()`, so an unknown name raises `TypeError: 'NoneType' object is not callable` (`model_catalog.py:275`; register C-11).
 - **Mathematical Mismatch:** Raises `ArchitectureMismatchError` if `steps % output_chunk_length != 0`.
 
 ---

@@ -1,6 +1,8 @@
 
 # ADR README and Governance Map
 
+**Revised:** 2026-09-10 — re-derived with the ADR set against 0.2.x.  
+
 This repository uses Architectural Decision Records (ADRs) to govern
 structural, semantic, and operational behavior.
 

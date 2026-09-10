@@ -27,6 +27,7 @@
 
 - `build_entity_timeseries(...)` — one `TimeSeries` per entity from frame-shaped arrays, with the entity id as a static covariate.
 - `prediction_frame_from_darts(...)`, `prediction_frames_from_darts(...)` — Darts predictions (2-D or 3-D) back to `views_frames.PredictionFrame`(s), sample dimension preserved.
+- **Not currently on the production path:** `build_entity_timeseries` is imported by `dataset/base.py:1597` and never called; `ViewsDataset.to_darts_timeseries` constructs `TimeSeries` directly at `base.py:1702` with its own local `import pandas`. The bridge's inbound half is bypassed (register C-45).
 - `prediction_frames_to_dataframe(...)` — the on-demand DataFrame view; never called implicitly.
 - Darts `TimeSeries` are short-lived views; the memmap-backed frame stays the source of truth.
 
@@ -46,7 +47,7 @@
 
 ## 6. Failure Modes and Loudness
 
-- `ValueError` — empty prediction list; time-index or component mismatch between series; entity id missing from static covariates.
+- `ValueError` — empty prediction list; component mismatch or multi-target series; entity id missing from static covariates. *(No time-index comparison is performed.)*
 
 ---
 
@@ -54,7 +55,7 @@
 
 - **Physical Zen:** `views_r2darts2/transformers/darts_bridge.py`.
 - Imports `darts`, `views_frames`, `pandas`, `numpy`; nothing from the package. Imported by `ViewsDataset` (lazily) and `DartsForecastingModelManager`.
-- Any new `import pandas` elsewhere in the package is a violation of this contract (the two local imports in `dataset/converters.py` and `dataset/readers.py` are the recorded exceptions).
+- Any new `import pandas` elsewhere in the package is a violation of this contract. Recorded exceptions: `dataset/converters.py:18` (module-level), `dataset/readers.py:30` (function-local), `dataset/base.py:1659` (function-local, inside `to_darts_timeseries`).
 
 ---
 
@@ -70,7 +71,7 @@ df = prediction_frames_to_dataframe(frames)   # only when a DataFrame is actuall
 ## 9. Examples of Incorrect Usage
 
 - Calling `TimeSeries.pd_dataframe()` in the engines to get a DataFrame.
-- Building a `TimeSeries` in `dataset/base.py` directly instead of through `build_entity_timeseries`.
+- Building a `TimeSeries` in `dataset/base.py` directly instead of through `build_entity_timeseries` — *which is what production currently does (C-45); this line states the intent, not the state.*
 
 ---
 

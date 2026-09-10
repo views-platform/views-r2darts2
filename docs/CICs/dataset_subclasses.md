@@ -27,7 +27,7 @@ Six thin subclasses of `ViewsDataset`, one per VIEWS level of analysis, each add
 - `PGDataset` — entity must be `priogrid_id`. `CDataset` — entity must be `country_id`.
 - `PGMDataset(PGDataset)`, `CMDataset(CDataset)` — time must be `month_id`.
 - `PGYDataset`, `CYDataset` — time must be `year_id` (and the entity of their parent).
-- Invariants are layered through inheritance so one `validate_indices` chain checks both axes.
+- Invariants are layered through inheritance so one `validate_indices` chain checks both axes — except `PGYDataset`, which inherits `ViewsDataset` directly and re-checks the entity inline (`subclasses.py:36`), an asymmetry with `CYDataset(CDataset)`. Behaviour is identical.
 
 ---
 

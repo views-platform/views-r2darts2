@@ -30,7 +30,7 @@ The `FeatureScalerManager` is a specialized orchestrator responsible for applyin
 - **Enforces Transformation Sequence:** Correctly manages the forward and inverse execution of "Chained Scalers" (e.g., Asinh -> Standard) using Darts native `Pipeline` (ADR-012).
 - **Ensures Global Calibration:** Guarantees that all internal scalers are instantiated with `global_fit=True` to preserve the semantic meaning of values across different entities (countries).
 - **Guarantees Shape Preservation:** Ensures that transformations do not collapse the sample dimension, maintaining compatibility with probabilistic forecasting tensors.
-- **Ensures Total Coverage:** Guarantees that any feature not explicitly mapped in the configuration is automatically assigned to a `default_scaler`.
+- **Ensures Total Coverage:** When the map is non-empty, any feature not explicitly mapped is assigned to `default_scaler`. (An empty map returns early and scales nothing; `ViewsDataset` only constructs the manager for a non-empty map.)
 
 ---
 
@@ -45,15 +45,15 @@ The `FeatureScalerManager` is a specialized orchestrator responsible for applyin
 ## 5. Outputs and Side Effects
 
 - **Scaled Data:** Produces lists of `darts.TimeSeries` where components have been transformed in-place or returned as new objects.
-- **State Mutation:** Updates internal fitted states for each group-specific scaler during `fit()`.
-- **Logging:** Emits descriptive logs of the mapping structure during initialization.
+- **State Mutation:** Updates internal fitted states for each group-specific scaler during `fit_transform()` (there is no separate `fit()`).
+- **Introspection:** `__repr__` summarises the mapping; the module has no logger.
 
 ---
 
 ## 6. Failure Modes and Loudness
 
 - **Collision Failure:** Raises `ValueError` if a single feature is assigned to multiple scaling groups.
-- **Unfitted Transform:** Fails loudly if `transform()` is called before `fit()`.
+- **Unfitted Transform:** Raises `RuntimeError` if `transform()` or `inverse_transform()` is called before `fit_transform()`.
 - **Config Ambiguity:** Raises `ValueError` if the `feature_scaler_map` follows an unrecognized schema.
 - **Mathematical Insanity:** Passes through numerical errors from underlying Sklearn scalers if input data contains prohibited values (Infs/NaNs).
 
@@ -78,8 +78,8 @@ scaler_map = {
     "conflict": {"scaler": "AsinhTransform->RobustScaler", "features": ["ged_sb"]}
 }
 manager = FeatureScalerManager(feature_scaler_map=scaler_map, all_features=cols)
-manager.fit(training_data)
-scaled_data = manager.transform(test_data)
+scaled_train = manager.fit_transform(training_data)
+scaled_test  = manager.transform(test_data)
 ```
 
 ---

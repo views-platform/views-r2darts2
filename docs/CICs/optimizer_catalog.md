@@ -29,7 +29,7 @@ The `OptimizerCatalog` is a specialized factory responsible for translating abst
 - **Guarantees Genomic Compliance:** Enforces that every optimizer request includes all mandatory genes (e.g., `lr` and `weight_decay` for Adam).
 - **Ensures Whitelisted Access:** Refuses to instantiate any optimizer not explicitly registered in the Fortress whitelist.
 - **Provides Instructional Errors:** On failure, guarantees an error message that lists all currently authorized optimizers to improve researcher UX.
-- **Translates Hyperparameters:** Correctly maps DNA keys to the specific keyword arguments expected by PyTorch optimizer constructors.
+- **Translates Hyperparameters:** Correctly maps DNA keys to the specific keyword arguments expected by PyTorch optimizer constructors. A second tier, `ReproducibilityGate.Config.OPTIMIZER_OPTIONAL_GENES` (e.g. `betas` for Adam), is accepted and passed through when present, never required.
 
 ---
 
@@ -89,8 +89,7 @@ optimizer = opt_cls(params, **opt_kwargs)
 
 ## 10. Test Alignment
 
-- **Red Team:** `tests/test_model_catalog.py` (Validation of invalid optimizer failure).
-- **Green Team:** `tests/test_genomic_handshake.py` (Verification of parameter mapping).
+- **Red + Green Team:** `tests/test_genomic_handshake.py` (invalid-optimizer failure at `:20`; parameter mapping). `tests/test_model_catalog.py` does not import this class.
 
 ---
 

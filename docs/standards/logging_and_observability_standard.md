@@ -130,7 +130,7 @@ The following must be logged:
 To prevent race conditions and detect device drift, the following hardware events must be logged:
 - Successful restoration of model weights from CPU to GPU (`INFO`).
 - Failure to restore device state (`CRITICAL` by this standard and ADR-008/011; **the current code emits `WARNING` and continues on CPU** — register D-01. Until ruled, expect `WARNING`).
-- Concurrency adjustments (e.g., forcing `max_workers=1` on GPU) (`INFO`).
+- Concurrency adjustments (e.g., forcing `max_workers=1` on GPU) (`INFO`). *Not currently emitted — the branch at `darts_forecasting_model_manager.py:335-338` is silent (register C-47).*
 
 ### 5.3 Optional Logging
 

@@ -25,7 +25,7 @@
 ## 3. Responsibilities and Guarantees
 
 - Reads in entity blocks aligned to the Zarr entity-chunk size (default block 1024, a multiple of 256), so every chunk is read exactly once.
-- **Verify, then delete:** after writing and flushing the memmaps it verifies shape, target names, and a readback. Only then is the Zarr store deleted. **On any verification failure the Zarr store is kept and `PredictionFrameVerificationError` is raised** — the failure mode is never data loss.
+- **Verify, then delete:** after writing and flushing the memmaps it verifies shape, target names, and a readback. Only then is the Zarr store deleted (`zarr_cleanup=True`, the default; pass `zarr_cleanup=False` to keep it). **On any verification failure the Zarr store is kept and `PredictionFrameVerificationError` is raised** — the failure mode is never data loss.
 
 ---
 
@@ -59,7 +59,7 @@
 ## 8. Examples of Correct Usage
 
 ```python
-frames = build_prediction_frames_from_dataset(ds, out_dir)   # ds's Zarr is gone afterwards
+frames = build_prediction_frames_from_dataset(ds, target_names, out_dir)   # ds's Zarr is gone afterwards
 ```
 
 ---
@@ -73,7 +73,8 @@ frames = build_prediction_frames_from_dataset(ds, out_dir)   # ds's Zarr is gone
 
 ## 10. Test Alignment
 
-- **Green + Red:** `tests/test_frame_builder.py` (shape/name/readback verification, failure retention); `tests/test_zarr_cleanup.py` (delete-exactly-once interplay).
+- **Green:** `tests/test_frame_builder.py` (shape/name/readback verification).
+- **Red:** `tests/test_zarr_cleanup.py::test_failed_readback_keeps_zarr_and_raises` (failure retention) and the delete-exactly-once interplay.
 
 ---
 

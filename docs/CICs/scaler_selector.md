@@ -43,7 +43,7 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 
 ## 5. Outputs and Side Effects
 
-- **Estimator:** Produces an uninstantiated class type or a `partial` function for single scalers.
+- **Estimator:** `get_scaler` produces a constructed sklearn estimator instance.
 - **Darts Scaler/Pipeline:** `instantiate_darts_scaler` produces Darts-wrapped `Scaler` or `Pipeline` objects (not raw sklearn estimators).
 - **Side Effects:** None. This is a stateless factory.
 
@@ -52,7 +52,8 @@ The `ScalerSelector` is a specialized factory responsible for instantiating data
 ## 6. Failure Modes and Loudness
 
 - **Unknown Scaler:** Raises `ValueError` if the requested name is not in the registry.
-- **Invalid Chain:** Raises `ValueError` if a chain specification is syntactically invalid or contains unknown components.
+- **Unknown Component:** Raises `ValueError` if a chain names a scaler not in the registry.
+- **Malformed Chain:** Raises `TypeError` if a chain element is not a non-empty string (`scaler_selector.py:259`), and `ValueError` if the chain is empty.
 - **Invalid Config Type:** Raises `TypeError` if `instantiate_darts_scaler` receives a type other than None/str/list/dict.
 - **Missing Dict Key:** Raises `ValueError` if a dict config lacks both `name` and `chain` keys.
 

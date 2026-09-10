@@ -28,12 +28,12 @@ Circular dependencies are forbidden. Cross-layer "shortcuts" are forbidden.
 The package has six sub-packages. Measured against `development` @ `fe7e681` (2026-09-10), their import graph is acyclic and forms four layers (from lowest to highest):
 
 ### Layer 0: Foundations — `views_r2darts2/infrastructure/` and `views_r2darts2/math/`
-- **`infrastructure/`:** `exceptions.py`, `reproducibility_gate.py`, `device.py`, `encoders.py`, `patches.py`, `callbacks.py`. Imports nothing from the rest of the package.
+- **`infrastructure/`:** `exceptions.py`, `reproducibility_gate.py`, `device.py`, `encoders.py`, `patches.py`, `callbacks.py`. Imports nothing from the rest of the package — with one recorded inversion: `patches.py:45` attempts `from tests.conftest import CLEAN_TORCH_LOAD` inside a `try/except` (register C-25; the symbol no longer exists, so the branch is dead-by-`ImportError`).
 - **`math/`:** loss functions and the `WarmupCAWR` scheduler. May import `infrastructure/exceptions.py` (for `NumericalSanityError`) and nothing else internal.
 - **Constraint:** Neither may import from any layer above. These are the physical laws and the arithmetic.
 
 ### Layer 1: Translators — `views_r2darts2/transformers/` and `views_r2darts2/catalogs/`
-- **`transformers/`:** `scaler_selector.py`, `feature_scaler_manager.py`, `inverse.py`, `darts_bridge.py`, `frame_builder.py`, `static_covariates.py`. Imports only within itself. `darts_bridge.py` is the package's sole pandas boundary.
+- **`transformers/`:** `scaler_selector.py`, `feature_scaler_manager.py`, `inverse.py`, `darts_bridge.py`, `frame_builder.py`, `static_covariates.py`. Imports only within itself. `darts_bridge.py` is the Darts pandas boundary; `dataset/converters.py` (module-level) and function-local imports in `dataset/readers.py` and `dataset/base.py` are the other three sanctioned pandas importers (see ADR-001).
 - **`catalogs/`:** the four Genome Translators. Import `infrastructure/` and `math/` only.
 - **Constraint:** May depend on Layer 0. `transformers/` and `catalogs/` do not import each other.
 
@@ -43,7 +43,7 @@ The package has six sub-packages. Measured against `development` @ `fe7e681` (20
 
 ### Layer 3: Engines — `views_r2darts2/engines/`
 - `darts_forecaster.py`, `darts_forecasting_model_manager.py`.
-- **Constraint:** The highest layer. May depend on everything below. The only layer that coordinates the lifecycle of artifacts and data flows, and the only layer that may import `views_pipeline_core` (lazily, in the manager).
+- **Constraint:** The highest layer. May depend on everything below. The only layer that coordinates the lifecycle of artifacts and data flows. It imports `views_pipeline_core` lazily in the manager; `dataset/base.py` also imports `views_pipeline_core` lazily (predstore/datastore/appwrite persistence methods) — a sanctioned Layer-2 exception because those are storage back-ends, not orchestration.
 
 ---
 

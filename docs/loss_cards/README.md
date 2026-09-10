@@ -21,7 +21,7 @@ a card shows a value, it is a typical starting point that must still be declared
 | `WeightedPenaltyHuberLoss` | `weighted_penalty_huber_loss_spec.md`, `weighted_penalty_huber.md` (short form + audit) | `views_r2darts2/math/weighted_penalty_huber_loss.py` |
 | `ZeroInflatedLoss` | `zero_inflated_loss_spec.md` | `views_r2darts2/math/zero_inflated_loss.py` |
 
-## Registered losses with no card (12 of 20 — register C-41)
+## Loss modules with no card (12 of 20 — register C-41)
 
 The **production loss family** is entirely uncarded:
 
@@ -35,11 +35,13 @@ The **production loss family** is entirely uncarded:
 - `SentinelLoss` — `views_r2darts2/math/sentinel_loss.py`
 - `CharbonnierLoss` — `views_r2darts2/math/charbonnier_loss.py`
 
-Passthrough / thin wrappers, low priority:
+Passthrough / thin wrappers, low priority — and each with a wrinkle (register C-46):
 
-- `HuberLoss` — `views_r2darts2/math/huber_loss.py`
-- `LogCoshLoss` — `views_r2darts2/math/logcosh_loss.py`
-- `MSELoss` — `views_r2darts2/math/mse_loss.py`
+- `HuberLoss` — `views_r2darts2/math/huber_loss.py` — *shadowed*: `LossCatalog` binds the name to `torch.nn.HuberLoss`, not this module
+- `MSELoss` — `views_r2darts2/math/mse_loss.py` — *shadowed* likewise by `torch.nn.MSELoss`
+- `LogCoshLoss` — `views_r2darts2/math/logcosh_loss.py` — *unregistered*: imported by the catalog but absent from its registry, so unselectable
+
+Registered names with no local module and no card: `L1Loss`, `SmoothL1Loss`, `PoissonNLLLoss` (`torch.nn` passthroughs).
 
 `views_r2darts2/math/README.md` (on the code side) gives an architectural overview of the Spotlight
 family and is the best current substitute for the missing cards. Writing the cards is blocked on the

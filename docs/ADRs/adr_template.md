@@ -4,6 +4,7 @@
 **Status:** Proposed | Accepted | Superseded | Deprecated  
 **Date:** YYYY-MM-DD  
 **Deciders:** <Names / roles>  
+**Revised:** <Optional — YYYY-MM-DD and what was re-derived; add when the body changes after acceptance>  
 **Consulted:** <Optional>  
 **Informed:** <Optional>  
 

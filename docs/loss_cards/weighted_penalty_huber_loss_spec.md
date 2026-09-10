@@ -48,7 +48,7 @@ This leads to the following weight outcomes:
 
 ### Parameters:
 
-| Symbol | Code Variable | Default | Description |
+| Symbol | Code Variable | Typical value (must be declared in DNA) | Description |
 | :--- | :--- | :--- | :--- |
 | `zt` | `self.threshold` | 0.01 | (`zero_threshold`) The threshold for considering a value non-zero. |
 | `delta` | `self.delta` | 0.5 | The Huber loss threshold. |
@@ -76,4 +76,4 @@ This leads to the following weight outcomes:
 - **CRITICAL: The `delta` parameter is highly sensitive to the scale of the data it receives after all pre-processing transformations.** A `delta` value that is appropriate for raw data will be unstable for data scaled to a `[0, 1]` range, and vice-versa.
 - The various weight parameters (`non_zero_weight`, `false_positive_weight`, `false_negative_weight`) also must be tuned carefully to balance the costs of different error types.
 - For detailed recommendations and a matrix of suggested `delta` ranges for common pipelines, please refer to the central guide:
-  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**
+  - **[Loss Function Pipeline Tuning Guide](../../reports/guides/loss_function_tuning_guide.md)**

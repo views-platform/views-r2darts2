@@ -13,7 +13,7 @@ The `GradientHealthCallback` provides the **Observability Layer** for model trai
 
 > **It acts as the "Internal Sensor" of the Fortress, ensuring that gradient failure is never silent.**
 
-*Scope note (2026-09-10):* `views_r2darts2/infrastructure/callbacks.py` defines sixteen callbacks; this contract covers `GradientHealthCallback` in detail and names the others. Eleven of them carry their own `Intent Contract:` docstring in code. `NaNDetectionCallback` (halts after `patience` consecutive NaN losses) and `GradientHealthCallback` are the two fail-loud kill-switches; both are attached to every trainer by `ModelCatalog._get_common_pl_trainer_kwargs`, alongside `TrainingStepPatchCallback` (must be first), `WeightNormCallback`, `RevINMonitorCallback`, `PredictionSanityCallback`, `LossStabilityCallback`, `EpochTimingCallback`, `YHatBarCallback`, `ValMetricsCallback`, `InputBatchMonitorCallback`, and `LossGradientDiagnosticsCallbackV2`.
+*Scope note (2026-09-10):* `views_r2darts2/infrastructure/callbacks.py` defines fifteen callbacks plus one private patch helper (`_PatchedTrainingStep`); this contract covers `GradientHealthCallback` in detail and names the others. Eleven callbacks carry their own `Intent Contract:` docstring in code. `NaNDetectionCallback` (halts after `patience` consecutive NaN losses) and `GradientHealthCallback` are the two fail-loud kill-switches; both are attached to every trainer by `ModelCatalog._get_common_pl_trainer_kwargs`, alongside `TrainingStepPatchCallback` (must be first), `WeightNormCallback`, `RevINMonitorCallback`, `PredictionSanityCallback`, `LossStabilityCallback`, `EpochTimingCallback`, `YHatBarCallback`, `ValMetricsCallback`, `InputBatchMonitorCallback`, `LossComponentCallback`, `RichLossDiagnosticsCallback`, and `LossGradientDiagnosticsCallbackV2`.
 
 ---
 
@@ -29,7 +29,7 @@ The `GradientHealthCallback` provides the **Observability Layer** for model trai
 ## 3. Responsibilities and Guarantees
 
 ### GradientHealthCallback
-- **Guarantees Per-Step Auditing:** Audits the global gradient norm in `on_before_optimizer_step`, gated by `log_every_n_epochs`; sets `trainer.should_stop = True` on a non-finite or exploding norm.
+- **Guarantees Per-Step Snapshot, Per-Epoch Verdict:** Snapshots gradient statistics in `on_before_optimizer_step` (gated by `log_every_n_epochs`); the verdict and the halt live in `on_train_epoch_end`. `trainer.should_stop = True` fires **only on NaN/Inf gradients** (`callbacks.py:271-274`); an exploding norm changes the status string (`:245`) and does not halt.
 - **Detects Vanishing/Exploding Gradients:** Provides high-visibility status messages (`✅ healthy` vs `🚨 exploding`) based on configurable thresholds.
 - **Exposes Sparsity:** Reports the ratio of zero gradients, identifying potentially "dead" neurons or bottlenecks.
 
@@ -45,14 +45,14 @@ The `GradientHealthCallback` provides the **Observability Layer** for model trai
 ## 5. Outputs and Side Effects
 
 - **Logs:** Emits structured status updates to the standard logging stream.
-- **Side Effects:** None. This is designed to be non-intrusive.
+- **Side Effects:** Halts training on NaN/Inf gradients; pushes scalar metrics to the PL logger (`:258`). Does not touch weights or gradients.
 
 ---
 
 ## 6. Failure Modes and Loudness
 
 - **Silent Success:** If gradients are healthy, it logs an `INFO` message (unless logging frequency is reduced).
-- **Fail-Loud Mandate:** If this callback cannot access gradients due to framework changes, it must fail loudly rather than silently assuming everything is fine.
+- **Fail-Loud Mandate (aspirational):** If this callback cannot access gradients, it should fail loudly. *It does not:* with no populated gradients it returns early (`:231`) or reports a zero-statistics "vanishing" verdict at `INFO`. Register C-47.
 
 ---
 

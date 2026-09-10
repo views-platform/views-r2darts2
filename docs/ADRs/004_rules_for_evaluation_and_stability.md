@@ -26,7 +26,7 @@ We define three **Stability Tiers** for the components of this repository. The s
 - **Change Rule:** Changes require a new ADR or a superseding of an existing one. Breaking a "Gate" is considered a critical regression.
 
 ### Tier 2: The DNA Schema (Medium Stability)
-- **Scope:** `docs/standards/REPRODUCIBILITY_MANIFEST.md` and the `CORE_GENOME` / `ALGORITHM_GENOMES` / `OPTIMIZER_GENOMES` / `SCHEDULER_GENOMES` / `LOSS_GENOMES` registries on `ReproducibilityGate.Config` in `views_r2darts2/infrastructure/reproducibility_gate.py`.
+- **Scope:** `docs/standards/REPRODUCIBILITY_MANIFEST.md` and the `CORE_GENOME` / `ALGORITHM_GENOMES` / `OPTIMIZER_GENOMES` / `OPTIMIZER_OPTIONAL_GENES` / `SCHEDULER_GENOMES` / `LOSS_GENOMES` registries on `ReproducibilityGate.Config` in `views_r2darts2/infrastructure/reproducibility_gate.py`.
 - **Guarantee:** Defines what an experiment *must* declare.
 - **Change Rule:** New parameters can be added (evolving the schema), but removing or renaming existing mandatory parameters requires updating all active `sweep_configs` and existing artifacts.
 

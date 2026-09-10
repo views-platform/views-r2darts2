@@ -44,7 +44,7 @@ The loss is a weighted sum of two distinct loss components: a binary classificat
 
 ### Code Mapping & Parameters:
 
-| Term | Code Variable | Default | Description |
+| Term | Code Variable | Typical value (must be declared in DNA) | Description |
 | :--- | :--- | :--- | :--- |
 | `zw` | `self.zero_weight` | 1.0 | The weight for the binary (`L_zero`) component. |
 | `cw` | `self.count_weight` | 1.0 | The weight for the regression (`L_count`) component. |
@@ -76,4 +76,4 @@ The loss is a weighted sum of two distinct loss components: a binary classificat
 - The hardcoded `10x` multiplier in the `sigmoid(-10 * preds)` for the zero-component makes it very sensitive.
 
 - For detailed recommendations and a matrix of suggested `delta` ranges for common pipelines, please refer to the central guide:
-  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**
+  - **[Loss Function Pipeline Tuning Guide](../../reports/guides/loss_function_tuning_guide.md)**

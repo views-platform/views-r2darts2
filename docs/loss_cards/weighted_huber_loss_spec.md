@@ -34,7 +34,7 @@ The weight `w` for each sample is determined by the target value:
 
 ### Parameters:
 
-| Symbol | Code Variable | Default | Description |
+| Symbol | Code Variable | Typical value (must be declared in DNA) | Description |
 | :--- | :--- | :--- | :--- |
 | `delta` | `self.delta` | 0.5 | The Huber loss threshold. |
 | `zt` | `self.threshold` | 0.01 | (`zero_threshold`) The threshold to determine if a target is non-zero. |
@@ -64,4 +64,4 @@ The weight `w` for each sample is determined by the target value:
 - **CRITICAL: The `delta` parameter is highly sensitive to the scale of the data it receives after all pre-processing transformations.** A `delta` value that is appropriate for raw data will be unstable for data scaled to a `[0, 1]` range, and vice-versa.
 
 - **Recommendation:** Always tune `delta` based on your specific data pipeline. For detailed recommendations and a matrix of suggested `delta` ranges for common pipelines, please refer to the central guide:
-  - **[Loss Function Pipeline Tuning Guide](../../specs/loss_function_tuning_guide.md)**
+  - **[Loss Function Pipeline Tuning Guide](../../reports/guides/loss_function_tuning_guide.md)**

@@ -1,8 +1,8 @@
 # ADR-015: Artifact-Prediction Timestamp Contract
 
-**Status:** Accepted
-**Date:** 2026-05-19
-**Deciders:** Simon Polichinel von der Maase
+**Status:** Accepted  
+**Date:** 2026-05-19  
+**Deciders:** Simon Polichinel von der Maase  
 **Consulted:** views-pipeline-core ADR-052 (central contract)
 
 ---

@@ -3,6 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-02-11  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-10 — compliance notes added; decision unchanged.  
 
 ---
 
@@ -34,6 +35,7 @@ This repository adopts the invariant: **Structural failures must be logged persi
 ## Observability Patterns in `views-r2darts2`
 
 - **The Configuration Summary:** Every run must log a "DNA Manifest Summary" to stdout/W&B before training starts.
+  *Compliance note (2026-09-10):* no such log is emitted anywhere in `views_r2darts2/` — the manager runs `audit_manifest` → `audit_architecture` → build → train with no config summary. Register **C-47**.
 - **The Health Check:** Long-running models should log gradient norms and loss values at every epoch.
 - **The Audit Log:** Every `ReproducibilityGate` check must emit a log entry if it encounters an adversarial outlier, even if it doesn't terminate the run.
 

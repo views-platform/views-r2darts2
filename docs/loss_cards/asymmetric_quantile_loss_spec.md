@@ -35,7 +35,7 @@ The implementation uses `(tau - 1) * e` for the overestimation case, which is eq
 
 ### Parameters:
 
-| Symbol | Code Variable | Default | Description |
+| Symbol | Code Variable | Typical value (must be declared in DNA) | Description |
 | :--- | :--- | :--- | :--- |
 | `tau`| `self.tau` | 0.75 | The quantile level. |
 | `nzw`| `self.non_zero_weight`| 5.0 | The weight for non-zero targets. |
@@ -63,4 +63,4 @@ The implementation uses `(tau - 1) * e` for the overestimation case, which is eq
 - **`tau` Parameter:** The `tau` parameter (must be between 0 and 1) directly controls the asymmetry of the penalties. A `tau > 0.5` penalizes underestimation more heavily. This parameter is scale-invariant.
 - **`non_zero_weight` Parameter:** This applies an additional weight to non-zero targets. It should be tuned with care, and `1.0` (no extra weight) should be tested as a baseline.
 - For more detailed guidance, see the central guide:
-  - **[Loss Function Pipeline Tuning Guide](../loss_function_tuning_guide.md)**
+  - **[Loss Function Pipeline Tuning Guide](../../reports/guides/loss_function_tuning_guide.md)**

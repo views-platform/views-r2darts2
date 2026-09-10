@@ -39,7 +39,7 @@ This repository treats **testing as mandatory critical infrastructure**. All non
 - **Views-r2darts2 Examples:**
   - **DNA Manifest Audit:** Verifying that a run is blocked if `random_state` is missing.
   - **OCL/Step Mismatch:** Ensuring an error is raised if the forecast horizon isn't a multiple of the output chunk length.
-  - **Ghost Imports:** Verifying that the code fails if it tries to import from a temporary/stale folder.
+  - **Genomic Handshake:** Verifying that a manifest missing a mandatory gene is refused before any object is built (`tests/test_genomic_handshake.py`). *(An earlier example here — a "ghost import" test — no longer exists in the suite.)*
 
 ### 🟩 Green Team Tests (Resilience & Correctness)
 - **Goal:** Ensure the system works as intended and remains stable over time.

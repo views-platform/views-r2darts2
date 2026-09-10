@@ -1,8 +1,8 @@
 # ADR-014: Technical Risk Register as First-Class Governance Artifact
 
-**Status:** Accepted
-**Date:** 2026-04-11
-**Deciders:** Simon Polichinel von der Maase
+**Status:** Accepted  
+**Date:** 2026-04-11  
+**Deciders:** Simon Polichinel von der Maase  
 
 ---
 

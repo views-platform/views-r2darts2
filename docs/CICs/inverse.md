@@ -45,7 +45,7 @@
 
 ## 6. Failure Modes and Loudness
 
-- **Silent passthrough:** when `extract_fitted_sklearn_scaler` returns `None`, both inverse helpers fall through to `# Last resort: passthrough` and return the *unscaled* values **with no log line** (`inverse.py:143`, `:179`). The 0.1.x code at least warned. This is register **C-10**, escalated.
+- **Silent passthrough:** when `extract_fitted_sklearn_scaler` returns `None` *and* the scaler's transformer has no `inverse_func` (`:130-141`, `:170-177`), both inverse helpers fall through to `# Last resort: passthrough` and return the *unscaled* values **with no log line** (`inverse.py:143`, `:179`). The 0.1.x code at least warned. This is register **C-10**, escalated.
 
 ---
 

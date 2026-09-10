@@ -5,8 +5,8 @@
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
 | Last Updated      | 2026-09-10                           |
-| Total Concerns    | 57                                   |
-| Open Concerns     | 44                                   |
+| Total Concerns    | 58                                   |
+| Open Concerns     | 45                                   |
 | Resolved Concerns | 13                                   |
 | Governed by       | ADR-014                              |
 
@@ -404,7 +404,7 @@
 - **Tier:** 4 *(one W&B sweep config points at a script that is not on any runtime path; the sweep would fail at launch, loudly)*
 - **Source:** repo-assimilation (2026-09-10) (reports audit, Part 3)
 - **Trigger:** Launching `lr_finder_sweep` through W&B.
-- **Location:** `sweep_configs/experimental_sweep_configs/lr_finder_sweep.py:7` on `survey_risk` (the `sweep_configs/` tree is absent from `development`; entry scoped to the 0.1.x line) — `"program": "simple_training_run.py"`; the only file of that name is `reports/archived/simple_training_run.py`.
+- **Location:** `sweep_configs/experimental_sweep_configs/lr_finder_sweep.py:7` at tag `archive/survey_risk-0.1.x` (the `sweep_configs/` tree is absent from `development`; entry scoped to the 0.1.x line) — `"program": "simple_training_run.py"`; the only file of that name is `reports/archived/simple_training_run.py`.
 - **Narrative:** The archived directory carries an `__init__.py` and is therefore importable, which may be why this once worked from a particular working directory. Noted in `reports/archived/README.md` (Stage 0). The sweep file is out of scope for the documentation branch.
 - **Cross-refs:** none.
 
@@ -561,6 +561,17 @@
 - **Location:** `README.md` "Production Configuration Template" — `time_steps`, `rolling_origin_stride`, `n_jobs`; `grep -rn` over `views_r2darts2/` → 0 hits for each. `static_covariate_stats` (C-36) is the fourth inert key, already flagged.
 - **Narrative:** `views-pipeline-core` is not installed in the audit environment, so consumption by the manager's base class cannot be ruled out for `time_steps` (a plausible forecast-horizon key). The template now flags all three inline. If pipeline-core does read `time_steps`, downgrade this to a comment; if not, delete the keys.
 - **Cross-refs:** C-36 (the fourth inert key); C-42 (the harness never installs pipeline-core, which is why this cannot be settled locally).
+
+---
+
+### C-58 — `_resolve_raw_parquet_path` infers the raw-parquet filename by convention instead of using pipeline-core's declared `_get_cached_data_path()`
+
+- **Tier:** 3 *(an ADR-003 "inference over declaration" seam with a warn-only fallback: when the preferred `{run_type}_{source}_df.parquet` is absent the manager silently-but-logged falls through to any other source label, so a stale `viewser` parquet can be loaded when a `datafactory` one was expected. Not Tier 2: the preferred label is tried first, the fallback logs at `WARNING`, and a total miss raises.)*
+- **Source:** survey_risk retirement audit (2026-09-10)
+- **Trigger:** `views-pipeline-core`'s dataloader changing its cache filename or directory convention; or a model whose queryset `source` is none of `viewser` / `views-datafactory` / `synthetic`.
+- **Location:** `views_r2darts2/engines/darts_forecasting_model_manager.py:174-221` (`_infer_cache_source_label`, `_resolve_raw_parquet_path`; fallback warning at `:206-211`), `:223-229` (`_build_dataset`). The declared alternative: pipeline-core 3.2.0 `views_pipeline_core/managers/model/model.py:997` (`_get_cached_data_path`), set at `:1287` from the dataloader (`modules/dataloaders/dataloaders.py:1047`).
+- **Narrative:** The 0.1.x manager was fixed on 2026-04-27 (`c54e356`, "fix(C-59): use `_get_cached_data_path()` instead of hardcoded filename" — that ID belongs to an older numbering, not this register) to take the raw-data path from pipeline-core rather than guess it. The 0.2.x rewrite deleted those call sites and re-solved the problem by enumerating filename candidates. The `survey_risk` branch carried a second copy of the 0.1.x fix (`d847a34`); it was retired unported on 2026-09-10 and this entry replaces it. The sibling managers in `views-hydranet`, `views-baseline` and `views-impact` still use the seam, so this repository is the odd one out. One method (`_build_dataset`) would change: prefer `self._get_cached_data_path()` when set, fall back to the current enumeration.
+- **Cross-refs:** C-51 (the warn-and-continue family); C-42 (why no test of this can run in CI); ADR-003.
 
 ---
 
@@ -775,7 +786,7 @@
 ## Register Conventions
 
 - **ID format:** `C-xx` for concerns, `D-xx` for disagreements. IDs are permanent — gaps indicate merged or resolved entries.
-- **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `review-base-docs`, `code-review`, `falsify`, `incident`.
+- **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `review-base-docs`, `code-review`, `falsify`, `survey_risk retirement audit`, `incident`.
 - **Disagreements:** `D-xx` entries record an ADR-vs-code contradiction awaiting a ruling. They are not concerns; they point at the concern (if any) that is the code side.
 - **Re-derivation:** when the code moves under an entry, the entry is re-verified and carries a dated `re-derivation` bullet; Location is updated to current line numbers; Tier is changed only with a stated reason.
 - **Resolution:** Move to "Resolved Concerns" with resolution date and one-line summary when addressed. Do not delete.

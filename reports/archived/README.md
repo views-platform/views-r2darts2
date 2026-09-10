@@ -11,10 +11,12 @@ inbound links that exist are between siblings in this directory and `reports/pos
 The register does not cite them. They are kept so the reasoning behind decisions made then
 remains recoverable, not because they describe the present.
 
-**Not carried onto this branch:** `survey_risk` @ `d847a34` also holds a `TEMP/docs/` directory — five
-February-2026 draft templates (ADR/CIC compliance-audit templates, a hardened-protocol template,
-a specification-card template, and `physical_architecture_standard.md`) that exist nowhere else.
-They were never adopted and are not restored here; `survey_risk` remains their home.
+**The 0.1.x archive:** the pre-rewrite governance layer — the original `docs/` and `reports/`, and a
+`TEMP/docs/` directory of 28 February-2026 draft templates — is preserved at tag
+`archive/survey_risk-0.1.x` (commit `d847a34`). The `survey_risk` branch that carried it was retired
+on 2026-09-10 after PR #38 re-derived the layer against 0.2.x. The three drafts that existed nowhere
+else (the ADR and CIC compliance-audit templates and the specification-card template) were moved
+out of the repository into the platform's shared `base_docs` template set; the rest were superseded.
 
 **One live pointer to be aware of:** `sweep_configs/experimental_sweep_configs/lr_finder_sweep.py:7`
 declares `"program": "simple_training_run.py"` as a W&B sweep entrypoint. The only file of that

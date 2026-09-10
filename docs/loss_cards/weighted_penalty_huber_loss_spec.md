@@ -39,7 +39,7 @@ The final weight is determined by a nested logic based on the type of outcome.
     - Otherwise (TP/TN): `w_final = w_base`
 
 This leads to the following weight outcomes:
-| Outcome | Target | Prediction | Final Weight | Example (defaults) |
+| Outcome | Target | Prediction | Final Weight | Example (typical values) |
 | :--- | :--- | :--- | :--- | :--- |
 | True Negative (TN)| ~0 | ~0 | 1.0 | 1.0 |
 | True Positive (TP)| > 0 | > 0 | `non_zero_weight` | 5.0 |

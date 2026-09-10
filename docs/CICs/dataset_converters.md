@@ -48,7 +48,8 @@ The converter family is the **Data Airlock** of 0.2.x: one converter per input k
 
 ## 6. Failure Modes and Loudness
 
-- `ValueError` — targets not found among columns; unsupported spec; shape conflicts.
+- `ValueError` — targets not found among columns; shape conflicts. (Spec validation is *not* here — it lives in `builder.py` `_normalize_specs`.)
+- **Silent:** `ParquetConverter` skips any column whose Arrow type is not list/float/int without raising.
 - Pandas is imported here at module level (`:18`) — this, `readers.py` and one local import in `dataset/base.py` are the exceptions to the package's pandas-free claim.
 
 ---

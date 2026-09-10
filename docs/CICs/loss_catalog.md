@@ -51,7 +51,7 @@ The `LossCatalog` is a specialized factory responsible for translating abstract 
 
 - **Unknown Loss:** Raises `ValueError` if the `loss_name` is not in the whitelist.
 - **Missing Genes:** Raises `ValueError` if mandatory hyperparameters for the specific loss are missing or `None`.
-- **Numerical Insanity:** Custom Fortress losses raise `NumericalSanityError` if NaNs are detected during the forward pass. The `torch.nn` passthroughs (`MSELoss`, `L1Loss`, `HuberLoss`, `SmoothL1Loss`, `PoissonNLLLoss`) do not.
+- **Numerical Insanity:** every registered Fortress loss halts on a NaN in the forward pass, but **the exception type is inconsistent**: the Spotlight family, `SpotlightFocalLoss` and `PrismLoss` raise bare `RuntimeError` (`spotlight_loss.py:270-276`, `spotlight_loss_logcosh.py:238`); `AsymmetricQuantileLoss`, `TweedieLoss`, `SentinelLoss`, `ShrinkageLoss` and the Huber variants raise `NumericalSanityError`; `CharbonnierLoss` and the `torch.nn` passthroughs do not check at all. A caller catching `NumericalSanityError` misses the production losses (register C-52).
 
 ---
 

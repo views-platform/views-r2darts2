@@ -8,7 +8,7 @@ sensitivity). Cards are specifications, not implementation docs; the implementat
 **No card lists a constructor default.** Every gene in `LOSS_GENOMES` is mandatory (ADR-003). Where
 a card shows a value, it is a typical starting point that must still be declared in the DNA.
 
-## Cards (8 losses, 9 files)
+## Cards (8 losses, 10 files — 8 spec cards + 2 short-form audits)
 
 | Loss | Card(s) | Module |
 |---|---|---|
@@ -50,4 +50,4 @@ same gap as register C-06: the family has no behavioural tests to draw an audit 
 ## Related
 
 - `reports/guides/loss_function_tuning_guide.md` — scale-dependent parameter tuning per pipeline
-- `tests/losses/harness.py` — the integrity harness the audit profiles were produced with
+- `tests/losses/harness.py` — batch generator, scaler simulation and `gradcheck` used by the loss tests. The behavioural audit profiles in the two short-form cards (cowardice signal, seed sensitivity) came from a February-2026 session whose scripts are not in the repository.

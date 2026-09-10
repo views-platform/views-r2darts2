@@ -6,12 +6,12 @@
 - **Version:** 1.0
 - **Source:** Inspired by "Deep Regression Tracking with Shrinkage Loss" by Lu et al. (2018).
 - **Purpose:** To improve regression performance on datasets with imbalanced error magnitudes, particularly zero-inflated data. The loss "shrinks" the contribution of easy samples (small errors), forcing the model to focus on hard samples (large errors).
-- **Customizations:** This implementation includes a custom `importance_weight` term (`exp(targets)`) that is not part of the original paper's formula. This weight is intended to give more importance to samples with larger target values, assuming the targets are log1p-transformed (`targets = log(1 + y_original)`).
+- **Customizations:** none on 0.2.x. *(An earlier version carried an `importance_weight = exp(targets)` multiplier; it was removed in February 2026 and `forward()` at `views_r2darts2/math/shrinkage_loss.py:48-55` now computes the paper's formula only. This card was corrected 2026-09-10.)* The historical note continues: This weight is intended to give more importance to samples with larger target values, assuming the targets are log1p-transformed (`targets = log(1 + y_original)`).
 
 ## 2. Canonical Formula & Code Mapping
 
 The loss is calculated as:
-`loss = mean( (importance_weight * l^2) / shrinkage_factor )`
+`loss = mean( l^2 / shrinkage_factor )`
 
 ### Formula Components:
 
@@ -19,8 +19,7 @@ The loss is calculated as:
 | :--- | :--- | :--- | :--- |
 | `l` | `|preds - targets|` | `l` | The absolute error (L1 distance). |
 | `shrinkage_factor` | `1 + exp(a * (c - l))` | `shrinkage_factor` | The core mechanism. It is a large value for small `l` (easy samples) and approaches 1 for large `l` (hard samples). |
-| `importance_weight`| `exp(targets)` | `importance_weight` | A custom, non-standard weight. If `targets` are `log(1+y)`, this equals `1+y`, applying a linear weight based on the original target magnitude. |
-| `base_loss` | `importance_weight * l^2` | `base_loss` | The weighted squared error before shrinkage is applied. |
+| `base_loss` | `l^2` | `base_loss` | The squared error before shrinkage is applied. |
 
 ### Parameters:
 

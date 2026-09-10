@@ -52,9 +52,9 @@
 
 ## 6. Failure Modes and Loudness
 
-- `ValueError` on: non-1-D or empty coordinates, duplicates, unknown coordinate values in a batch, no columns, shape mismatch, duplicate write under `strict=True`, incomplete grid under `require_complete=True`.
+- `ValueError` on: non-1-D or empty coordinates, duplicates, unknown coordinate values in a batch, no columns, element-count mismatch, duplicate write under `strict=True`, incomplete grid under `require_complete=True`.
 - `RuntimeError` on any write after `close()`.
-- Nothing is silently dropped or coerced.
+- Two silent paths exist: `write_batch` returns without error on an empty batch (before column validation), and `_validate_column` checks `arr.size` only, so a transposed `(sample_size, n_rows)` array with the right element count is reshaped rather than rejected.
 
 ---
 

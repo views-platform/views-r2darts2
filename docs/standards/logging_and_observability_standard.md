@@ -122,7 +122,7 @@ The following must be logged:
 * Pipeline stage transitions
 * Model training start/finish
 * Data loading and validation outcomes
-* Configuration summaries
+* Configuration summaries *(mandated, not emitted — register C-47)*
 * All structural failures
 
 ### 5.2 Hardware Observability (ADR-011)

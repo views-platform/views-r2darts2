@@ -60,8 +60,8 @@ The loss is a weighted sum of two distinct loss components: a binary classificat
 ## 4. Edge Case Policy
 
 - **`targets = 0`:** The `count_mask` is zero, so `L_count` is zero. The loss is determined entirely by the `L_zero` component.
-- **`preds` is large and positive:** `p_zero` approaches 0. If the target is non-zero (`is_zero=0`), `L_zero` approaches 0. If the target is zero (`is_zero=1`), `L_zero` approaches infinity. This correctly penalizes confident misclassifications of zero-valued targets.
-- **`preds` is large and negative:** `p_zero` approaches 1. If the target is zero (`is_zero=1`), `L_zero` approaches 0. If the target is non-zero (`is_zero=0`), `L_zero` approaches infinity. This correctly penalizes confident misclassifications of non-zero-valued targets.
+- **`preds` is large and positive:** `p_zero` approaches 0. If the target is non-zero (`is_zero=0`), `L_zero` approaches 0. If the target is zero (`is_zero=1`), `L_zero` rises to its ceiling `−log(eps)` (≈ 18.4 for `eps = 1e-8`) and its gradient through the zero component vanishes — the `eps` clamp bounds it, it does not approach infinity. This correctly penalizes confident misclassifications of zero-valued targets.
+- **`preds` is large and negative:** `p_zero` approaches 1. If the target is zero (`is_zero=1`), `L_zero` approaches 0. If the target is non-zero (`is_zero=0`), `L_zero` rises to the same `−log(eps)` ceiling with a vanishing gradient. This correctly penalizes confident misclassifications of non-zero-valued targets.
 
 ## 5. Known Equivalences & Invariants
 

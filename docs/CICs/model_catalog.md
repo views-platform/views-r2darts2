@@ -42,7 +42,7 @@ The `ModelCatalog` acts as the central factory for translating abstract DNA mani
 ## 5. Outputs and Side Effects
 
 - **Instantiated Models:** Produces a concrete subclass of `TorchForecastingModel` (e.g., `NBEATSModel`).
-- **Side Effects:** None. This is a pure factory.
+- **Side Effects:** process-global. Construction calls `get_device()` (which can call `torch.set_default_dtype` on MPS — C-34) and every factory registers classes via `torch.serialization.add_safe_globals`. Not a pure factory.
 
 ---
 

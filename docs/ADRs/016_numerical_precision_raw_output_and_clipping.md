@@ -60,7 +60,7 @@ ADR-010 also cites a deleted method, a nonexistent epsilon, and a deleted test f
 ## Implementation Notes
 
 - Precision: `views_r2darts2/dataset/converters.py` (all converters emit `float32`); `views_r2darts2/infrastructure/reproducibility_gate.py` (`audit_frame_schema`).
-- Clipping sites: `views_r2darts2/dataset/base.py` (`ingest_darts_predictions`, `ingest_numpy_predictions`, parameter `clip_negatives`) **and** `views_r2darts2/engines/darts_forecaster.py:515` (unconditional, streaming path).
+- Clipping sites: `views_r2darts2/dataset/base.py` (`ingest_darts_predictions`, `ingest_numpy_predictions`, parameter `clip_negatives`); `views_r2darts2/engines/darts_forecaster.py:515` (unconditional, streaming path); and two unconditional `np.maximum(arr, 0)` floors on the `log_targets` inverse path, `base.py:1520` and `:1559`, applied before `expm1`. (`base.py:1242`, `:1260` floor *inputs* before `log1p` — a domain guard, not a prediction clip.)
 - No code change is required by this ADR. The change required by D-05's eventual ruling touches two sites — the ingest default and the hardcoded streaming clip — plus `DartsForecaster`'s docstring and `docs/CICs/darts_forecaster.md`.
 
 ---

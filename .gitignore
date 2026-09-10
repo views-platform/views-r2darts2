@@ -197,6 +197,7 @@ cython_debug/
 *.parquet
 *.pt
 *.pkl 
+*.ckpt
 
 # folders
 **/wandb/

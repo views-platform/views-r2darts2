@@ -72,7 +72,7 @@ ds = ViewsDataset.for_loa("cm", source=frame)   # -> CMDataset, or ValueError
 
 ## 10. Test Alignment
 
-- **Red:** `tests/test_views_dataset.py` (wrong-dimension rejection per subclass).
+- **Red:** none — no test triggers a subclass `validate_indices` `ValueError`; `tests/test_views_dataset.py` only asserts `for_loa` routing (`isinstance`) for two subclasses.
 - **Green:** `tests/test_builder.py` (built datasets have the declared subclass).
 
 ---

@@ -95,7 +95,7 @@ scaler = ScalerSelector.instantiate_darts_scaler(None)  # returns None
 
 ## 10. Test Alignment
 
-- **Green Team:** `tests/test_scaler_selector.py` (registry, all four chain-spec forms, single-element collapse, empty/invalid-element errors, `global_fit=True`).
+- **Green Team:** `tests/test_scaler_selector.py` (registry, all four chain-spec forms, single-element collapse, empty/invalid-element errors). `global_fit=True` is not asserted by any test (ADR-012).
 
 ---
 

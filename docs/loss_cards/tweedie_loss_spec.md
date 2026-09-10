@@ -16,6 +16,8 @@ For numerical stability, `eta` is mapped to the mean `μ` via the `softplus` lin
 The loss, up to constants that do not depend on `μ`, is:
 `L(y, μ) = (μ**(2-p) / (2-p)) - (y * μ**(1-p) / (1-p))`
 
+> **What `forward()` actually returns (2026-09-10):** the NLL above multiplied by a per-sample weight built from `non_zero_weight` (target-dependent, via `zero_threshold`) and the FP/FN penalty genes (prediction-dependent). The *weighted* loss is not the canonical Tweedie NLL and the "proper scoring rule" property below holds for the unweighted core only. Also: `forward()` silently clamps negative targets to 0 (`views_r2darts2/math/tweedie_loss.py:67`) rather than rejecting them.
+
 ### Critical Property
 Minimizing the expected value of this loss function with respect to `μ` recovers the true conditional mean, `arg min E[L(y, μ)] => μ = E[Y]`. This property makes the loss function ideal for tasks where mean calibration is a primary objective.
 
@@ -46,7 +48,7 @@ Minimizing the expected value of this loss function with respect to `μ` recover
 
 - As `p -> 1`, the Tweedie distribution approaches a scaled Poisson distribution.
 - As `p -> 2`, the Tweedie distribution approaches a Gamma distribution.
-- The loss function is a proper scoring rule, meaning it is uniquely minimized in expectation when the predicted mean equals the true mean.
+- The unweighted core is a proper scoring rule, meaning it is uniquely minimized in expectation when the predicted mean equals the true mean. The weighting applied in `forward()` breaks this guarantee by design (it is the point of the weights).
 - The dispersion `φ` is treated as a constant nuisance parameter during training and can be fixed to 1 without affecting the optimization of model weights.
 
 ## 6. Practical Guidance & Parameter Tuning

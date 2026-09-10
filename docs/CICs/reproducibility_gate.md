@@ -51,7 +51,7 @@ The `ReproducibilityGate` is "The Law" of the repository. It is a stateless util
 ## 5. Outputs and Side Effects
 
 - **Assertions:** Produces no data; its only output is either "Pass" (continued execution) or "Fail" (exception raised).
-- **Logging:** Emits `ERROR` or `CRITICAL` logs describing the exact nature of an invariant violation before raising.
+- **Logging:** none — the module has no `logger.error`/`logger.critical` call; every violation raises with the detail in the exception message only.
 - **Siren Alerts:** Emits high-visibility warnings for non-standard but valid states (e.g., non-36 month horizons).
 
 ---

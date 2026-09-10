@@ -20,6 +20,7 @@ This leads to `RuntimeError` (Device Mismatch) or silent, massive performance de
 1.  **Device Self-Healing:** The `DartsForecaster` must implement a **Verify-and-Restore** pattern before every prediction. It must audit the current device of the model weights and move them back to the target device if drift is detected.
 2.  **GPU Serialization:** Parallel prediction (via `ThreadPoolExecutor`) is **forbidden** for GPU-resident models. `max_workers` must be forced to `1` for all GPU prediction jobs.
 3.  **CPU Parallelism:** Parallel prediction is permitted and encouraged for CPU-only models to maximize hardware utilization.
+    *Compliance note (2026-09-10):* there are no CPU-only models in practice — `ModelCatalog._get_common_pl_trainer_kwargs` hardcodes `accelerator="gpu"` (`catalogs/model_catalog.py:203`), so training fails on any non-CUDA host (register C-21).
 
 ---
 

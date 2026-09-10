@@ -85,7 +85,8 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 - [x] `loss_cards/README.md` indexes every card and names the modules without one
 - [ ] A card for every registered loss — 8 of 20 loss modules have one (register C-41);
       the production `SpotlightLoss` family has none
-- [x] No card advertises a constructor default the code does not have (ADR-003)
+- [x] No card advertises a constructor default the code does not have (ADR-003) — re-verified
+      2026-09-10 after a review found one surviving "Example (defaults)" column
 
 ---
 
@@ -101,4 +102,4 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 - [x] `docs/validate_docs.sh` present and passing
 - [x] Compliance report archived — `archive/ADR_COMPLIANCE_REPORT.md` is marked HISTORICAL
       (it certified the 0.1.x codebase; nothing in it is asserted of 0.2.x). Current
-      compliance state is the register: `reports/technical_risk_register.md` and D-01..D-05.
+      compliance state is the register: `reports/technical_risk_register.md` and D-01..D-07.

@@ -21,7 +21,7 @@ This repository adopts the invariant: **Structural failures must be logged persi
 
 ### 1. The Fail-Loud Mandate
 - **Device Integrity:** If a component is expected on `cuda` but found on `cpu`, the system must log the mismatch and raise an error immediately.
-  *Compliance note (2026-09-10):* `DartsForecaster._ensure_model_on_device` in `views_r2darts2/engines/darts_forecaster.py` currently logs a `WARNING` and continues on CPU when restoration fails. That contradicts this mandate. The ruling — change the code or the mandate — is register **D-01**; until it is made, this line describes intent, not behaviour.
+  *Compliance note (2026-09-10):* `DartsForecaster._ensure_model_on_device` in `views_r2darts2/engines/darts_forecaster.py` currently logs a `WARNING` and continues on CPU when restoration fails. That contradicts this mandate. The ruling — change the code or the mandate — is register **D-01**; until it is made, this line describes intent, not behaviour. Two sibling warn-and-continue sites in the same file — a failed `checkpoint_mode='last'` weight reload (`:208-212`) and the silent disabling of `log_targets` when it conflicts with `target_scaler="LogTransform"` (`:130-135`) — are register **C-51**.
 - **Numerical Sanity:** We use callbacks like `NaNDetectionCallback` and `GradientHealthCallback`. If NaNs are detected, the training must be terminated explicitly, not allowed to "zero-out" and continue.
 - **Gate Failures:** Violations of `ReproducibilityGate` (temporal holes, DNA missing) must raise a `ReproducibilityError`. Swallowing these errors as warnings is forbidden.
 

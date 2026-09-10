@@ -62,7 +62,7 @@
 ## 8. Examples of Correct Usage
 
 ```python
-frames = prediction_frames_from_darts(darts_preds, targets=ds.targets, ...)
+frames = prediction_frames_from_darts(predictions=darts_preds, target_columns=ds.targets, ...)   # keyword-only
 df = prediction_frames_to_dataframe(frames)   # only when a DataFrame is actually needed
 ```
 

@@ -19,6 +19,13 @@ cd "$SCRIPT_DIR"
 
 errors=0
 
+# Passes 3-7 rely on GNU grep -P. On BSD/macOS grep every extraction would be empty and
+# the script would print PASSED having checked nothing. Refuse instead.
+if ! echo x | grep -qP 'x' 2>/dev/null; then
+    echo "ERROR: this script needs GNU grep with -P (install 'grep' via Homebrew on macOS)."
+    exit 2
+fi
+
 echo "=== views-r2darts2 docs validation ==="
 echo ""
 
@@ -118,10 +125,10 @@ echo "  INFO: $template_count file(s) still have --template-- status"
 #    string mentioned in LIVE governance docs must exist in the repository. This is the
 #    pass that catches documentation describing deleted or renamed code — the failure
 #    mode that let docs drift silently through the 0.1.x -> 0.2.x rewrite.
-#    Scope: docs/ (excluding docs/archive/), reports/technical_risk_register.md,
-#    reports/guides/. Historical records (docs/archive/, reports/archived/,
-#    reports/post_mortems/, reports/investigations/) are intentionally exempt —
-#    they carry a banner saying their paths are historical.
+#    Scope: docs/ (excluding docs/archive/), the root README.md, reports/technical_risk_register.md
+#    (Open + Disagreements), reports/guides/. Historical records (docs/archive/, reports/archived/,
+#    reports/post_mortems/, reports/investigations/) are intentionally out of scope: each
+#    directory's README (or a per-file banner, for post_mortems) says their paths are historical.
 echo "--- Checking code/test path references resolve against the repo ---"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 path_errors=0
@@ -142,6 +149,7 @@ done < <( {
     # files that were later removed.
     sed '/^## Resolved Concerns/,$d' "$REPO_ROOT/reports/technical_risk_register.md" 2>/dev/null | grep -noP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' | sed "s|^|../reports/technical_risk_register.md:|"
     grep -rnoP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' --include='*.md' "$REPO_ROOT/reports/guides" 2>/dev/null | sed "s|$REPO_ROOT/|../|"
+    grep -noP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' "$REPO_ROOT/README.md" 2>/dev/null | sed "s|^|../README.md:|"
   } | sort -u || true)
 if [ "$path_errors" -eq 0 ]; then
     echo "  OK"

@@ -28,7 +28,7 @@ For every substantial and non-trivial class `MyClass`, there must be exactly one
 The folder structure must match the **Ontology (ADR-001)**. A developer should be able to guess the path of any class based on its name and category.
 - `ModelCatalog` → `views_r2darts2/catalogs/model_catalog.py`
 - `LossCatalog` → `views_r2darts2/catalogs/loss_catalog.py`
-- `ViewsDataset` → `views_r2darts2/dataset/base.py`
+- `ViewsDataset` → `views_r2darts2/dataset/base.py` *(a departure from §1's `views_dataset.py` — recorded under D-04, not endorsed)*
 - `DartsForecaster` → `views_r2darts2/engines/darts_forecaster.py`
 
 ### 3. Consolidation of Heterogeneous Logic
@@ -44,6 +44,8 @@ Generic file names like `utils.py`, `model.py`, `handlers.py`, or `gates.py` are
 The 1-Class-1-File invariant is **not unconditionally held** on `development` @ `fe7e681`. Three files hold homogeneous families: `views_r2darts2/dataset/converters.py` (five converter classes), `views_r2darts2/dataset/subclasses.py` (six level-of-analysis dataset classes), and `views_r2darts2/transformers/static_covariates.py` (a config and a result dataclass). Whether such families are granted hub status like the three in §3, or must be split, is register **D-04**. This ADR does not assert compliance until that is ruled.
 
 A second, separate departure: `views_r2darts2/__init__.py:45-77` and `dataset/__init__.py` carry a PEP-562 lazy `__getattr__` façade — logic in `__init__.py`, which §Context names as ghost logic. It exists so the package imports without the optional `manager` extra. Register **D-06**: write an ADR sanctioning the façade, or remove it.
+
+A third: `PredictionFrameVerificationError` is defined in `views_r2darts2/transformers/frame_builder.py:46`, not in `infrastructure/exceptions.py` as §3 requires (folded into D-04).
 
 ---
 

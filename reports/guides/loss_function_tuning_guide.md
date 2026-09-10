@@ -12,7 +12,7 @@ Detailed behavioral profiles for each custom loss can be found in the **[Loss Ca
 
 ---
 
-> **Scope (2026-09-10):** this guide predates the Spotlight / Prism / Sentinel loss family that is now in production use and does not cover them (register C-06, C-41). It remains accurate for the eight losses it names.
+> **Scope (2026-09-10):** this guide predates the Spotlight / Prism / Sentinel loss family that is now in production use and does not cover them (register C-06, C-41). It remains accurate for the six losses it names (plus `TweedieLoss` by path).
 
 ## 2. Standard Symmetrical Paths
 For reference, all custom objective functions live in `views_r2darts2/math/` and follow the 1-Class-1-File Zen standard (e.g., `views_r2darts2/math/tweedie_loss.py`).

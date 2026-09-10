@@ -86,7 +86,7 @@ trainer = pl.Trainer(callbacks=callbacks)
 
 ## 10. Test Alignment
 
-- **None.** No test under `tests/` references `callbacks`, `NaNDetectionCallback`, or `GradientHealthCallback` — the `should_stop` kill-switches have zero coverage (C-13). `tests/test_model_catalog.py` verifies only that they are attached.
+- **None.** No test under `tests/` references `callbacks`, `NaNDetectionCallback`, or `GradientHealthCallback` — the `should_stop` kill-switches have zero coverage (C-13). No test verifies they are attached either.
 
 ---
 

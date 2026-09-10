@@ -34,6 +34,7 @@ This repository adopts the invariant: **All architectural boundaries must declar
 
 #### `DartsForecaster` -> `dict[str, PredictionFrame]`
 - **Contract:** `predict()` returns one `views_frames.PredictionFrame` per target, finite, on the original data scale, with the sample dimension preserved for probabilistic runs. DataFrame conversion is on demand via `transformers/darts_bridge.py`, never implicit.
+- **Unwired gates (2026-09-10, register C-44):** ⚠ `audit_boundary_integrity`, ⚠ `audit_sequence_contiguity`, ⚠ `audit_leakage`, ⚠ `audit_frame_schema`, ⚠ `audit_numerical_sanity` — implemented and tested, called by nothing in `views_r2darts2/`.
 - **Numerical Airlock:** Predictions are scanned for NaNs per batch in `DartsForecaster.predict` (`engines/darts_forecaster.py:492-496`) before being written; the dataset's own `ingest_*_predictions` methods are unguarded, and `audit_numerical_sanity` is not invoked on any production path (C-44).
 
 ### 2. The Handshake Principle

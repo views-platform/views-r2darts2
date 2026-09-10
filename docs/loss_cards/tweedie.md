@@ -6,7 +6,7 @@ Statistical deviance loss based on the Tweedie distribution (1 < p < 2), which n
 ## 2. Assumptions & Domain
 - **Input Scale:** **STRICT REQUIREMENT.** Must receive count-scale or similar original magnitude data. Applying `MinMax` or aggressive `Log` before Tweedie may violate its mean-variance relationship assumptions.
 - **Target Domain:** Non-negative continuous.
-- **Positivity:** Strictly required for targets ($y \ge 0$). Predictions are passed through `softplus` to ensure $\mu > 0$.
+- **Positivity:** Required for targets ($y \ge 0$) — but *not enforced*: `forward()` clamps negative targets to 0 silently (`tweedie_loss.py:67`). Predictions are passed through `softplus` to ensure $\mu > 0$.
 
 ## 3. Mandatory Genes (DNA)
 - `p`: Power parameter (1.5 is standard for conflict).

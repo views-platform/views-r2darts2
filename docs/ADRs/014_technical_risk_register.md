@@ -3,6 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-04-11  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-10 — §6 added (disagreement entries); tier wording aligned with the register.  
 
 ---
 
@@ -26,7 +27,7 @@ Concerns are assigned one of four tiers:
 
 | Tier | Criterion |
 |------|-----------|
-| 1 | Silent data or model-output corruption with no error signal |
+| 1 | Silent data corruption or model-output correctness risk with no error signal |
 | 2 | Structural fragility with a concrete, realistic trigger |
 | 3 | Coupling / maintainability cost affecting multiple contributors |
 | 4 | Code quality observation with no correctness or reliability impact |
@@ -38,6 +39,9 @@ Every concern MUST specify a concrete future developer action that would make th
 
 ### 4. Deduplication is Mandatory
 No concern may be registered without first checking every existing entry for overlap. Overlapping findings merge into existing entries rather than creating new ones. IDs are permanent — gaps indicate merged or resolved entries.
+
+### 6. Disagreements are Registered, Not Settled by Edit
+When an ADR and the code contradict each other, neither is silently changed to match the other. The contradiction is recorded as a `D-xx` entry (ADR position / code position / where / resolution), stays open until a maintainer rules, and the affected ADR carries a compliance note pointing at it. D-entries are untiered.
 
 ### 5. Resolution is Explicit
 Concerns move from `Open Concerns` to `Resolved Concerns` only with an explicit resolution note and date. A concern is never silently deleted.

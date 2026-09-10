@@ -46,7 +46,7 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 ## 5. Outputs and Side Effects
 
 - **Artifacts:** Produces persistent `.pt` model artifacts containing weights and coupled scaler states.
-- **Predictions:** Produces `dict[str, PredictionFrame]` per sequence (evaluation) or per run (forecast); DataFrame conversion only on demand via `_predictions_to_dataframe`.
+- **Predictions:** Produces `dict[str, PredictionFrame]` per sequence (evaluation) or per run (forecast) when `prediction_format="frames"`; **the default is `"dataframe"`**, so by default `_evaluate_model_artifact` returns `list[pd.DataFrame]` via `_predictions_to_dataframe`.
 - **Logging:** Emits structured logs via `WandbLogger` and standard logging for lifecycle events.
 - **Monkeypatching:** Performs a controlled override of `torch.load` to handle Darts serialization requirements.
 
@@ -96,7 +96,7 @@ predictions = manager._evaluate_model_artifact(eval_type="standard")
 - **Green Team:** `tests/test_darts_forecasting_model_manager.py` (`_resolve_total_sequence_number` boundary and failure cases, lazy-import path, lifecycle wiring).
 - **Red Team:** `tests/test_reproducibility_gate.py` (the gates this class invokes at the handshake).
 - **Beige Team:** `tests/test_model_catalog.py` (catalog integration).
-- **Not covered:** no test executes a real `model.fit()` — CI runs on a host without CUDA and `"accelerator": "gpu"` is hardcoded (C-21).
+- **Not covered through this class:** no test drives a real `model.fit()` *via the manager* — CI has no CUDA and `"accelerator": "gpu"` is hardcoded (C-21). Five loss-integration tests do train real Darts models on CPU by supplying their own `pl_trainer_kwargs`, bypassing the catalog.
 
 ---
 

@@ -37,7 +37,7 @@ cd views-r2darts2
 pip install -e .
 ```
 
-Requires `darts==0.46.1`. `views-pipeline-core>=3.0.0,<4.0.0` is an optional extra needed only for `DartsForecastingModelManager`: `pip install -e ".[manager]"`. For GPU support, install the appropriate PyTorch version for your CUDA setup first. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
+Requires `darts==0.46.1`. `views-pipeline-core>=3.0.0,<4.0.0` is an optional extra: `pip install -e ".[manager]"`. It is imported lazily by `DartsForecastingModelManager` and by the four `ViewsDataset` persistence methods (`save_predstore`, `save_appwrite`, `from_predstore_latest`, `from_appwrite_latest`); everything else works without it. For GPU support, install the appropriate PyTorch version for your CUDA setup first. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
 ---
 
@@ -51,12 +51,12 @@ Requires `darts==0.46.1`. `views-pipeline-core>=3.0.0,<4.0.0` is an optional ext
 | **BlockRNN** | ✅ Concatenation | Stacked RNN/LSTM/GRU with optional static covariate injection. | Sequential dependency modeling; autoregressive forecasting. |
 | **NLinear** | ✅ Concatenation | Lightweight linear model with optional trend/seasonality decomposition. | Baseline modeling; rapid prototyping. |
 | **DLinear** | ✅ Concatenation | Decomposition-Linear — separate linear layers for trend and seasonal components. | Trend/seasonality separation; fast inference. |
-| **N-HiTS** | ❌ Not consumed | Hierarchical interpolation with per-stack pooling→FC→theta pipelines. Flag accepted but **not passed to the Darts constructor** — static covariate fingerprints are computed and attached but silently ignored by the model. | Multi-scale temporal pattern extraction; long-term forecasting. |
+| **N-HiTS** | ❌ Not consumed | Hierarchical interpolation with per-stack pooling→FC→theta pipelines. Flag accepted but **not passed to the Darts constructor** — the entity-id static covariate is attached but ignored by the model. | Multi-scale temporal pattern extraction; long-term forecasting. |
 | **Transformer** | ❌ Not consumed | Self-attention encoder with positional encoding. Flag accepted but **silently ignored** — no `use_static_covariates` is passed to the Darts constructor. | Long-range temporal dependency modeling. |
 | **N-BEATS** | ❌ Not supported | Fully-connected stacks with basis expansions for trend/seasonality. Static covariates are architecturally incompatible. Do not configure `use_static_covariates=True`. | Interpretable decomposition; univariate/multivariate forecasting. |
 | **TCN** (Temporal Convolutional Network) | ❌ Not consumed | Dilated causal convolutions with residual connections. | High-frequency series; long-range dependencies. |
 
-> **Important**: Models marked ❌ will silently drop static covariate fingerprints even if `use_static_covariates=True` is set in the config. This is a Darts library constraint, not a bug in this package. For N-HiTS and Transformer, the fingerprints are computed (respecting `stat_time_range` for leakage prevention) but never seen by the model weights.
+> **Important**: Models marked ❌ will silently drop static covariate fingerprints even if `use_static_covariates=True` is set in the config. This is a Darts library constraint, not a bug in this package. On 0.2.x no fingerprint is computed for any model (see *Static Covariate Fingerprints* below); only the entity id is attached, and for N-HiTS and Transformer even that is never seen by the model weights.
 
 ---
 
@@ -109,7 +109,8 @@ Use the `->` operator to compose transforms sequentially. This is the **producti
     ],
 }
 
-# Static covariate statistics (for models that consume them)
+# Static covariate statistics — INERT on 0.2.x: forwarded to a forecaster parameter its own
+# docstring marks unused; nothing computes the fingerprint (register C-36)
 "static_covariate_stats": {"transform": "AsinhTransform->MaxAbsScaler"}
 ```
 
@@ -170,7 +171,7 @@ All loss functions target **zero-inflated conflict data**: ~90% zeros, ~10% even
 | Loss Function | Status | Base Cell Loss | Key Mechanism | Use When |
 |---------------|--------|---------------|---------------|----------|
 | **SpotlightLossLogcosh** | ⭐ **Production** | log_cosh | Event-gated shape + event-only level + dead-cell anchor (three components) | Default for all models in production |
-| **SpotlightLoss** | ⭐ **Production** | Barron(α=1.5) | Same as above with more robust base cell loss | When log_cosh gradient is too aggressive on large errors |
+| **SpotlightLoss** | ⭐ **Production** | Barron(α=1.5) | Same three-component structure on a heavier-tailed base; single gene `non_zero_threshold`; spectral term hard-disabled (`_STFT = False`) | When log_cosh gradient is too aggressive on large errors |
 | **PrismLoss** | Research | MSE (= MSLE in log space) | KL-DRO + compound weights, no DC/AC decomp, no level anchor | MSLE-aligned optimization without RevIN |
 | **SpotlightFocalLoss** | Research | log_cosh | Focal weighting by difficulty `(1−exp(−\|e\|))^γ`, no DRO | Models without RevIN; exploration |
 | **SentinelLoss** | Research | Generalised Charbonnier | Power-law magnitude weights + SiLU symmetry + temporal gradient | Alternative robust base when Barron α needs tuning |
@@ -180,49 +181,14 @@ All loss functions target **zero-inflated conflict data**: ~90% zeros, ~10% even
 | **TweedieLoss** | Legacy | Tweedie (p≈1.5) | Compound Poisson-Gamma | Count data without asinh transform |
 | **AsymmetricQuantileLoss** | Legacy | Quantile | Asymmetric τ-penalty | When underestimation cost >> overestimation |
 | **ZeroInflatedLoss** | Legacy | Huber (two-part) | Explicit binary + count split | Explicit zero-inflation modeling |
-| **SpikeFocalLoss** | Legacy | log_cosh | Focal on absolute magnitude | Predates KL-DRO; superseded by Spotlight family |
+| **SpikeFocalLoss** | Legacy | MSE | Focal on absolute magnitude | Predates KL-DRO; superseded by Spotlight family |
 | **ShrinkageLoss** | Legacy | Shrinkage | Suppresses easy samples via sigmoid gate | Exploratory; not validated for conflict |
 
 ### SpotlightLossLogcosh — Architecture Deep Dive
 
 The production loss for all current VIEWS models. Operates entirely in **asinh space**; the target scaler must be `AsinhTransform`.
 
-> **Note (2026-09-10):** the class at `views_r2darts2/math/spotlight_loss_logcosh.py` is a **three-component** loss with a single gene, `non_zero_threshold`. Its docstring: *shape* — log_cosh on demeaned per-cell errors, gated by an event mask, DRO-weighted; *level* — T-scaled log_cosh of the event-only mean gap; *anchor* — log_cosh of the dead-cell sum. The five-component description below is the earlier architecture that `SpotlightLoss` (Barron base) still follows; it is kept for that class. `SpotlightLossLogcosh` has no `delta` and no spectral term — a configured `delta` is silently dropped by the genome filter.
-
-**Five orthogonal components (SpotlightLoss; historical for Logcosh):**
-
-**1. DC/AC decomposition** — prevents RevIN from amplifying bias:
-```
-e_shape = e − mean(e)    per series
-```
-The shape gradient sums to zero per series by construction (`J = I − 11ᵀ/T`). A small bias `b` in normalized space becomes `b·σ` after RevIN denormalization, and `sinh(b·σ) > sinh(E[b·σ])` via Jensen's inequality — exponential overprediction in raw death counts. The DC/AC split structurally blocks this. The level anchor (component 4) is the *only* mechanism that can shift per-series means.
-
-**2. Adaptive compound weighting** — parameter-free event focus:
-```
-difficulty  = 1 − exp(−|e_shape|)           ∈ [0, 1)
-importance  = 1 − exp(−max(|y|, |ŷ_sg|))   ∈ [0, 1)
-w_compound  = 1 + difficulty × importance    ∈ [1, 2)
-```
-Both signals must be active simultaneously. Perfect predictions get `difficulty→0 → w→1` regardless of magnitude. Replaces the `alpha` hyperparameter from earlier versions.
-
-**3. KL-DRO tail aggregation** — proportional outlier detection:
-```
-log_l  = log(l + ε)
-z      = (log_l − mean(log_l)) / std(log_l)
-dro_w  = log1p(clamp(1+z, min=0))
-dro_w  = dro_w / mean(dro_w)
-α_soft = log_std / (log_std + 1.0)          # soft activation (uniform early in training)
-```
-Unlike χ²-DRO (which detects *absolute* loss outliers and causes Syria to dominate), KL-DRO detects *proportional* outliers: a village miss at 10× the median receives the same weight as a Syria miss at 10× the median. Aligned with the proportional error sensitivity of asinh-space MSE.
-
-**4. Level anchor** — T-scaled log_cosh on per-series mean error:
-```
-L_level = T · mean_per_series[ log_cosh(mean(ŷ) − mean(y)) ]
-```
-The *only* mechanism that can shift series-level means. T-scaling compensates for the `1/T` chain-rule factor from mean reduction.
-
-**5. Spectral regularization** (optional, `δ > 0`):
-Multi-resolution STFT magnitude comparison with the DC bin masked. Enforces temporal structure without caring about phase. Proportional contribution tuned via `delta` (current production values: 0.015–0.12 depending on model).
+> **Note (2026-09-10):** both production classes — `views_r2darts2/math/spotlight_loss_logcosh.py` and `views_r2darts2/math/spotlight_loss.py` — are **three-component** losses with a single gene, `non_zero_threshold` (`LOSS_GENOMES`): *shape* — base cell loss on demeaned per-cell errors, gated by an event mask, DRO-weighted; *level* — T-scaled loss on the event-only mean gap; *anchor* — loss on the dead-cell sum. Neither accepts `delta`; `SpotlightLoss` carries a spectral branch behind a hard-coded `_STFT = False`. A configured `delta` is silently dropped by the genome filter. The five-component design (DC/AC decomposition, compound weights, KL-DRO, level anchor, spectral) described in `views_r2darts2/math/README.md` is the Gen-5 *design lineage*; that file's configuration block still advertises `delta` and is stale (register C-15).
 
 **Configuration (SpotlightLossLogcosh):**
 ```python
@@ -240,8 +206,8 @@ The loss function development followed a clear progression as each failure mode 
 | Gen 2 | `TweedieLoss`, `SpikeFocalLoss` | Compound Poisson structure; focal weighting | No DRO; focal exponent γ is a fragile hyperparameter |
 | Gen 3 | `PrismLoss` | KL-DRO replaces χ²-DRO; compound weighting is parameter-free | No DC/AC decomposition; RevIN bias accumulates; no level anchor |
 | Gen 4 | `SpotlightFocalLoss` | Focal mechanism adapted for regression, no class-specific logic | No DRO; still requires γ tuning |
-| Gen 5 | `SpotlightLossLogcosh` | DC/AC decomp + compound + KL-DRO + level anchor + spectral; fully parameter-free weighting | log_cosh gradient can clip large errors aggressively |
-| Gen 5b | `SpotlightLoss` | Barron(α=1.5) base cell loss — heavier tail than log_cosh | Same architecture as v36 Logcosh |
+| Gen 5 | `SpotlightLossLogcosh` | DC/AC decomp + compound + KL-DRO + level anchor (+ spectral, since removed); parameter-free weighting | log_cosh gradient can clip large errors aggressively |
+| Gen 5b | `SpotlightLoss` | Barron(α=1.5) base cell loss — heavier tail than log_cosh | Same three-component structure as current Logcosh; spectral branch disabled |
 
 ---
 
@@ -306,12 +272,12 @@ The repository is governed by:
 - **[Architectural Decision Records (ADRs)](docs/ADRs/README.md)**: Sequential, authoritative records of every major design choice.
 - **[Class Intent Contracts (CICs)](docs/CICs/README.md)**: Explicit declarations of purpose and responsibility for every critical class.
 - **[Reproducibility Manifest](docs/standards/REPRODUCIBILITY_MANIFEST.md)**: The mandatory DNA genome that every experiment must declare before execution.
-- **[Technical Risk Register](reports/technical_risk_register.md)**: Every known, unfixed concern, tiered and triggered (ADR-014); and the open ADR-vs-code disagreements D-01..D-05.
-- `bash docs/validate_docs.sh` checks the documentation set against itself *and* against the code tree — every path a live doc names must exist.
+- **[Technical Risk Register](reports/technical_risk_register.md)**: Every known, unfixed concern, tiered and triggered (ADR-014); and the open ADR-vs-code disagreements D-01..D-07 (each also filed as a GitHub issue, #39–#45).
+- `bash docs/validate_docs.sh` checks the documentation set against itself *and* against the code tree — every `views_r2darts2/…py` or `tests/…py` path a live doc (this README included) names must exist. It is run by hand, not by CI (register C-55).
 
 ### Training Stability Callbacks
 
-Every training run is monitored by mandatory Fortress callbacks configured in `ModelCatalog` (8 of the 14 attached are shown; the others are `TrainingStepPatchCallback`, `ValMetricsCallback`, `InputBatchMonitorCallback`, `LossComponentCallback`, `RichLossDiagnosticsCallback`, `LossGradientDiagnosticsCallbackV2`, plus Lightning's `EarlyStopping` and `LearningRateMonitor`):
+Every training run is monitored by mandatory Fortress callbacks configured in `ModelCatalog` (8 of the 14 attached are shown; the others are `TrainingStepPatchCallback`, `ValMetricsCallback`, `InputBatchMonitorCallback`, `LossComponentCallback`, `RichLossDiagnosticsCallback`, `LossGradientDiagnosticsCallbackV2`, plus Lightning's `EarlyStopping`, `LearningRateMonitor` and `ModelCheckpoint`):
 
 | Callback | Purpose |
 |----------|---------|
@@ -328,7 +294,7 @@ Every training run is monitored by mandatory Fortress callbacks configured in `M
 
 ## 🔧 API Reference
 
-Every core class follows the **1-Class-1-File** standard.
+Most core classes follow the **1-Class-1-File** standard; three homogeneous families (`dataset/converters.py`, `dataset/subclasses.py`, `transformers/static_covariates.py`) do not — register D-04 / issue #44.
 
 ### ScalerSelector
 ```python
@@ -383,7 +349,7 @@ For level-specific validation use `ViewsDataset.for_loa("cm", source=...)`.
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 
 ReproducibilityGate.Config.audit_manifest(config)
-ReproducibilityGate.Data.lock_entropy(config["random_state"])   # bit-identical probabilistic samples
+ReproducibilityGate.Data.lock_entropy(config["random_state"])   # seeds torch/numpy/random; not full GPU determinism (C-24)
 ReproducibilityGate.Temporal.audit_continuity(partition)
 ```
 
@@ -410,7 +376,7 @@ def get_hp_config():
                 # All conflict counts, macro indicators, and lagged features
             ],
         },
-        "static_covariate_stats": {"transform": "AsinhTransform->MaxAbsScaler"},
+        "static_covariate_stats": {"transform": "AsinhTransform->MaxAbsScaler"},   # inert on 0.2.x (C-36)
 
         # Loss — production standard
         "loss_function": "SpotlightLossLogcosh",

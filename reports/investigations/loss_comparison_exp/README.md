@@ -5,6 +5,13 @@
 > deliberately pandas-free except at `transformers/darts_bridge.py`). CI never runs it. Its one
 > production coupling — `from views_r2darts2.math import WeightedPenaltyHuberLoss, AsymmetricQuantileLoss`
 > — still resolves on 0.2.x. Safe to leave, safe to delete, not safe to describe as runnable.
+>
+> **Validity note (2026-09-10):** `evaluate.py:72` scores each model's forecast of the 60 steps
+> *after* the validation window against the validation window itself, while the baseline in
+> `main.py` is aligned — so the loss comparison this experiment reports is not sound. The
+> standalone `train.py` / `evaluate.py` entrypoints also call `TimeSeries.from_dataframe(..., group_cols=)`,
+> which does not exist in Darts 0.46. The two `models/*.pkl.ckpt` files were removed on this
+> date: nothing could load them (their `.pkl` twins are gitignored).
 
 # Plan: Modular Experiment for Loss Function Comparison
 

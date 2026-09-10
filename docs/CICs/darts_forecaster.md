@@ -76,7 +76,7 @@ The `DartsForecaster` is a slim orchestrator that couples one Darts model to one
 
 ```python
 # Instantiate and train
-forecaster = DartsForecaster(dataset=ds, model=m, partition_dict=p)
+forecaster = DartsForecaster(dataset=ds, model=m, partition_dict=p, random_state=42)   # random_state is mandatory
 forecaster.train()
 
 # Predict; returns dict[target -> PredictionFrame] on the raw scale
@@ -96,7 +96,7 @@ frames = forecaster.predict(sequence_number=0)
 ## 10. Test Alignment
 
 - **Green Team:** `tests/test_darts_forecaster.py` (construction guards, `predict` at `sequence_number=0`, save/load round-trip). *No test calls `train()`; no rolling-origin sequence > 0 is exercised.*
-- **Green Team:** `tests/test_parity_e2e.py` (end-to-end fit → predict → inverse precision).
+- **Adjacent, not this class:** `tests/test_parity_e2e.py` exercises `ViewsDataset.ingest_darts_predictions` and the inverse path directly; it never constructs `DartsForecaster`.
 - **Green Team:** `tests/test_streaming_predict_builder.py` (streaming prediction path).
 - **Red Team:** `tests/test_reproducibility_gate.py` (the gates this class invokes).
 - **Not covered:** device-restore failure (D-01), `parallel_workers > 1` reproducibility (C-24).

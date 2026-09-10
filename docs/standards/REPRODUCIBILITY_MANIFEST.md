@@ -4,7 +4,7 @@ This document defines the mandatory configuration standards and runtime safety g
 
 ## 1. The Mandatory Reproducibility Manifest (DNA)
 
-No model may be initialized, trained, or evaluated unless its configuration explicitly defines the following parameters. The DNA is **polymorphic**: the requirements are determined dynamically based on the chosen algorithm. The system will **refuse to run** if any manifest key is missing or set to `None`.
+No model may be initialized, trained, or evaluated unless its configuration explicitly defines the following parameters. The DNA is **polymorphic**: the requirements are determined dynamically based on the chosen algorithm. The system will **refuse to run** if any manifest key is missing or set to `None` — except the six architecture keys in `ReproducibilityGate.Config.NULLABLE_PARAMS` (`hidden_fc_sizes`, `pooling_kernel_sizes`, `n_freq_downsample`, `categorical_embedding_sizes`, `temporal_hidden_size_past`, `temporal_hidden_size_future`), for which `None` is a legal declared value.
 
 ### 1.1 The Core Genome (Universal)
 Required by ALL experiments regardless of model.

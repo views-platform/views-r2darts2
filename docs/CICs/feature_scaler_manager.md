@@ -30,7 +30,7 @@ The `FeatureScalerManager` is a specialized orchestrator responsible for applyin
 - **Enforces Transformation Sequence:** Correctly manages the forward and inverse execution of "Chained Scalers" (e.g., Asinh -> Standard) using Darts native `Pipeline` (ADR-012).
 - **Ensures Global Calibration:** Guarantees that all internal scalers are instantiated with `global_fit=True` to preserve the semantic meaning of values across different entities (countries).
 - **Guarantees Shape Preservation:** Ensures that transformations do not collapse the sample dimension, maintaining compatibility with probabilistic forecasting tensors.
-- **Ensures Total Coverage:** When the map is non-empty, any feature not explicitly mapped is assigned to `default_scaler`. (An empty map returns early and scales nothing; `ViewsDataset` only constructs the manager for a non-empty map.)
+- **Ensures Total Coverage — conditionally:** When the map is non-empty *and* `default_scaler` is not `None`, any feature not explicitly mapped is assigned to `default_scaler`. With `default_scaler=None` unmapped features are left **unscaled, silently** (register C-53). An empty map returns early and scales nothing; `ViewsDataset` only constructs the manager for a non-empty map.
 
 ---
 
@@ -93,7 +93,7 @@ scaled_test  = manager.transform(test_data)
 
 ## 10. Test Alignment
 
-- **Green Team:** `tests/test_feature_scaler_manager.py` (simple and named-group formats, chaining, `global_fit`, sample-dimension preservation, `None`-config rejection).
+- **Green Team:** `tests/test_feature_scaler_manager.py` (simple and named-group formats, chaining, sample-dimension preservation, `None`-config rejection). `global_fit` is not asserted anywhere.
 - **Not covered directly:** `transformers/inverse.py`'s silent passthrough when fitted params are missing (C-10).
 
 ---

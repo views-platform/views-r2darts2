@@ -8,7 +8,7 @@ structural, semantic, and operational behavior.
 
 ADRs are divided into two categories:
 
-1. **Constitutional ADRs (001–009)**  
+1. **Constitutional ADRs (000–009)**  
    Foundational architectural rules that apply across the system.
 
 2. **Project-Specific ADRs (010+)**  
@@ -19,6 +19,9 @@ ADRs are divided into two categories:
 ## Constitutional ADRs
 
 These ADRs define system philosophy and governance:
+
+- **ADR-000** — Use of ADRs  
+  Why this repository records decisions this way.
 
 - **ADR-001** — Ontology of the Repository  
   Defines what concepts exist.

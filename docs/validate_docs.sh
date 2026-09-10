@@ -121,8 +121,8 @@ echo "--- Checking template status markers ---"
 template_count=$(grep -rl '\-\-template\-\-' --include='*.md' . 2>/dev/null | wc -l)
 echo "  INFO: $template_count file(s) still have --template-- status"
 
-# 7. Code-path and test-path integrity. Every `views_r2darts2/...py` and `tests/...py`
-#    string mentioned in LIVE governance docs must exist in the repository. This is the
+# 7. Code-path and test-path integrity. Every `views_r2darts2/...py`, `tests/...py` and
+#    unprefixed `<pkgdir>/<file>.py` string mentioned in LIVE governance docs must exist in the repository. This is the
 #    pass that catches documentation describing deleted or renamed code — the failure
 #    mode that let docs drift silently through the 0.1.x -> 0.2.x rewrite.
 #    Scope: docs/ (excluding docs/archive/), the root README.md, reports/technical_risk_register.md
@@ -135,21 +135,23 @@ path_errors=0
 while IFS= read -r ref; do
     [[ -z "$ref" ]] && continue
     file=$(echo "$ref" | cut -d: -f1)
-    p=$(echo "$ref" | grep -oP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' | head -1)
+    p=$(echo "$ref" | grep -oP '((views_r2darts2|tests)/[A-Za-z0-9_/]+\.py|(dataset|engines|catalogs|transformers|infrastructure|math)/[a-z0-9_]+\.py)' | head -1)
     [[ -z "$p" ]] && continue
+    # Unprefixed cites (`dataset/base.py:1645`, the register's dominant form) resolve under the package.
+    case "$p" in views_r2darts2/*|tests/*) ;; *) p="views_r2darts2/$p" ;; esac
     if [ ! -f "$REPO_ROOT/$p" ]; then
         echo "  ERROR: $file references $p but it does not exist in the repo"
         errors=$((errors + 1))
         path_errors=$((path_errors + 1))
     fi
 done < <( {
-    grep -rnoP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' --include='*.md' --exclude-dir=archive . 2>/dev/null
+    grep -rnoP '((views_r2darts2|tests)/[A-Za-z0-9_/]+\.py|(dataset|engines|catalogs|transformers|infrastructure|math)/[a-z0-9_]+\.py)' --include='*.md' --exclude-dir=archive . 2>/dev/null
     # Register: scan only Open Concerns + Disagreements. "Resolved Concerns" is a historical
     # record by the register's own conventions ("Do not delete") and legitimately names
     # files that were later removed.
-    sed '/^## Resolved Concerns/,$d' "$REPO_ROOT/reports/technical_risk_register.md" 2>/dev/null | grep -noP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' | sed "s|^|../reports/technical_risk_register.md:|"
-    grep -rnoP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' --include='*.md' "$REPO_ROOT/reports/guides" 2>/dev/null | sed "s|$REPO_ROOT/|../|"
-    grep -noP '(views_r2darts2|tests)/[A-Za-z0-9_/]+\.py' "$REPO_ROOT/README.md" 2>/dev/null | sed "s|^|../README.md:|"
+    sed '/^## Resolved Concerns/,$d' "$REPO_ROOT/reports/technical_risk_register.md" 2>/dev/null | grep -noP '((views_r2darts2|tests)/[A-Za-z0-9_/]+\.py|(dataset|engines|catalogs|transformers|infrastructure|math)/[a-z0-9_]+\.py)' | sed "s|^|../reports/technical_risk_register.md:|"
+    grep -rnoP '((views_r2darts2|tests)/[A-Za-z0-9_/]+\.py|(dataset|engines|catalogs|transformers|infrastructure|math)/[a-z0-9_]+\.py)' --include='*.md' "$REPO_ROOT/reports/guides" 2>/dev/null | sed "s|$REPO_ROOT/|../|"
+    grep -noP '((views_r2darts2|tests)/[A-Za-z0-9_/]+\.py|(dataset|engines|catalogs|transformers|infrastructure|math)/[a-z0-9_]+\.py)' "$REPO_ROOT/README.md" 2>/dev/null | sed "s|^|../README.md:|"
   } | sort -u || true)
 if [ "$path_errors" -eq 0 ]; then
     echo "  OK"

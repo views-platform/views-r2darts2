@@ -5,8 +5,8 @@
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
 | Last Updated      | 2026-09-10                           |
-| Total Concerns    | 55                                   |
-| Open Concerns     | 42                                   |
+| Total Concerns    | 57                                   |
+| Open Concerns     | 44                                   |
 | Resolved Concerns | 13                                   |
 | Governed by       | ADR-014                              |
 
@@ -542,6 +542,28 @@
 
 ---
 
+### C-56 — `validate_docs.sh` pass 7 was blind to the register's dominant citation form *(closed same day)*
+
+- **Tier:** 3 *(guard blind spot: 47 unprefixed cites — `dataset/base.py:1645`, `engines/darts_forecaster.py:515` — were never checked, so the next module rename would have passed green; the exact failure C-55 exists to prevent. Kept open as a record because the fix is one regex and the pattern — a guard whose scope is narrower than its description — has now recurred three times on this branch.)*
+- **Source:** falsify (2026-09-10) (probe P7(ii): a planted cite to a nonexistent module in `dataset/`, written in the unprefixed form, passed the validator — and after the fix, the same planted cite quoted in this entry's first draft made the validator fail, which is the intended behaviour)
+- **Trigger:** Adding a new cite form to the docs (e.g. dotted module paths `views_r2darts2.dataset.base`) without extending pass 7's regex.
+- **Location:** `docs/validate_docs.sh` pass 7 extraction regex and the `case` prefixing added 2026-09-10.
+- **Narrative:** Fixed the same day by widening the regex to `(dataset|engines|catalogs|transformers|infrastructure|math)/<file>.py` and resolving those under `views_r2darts2/`. Dotted module paths and non-`.py` links are still unchecked.
+- **Cross-refs:** C-55 (the validator is not in CI); C-40 (the drift it guards against).
+
+---
+
+### C-57 — README production template carries three keys nothing in the package reads
+
+- **Tier:** 4 *(no runtime effect — the keys are ignored; the cost is a user sweeping or "tuning" a knob that does nothing)*
+- **Source:** falsify (2026-09-10) (probe P9, consumer simulation)
+- **Trigger:** Copying the template and adjusting `time_steps`, `rolling_origin_stride` or `n_jobs` expecting a change in behaviour.
+- **Location:** `README.md` "Production Configuration Template" — `time_steps`, `rolling_origin_stride`, `n_jobs`; `grep -rn` over `views_r2darts2/` → 0 hits for each. `static_covariate_stats` (C-36) is the fourth inert key, already flagged.
+- **Narrative:** `views-pipeline-core` is not installed in the audit environment, so consumption by the manager's base class cannot be ruled out for `time_steps` (a plausible forecast-horizon key). The template now flags all three inline. If pipeline-core does read `time_steps`, downgrade this to a comment; if not, delete the keys.
+- **Cross-refs:** C-36 (the fourth inert key); C-42 (the harness never installs pipeline-core, which is why this cannot be settled locally).
+
+---
+
 
 ## Disagreements
 
@@ -753,7 +775,7 @@
 ## Register Conventions
 
 - **ID format:** `C-xx` for concerns, `D-xx` for disagreements. IDs are permanent — gaps indicate merged or resolved entries.
-- **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `review-base-docs`, `code-review`, `incident`.
+- **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `review-base-docs`, `code-review`, `falsify`, `incident`.
 - **Disagreements:** `D-xx` entries record an ADR-vs-code contradiction awaiting a ruling. They are not concerns; they point at the concern (if any) that is the code side.
 - **Re-derivation:** when the code moves under an entry, the entry is re-verified and carries a dated `re-derivation` bullet; Location is updated to current line numbers; Tier is changed only with a stated reason.
 - **Resolution:** Move to "Resolved Concerns" with resolution date and one-line summary when addressed. Do not delete.

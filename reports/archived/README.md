@@ -11,6 +11,11 @@ inbound links that exist are between siblings in this directory and `reports/pos
 The register does not cite them. They are kept so the reasoning behind decisions made then
 remains recoverable, not because they describe the present.
 
+**Not carried onto this branch:** `survey_risk` @ `d847a34` also holds a `TEMP/docs/` directory — five
+February-2026 draft templates (ADR/CIC compliance-audit templates, a hardened-protocol template,
+a specification-card template, and `physical_architecture_standard.md`) that exist nowhere else.
+They were never adopted and are not restored here; `survey_risk` remains their home.
+
 **One live pointer to be aware of:** `sweep_configs/experimental_sweep_configs/lr_finder_sweep.py:7`
 declares `"program": "simple_training_run.py"` as a W&B sweep entrypoint. The only file of that
 name in the repository is `reports/archived/simple_training_run.py`, which is not on any import

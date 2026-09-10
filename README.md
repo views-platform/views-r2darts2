@@ -415,15 +415,15 @@ def get_hp_config():
 
         # Reproducibility
         "random_state": 67,
-        "time_steps": 36,
-        "rolling_origin_stride": 1,
+        "time_steps": 36,               # not read by views_r2darts2; consumed (if at all) by views-pipeline-core (C-57)
+        "rolling_origin_stride": 1,     # not read by views_r2darts2 (C-57)
         "prediction_format": "dataframe",
 
         # Prediction
         "likelihood": None,
         "num_samples": 1,
         "mc_dropout": False,
-        "n_jobs": -1,
+        "n_jobs": -1,                   # not read by views_r2darts2 (C-57)
     }
 ```
 

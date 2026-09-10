@@ -470,7 +470,7 @@
 - **Tier:** 2 *(a leak seam on the live path with no error signal: the default argument produces test-contaminated scaler statistics and an optimistic evaluation. Held at 2 rather than 1 because the one production caller — `DartsForecaster.train()` — passes the window correctly; every other caller is exposed.)*
 - **Source:** code-review (2026-09-10) (Angle B, removed-behaviour audit)
 - **Trigger:** Any call to `ViewsDataset.fit_scalers(...)` that omits `time_ids` — a sweep script, a notebook, a user copying the README example and dropping the `time_ids=` line — or a future refactor of `train()` that stops passing it.
-- **Location:** `views_r2darts2/dataset/base.py:160`, `:174` (`time_ids: Any = None`); `:1193-1196` passes it straight to `to_darts_timeseries`, whose `:1616` `if time_ids is not None` branch otherwise materialises every time step. Docstring `:1151` says "Optional time-id filter (prevents test-period leakage)". Only production caller with ids: `engines/darts_forecaster.py:173-180`.
+- **Location:** `views_r2darts2/dataset/base.py:1131` (`fit_scalers`), `:1139` (`time_ids: Any = None`), `:1151` (docstring); `:1193-1196` passes it straight to `to_darts_timeseries`, whose `:1616` `if time_ids is not None` branch otherwise materialises every time step. Docstring `:1151` says "Optional time-id filter (prevents test-period leakage)". Only production caller with ids: `engines/darts_forecaster.py:173-180`.
 - **Narrative:** The 0.1.x path fitted scalers inside `_preprocess_timeseries`, which always received the training slice. The rewrite made the window a caller responsibility and defaulted it to "everything". `audit_leakage` — the gate that would have caught train/test overlap — is unwired (C-44), so nothing downstream notices. The CIC (`docs/CICs/views_dataset.md` §2) and README example were corrected on 2026-09-10 to say so. The fix is small: default to raising, or require `time_ids` as a keyword-only argument.
 - **Cross-refs:** C-08 (the same leak shape in the static-covariate module, re-tiered to 2 on the same day); C-44 (the unwired guard); C-22 (encoder-fit divergence on the same method).
 
@@ -498,9 +498,9 @@
 
 ---
 
-### C-52 — NaN halts in the loss family raise three different things, and two modules raise nothing
+### C-52 — NaN halts in the loss family raise two different exception types, and four modules raise nothing
 
-- **Tier:** 3 *(the fail-loud invariant holds for 17 of 21 modules, but under inconsistent exception types, so a caller cannot catch "a Fortress numerical violation" without catching `RuntimeError` generally; two modules have no check)*
+- **Tier:** 3 *(the fail-loud invariant holds for 16 of the 20 loss modules, but under inconsistent exception types, so a caller cannot catch "a Fortress numerical violation" without catching `RuntimeError` generally; two modules have no check)*
 - **Source:** code-review (2026-09-10) (CIC audit, engines/catalogs)
 - **Trigger:** Wrapping training in `except NumericalSanityError` to distinguish a numerical halt from any other `RuntimeError`; or adding a loss by copying `spotlight_loss.py` as the template.
 - **Location:** bare `RuntimeError`: `views_r2darts2/math/spotlight_loss.py:270-276`, `spotlight_loss_logcosh.py:238`, `spotlight_loss_asinh.py`, `spotlight_loss_huber.py`, `spotlight_loss_power_law.py`, `spotlight_focal_loss.py`, `prism_loss.py`. `NumericalSanityError`: `asymmetric_quantile_loss.py`, `tweedie_loss.py`, `sentinel_loss.py`, `shrinkage_loss.py`, the Huber variants, `zero_inflated_loss.py`, `spike_focal_loss.py`. No NaN check: `charbonnier_loss.py`, and the passthrough `huber_loss.py` / `mse_loss.py` / `logcosh_loss.py` (C-46).

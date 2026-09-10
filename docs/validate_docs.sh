@@ -2,7 +2,7 @@
 # Validates internal consistency of the views-r2darts2 governance documentation set
 # (docs/ADRs, docs/CICs, docs/contributor_protocols, docs/standards), and that every
 # code/test path the live docs name actually exists in the repository (pass 7).
-# Exit 0 if clean, exit 1 if issues found.
+# Exit 0 if clean, exit 1 if issues found, exit 2 if the environment cannot run the checks (non-GNU grep).
 #
 # Adapted from base_docs/validate_docs.sh for a brownfield repo whose docs live
 # under docs/ and whose ADRs extend past the constitutional 000-009 range:
@@ -22,7 +22,7 @@ errors=0
 # Passes 3-7 rely on GNU grep -P. On BSD/macOS grep every extraction would be empty and
 # the script would print PASSED having checked nothing. Refuse instead.
 if ! echo x | grep -qP 'x' 2>/dev/null; then
-    echo "ERROR: this script needs GNU grep with -P (install 'grep' via Homebrew on macOS)."
+    echo "ERROR: this script needs GNU grep with -P (macOS: brew install grep; Alpine/BusyBox: apk add grep)."
     exit 2
 fi
 

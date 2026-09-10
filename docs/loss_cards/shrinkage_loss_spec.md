@@ -6,7 +6,7 @@
 - **Version:** 1.0
 - **Source:** Inspired by "Deep Regression Tracking with Shrinkage Loss" by Lu et al. (2018).
 - **Purpose:** To improve regression performance on datasets with imbalanced error magnitudes, particularly zero-inflated data. The loss "shrinks" the contribution of easy samples (small errors), forcing the model to focus on hard samples (large errors).
-- **Customizations:** none on 0.2.x. *(An earlier version carried an `importance_weight = exp(targets)` multiplier; it was removed in February 2026 and `forward()` at `views_r2darts2/math/shrinkage_loss.py:48-55` now computes the paper's formula only. This card was corrected 2026-09-10.)* The historical note continues: This weight is intended to give more importance to samples with larger target values, assuming the targets are log1p-transformed (`targets = log(1 + y_original)`).
+- **Customizations:** none on 0.2.x. *(An earlier version carried an `importance_weight = exp(targets)` multiplier; it was removed in February 2026 and `forward()` at `views_r2darts2/math/shrinkage_loss.py:48-55` now computes the paper's formula only. This card was corrected 2026-09-10.)*
 
 ## 2. Canonical Formula & Code Mapping
 

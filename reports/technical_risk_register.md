@@ -5,8 +5,8 @@
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
 | Last Updated      | 2026-09-10                           |
-| Total Concerns    | 58                                   |
-| Open Concerns     | 45                                   |
+| Total Concerns    | 59                                   |
+| Open Concerns     | 46                                   |
 | Resolved Concerns | 13                                   |
 | Governed by       | ADR-014                              |
 
@@ -156,7 +156,7 @@
 - **Narrative:** `_spectral_loss`/`_log_cosh`/`__repr__`/`__init__` are copy-pasted ~6× with no shared base class; docstrings carry embedded v35→v37 changelogs and a self-contradictory version label (class says v37, warning says v36). Competing versions (v36/v37/v46) coexist with no canonical marker. A fix to the shared math must be hand-applied to each copy. Refactor is blocked on C-06 (no tests).
 - **graphify (2026-09-09) corroboration:** Graph extraction over the loss family produced **45 `semantically_similar_to` duplication edges** between the copy-pasted helpers, confirming the duplication is pervasive rather than incidental. It also surfaced a documentation defect not previously recorded: the `SpotlightLossHuber` and `SpotlightLossPowerLaw` docstrings both claim an *"identical architecture as SpotlightLossLogcosh ... KL-DRO"*, but `SpotlightLossLogcosh` is at v46 and uses **per-series sqrt DRO**, not KL-DRO. A reader trusting either docstring will form a wrong model of what the loss actually optimizes. Version strings v33/v35/v36/v37/v46 all coexist across the family with no canonical marker.
 - **re-derivation (2026-09-10, `development` @ `fe7e681`):** **Partly changed.** Resolved: the `spotlight_loss.py` v37-vs-v36 contradiction, the vestigial `alpha` in `spotlight_loss.py` and `spotlight_loss_huber.py` (`spotlight_loss_power_law.py:41-47` now deprecates it with a warning), and the false KL-DRO claim in `spotlight_loss_huber.py`. Still present: the same claim in `spotlight_loss_power_law.py`, five copies each of `_log_cosh` and `_spectral_loss` with no base class, and a self-contradictory version label that moved from `spotlight_loss.py` to `spotlight_loss_asinh.py`.
-- **review-base-docs / code-review (2026-09-10):** `views_r2darts2/math/README.md:89-97` still advertises `"delta": 0.02` as one of "two hyperparameters" for both production losses; neither class accepts it (`LOSS_GENOMES` = `["non_zero_threshold"]`), and its "four-component architecture" heading disagrees with the code's three components. Not edited on `governance-0.2.x` (file lives under `views_r2darts2/`); the root README now says so.
+- **review-base-docs / code-review (2026-09-10):** `views_r2darts2/math/README.md:89-97` still advertises `"delta": 0.02` as one of "two hyperparameters" for both production losses; neither class accepts it (`LOSS_GENOMES` = `["non_zero_threshold"]`), and its "four-component architecture" heading disagrees with the code's three components. Its loss table (`:19`, `:126`) also gives `SpikeFocalLoss` a log_cosh base — the code is `errors**2` (`spike_focal_loss.py:42`) and the root README was corrected to MSE on 2026-09-10, so the two READMEs now disagree. Not edited on `governance-0.2.x` (file lives under `views_r2darts2/`); the root README marks it stale and `docs/loss_cards/README.md` still names it as the substitute for the missing Spotlight cards — a reader following that pointer gets the wrong base loss.
 - **Cross-refs:** C-06 (same modules, testing dimension); C-33 (a stale replica in the test suite, same drift-between-copies root cause).
 
 ---
@@ -339,7 +339,7 @@
 - **Location:** `views_r2darts2/transformers/static_covariates.py:133` (`compute_static_covariates`); callers: `views_r2darts2/transformers/__init__.py:18` (export only) and `tests/test_static_covariates.py`; `views_r2darts2/dataset/base.py:1706-1709` attaches only the entity id as a static covariate.
 - **Narrative:** The module reimplements the 0.1.x pandas fingerprint in numpy, claims bit-for-bit parity with it, and is covered by a 420-line test file. Nothing in `views_r2darts2/` calls it. `ViewsDataset.to_darts_timeseries` attaches the entity id and nothing else. So on 0.2.x the "Static Covariate Fingerprints" feature the README advertises does not exist at runtime, while a fully-built implementation of it sits one import away. The parity claim is against an implementation that was deleted.
 - **code-review (2026-09-10):** the README template ships `"static_covariate_stats": {"transform": ...}`; the manager forwards it (`darts_forecasting_model_manager.py:251-252`) into `DartsForecaster(static_covariate_stats=...)`, whose docstring (`darts_forecaster.py:93-94`) says "unused in slim version". A config key that is read, passed, and ignored. README now labels it inert at both sites.
-- **Cross-refs:** C-08 (the latent leakage seam inside this dead module — reconnecting it re-arms that one); C-07 (four architectures would ignore the fingerprint anyway); C-40 (README still advertises the feature).
+- **Cross-refs:** C-08 (the latent leakage seam inside this dead module — reconnecting it re-arms that one); C-07 (four architectures would ignore the fingerprint anyway); C-40 (README still advertises the feature); C-57 (the other inert template keys — resolve or downgrade both together).
 
 ---
 
@@ -537,7 +537,7 @@
 - **Source:** code-review (2026-09-10) (efficiency angle)
 - **Trigger:** Renaming or deleting any file under `views_r2darts2/` or `tests/` that a live doc cites, without running the script by hand.
 - **Location:** `.github/workflows/run_pytest.yml` (last step `poetry run pytest tests/`; no docs step); no `.pre-commit-config.yaml`; only mentions are `README.md` and `docs/INSTANTIATION_CHECKLIST.md`.
-- **Narrative:** One workflow step — `run: bash docs/validate_docs.sh` — closes this. The script is fork-bound (~4.5 s; a fork-free rewrite of passes 3 and 7 measured 0.04 s) but that is not a blocker for CI. Two related review findings were fixed on 2026-09-10: pass 7 now scans the root `README.md`, and the script refuses to run on a non-GNU `grep` instead of silently passing.
+- **Narrative:** One workflow step — `run: bash docs/validate_docs.sh` — closes this, **but placement is load-bearing**: appended after `poetry install` in the existing `test` job it would never run, because C-42 keeps that step red and Actions skips later steps of a failed job. It must be its own job, or sit right after checkout before Python setup (it needs no Python). Six sibling repos already run their copy in CI (`views-appwrite`, `views-datafactory`, `views-evaluation`, `views-frames`, `views-impact`, `docs`). The script is fork-bound (~4.5 s; a fork-free rewrite of passes 3 and 7 measured 0.04 s) but that is not a blocker for CI. Two related review findings were fixed on 2026-09-10: pass 7 now scans the root `README.md`, and the script refuses to run on a non-GNU `grep` instead of silently passing.
 - **Cross-refs:** C-40 (the README drift this gate exists to prevent); ADR-005.
 
 ---
@@ -558,7 +558,7 @@
 - **Tier:** 4 *(no runtime effect — the keys are ignored; the cost is a user sweeping or "tuning" a knob that does nothing)*
 - **Source:** falsify (2026-09-10) (probe P9, consumer simulation)
 - **Trigger:** Copying the template and adjusting `time_steps`, `rolling_origin_stride` or `n_jobs` expecting a change in behaviour.
-- **Location:** `README.md` "Production Configuration Template" — `time_steps`, `rolling_origin_stride`, `n_jobs`; `grep -rn` over `views_r2darts2/` → 0 hits for each. `static_covariate_stats` (C-36) is the fourth inert key, already flagged.
+- **Location:** `README.md` "Production Configuration Template" — `time_steps`, `rolling_origin_stride`, `n_jobs`; `grep -rn` over `views_r2darts2/` → 0 hits for `rolling_origin_stride` and `n_jobs`; `time_steps` appears only as a local variable name (e.g. `darts_forecasting_model_manager.py:322`), never as a config key read. `static_covariate_stats` (C-36) is the fourth inert key, already flagged.
 - **Narrative:** `views-pipeline-core` is not installed in the audit environment, so consumption by the manager's base class cannot be ruled out for `time_steps` (a plausible forecast-horizon key). The template now flags all three inline. If pipeline-core does read `time_steps`, downgrade this to a comment; if not, delete the keys.
 - **Cross-refs:** C-36 (the fourth inert key); C-42 (the harness never installs pipeline-core, which is why this cannot be settled locally).
 
@@ -572,6 +572,17 @@
 - **Location:** `views_r2darts2/engines/darts_forecasting_model_manager.py:174-221` (`_infer_cache_source_label`, `_resolve_raw_parquet_path`; fallback warning at `:206-211`), `:223-229` (`_build_dataset`). The declared alternative: pipeline-core 3.2.0 `views_pipeline_core/managers/model/model.py:997` (`_get_cached_data_path`), set at `:1287` from the dataloader (`modules/dataloaders/dataloaders.py:1047`).
 - **Narrative:** The 0.1.x manager was fixed on 2026-04-27 (`c54e356`, "fix(C-59): use `_get_cached_data_path()` instead of hardcoded filename" — that ID belongs to an older numbering, not this register) to take the raw-data path from pipeline-core rather than guess it. The 0.2.x rewrite deleted those call sites and re-solved the problem by enumerating filename candidates. The `survey_risk` branch carried a second copy of the 0.1.x fix (`d847a34`); it was retired unported on 2026-09-10 and this entry replaces it. The sibling managers in `views-hydranet`, `views-baseline` and `views-impact` still use the seam, so this repository is the odd one out. One method (`_build_dataset`) would change: prefer `self._get_cached_data_path()` when set, fall back to the current enumeration.
 - **Cross-refs:** C-51 (the warn-and-continue family); C-42 (why no test of this can run in CI); ADR-003.
+
+---
+
+### C-59 — `ModelCatalog`'s `ModelCheckpoint` has no `dirpath`, so every run writes checkpoints to the current working directory
+
+- **Tier:** 4 *(disk-hygiene, not correctness: the files are written and never read; the `*.ckpt` ignore rule added on 2026-09-10 hides the symptom from `git status` rather than fixing it)*
+- **Source:** code-review (2026-09-15) (Altitude angle, verified against darts 0.46.1 and Lightning 2.5.2 source)
+- **Trigger:** Training with the repository (or any directory you care about) as CWD, then wondering where `lightning_logs/<run_id>/checkpoints/epoch=NNN-best.ckpt` and `last.ckpt` came from and whether anything uses them.
+- **Location:** `views_r2darts2/catalogs/model_catalog.py:181-187` — `ModelCheckpoint(monitor=..., mode="min", save_top_k=1, save_last=True, filename="{epoch:03d}-best")` with no `dirpath`; `grep -rn 'dirpath\|default_root_dir\|work_dir' views_r2darts2` → 0 hits. Darts never sets `default_root_dir`, so Lightning resolves the path to `<WandbLogger.save_dir="."> /lightning_logs/<run_id>/checkpoints/` (or `./checkpoints/` when `logger=False`, `:204`). Reader side: the only checkpoint reload is `darts_forecaster.py:209` `load_weights_from_checkpoint(best=False)`, which reads Darts' own `darts_logs/` folder (already ignored, `.gitignore:206`).
+- **Narrative:** Two checkpoint writers run per training: Darts' own (`darts_logs/…`, read back) and this one (CWD-relative, never read). For TFT/TiDE that is tens to hundreds of MB per run left wherever the process started. Either give the callback `dirpath=<model_path.artifacts>/checkpoints` so the "best" it selects is where the artifacts live, or drop the callback and rely on Darts'. The `.pt.ckpt` sidecar `TorchForecastingModel.save` writes next to every saved artifact is legitimate and separate.
+- **Cross-refs:** C-13 (callbacks untested); C-51 (the `checkpoint_mode='last'` reload that *is* read, and swallows failures).
 
 ---
 

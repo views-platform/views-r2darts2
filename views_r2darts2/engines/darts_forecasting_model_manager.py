@@ -383,8 +383,13 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
     # ------------------------------------------------------------------ sweep
 
     def _execute_model_sweeping(self) -> None:
-        """Execute a single wandb sweep iteration."""
-        import wandb
+        """Execute a single wandb sweep iteration.
+
+        The sweep parameters are read from the ``Run`` that
+        ``WandBModule.initialize_run`` returns (``run.config`` is the object
+        the module-level ``wandb.config`` proxies), so this package never
+        imports ``wandb`` itself.
+        """
         from views_pipeline_core.exceptions.exceptions import PipelineException
         from views_pipeline_core.modules.validation.core_prediction_sniffer import (
             CorePredictionSniffer,
@@ -392,10 +397,10 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
         with self._wandb_module.initialize_run(
             project=self._project, config=None, job_type="sweep",
-        ):
+        ) as run:
             try:
                 self._config_manager.update_for_sweep_run(
-                    wandb.config, self.args, wandb_module=self._wandb_module,
+                    run.config, self.args, wandb_module=self._wandb_module,
                 )
                 active_config = self.configs
                 ReproducibilityGate.Config.audit_manifest(active_config)

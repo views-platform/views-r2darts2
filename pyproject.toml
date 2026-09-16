@@ -15,6 +15,8 @@ darts = { version = "==0.46.1", extras = ["torch"] }   # declares torch + pytorc
 dask = ">=2026.7.1"
 pyarrow = ">=14.0.0"
 scikit-learn = ">=1.6.0,<1.10.0"
+numpy = ">=1.26.0"   # imported throughout; floor copied from darts 0.46.1 (arrived transitively before)
+pandas = ">=2.2.0"   # imported in dataset/converters.py, readers.py, base.py, transformers/darts_bridge.py; floor copied from darts 0.46.1
 xarray = ">=2026.7.0"
 zarr = ">=3.0"   # module-level import in dataset/converters.py; xarray 2026.x needs zarr>=3
 views-frames = ">=1.10.2,<2.0.0"   # the range views-pipeline-core requires; 2.x is untested here (issue #34)

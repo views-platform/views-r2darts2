@@ -447,11 +447,12 @@ class GridWriter:
 
 
 class ParquetConverter:
-    """Parquet -> Zarr store via dask parallel reads.
+    """Parquet -> Zarr store via row-group reads.
 
-    Reads the parquet file in parallel using dask.dataframe, which
-    splits by row group and processes chunks concurrently. The data
-    is then scattered into the Zarr skeleton via GridWriter.
+    Reads the parquet file one row group at a time with pyarrow and
+    scatters each batch into the Zarr skeleton via GridWriter. The
+    ``dask.array`` skeleton is unchanged; only the parquet read no longer
+    goes through ``dask.dataframe`` (see the note in ``convert``).
     """
 
     @staticmethod
@@ -463,7 +464,6 @@ class ParquetConverter:
         broadcast_features: bool = False,
         extra_attrs: dict[str, Any] | None = None,
     ) -> Path:
-        import dask.dataframe as dd
         import pyarrow.parquet as pq
         import pyarrow.types as pat
 
@@ -517,16 +517,16 @@ class ParquetConverter:
             store_path, time_id, entity_id, times, entities, sample_size, specs, attrs
         )
 
-        # --- Parallel data write via dask ---
-        # dask.dataframe reads row groups in parallel and we write each
-        # partition to the Zarr skeleton. The parquet may have MultiIndex
-        # columns (month_id, priogrid_id) which dask treats as index, not
-        # regular columns. We read ALL columns without filtering so the
-        # index columns are accessible.
-        ddf = dd.read_parquet(str(parquet_path))
-
-        for partition in ddf.partitions:
-            df_part = partition.compute()
+        # --- Batched data write via pyarrow ---
+        # Read the parquet one row group at a time and write each batch to
+        # the Zarr skeleton. The parquet may carry a pandas MultiIndex
+        # (month_id, priogrid_id) in its metadata; to_pandas() restores it
+        # as the index, so both index-form and column-form files are handled
+        # below. (Previously dask.dataframe; dask's dataframe module needs
+        # pandas>=2 on current Python, which the platform cannot host.)
+        pf = pq.ParquetFile(str(parquet_path))
+        for rg in range(pf.num_row_groups):
+            df_part = pf.read_row_group(rg).to_pandas()
             if df_part.empty:
                 continue
             # Handle MultiIndex: time_id and raw_entity may be in the index

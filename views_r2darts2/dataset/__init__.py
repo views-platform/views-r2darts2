@@ -27,6 +27,9 @@ from __future__ import annotations
 
 from typing import Any
 
+# Must precede any dask import in this package (see the module docstring).
+import views_r2darts2.infrastructure.tlz_compat  # noqa: F401
+
 __all__ = [
     "ViewsDataset",
     "PGDataset",

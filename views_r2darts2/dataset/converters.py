@@ -10,6 +10,7 @@ so peak memory is one batch, never the whole file.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,84 @@ import zarr
 from views_r2darts2.dataset import readers
 
 _FLOAT = np.float32
+
+logger = logging.getLogger(__name__)
+
+
+def _log_entity_filter(
+    final_time: Any,
+    original_entities: np.ndarray | list,
+    valid_entities: np.ndarray | list,
+) -> None:
+    dropped = sorted(set(original_entities) - set(valid_entities))
+    logger.info(
+        "Entity-at-end filter: final_timestamp=%s original=%d retained=%d "
+        "dropped=%d dropped_ids=%s",
+        final_time,
+        len(original_entities),
+        len(valid_entities),
+        len(dropped),
+        dropped,
+    )
+
+
+def filter_frame_entities_at_end(
+    df: pd.DataFrame,
+    time_id: str,
+    entity_id: str,
+) -> pd.DataFrame:
+    """Keep entities represented by a row at the source's final timestamp."""
+    if df.empty:
+        raise ValueError("Cannot filter entities at end of an empty observational source")
+    final_time = df.index.get_level_values(time_id).max()
+    original_entities = df.index.get_level_values(entity_id).unique()
+    final_rows = df.xs(final_time, level=time_id, drop_level=False)
+    valid_entities = final_rows.index.get_level_values(entity_id).unique()
+    if len(valid_entities) == 0:
+        raise ValueError(
+            f"No entities are present at final timestamp {final_time!r}"
+        )
+    _log_entity_filter(final_time, original_entities, valid_entities)
+    return df[
+        df.index.get_level_values(entity_id).isin(valid_entities)
+    ]
+
+
+def filter_dataset_entities_at_end(ds: xr.Dataset) -> xr.Dataset:
+    """Filter an observational coordinate grid to entities present at its end."""
+    if bool(ds.attrs.get("is_prediction", False)):
+        return ds
+    time_id = ds.attrs.get("time_id")
+    entity_id = ds.attrs.get("entity_id")
+    if not time_id or not entity_id or time_id not in ds.coords or entity_id not in ds.coords:
+        raise ValueError(
+            "Cannot filter observational dataset without time_id/entity_id coordinates"
+        )
+    if ds.sizes.get(time_id, 0) == 0 or ds.sizes.get(entity_id, 0) == 0:
+        raise ValueError("Cannot filter entities at end of an empty observational dataset")
+
+    final_time = ds[time_id].values.max()
+    present = None
+    for variable in ds.data_vars.values():
+        if time_id not in variable.dims or entity_id not in variable.dims:
+            continue
+        at_end = variable.sel({time_id: final_time}).notnull()
+        reduce_dims = [dim for dim in at_end.dims if dim != entity_id]
+        if reduce_dims:
+            at_end = at_end.any(dim=reduce_dims)
+        present = at_end if present is None else (present | at_end)
+    if present is None:
+        raise ValueError("Observational dataset has no time/entity data variables")
+
+    valid_mask = np.asarray(present.compute().values, dtype=bool)
+    original_entities = np.asarray(ds[entity_id].values)
+    valid_entities = original_entities[valid_mask]
+    if len(valid_entities) == 0:
+        raise ValueError(
+            f"No entities are present at final timestamp {final_time!r}"
+        )
+    _log_entity_filter(final_time, original_entities, valid_entities)
+    return ds.sel({entity_id: valid_entities})
 
 
 # --------------------------------------------------------------------------- #
@@ -131,9 +210,13 @@ class DataFrameConverter:
         *,
         targets: list[str] | None = None,
         broadcast_features: bool = False,
+        filter_entities_at_end: bool = True,
         extra_attrs: dict[str, Any] | None = None,
     ) -> Path:
         df, time_id, entity_id = _normalize_dataframe(df)
+        is_prediction = any(str(c).startswith("pred_") for c in df.columns)
+        if filter_entities_at_end and not is_prediction:
+            df = filter_frame_entities_at_end(df, time_id, entity_id)
         times, entities, sample_size, columns, specs = _frame_to_grid(
             df, time_id, entity_id
         )
@@ -274,12 +357,26 @@ class FeatureFrameConverter:
         ff: Any, store_path: Path, *,
         targets: list[str] | None = None,
         broadcast_features: bool = False,
+        filter_entities_at_end: bool = True,
         extra_attrs: dict[str, Any] | None = None,
     ) -> Path:
         entity_id = ff.index.level.entity_column
         time = np.asarray(ff.identifiers["time"])
         unit = np.asarray(ff.identifiers["unit"])
         values = np.asarray(ff.values, dtype=_FLOAT)  # (N, F, S)
+        if filter_entities_at_end:
+            if len(time) == 0:
+                raise ValueError("Cannot filter entities at end of an empty FeatureFrame")
+            final_time = time.max()
+            original_entities = np.unique(unit)
+            valid_entities = np.unique(unit[time == final_time])
+            if len(valid_entities) == 0:
+                raise ValueError(
+                    f"No entities are present at final timestamp {final_time!r}"
+                )
+            _log_entity_filter(final_time, original_entities, valid_entities)
+            keep = np.isin(unit, valid_entities)
+            time, unit, values = time[keep], unit[keep], values[keep]
         names = list(ff.feature_names)
         specs = {name: "num3" for name in names}
         # Read metadata from the FeatureFrame if available
@@ -461,6 +558,7 @@ class ParquetConverter:
         *,
         targets: list[str] | None = None,
         broadcast_features: bool = False,
+        filter_entities_at_end: bool = True,
         extra_attrs: dict[str, Any] | None = None,
     ) -> Path:
         import dask.dataframe as dd
@@ -486,16 +584,28 @@ class ParquetConverter:
 
         list_cols = [n for n, s in specs.items() if s == "num3"]
 
+        is_prediction = any(n.startswith("pred_") for n in specs)
+
         # --- Coordinate + sample_size discovery (single pass, fast columns only) ---
         times_set: set[int] = set()
         entities_set: set[int] = set()
+        final_time: int | None = None
+        final_entities: set[int] = set()
         sample_size = 1
         scan_cols = [time_id, raw_entity, *list_cols[:1]]
         for batch in pf.iter_batches(columns=scan_cols, batch_size=100000):
-            times_set.update(batch.column(time_id).to_numpy(zero_copy_only=False).tolist())
-            entities_set.update(
-                batch.column(raw_entity).to_numpy(zero_copy_only=False).tolist()
-            )
+            batch_times = batch.column(time_id).to_numpy(zero_copy_only=False)
+            batch_entities = batch.column(raw_entity).to_numpy(zero_copy_only=False)
+            times_set.update(batch_times.tolist())
+            entities_set.update(batch_entities.tolist())
+            if len(batch_times):
+                batch_final = int(batch_times.max())
+                at_batch_final = set(batch_entities[batch_times == batch_final].tolist())
+                if final_time is None or batch_final > final_time:
+                    final_time = batch_final
+                    final_entities = at_batch_final
+                elif batch_final == final_time:
+                    final_entities.update(at_batch_final)
             if list_cols and batch.num_rows:
                 first = batch.column(list_cols[0])[0]
                 if first.is_valid and hasattr(first, "as_py"):
@@ -504,9 +614,13 @@ class ParquetConverter:
                         sample_size = max(sample_size, len(value))
 
         times = np.array(sorted(times_set), dtype="int64")
+        if filter_entities_at_end and not is_prediction:
+            if final_time is None or not final_entities:
+                raise ValueError("No entities are present at the parquet's final timestamp")
+            _log_entity_filter(final_time, sorted(entities_set), sorted(final_entities))
+            entities_set = final_entities
         entities = np.array(sorted(entities_set), dtype="int64")
 
-        is_prediction = any(n.startswith("pred_") for n in specs)
         attrs = build_schema_attrs(
             specs, targets=targets, is_prediction=is_prediction,
             time_id=time_id, entity_id=entity_id,
@@ -538,6 +652,11 @@ class ParquetConverter:
                 entities_b = df_part[raw_entity].to_numpy()
             else:
                 continue
+            row_mask = np.isin(entities_b, entities)
+            if not row_mask.any():
+                continue
+            times_b = times_b[row_mask]
+            entities_b = entities_b[row_mask]
             cols_b = {}
             for name in specs:
                 if name not in df_part.columns:
@@ -549,12 +668,12 @@ class ParquetConverter:
                         cols_b[name] = np.stack([
                             np.asarray(v, dtype=_FLOAT) if isinstance(v, (list, np.ndarray))
                             else np.full(sample_size, np.nan, dtype=_FLOAT)
-                            for v in col.to_numpy()
+                            for v in col.to_numpy()[row_mask]
                         ])
                     else:
-                        cols_b[name] = col.to_numpy(dtype=_FLOAT).reshape(-1, 1)
+                        cols_b[name] = col.to_numpy(dtype=_FLOAT)[row_mask].reshape(-1, 1)
                 else:
-                    cols_b[name] = df_part[name].to_numpy(dtype=_FLOAT)
+                    cols_b[name] = df_part[name].to_numpy(dtype=_FLOAT)[row_mask]
             writer.write_batch(times_b, entities_b, cols_b)
 
         return store_path

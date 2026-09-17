@@ -1,0 +1,104 @@
+
+# ADR README and Governance Map
+
+**Revised:** 2026-09-10 — re-derived with the ADR set against 0.2.x.  
+
+This repository uses Architectural Decision Records (ADRs) to govern
+structural, semantic, and operational behavior.
+
+ADRs are divided into two categories:
+
+1. **Constitutional ADRs (000–009)**  
+   Foundational architectural rules that apply across the system.
+
+2. **Project-Specific ADRs (010+)**  
+   Domain, implementation, or feature-level decisions.
+
+---
+
+## Constitutional ADRs
+
+These ADRs define system philosophy and governance:
+
+- **ADR-000** — Use of ADRs  
+  Why this repository records decisions this way.
+
+- **ADR-001** — Ontology of the Repository  
+  Defines what concepts exist.
+
+- **ADR-002** — Topology and Dependency Rules  
+  Defines structural dependency direction.
+
+- **ADR-003** — Authority of Declarations Over Inference  
+  Defines where semantic authority lives.
+
+- **ADR-004** — Rules for Evolution and Stability  
+  Defines Stability Tiers for the Fortress architecture.
+
+- **ADR-005** — Testing as Mandatory Critical Infrastructure  
+  Defines red / beige / green test doctrine.
+
+- **ADR-006** — Intent Contracts for Non-Trivial Classes  
+  Requires declared class-level purpose.
+
+- **ADR-007** — Silicon-Based Agents as Untrusted Contributors  
+  Governs automated modification.
+
+- **ADR-008** — Observability and Explicit Failure  
+  Defines fail-loud + log requirements.
+
+- **ADR-009** — Boundary Contracts and Configuration Validation  
+  Defines explicit interface contracts and configuration validation.
+
+These ADRs form the architectural constitution of the repository.
+
+---
+
+## Operational & Domain ADRs
+
+ADRs numbered 010 and above define specific infrastructure, mathematical, and domain-level decisions:
+
+- **ADR-010** — Numerical Precision and Semantic Thresholds *(superseded by ADR-016)*  
+  Standardized `float32` and prohibited hardcoded model floors; the floor prohibition is contested on 0.2.x.
+
+- **ADR-011** — Hardware Integrity and Parallelism  
+  Defines device self-healing and GPU prediction constraints.
+
+- **ADR-012** — Scaling Pipeline and Calibration Integrity  
+  Standardizes on Darts `Pipeline`/`Scaler` and mandatory `global_fit`; the custom-wrapper prohibition is contested (D-03).
+
+- **ADR-013** — Physical Symmetrical Architecture  
+  Mandates the 1-Class-1-File Zen standard for file organization; three family files are contested (D-04).
+
+- **ADR-014** — Technical Risk Register  
+  Adopts a durable risk register as a first-class governance artifact.
+
+- **ADR-015** — Artifact-Prediction Timestamp Contract  
+  Documents the correct timestamp extraction pattern (satellite of views-pipeline-core ADR-052).
+
+- **ADR-016** — Numerical Precision, Raw Output, and the Clipping Question  
+  Supersedes ADR-010 for 0.2.x; carries `float32` and raw-output forward, records the `clip_negatives` contradiction as D-05.
+
+These must comply with the constitutional ADRs above.
+
+---
+
+## Governance Structure (Conceptual Map)
+
+- **Ontology (001)** defines what exists.
+- **Topology (002)** defines structural direction.
+- **Authority (003)** defines who owns meaning.
+- **Evolution (004)** defines stability tiers.
+- **Boundary Contracts (009)** define interaction rules.
+- **Numerical Laws (016, superseding 010)** ensure precision and raw intentionality.
+- **Hardware Laws (011)** prevent race conditions and device drift.
+- **Mathematical Laws (012)** preserve probabilistic calibration.
+- **Physical Zen (013)** ensures predictable class-to-file discovery.
+- **Observability (008)** enforces failure semantics.
+- **Testing (005)** verifies system integrity.
+- **Intent Contracts (006)** bind class-level behavior.
+- **Automation Governance (007)** constrains silicon-based agents.
+- **Risk Register (014)** tracks known risks durably.
+- **Timestamp Contract (015)** preserves artifact-prediction traceability.
+
+Together, these define the invariant layer of the Fortress architecture.

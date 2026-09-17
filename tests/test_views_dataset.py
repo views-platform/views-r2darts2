@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import pytest
+import xarray as xr
 from darts import TimeSeries
 
 from views_frames import (
@@ -99,6 +100,112 @@ def dataset(synthetic_cm_parquet_small: Path) -> ViewsDataset:
 
 class TestViewsDatasetLoad:
     """Top-level load sanity tests."""
+
+    def test_dataframe_filters_entities_absent_at_final_time_by_default(self) -> None:
+        index = pd.MultiIndex.from_tuples(
+            [(1, 10), (1, 20), (2, 10)], names=["month_id", "country_id"]
+        )
+        frame = pd.DataFrame({"target": [1.0, 2.0, 3.0]}, index=index)
+
+        dataset = ViewsDataset(frame, targets=["target"])
+
+        assert dataset._ds["country_id"].values.tolist() == [10]
+
+    def test_dataframe_entity_filter_can_be_disabled(self) -> None:
+        index = pd.MultiIndex.from_tuples(
+            [(1, 10), (1, 20), (2, 10)], names=["month_id", "country_id"]
+        )
+        frame = pd.DataFrame({"target": [1.0, 2.0, 3.0]}, index=index)
+
+        dataset = ViewsDataset(
+            frame, targets=["target"], filter_entities_at_end=False
+        )
+
+        assert dataset._ds["country_id"].values.tolist() == [10, 20]
+
+    def test_dataframe_presence_depends_on_row_not_values(self) -> None:
+        index = pd.MultiIndex.from_tuples(
+            [(1, 10), (1, 20), (2, 10), (2, 20)],
+            names=["month_id", "country_id"],
+        )
+        frame = pd.DataFrame(
+            {"target": [1.0, 2.0, 3.0, np.nan]}, index=index
+        )
+
+        dataset = ViewsDataset(frame, targets=["target"])
+
+        assert dataset._ds["country_id"].values.tolist() == [10, 20]
+
+    def test_parquet_filters_entities_absent_at_final_time(
+        self, tmp_path: Path
+    ) -> None:
+        index = pd.MultiIndex.from_tuples(
+            [(1, 10), (1, 20), (2, 10)], names=["month_id", "country_id"]
+        )
+        path = tmp_path / "observations.parquet"
+        pd.DataFrame({"target": [1.0, 2.0, 3.0]}, index=index).to_parquet(path)
+
+        dataset = ViewsDataset(path, targets=["target"])
+
+        assert dataset._ds["country_id"].values.tolist() == [10]
+
+    def test_feature_frame_filters_entities_absent_at_final_time(self) -> None:
+        index = SpatioTemporalIndex(
+            time=np.array([1, 1, 2], dtype=np.int64),
+            unit=np.array([10, 20, 10], dtype=np.int64),
+            level=SpatialLevel.CM,
+        )
+        frame = FeatureFrame.from_2d(
+            np.array([[1.0], [2.0], [3.0]], dtype=np.float32),
+            index=index,
+            feature_names=["target"],
+        )
+
+        dataset = ViewsDataset(frame, targets=["target"])
+
+        assert dataset._ds["country_id"].values.tolist() == [10]
+
+    def test_observational_xarray_filters_all_nan_final_entities(self) -> None:
+        source = xr.Dataset(
+            {"target": (("month_id", "country_id"), [[1.0, 2.0], [3.0, np.nan]])},
+            coords={"month_id": [1, 2], "country_id": [10, 20], "sample": [0]},
+            attrs={
+                "time_id": "month_id",
+                "entity_id": "country_id",
+                "is_prediction": False,
+                "sample_size": 1,
+                "targets": ["target"],
+                "features": [],
+                "pred_vars": [],
+                "text_cols": [],
+                "broadcast_features": False,
+            },
+        )
+
+        dataset = ViewsDataset(source)
+
+        assert dataset._ds["country_id"].values.tolist() == [10]
+
+    def test_filter_logs_every_dropped_entity(self, caplog: pytest.LogCaptureFixture) -> None:
+        index = pd.MultiIndex.from_tuples(
+            [(1, 10), (1, 20), (1, 30), (2, 10)],
+            names=["month_id", "country_id"],
+        )
+        frame = pd.DataFrame({"target": [1.0, 2.0, 3.0, 4.0]}, index=index)
+
+        with caplog.at_level("INFO", logger="views_r2darts2.dataset.converters"):
+            ViewsDataset(frame, targets=["target"])
+
+        assert "dropped_ids=[20, 30]" in caplog.text
+
+    def test_empty_observational_source_fails_loudly(self) -> None:
+        index = pd.MultiIndex.from_arrays(
+            [[], []], names=["month_id", "country_id"]
+        )
+        frame = pd.DataFrame({"target": pd.Series(dtype=float)}, index=index)
+
+        with pytest.raises(ValueError, match="empty observational source"):
+            ViewsDataset(frame, targets=["target"])
 
     def test_load_full_dataset(self, dataset: ViewsDataset) -> None:
         """Dataset must report 200 entities / 100 time steps / CM level."""
@@ -703,6 +810,20 @@ class TestViewsDatasetFrames:
         out = pred_ds.to_predictionframe()
         assert isinstance(out, PredictionFrame)
         assert out.n_rows == 2
+
+    def test_prediction_frame_bypasses_entity_filter(self) -> None:
+        index = SpatioTemporalIndex(
+            time=np.array([100, 100, 101], dtype=np.int64),
+            unit=np.array([1, 2, 1], dtype=np.int64),
+            level=SpatialLevel.CM,
+        )
+        frame = PredictionFrame(
+            np.array([[0.5], [1.5], [2.5]], dtype=np.float32), index=index
+        )
+
+        dataset = ViewsDataset(frame, targets=["sb"])
+
+        assert dataset._ds["country_id"].values.tolist() == [1, 2]
 
 
 # ----------------------------------------------------------------------

@@ -5,8 +5,8 @@
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
 | Last Updated      | 2026-09-17                           |
-| Total Concerns    | 61                                   |
-| Open Concerns     | 46                                   |
+| Total Concerns    | 62                                   |
+| Open Concerns     | 47                                   |
 | Resolved Concerns | 15                                   |
 | Governed by       | ADR-014                              |
 
@@ -183,6 +183,7 @@
 - **Narrative:** CI now installs exactly the pinned version, so the tested/shipped split that motivated this entry is closed. What remains is structural: five patches rebind private Darts classes and methods, guarded only by ad-hoc attribute flags, with no `darts.__version__` assertion and no test that imports the patched classes and checks the rebinding took effect (the one RevIN test, C-33, tests a replica). The module docstring is already one version behind the pin. Whether the patches behave correctly against `0.46.1` internals could not be verified on the audit machine — `darts` is not installed.
 - **Cross-refs:** C-12 (patch ordering/fragility); C-33 (the only patch test, against a replica); C-42 (CI seam).
 - **re-derivation (2026-09-17, `compat-darts040`):** the pin moved *down* to darts 0.40.0 and every patch still applies — the full suite passes — but the docstring's "0.45" is now wrong in the other direction, and there is still no version assertion. Raised with the maintainer on issue #36 (not a priority, his call).
+- **re-derivation (2026-09-17, later the same day):** the "every patch applies" claim above was true of import and of the unit suite, and false of a real fit — `_PatchedTrainingStep` and `ValMetricsCallback` hardcoded Darts 0.46's six-element `_produce_train_output` tuple; 0.40–0.45 take five. The first raised, the second swallowed the error at `DEBUG` (so no `val_metrics/*` were logged and `EarlyStopping` died on a missing monitor). Fixed in `cceed99` by reading the layout from the installed Darts at import (`callbacks.py` `_produce_train_output_takes_target`). This is exactly the failure this entry predicts: a patch on private internals with no version guard, invisible to unit tests because they mock the module. Two other patches (`patches.py`) survived 0.40 unchanged; nothing asserts that they will survive the next pin.
 
 ---
 
@@ -208,6 +209,7 @@
 - **re-derivation (2026-09-10, `development` @ `fe7e681`):** **Still present**, unchanged in substance; `get_device()` moved to `infrastructure/device.py`.
 - **code-review (2026-09-10):** ADR-011 decision 3 permits and encourages CPU parallel prediction "for CPU-only models"; this hardcode means no such model can be trained. ADR-011 now carries a compliance note pointing here.
 - **Cross-refs:** C-13, C-30 (coverage gaps this constraint enforces); C-18 (both concern divergence between what is tested and what ships); C-42 (the other CI seam — dependency resolution fails before any test runs).
+- **re-derivation (2026-09-17):** with `_get_common_pl_trainer_kwargs` overridden to `accelerator="cpu"` in a probe, NLinear and TiDE train and predict end-to-end on CPU (darts 0.40). So the hardcode is the *only* thing standing between CI and a real training test. Still unfixed in the catalog.
 
 ---
 
@@ -587,6 +589,16 @@
 
 ---
 
+### C-62 — `run_type="test"` sets `logger=False` while `LearningRateMonitor` is always attached, so any test-mode training run dies at `on_train_start`
+
+- **Tier:** 2 *(a documented run type that cannot train at all: Lightning raises `MisconfigurationException: Cannot use LearningRateMonitor callback with Trainer that has no logger` before the first batch. Not silent — but it means the one mode intended for CI/smoke use is the one mode that is unusable, and nothing in the suite exercises it.)*
+- **Source:** compat-darts040 end-to-end probe (2026-09-17) — found while trying to run a real fit with `run_type="test"`; reproduced independent of the Darts version.
+- **Trigger:** Any `ModelCatalog(config)` training with `config["run_type"] == "test"` — the value the catalog itself special-cases to avoid W&B.
+- **Location:** `views_r2darts2/catalogs/model_catalog.py:194-195` (`callbacks.append(LearningRateMonitor(logging_interval="epoch"))`, unconditional) vs `:200-204` (`"logger": False if is_test else WandbLogger(...)`).
+- **Narrative:** The two lines were written for different purposes — the monitor "makes LR reductions visible in WandB", the `logger=False` keeps test runs off W&B — and never met. Fix is one condition: attach the monitor only when a logger exists, or give test runs a `CSVLogger`. The probe used the second. Once fixed, `run_type="test"` plus the C-21 accelerator fix would let CI train a model.
+- **Cross-refs:** C-21 (the other blocker on the same path); C-13 (callbacks untested — this would have been caught by any test that constructs a Trainer from the catalog).
+
+---
 
 ## Disagreements
 

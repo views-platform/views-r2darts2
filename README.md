@@ -4,7 +4,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python Version" />
   &nbsp;&nbsp;
-  <img src="https://img.shields.io/badge/darts-0.46.1-green.svg" alt="Darts Version" />
+  <img src="https://img.shields.io/badge/darts-0.40.0-green.svg" alt="Darts Version" />
   &nbsp;&nbsp;
   <img src="https://img.shields.io/badge/pytorch-2.x-orange.svg" alt="PyTorch" />
   &nbsp;&nbsp;
@@ -37,7 +37,7 @@ cd views-r2darts2
 pip install -e .
 ```
 
-Requires `darts==0.46.1`. `views-pipeline-core>=3.0.0,<4.0.0` is an optional extra: `pip install -e ".[manager]"`. It is imported lazily by `DartsForecastingModelManager` and by the four `ViewsDataset` persistence methods (`save_predstore`, `save_appwrite`, `from_predstore_latest`, `from_appwrite_latest`); everything else works without it. For GPU support, install the appropriate PyTorch version for your CUDA setup first. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
+Requires `darts==0.40.0` and pandas 1.x — the newest versions the VIEWS platform can host (its `viewser` / `views-transformation-library` dependencies pin `pandas<2`, `views-datafactory` caps `xarray<2026` and `zarr<3`). `views-pipeline-core>=3.0.0,<4.0.0` is an optional extra: `pip install -e ".[manager]"`. It is imported lazily by `DartsForecastingModelManager` and by the four `ViewsDataset` persistence methods (`save_predstore`, `save_appwrite`, `from_predstore_latest`, `from_appwrite_latest`); everything else works without it. For GPU support, install the appropriate PyTorch version for your CUDA setup first. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
 ---
 

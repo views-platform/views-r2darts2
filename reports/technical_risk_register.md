@@ -6,8 +6,8 @@
 | Owner             | Simon Polichinel von der Maase       |
 | Last Updated      | 2026-09-17                           |
 | Total Concerns    | 61                                   |
-| Open Concerns     | 48                                   |
-| Resolved Concerns | 13                                   |
+| Open Concerns     | 46                                   |
+| Resolved Concerns | 15                                   |
 | Governed by       | ADR-014                              |
 
 ---
@@ -174,7 +174,7 @@
 
 ---
 
-### C-18 — Patch layer reaches into Darts internals with no version assertion; module docstring names 0.45 against a 0.46.1 pin
+### C-18 — Patch layer reaches into Darts internals with no version assertion; module docstring names 0.45 against the pin (0.46.1 until 2026-09-17, 0.40.0 since)
 
 - **Tier:** 2 *(the monkey-patches target version-specific Darts internals; a version bump can make a patch fail to apply or silently no-op with no test catching it — silent divergence between intended and shipped behaviour. **Rewritten 2026-09-10**: the original 0.40.0-vs-0.38.0 divergence is gone; the residual is the absence of any guard.)*
 - **Source:** tech-debt-cleanup (survey) + test-review (F-7); re-derived 2026-09-10
@@ -182,6 +182,7 @@
 - **Location:** `pyproject.toml:14` (`darts = "==0.46.1"`); `views_r2darts2/infrastructure/patches.py:3` (docstring: "Darts 0.45 internals"); `patches.py:204-946` (RevIN, TCN, TiDE MC-dropout, N-HiTS and N-BEATS layernorm patches, all reaching into Darts private classes). No test asserts `darts.__version__`. `.github/workflows/run_pytest.yml:31-33` installs the pin fresh each run (no committed lockfile).
 - **Narrative:** CI now installs exactly the pinned version, so the tested/shipped split that motivated this entry is closed. What remains is structural: five patches rebind private Darts classes and methods, guarded only by ad-hoc attribute flags, with no `darts.__version__` assertion and no test that imports the patched classes and checks the rebinding took effect (the one RevIN test, C-33, tests a replica). The module docstring is already one version behind the pin. Whether the patches behave correctly against `0.46.1` internals could not be verified on the audit machine — `darts` is not installed.
 - **Cross-refs:** C-12 (patch ordering/fragility); C-33 (the only patch test, against a replica); C-42 (CI seam).
+- **re-derivation (2026-09-17, `compat-darts040`):** the pin moved *down* to darts 0.40.0 and every patch still applies — the full suite passes — but the docstring's "0.45" is now wrong in the other direction, and there is still no version assertion. Raised with the maintainer on issue #36 (not a priority, his call).
 
 ---
 
@@ -388,17 +389,6 @@
 
 ---
 
-### C-42 — `views-r2darts2[manager]` cannot be installed against any published `views-pipeline-core`; CI red on `development` since 2026-08-15 (`main` since ≤2026-08-26). r2darts2's two edges fixed 2026-09-16; two platform edges remain
-
-- **Tier:** 2 *(**rewritten 2026-09-16** after `/code-review` of PR #47 — the earlier text named the wrong live mechanism. The live line's test job fails at dependency resolution on every run, so no test has executed in CI since 2026-07-02; structural, with a trigger on every push and every release. Stays 2 after this repository's edges are closed because the platform edges still make `[manager]` uninstallable.)*
-- **Source:** repo-assimilation (2026-09-10) (Phase 6); the full four-edge analysis is `views-r2darts2` issue #34 (Polichinel, 2026-09-09), which this entry should have followed from the start.
-- **Trigger:** Cutting a release; changing any dependency bound in `pyproject.toml` and relying on a green CI run as evidence it resolves; or reading "CI is green" as evidence that tests ran (see C-60).
-- **Location:** `pyproject.toml:14-24` (`darts`, `dask`, `numpy`, `pandas`, `xarray`, `zarr`, `views-frames`, `wandb`, `views-pipeline-core`); `.github/workflows/run_pytest.yml:33` (`poetry install`, no lockfile — Poetry resolves the optional extra whether or not it is selected). Platform side: pipeline-core 3.0.0–3.2.0 all declare `views-transformation-library>=2.7.2,<3.0.0` (only 2.7.2 exists: `pandas>=1.2.3,<2.0.0`) and `viewser>=6.6.4,<7.0.0` (only 6.6.4 exists: `pandas<2.0.0`, `toolz>=0.11.1,<0.12.0`).
-- **Narrative — what is live now:** two independent platform edges. **pandas:** `darts==0.46.1` and `xarray>=2026.7.0` both need `pandas>=2.2`; the hub's `views-transformation-library` and `viewser` pins both need `pandas<2`. **toolz:** `dask>=2026.7.1` needs `toolz>=0.12`; `viewser` needs `toolz<0.12`. Neither has a version inside pipeline-core's declared ranges that relaxes it; both close only when pipeline-core drops or upgrades those two packages (its `chore/retire-update-viewser` branch — which at `9cdcb0e` still declares `viewser = "^6.6.4"` — and issue #308 / C-112 there). Resolver-verified 2026-09-16 (uv, py3.11): the base install resolves; `--extra manager` fails on pandas, and peeling pandas surfaces toolz. **Not fixable from this repository.** A `views-r2darts2` release is also still needed before consumers see any of this: PyPI 0.2.1 declares `wandb>=0.28.2`, and `publish_package.yml:41` refuses to publish without a version bump (maintainer's step).
-- **re-derivation (2026-09-16, `wandb-unpin` @ `c7fc4c8`, `243afed`):** r2darts2's own edges are closed. (1) The wandb pin `>=0.28.2` (added 2026-08-13 in `b933e34`, one line, message "wandb", the day after 0.28.2 shipped) is replaced by the **floor `>=0.18.7`** issue #34 asked for — as a *main* dependency, because `catalogs/model_catalog.py:204` instantiates `WandbLogger` outside the manager path and PyTorch Lightning declares no wandb of its own. PR #47's first commit (`21df698`) had *deleted* the line instead; that left a base install without wandb and was reverted here. (2) `views-frames` bounded `>=1.10.2,<2.0.0` (#34's second ask). (3) `darts[torch]` and `zarr>=3.0` declared — see C-60; `numpy>=1.26.0` and `pandas>=2.2.0` declared too (imported directly, floors copied from darts 0.46.1 — no change to the resolution, the file just stops relying on a transitive accident). (4) The last `import wandb` (sweep loop) is gone: `WandBModule.initialize_run()` returns the `Run` (`views_pipeline_core/modules/wandb/wandb.py:44-91`), and `run.config` is what `wandb.config` proxies — a local edit, contrary to what the previous draft of this entry, PR #47's body and hydranet #379 said. History corrected: the wandb pin was **one of two independent causes**, never the sole one — `development` went red on 2026-08-15 (`8fc9a3a`), and run 31530136377 (2026-08-11, `3b4ca6c`) already failed on pandas two days before the pin existed; Poetry simply reported wandb first once both were present. Rule this repository now follows (its proper home is an ADR-002 amendment, follow-up): **a spoke declares every package it imports, with hub-compatible floors, never a range the hub excludes.** The earlier "spokes don't pin the hub's dependencies" was wrong for a spoke whose hub is optional and which imports the package itself (pipeline-core's own register treats used-but-undeclared as a defect, C-216/C-253 there).
-- **Cross-refs:** C-60 (why "install passes" would still not mean "tests ran"); C-21 (the other CI seam); C-18 (no lockfile, fresh resolve per run); C-51 (warn-and-continue family, for the `WandbLogger` failure mode when wandb is absent — now moot).
----
-
 ### C-43 — A live sweep config names an entrypoint script that exists only under `reports/archived/`
 
 - **Tier:** 4 *(one W&B sweep config points at a script that is not on any runtime path; the sweep would fail at launch, loudly)*
@@ -583,17 +573,6 @@
 - **Location:** `views_r2darts2/catalogs/model_catalog.py:181-187` — `ModelCheckpoint(monitor=..., mode="min", save_top_k=1, save_last=True, filename="{epoch:03d}-best")` with no `dirpath`; `grep -rn 'dirpath\|default_root_dir\|work_dir' views_r2darts2` → 0 hits. Darts never sets `default_root_dir`, so Lightning resolves the path to `<WandbLogger.save_dir="."> /lightning_logs/<run_id>/checkpoints/` (or `./checkpoints/` when `logger=False`, `:204`). Reader side: the only checkpoint reload is `darts_forecaster.py:209` `load_weights_from_checkpoint(best=False)`, which reads Darts' own `darts_logs/` folder (already ignored, `.gitignore:206`).
 - **Narrative:** Two checkpoint writers run per training: Darts' own (`darts_logs/…`, read back) and this one (CWD-relative, never read). For TFT/TiDE that is tens to hundreds of MB per run left wherever the process started. Either give the callback `dirpath=<model_path.artifacts>/checkpoints` so the "best" it selects is where the artifacts live, or drop the callback and rely on Darts'. The `.pt.ckpt` sidecar `TorchForecastingModel.save` writes next to every saved artifact is legitimate and separate.
 - **Cross-refs:** C-13 (callbacks untested); C-51 (the `checkpoint_mode='last'` reload that *is* read, and swallows failures).
-
----
-
-### C-60 — torch, pytorch-lightning and zarr were imported at module level and declared nowhere; CI could never have run a test even with the platform edges gone
-
-- **Tier:** 2 *(a "green" install step would have been followed by 29 collection errors and 0 tests executed; every "CI is green" reading since July would have been false. Declared as of 2026-09-16 (`{C1}`) but kept open: no CI run can prove collection until C-42's platform edges close.)*
-- **Source:** code-review (2026-09-16) (verified by building the pre-fix base environment: 169 packages, no torch / pytorch-lightning / zarr / wandb; `pytest tests/` → `Interrupted: 29 errors during collection` — 23× `No module named 'torch'`, 6× `No module named 'zarr'`)
-- **Trigger:** Any claim that CI is green, or any dependency edit that relies on `poetry install` having produced a working environment.
-- **Location:** `pyproject.toml:14` (`darts` — its `torch` extra carries `torch>=2.0.0` and `pytorch-lightning>=2.0.0`; darts ≥0.41 dropped them from core), `:21` (`zarr`); imports at `views_r2darts2/dataset/converters.py:20` (`import zarr`) and torch/Lightning across `catalogs/`, `engines/`, `infrastructure/`, `math/`; `.github/workflows/run_pytest.yml:33`.
-- **Narrative:** The last green run (2026-07-02, `e90cb41`) passed only because the pandas<2 edge then forced darts down to 0.40, whose core dependencies still included torch and Lightning. The 0.2.x rewrite pinned darts 0.46.1 and added zarr without declaring either's transitive needs, and CI has failed at install ever since, so the collection failure behind it was never seen. Fixed in `pyproject.toml` by `darts = {{ version = "==0.46.1", extras = ["torch"] }}` and `zarr = ">=3.0"`; verified locally by building the corrected base environment and running the suite (see the `wandb-unpin` PR). Resolve when a CI run on `development` shows tests collected.
-- **Cross-refs:** C-42 (the install-time edges that hide this one); C-21 (`accelerator="gpu"` — the *next* thing CI would hit once tests run); C-18 (no lockfile).
 
 ---
 
@@ -800,6 +779,39 @@
 - **Location:** Previously at `views_r2darts2/transformers/feature_scaler_manager.py:83-88`
 - **Resolution:** `_instantiate_scaler(None)` used to return `None`, which was then stored in `self._scalers` and later dereferenced as a Darts `Scaler`/`Pipeline` at fit time, producing an `AttributeError` on `scaler.transformer` that was hard to trace back to the misconfigured group. The fix makes `FeatureScalerManager._instantiate_scaler` raise `ValueError` at parse time when `scaler_cfg is None`, so the misconfiguration fails loudly at manager construction rather than at fit time. `DartsForecaster._instantiate_scaler` retains its `None → None` pass-through because a forecaster legitimately supports having no target or feature scaler — the narrow fix applies only to the manager where `None` is always a misconfiguration. Regression test in `tests/test_scaling.py::TestFeatureScalerManagerRejectsNoneScalerConfig` covers the direct `None` rejection and the named-group-without-scaler-and-no-default reproducer.
 - **Note:** Registered and resolved in the same commit — this was surfaced by a second Copilot comment during PR #10 review after the initial register (7b92bfa). Tier 2 because the silent propagation reached downstream fit code and only surfaced as a non-obvious `AttributeError`, meeting the "structural fragility with clear trigger" criterion.
+
+---
+
+---
+
+---
+
+### C-42 — `views-r2darts2[manager]` cannot be installed against any published `views-pipeline-core`; CI red on `development` since 2026-08-15 *(resolved 2026-09-17 — r2darts2 lowered to the platform's versions)*
+
+- **Tier:** 2 *(**rewritten 2026-09-16** after `/code-review` of PR #47 — the earlier text named the wrong live mechanism. The live line's test job fails at dependency resolution on every run, so no test has executed in CI since 2026-07-02; structural, with a trigger on every push and every release. Stays 2 after this repository's edges are closed because the platform edges still make `[manager]` uninstallable.)*
+- **Source:** repo-assimilation (2026-09-10) (Phase 6); the full four-edge analysis is `views-r2darts2` issue #34 (Polichinel, 2026-09-09), which this entry should have followed from the start.
+- **Trigger:** Cutting a release; changing any dependency bound in `pyproject.toml` and relying on a green CI run as evidence it resolves; or reading "CI is green" as evidence that tests ran (see C-60).
+- **Location:** `pyproject.toml:14-24` (`darts`, `dask`, `numpy`, `pandas`, `xarray`, `zarr`, `views-frames`, `wandb`, `views-pipeline-core`); `.github/workflows/run_pytest.yml:33` (`poetry install`, no lockfile — Poetry resolves the optional extra whether or not it is selected). Platform side: pipeline-core 3.0.0–3.2.0 all declare `views-transformation-library>=2.7.2,<3.0.0` (only 2.7.2 exists: `pandas>=1.2.3,<2.0.0`) and `viewser>=6.6.4,<7.0.0` (only 6.6.4 exists: `pandas<2.0.0`, `toolz>=0.11.1,<0.12.0`).
+- **Narrative — what is live now:** two independent platform edges. **pandas:** `darts==0.46.1` and `xarray>=2026.7.0` both need `pandas>=2.2`; the hub's `views-transformation-library` and `viewser` pins both need `pandas<2`. **toolz:** `dask>=2026.7.1` needs `toolz>=0.12`; `viewser` needs `toolz<0.12`. Neither has a version inside pipeline-core's declared ranges that relaxes it; both close only when pipeline-core drops or upgrades those two packages (its `chore/retire-update-viewser` branch — which at `9cdcb0e` still declares `viewser = "^6.6.4"` — and issue #308 / C-112 there). Resolver-verified 2026-09-16 (uv, py3.11): the base install resolves; `--extra manager` fails on pandas, and peeling pandas surfaces toolz. **Not fixable from this repository.** A `views-r2darts2` release is also still needed before consumers see any of this: PyPI 0.2.1 declares `wandb>=0.28.2`, and `publish_package.yml:41` refuses to publish without a version bump (maintainer's step).
+- **re-derivation (2026-09-16, `wandb-unpin` @ `c7fc4c8`, `243afed`):** r2darts2's own edges are closed. (1) The wandb pin `>=0.28.2` (added 2026-08-13 in `b933e34`, one line, message "wandb", the day after 0.28.2 shipped) is replaced by the **floor `>=0.18.7`** issue #34 asked for — as a *main* dependency, because `catalogs/model_catalog.py:204` instantiates `WandbLogger` outside the manager path and PyTorch Lightning declares no wandb of its own. PR #47's first commit (`21df698`) had *deleted* the line instead; that left a base install without wandb and was reverted here. (2) `views-frames` bounded `>=1.10.2,<2.0.0` (#34's second ask). (3) `darts[torch]` and `zarr>=3.0` declared — see C-60; `numpy>=1.26.0` and `pandas>=2.2.0` declared too (imported directly, floors copied from darts 0.46.1 — no change to the resolution, the file just stops relying on a transitive accident). (4) The last `import wandb` (sweep loop) is gone: `WandBModule.initialize_run()` returns the `Run` (`views_pipeline_core/modules/wandb/wandb.py:44-91`), and `run.config` is what `wandb.config` proxies — a local edit, contrary to what the previous draft of this entry, PR #47's body and hydranet #379 said. History corrected: the wandb pin was **one of two independent causes**, never the sole one — `development` went red on 2026-08-15 (`8fc9a3a`), and run 31530136377 (2026-08-11, `3b4ca6c`) already failed on pandas two days before the pin existed; Poetry simply reported wandb first once both were present. Rule this repository now follows (its proper home is an ADR-002 amendment, follow-up): **a spoke declares every package it imports, with hub-compatible floors, never a range the hub excludes.** The earlier "spokes don't pin the hub's dependencies" was wrong for a spoke whose hub is optional and which imports the package itself (pipeline-core's own register treats used-but-undeclared as a defect, C-216/C-253 there).
+- **Cross-refs:** C-60 (why "install passes" would still not mean "tests ran"); C-21 (the other CI seam); C-18 (no lockfile, fresh resolve per run); C-51 (warn-and-continue family, for the `WandbLogger` failure mode when wandb is absent — now moot).
+- **Resolution (2026-09-17, `compat-darts040`):** rather than wait for pipeline-core 4.0, a datafactory cap lift and an 18-model queryset migration (three repos, none of them this one), r2darts2 was pinned *down* to what the platform hosts: darts 0.40.0, pandas <2, numpy <2, xarray 2024.3, zarr 2, dask 2024.2. One code change (`ParquetConverter` reads row groups via pyarrow instead of `dask.dataframe`, a pandas-1/py3.11 wedge). Resolver: `[manager]` resolves against published pipeline-core 3.2.0 + viewser 6.6.4. Suite: 586 passed on that stack, identical to darts 0.46. Every monkey-patch applied unchanged. The platform edges described above still exist; they are no longer this package's problem. Reopen if a future feature needs darts >0.40 or pandas 2 — that reopens the whole chain.
+
+---
+
+---
+
+---
+
+### C-60 — torch, pytorch-lightning and zarr were imported at module level and declared nowhere; CI could never have run a test even with the platform edges gone *(resolved 2026-09-17)*
+
+- **Tier:** 2 *(a "green" install step would have been followed by 29 collection errors and 0 tests executed; every "CI is green" reading since July would have been false. Declared as of 2026-09-16 (`{C1}`) but kept open: no CI run can prove collection until C-42's platform edges close.)*
+- **Source:** code-review (2026-09-16) (verified by building the pre-fix base environment: 169 packages, no torch / pytorch-lightning / zarr / wandb; `pytest tests/` → `Interrupted: 29 errors during collection` — 23× `No module named 'torch'`, 6× `No module named 'zarr'`)
+- **Trigger:** Any claim that CI is green, or any dependency edit that relies on `poetry install` having produced a working environment.
+- **Location:** `pyproject.toml:14` (`darts` — its `torch` extra carries `torch>=2.0.0` and `pytorch-lightning>=2.0.0`; darts ≥0.41 dropped them from core), `:21` (`zarr`); imports at `views_r2darts2/dataset/converters.py:20` (`import zarr`) and torch/Lightning across `catalogs/`, `engines/`, `infrastructure/`, `math/`; `.github/workflows/run_pytest.yml:33`.
+- **Narrative:** The last green run (2026-07-02, `e90cb41`) passed only because the pandas<2 edge then forced darts down to 0.40, whose core dependencies still included torch and Lightning. The 0.2.x rewrite pinned darts 0.46.1 and added zarr without declaring either's transitive needs, and CI has failed at install ever since, so the collection failure behind it was never seen. Fixed in `pyproject.toml` by `darts = {{ version = "==0.46.1", extras = ["torch"] }}` and `zarr = ">=3.0"`; verified locally by building the corrected base environment and running the suite (see the `wandb-unpin` PR). Resolve when a CI run on `development` shows tests collected.
+- **Cross-refs:** C-42 (the install-time edges that hide this one); C-21 (`accelerator="gpu"` — the *next* thing CI would hit once tests run); C-18 (no lockfile).
+- **Resolution (2026-09-17):** declared in `pyproject.toml` (`darts[torch]`, `zarr`) on 2026-09-16; with C-42 resolved the same stack now installs in CI, so the next `development` run will show tests collected — the condition this entry was waiting for. Close when that run is green; reopen if collection fails.
 
 ---
 

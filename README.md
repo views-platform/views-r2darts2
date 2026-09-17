@@ -272,7 +272,7 @@ The repository is governed by:
 - **[Architectural Decision Records (ADRs)](docs/ADRs/README.md)**: Sequential, authoritative records of every major design choice.
 - **[Class Intent Contracts (CICs)](docs/CICs/README.md)**: Explicit declarations of purpose and responsibility for every critical class.
 - **[Reproducibility Manifest](docs/standards/REPRODUCIBILITY_MANIFEST.md)**: The mandatory DNA genome that every experiment must declare before execution.
-- **[Technical Risk Register](reports/technical_risk_register.md)**: Every known, unfixed concern, tiered and triggered (ADR-014); and the open ADR-vs-code disagreements D-01..D-07 (each also filed as a GitHub issue, #39–#45).
+- **[Technical Risk Register](reports/technical_risk_register.md)**: Every known, unfixed concern, tiered and triggered (ADR-014); and the ADR-vs-code disagreements D-01..D-07 (each filed as a GitHub issue, #39–#45; D-05 ruled and closed via #40).
 - `bash docs/validate_docs.sh` checks the documentation set against itself *and* against the code tree — every `views_r2darts2/…py` or `tests/…py` path a live doc (this README included) names must exist. It is run by hand, not by CI (register C-55).
 
 ### Training Stability Callbacks

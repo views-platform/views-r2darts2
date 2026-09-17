@@ -4,9 +4,9 @@
 |-------------------|--------------------------------------|
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
-| Last Updated      | 2026-09-16                           |
-| Total Concerns    | 60                                   |
-| Open Concerns     | 47                                   |
+| Last Updated      | 2026-09-17                           |
+| Total Concerns    | 61                                   |
+| Open Concerns     | 48                                   |
 | Resolved Concerns | 13                                   |
 | Governed by       | ADR-014                              |
 
@@ -597,6 +597,18 @@
 
 ---
 
+### C-61 — `clip_negatives=False` does not reach the streaming path
+
+- **Tier:** 3 *(a documented opt-out that silently does nothing on the path large runs take; the floor itself is now sanctioned (ADR-016), so the harm is confined to inspection and debugging, not to shipped forecasts)*
+- **Source:** falsify / code-review of PR #38 (2026-09-10), separated from D-05 when that was ruled (2026-09-17)
+- **Trigger:** Passing `clip_negatives=False` to inspect raw model output on a run that goes through `_predict_streaming`, and reading the clipped result as raw.
+- **Location:** `views_r2darts2/engines/darts_forecaster.py:515` (`np.maximum(target_values, 0.0, out=target_values)`, unconditional); `views_r2darts2/dataset/base.py` `ingest_*_predictions` (`clip_negatives=True`, honoured). The `expm1`-path floors at `base.py:1520`, `:1559` are domain guards before the inverse transform and are out of scope.
+- **Narrative:** One policy, two sites, one switch. The maintainer's ruling settles *whether* to clip; this entry is only about the switch reaching both places. The fix is to thread the ingest parameter (or a forecaster-level `clip_negatives`) through to `:515`, and to add a test that pushes a negative prediction through the streaming path with the opt-out set and asserts it survives. Raised with the maintainer on issue #40 as a consistency ask; no reply yet.
+- **Cross-refs:** D-05 (resolved — the design ruling); ADR-016 decision 3.
+
+---
+
+
 ## Disagreements
 
 > Each D-entry records a contradiction between an accepted ADR and the 0.2.x code, surfaced by the
@@ -645,17 +657,6 @@
 | Source | repo-assimilation (2026-09-10) |
 | Perspectives | **ADR-013 §1** — every non-trivial class has exactly one file. **Code** — `dataset/converters.py` (5 converters), `dataset/subclasses.py` (6 LOA datasets, 81 lines total), `transformers/static_covariates.py` (config + result dataclass). Each is a family with one shared contract; splitting `subclasses.py` would produce six ten-line files. |
 | Resolution | Unresolved. Ruling for the ADR → split three files into thirteen. Ruling for the code → extend ADR-013 §3's hub concept to "homogeneous families", and record the three as sanctioned. |
-
----
-
-### D-05: Output semantics — no semantic floors in the data layer (ADR-010/016) vs `clip_negatives=True` (code)
-
-| Field | Value |
-|-------|-------|
-| ID | D-05 |
-| Source | repo-assimilation (2026-09-10) |
-| Perspectives | **ADR-010 §3, carried into ADR-016 as an open question** — clipping in the data layer is a hidden heuristic that masks model behaviour; any floor belongs in evaluation or as a declared gene. **Code** — two sites: `ViewsDataset.ingest_darts_predictions` / `ingest_numpy_predictions` default `clip_negatives=True`, an **unconditional** `np.maximum(target_values, 0.0)` at `engines/darts_forecaster.py:515` on the streaming path with no opt-out, and two more unconditional floors on the `log_targets` inverse path at `dataset/base.py:1520` and `:1559` (before `expm1`); `DartsForecaster`'s docstring lists non-negativity as a guarantee; the argument is that fatality counts cannot be negative and this is physics, not modelling. |
-| Resolution | Unresolved. Ruling for the ADR → flip the ingest default, remove or gate the streaming and `expm1`-path clips (four sites), or add a `prediction_floor` gene; update the forecaster docstring and CIC. Ruling for the code → ADR-016 §3 becomes a decision rather than an open question, distinguishing the physical zero floor from modelling thresholds. |
 
 ---
 
@@ -804,11 +805,24 @@
 
 ---
 
+## Resolved Disagreements
+
+### D-05: Output semantics — no semantic floors in the data layer (ADR-010/016) vs `clip_negatives=True` (code) *(resolved 2026-09-17 — ruled for the code)*
+
+| Field | Value |
+|-------|-------|
+| ID | D-05 |
+| Source | repo-assimilation (2026-09-10) |
+| Perspectives | **ADR-010 §3, carried into ADR-016 as an open question** — clipping in the data layer is a hidden heuristic that masks model behaviour; any floor belongs in evaluation or as a declared gene. **Code** — two sites: `ViewsDataset.ingest_darts_predictions` / `ingest_numpy_predictions` default `clip_negatives=True`, an **unconditional** `np.maximum(target_values, 0.0)` at `engines/darts_forecaster.py:515` on the streaming path with no opt-out, and two more unconditional floors on the `log_targets` inverse path at `dataset/base.py:1520` and `:1559` (before `expm1`); `DartsForecaster`'s docstring lists non-negativity as a guarantee; the argument is that fatality counts cannot be negative and this is physics, not modelling. |
+| Resolution | **Ruled for the code.** Maintainer on issue #40 (2026-09-10): "Leave as is. Not a breaking issue." ADR-016 decision 3 rewritten on 2026-09-17 to state the floor as domain physics; ADR-010's prohibition now explicitly excludes it. The residual — `clip_negatives=False` does not reach `_predict_streaming` — is a consistency defect, not a disagreement, and is C-61. Superseded text of the field: Ruling for the ADR → flip the ingest default, remove or gate the streaming and `expm1`-path clips (four sites), or add a `prediction_floor` gene; update the forecaster docstring and CIC. Ruling for the code → ADR-016 §3 becomes a decision rather than an open question, distinguishing the physical zero floor from modelling thresholds. |
+
+---
+
 ## Register Conventions
 
 - **ID format:** `C-xx` for concerns, `D-xx` for disagreements. IDs are permanent — gaps indicate merged or resolved entries.
 - **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `review-base-docs`, `code-review`, `falsify`, `survey_risk retirement audit`, `incident`.
-- **Disagreements:** `D-xx` entries record an ADR-vs-code contradiction awaiting a ruling. They are not concerns; they point at the concern (if any) that is the code side.
+- **Disagreements:** `D-xx` entries record an ADR-vs-code contradiction awaiting a ruling. Once ruled, the entry moves to **Resolved Disagreements** with the ruling and its source (issue, PR, or conversation) in the Resolution field; the affected ADR is rewritten to state the ruling as a decision. They are not concerns; they point at the concern (if any) that is the code side.
 - **Re-derivation:** when the code moves under an entry, the entry is re-verified and carries a dated `re-derivation` bullet; Location is updated to current line numbers; Tier is changed only with a stated reason.
 - **Resolution:** Move to "Resolved Concerns" with resolution date and one-line summary when addressed. Do not delete.
 - **Header counts:** Manually maintained — update whenever a concern is added or resolved.

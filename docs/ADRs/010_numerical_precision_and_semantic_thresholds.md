@@ -6,7 +6,7 @@
 
 ---
 
-> **Superseded.** Decisions 1, 2 and 4 below carry forward unchanged into ADR-016. Decision 3 (Prohibition of Semantic Floors) is contradicted by the 0.2.x code and is the subject of register **D-05**. The implementation notes name a method (`_process_predictions`) and a scaling test file that no longer exist. Read ADR-016.
+> **Superseded.** Decisions 1, 2 and 4 below carry forward unchanged into ADR-016. Decision 3 (Prohibition of Semantic Floors) was contradicted by the 0.2.x code; the maintainer ruled on 2026-09-10 (issue #40) that the non-negativity floor is domain physics and stays — ADR-016 decision 3 records the ruling. The implementation notes name a method (`_process_predictions`) and a scaling test file that no longer exist. Read ADR-016.
 
 ## Context
 

@@ -44,7 +44,7 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 - [x] **ADR-014:** Technical risk register (governs `reports/technical_risk_register.md`)
 - [x] **ADR-015:** Artifact-prediction timestamp contract
       (satellite of views-pipeline-core ADR-052; cross-repo refs are intentional)
-- [x] **ADR-016:** Numerical precision, raw output, and the clipping question (D-05 open)
+- [x] **ADR-016:** Numerical precision, raw output, and the non-negativity floor (ruled 2026-09-10)
 
 ---
 
@@ -102,4 +102,4 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 - [x] `docs/validate_docs.sh` present and passing
 - [x] Compliance report archived — `archive/ADR_COMPLIANCE_REPORT.md` is marked HISTORICAL
       (it certified the 0.1.x codebase; nothing in it is asserted of 0.2.x). Current
-      compliance state is the register: `reports/technical_risk_register.md` and D-01..D-07.
+      compliance state is the register: `reports/technical_risk_register.md` and D-01..D-07 (D-05 resolved).

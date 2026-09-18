@@ -39,8 +39,8 @@
 > re-verified: 11 still present (line numbers refreshed), 2 moved, 9 changed (C-08 and C-22
 > re-tiered down; C-12, C-18, C-32 retitled), 7 resolved (five by the rewrite, two by the
 > `governance-0.2.x` branch), 9 registered (C-35..C-43, of which C-40 was resolved by Stage 5 of this branch), 5 disagreements opened (D-01..D-05). A three-agent drift audit of the re-derived docs (review-base-docs, same date) added C-44..C-48 and D-06..D-07 — including one Tier-2 finding the re-derivation itself had missed (C-44). A max-effort `code-review` of the whole branch (same date) added C-49..C-55 — two more Tier-2s (C-49 scaler leak by default, C-54 lost regression coverage) — re-tiered C-08 to 2, widened D-05 and D-07, and corrected ~40 doc claims, a third of them introduced by the drift-audit commit itself.
-> Two sub-claims are UNVERIFIED pending a `darts==0.46.1` install: C-12 (`_Block` guard collision)
-> and C-18 (patch behaviour against 0.46.1 internals).
+> Two sub-claims were UNVERIFIED pending a Darts install; both were settled on 2026-09-18 against the
+> pinned darts 0.40.0 (see C-12 and C-18 re-derivation bullets). No UNVERIFIED sub-claims remain.
 >
 > The "silent-acceptance seam" concerns (C-07, C-09, C-10, C-24, C-29, plus latent C-08) share a
 > root theme: seams where the otherwise fail-loud pipeline silently accepts a wrong, leaky, or
@@ -132,6 +132,7 @@
 - **Location:** `views_r2darts2/infrastructure/patches.py:938-944` (`apply_all_patches`, no docstring); `_TideModule.forward` set at `:603` by `apply_tide_mc_dropout_patch` and would be overwritten at `:793` by the disabled `apply_tide_skip_layernorm_patch`; `apply_nhits_layernorm_patch:854` and `apply_nbeats_layernorm_patch:917` share the guard attribute name `_Block._views_ln_patch`; `patches.py:3` docstring says "Darts 0.45 internals" against a `==0.46.1` pin.
 - **Narrative:** The original RevIN→TiDE dependency is no longer visible in code (`apply_tide_mc_dropout_patch` `:566-611` never touches RINorm). The same shape of hazard has moved: two patches assign the same `forward`, and two patches share one guard attribute — safe only if the N-HiTS and N-BEATS `_Block` classes are unrelated, which could not be verified here (`darts` not installed). There is still no runtime assertion and no per-patch exception handling, so a Darts-internal change surfaces as an opaque crash or a silent no-op. The version pin moved from `0.40.0` to `0.46.1` while the module docstring still names `0.45`.
 - **re-derivation (2026-09-10, `development` @ `fe7e681`):** **Changed.** Original ordering dependency gone; two new same-shape hazards, one UNVERIFIED pending a `darts==0.46.1` install.
+- **re-derivation (2026-09-18, darts 0.40.0 installed):** the UNVERIFIED sub-claim is settled — `nbeats._Block` and `nhits._Block` are distinct class objects on 0.40 (`NB is NH` → False), so the shared `_views_ln_patch` guard attribute is set on each independently and cannot collide. Each reports `True` after `apply_all_patches()`. The ordering and overwrite concerns above stand.
 
 ---
 

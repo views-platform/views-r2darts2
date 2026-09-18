@@ -45,9 +45,11 @@ class ViewsDataset:
         source: Any,
         targets: list[str] | None = None,
         broadcast_features: bool = False,
+        filter_entities_at_end: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         self.broadcast_features = broadcast_features
+        self.filter_entities_at_end = filter_entities_at_end
         self._user_metadata = metadata or {}
         self._store = ZarrStore()
         zarr_path = self._ingest(source, targets, broadcast_features)
@@ -66,12 +68,16 @@ class ViewsDataset:
         if kind == "dataframe":
             return converters.DataFrameConverter.to_zarr(
                 source, target, targets=targets,
-                broadcast_features=broadcast_features, extra_attrs=extra_attrs,
+                broadcast_features=broadcast_features,
+                filter_entities_at_end=self.filter_entities_at_end,
+                extra_attrs=extra_attrs,
             )
         if kind == "parquet":
             return converters.ParquetConverter.to_zarr(
                 Path(source), target, targets=targets,
-                broadcast_features=broadcast_features, extra_attrs=extra_attrs,
+                broadcast_features=broadcast_features,
+                filter_entities_at_end=self.filter_entities_at_end,
+                extra_attrs=extra_attrs,
             )
         if kind == "prediction_frame":
             name = _single_target(targets, "PredictionFrame")
@@ -81,16 +87,27 @@ class ViewsDataset:
         if kind == "feature_frame":
             return converters.FeatureFrameConverter.to_zarr(
                 source, target, targets=targets,
-                broadcast_features=broadcast_features, extra_attrs=extra_attrs,
+                broadcast_features=broadcast_features,
+                filter_entities_at_end=self.filter_entities_at_end,
+                extra_attrs=extra_attrs,
             )
         if kind == "zarr_dir":
-            readers.open_zarr_dir(source).to_zarr(target, mode="w", consolidated=False)
+            dataset = readers.open_zarr_dir(source)
+            if self.filter_entities_at_end:
+                dataset = converters.filter_dataset_entities_at_end(dataset)
+            dataset.to_zarr(target, mode="w", consolidated=False)
             return target
         if kind == "zarr_zip":
-            readers.open_zarr_zip(source).to_zarr(target, mode="w", consolidated=False)
+            dataset = readers.open_zarr_zip(source)
+            if self.filter_entities_at_end:
+                dataset = converters.filter_dataset_entities_at_end(dataset)
+            dataset.to_zarr(target, mode="w", consolidated=False)
             return target
         if kind == "dataset":
-            source.to_zarr(target, mode="w", consolidated=False)
+            dataset = source
+            if self.filter_entities_at_end:
+                dataset = converters.filter_dataset_entities_at_end(dataset)
+            dataset.to_zarr(target, mode="w", consolidated=False)
             return target
         raise TypeError(f"Unsupported source kind: {kind}")
 
@@ -949,7 +966,9 @@ class ViewsDataset:
         })
 
         # Route through for_loa so the right subclass is returned.
-        return ViewsDataset.for_loa(level_lower, ds)
+        return ViewsDataset.for_loa(
+            level_lower, ds, filter_entities_at_end=False
+        )
 
     def add_row(
         self,

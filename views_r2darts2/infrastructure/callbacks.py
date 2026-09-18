@@ -1720,6 +1720,16 @@ class RichLossDiagnosticsCallback(Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
             return
+        if not _HAS_RICH:
+            # The import block above tolerates a missing `rich`; honour that
+            # here too instead of dying on an undefined `Table` at epoch end.
+            if not getattr(self, "_warned_no_rich", False):
+                logger.warning(
+                    "RichLossDiagnosticsCallback: `rich` is not installed; "
+                    "console diagnostics disabled for this run."
+                )
+                self._warned_no_rich = True
+            return
 
         crit = getattr(pl_module, "train_criterion", None)
         comp = getattr(crit, "_last_components", None) if crit is not None else None

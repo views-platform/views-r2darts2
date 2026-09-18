@@ -20,7 +20,7 @@ pandas = ">=1.5.0,<2.0.0"   # the platform (viewser, views-transformation-librar
 xarray = ">=2024.1.0,<2024.5.0"   # 2024.3.0 is the last xarray accepting pandas 1; views-datafactory needs >=2024.1,<2026
 zarr = ">=2.16,<3.0"   # views-datafactory caps zarr<3; stores are written in zarr v2 format
 views-frames = ">=1.10.2,<2.0.0"   # the range views-pipeline-core requires; 2.x is untested here (issue #34)
-wandb = ">=0.18.7"   # floor only, compatible with views-pipeline-core (^0.18.7); needed by catalogs/model_catalog.py:204 outside the manager path (issue #34)
+wandb = ">=0.28.2"   # the maintainer's floor (older wandb hits W&B 5xx errors, issue #34); compatible with views-pipeline-core >=3.3 (wandb <1.0, PR #520 there); needed by catalogs/model_catalog.py:204 outside the manager path
 rich = ">=13.0"   # console diagnostics in infrastructure/callbacks.py (RichLossDiagnosticsCallback); was imported but never declared
 views-pipeline-core = { version = ">=3.0.0,<4.0.0", optional = true }
 

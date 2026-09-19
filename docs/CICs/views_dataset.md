@@ -32,6 +32,7 @@
 - **Scaler state is owned here:** `fit_scalers` fits target and feature scalers on whatever `time_ids` the caller passes — **the default `time_ids=None` fits on the full dataset, test period included, with no warning** (`base.py:1139`, docstring `:1151`; register C-49). `DartsForecaster.train()` passes the training window; any other caller must too. It returns the aligned `(targets, past_covariates)` lists in one call (`_split_targets_covariates`), so the two can never be misaligned by index.
 - **Inverse transforms preserve the sample dimension** for probabilistic predictions (via `transformers/inverse.py`).
 - **Predictions are ingested with `clip_negatives=True` by default** (`ingest_darts_predictions`, `ingest_numpy_predictions`). This is by design — the non-negativity floor is domain physics (ADR-016 decision 3, ruled 2026-09-10). The opt-out is for inspection.
+- **Entity presence is decided at ingest (ADR-017):** every observational source is reduced to the entities present at its final timestamp — a row exists (frames, parquet) or any value is non-NaN (xarray) — before the grid is built. `filter_entities_at_end=True` is the default (`base.py:48`) and is forwarded to every converter; `False` opts out for that dataset. Prediction sources are never filtered. Every dropped id is logged at `INFO` (`converters.py:30`).
 - **Streaming construction:** `ViewsDataset.builder(...)` yields a `DatasetBuilder` for datasets too large to hold in RAM.
 - **Incremental construction:** `create_empty` / `add_row` / `add_batch` mutate the store in place — a second write path alongside the builder, which bypasses `build_schema_attrs` (see the converters CIC).
 - **Structural NaN → 0:** on the Darts path, `to_darts_timeseries` applies `np.nan_to_num(nan=0.0)` (`base.py:1645`) on the premise that NaN means "entity absent for those time steps". A genuinely missing observation becomes a zero silently. This is register **D-07** against the fortress protocol's explicit `nan_to_num` prohibition.
@@ -58,8 +59,10 @@
 
 - `TypeError` — unsupported source object; `ValueError` — path with unrecognised suffix.
 - `ValueError` — missing required dimension; targets not found among columns; `split_data` on a prediction dataset; `to_predictionframe` outside prediction mode.
+- `ValueError` — an observational source that is empty, or has no entity present at its final timestamp (ADR-017 §4).
 - `RuntimeError` — `get_scaled_darts_timeseries` before `fit_scalers`.
 - `LookupError` — `from_*_latest` finds nothing.
+- **Silent, by design:** an entity with no row at the source's final month is dropped with an `INFO` line and no error (register C-63).
 - **Silent:** the inverse path falls through to unscaled values, with no log line, when a scaler's fitted params cannot be extracted (register C-10).
 
 ---

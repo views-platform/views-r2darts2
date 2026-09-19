@@ -46,7 +46,7 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 ## 5. Outputs and Side Effects
 
 - **Artifacts:** Produces persistent `.pt` model artifacts containing weights and coupled scaler states.
-- **Predictions:** Produces `dict[str, PredictionFrame]` per sequence (evaluation) or per run (forecast) when `prediction_format="frames"`; **the default is `"dataframe"`**, so by default `_evaluate_model_artifact` returns `list[pd.DataFrame]` via `_predictions_to_dataframe`.
+- **Predictions:** Produces `dict[str, PredictionFrame]` per sequence (evaluation) or per run (forecast) when `prediction_format="frames"`; **the default is `"dataframe"`**, so by default `_evaluate_model_artifact` returns `list[pd.DataFrame]` via `_predictions_to_dataframe`. **`num_samples == 1` yields point forecasts**; the evaluation configuration must then declare point metrics (`regression_point_metrics`) rather than sample metrics — this manager cannot check that, because it lives in the model's `config_meta.py`, and the mismatch surfaces only at evaluation time as a views-evaluation `ValueError`.
 - **Logging:** Emits structured logs via `WandbLogger` and standard logging for lifecycle events.
 - **Monkeypatching:** Performs a controlled override of `torch.load` to handle Darts serialization requirements.
 

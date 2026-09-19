@@ -1,8 +1,9 @@
-# ADR-016: Numerical Precision, Raw Output, and the Clipping Question
+# ADR-016: Numerical Precision, Raw Output, and the Non-Negativity Floor
 
 **Status:** Accepted (supersedes ADR-010)  
 **Date:** 2026-09-10  
 **Deciders:** Simon Polichinel von der Maase  
+**Revised:** 2026-09-17 — decision 3 ruled (maintainer, issue #40, 2026-09-10): the floor stays. D-05 closed.  
 
 ---
 
@@ -20,10 +21,10 @@ ADR-010 also cites a deleted method, a nonexistent epsilon, and a deleted test f
 
 1. **Universal Precision (carried forward).** All data tensors — targets and covariates — are `float32` before entering any model or loss. On 0.2.x this holds by construction: `ViewsDataset` stores `float32` (`dataset/converters.py` emits nothing else), and `ReproducibilityGate.Data.audit_frame_schema` raises `NumericalSanityError` on any non-`float32` frame as a defensive guard — though that guard has no production caller (C-44).
 2. **Raw Output Mandate (carried forward).** Models return their raw expected values. No rounding to integers anywhere in the package.
-3. **The clipping question is open.** Whether clipping negative predictions to zero at ingest is (a) a semantic floor that ADR-010 forbade and should be removed or made an explicit DNA gene, or (b) a physical-domain constraint (fatality counts cannot be negative) that belongs in the data layer, is **register D-05**. This ADR does not rule. Until D-05 is ruled, the code's behaviour — clip by default, opt out with `clip_negatives=False` — is the documented state, and every document that describes prediction output says so.
+3. **Non-negativity is a physical floor, applied in the data layer (ruled 2026-09-10).** Fatality counts cannot be negative, so predictions are clipped to `>= 0` before they leave the package — at ingest (`ViewsDataset.ingest_*_predictions`, `clip_negatives=True` by default) and on the streaming path. This is the one semantic floor ADR-010's prohibition does *not* cover: it is domain physics, not a modelling threshold. The maintainer ruled this on issue #40 ("leave as is"); the counter-argument (a negative prediction is a diagnostic signal that clipping erases) is recorded there and in D-05's history, and was heard. Two consequences follow: (a) the opt-out `clip_negatives=False` exists for inspection and should reach every clipping site, including `_predict_streaming`, which today clips unconditionally — a consistency defect, tracked as C-61, not a reopening of this decision; (b) `DartsForecaster`'s Intent Contract may keep "clipped to non-negative" as a guarantee.
 4. **Separation of Metrics (carried forward).** Any threshold beyond non-negativity — "fewer than 1.0 means zero" — belongs in the evaluation layer or must be a declared gene. Nothing in this package applies one.
 
-**In scope:** precision, output semantics, the clipping default.
+**In scope:** precision, output semantics, the non-negativity floor.
 **Out of scope:** the evaluation layer's own thresholds (owned by `views-evaluation`).
 
 ---
@@ -41,8 +42,8 @@ ADR-010 also cites a deleted method, a nonexistent epsilon, and a deleted test f
 ### Alternative A: patch ADR-010 in place
 - **Reason for rejection:** it names two deleted artifacts and one nonexistent constant; a patched ADR-010 would be a new document wearing an old number.
 
-### Alternative B: rule on clipping here
-- **Reason for rejection:** it is a modelling decision with downstream consequences for `views-evaluation` and for every published forecast, and the maintainer has not been consulted. It belongs in D-05.
+### Alternative B: remove the floor, or make it a declared DNA gene
+- **Reason for rejection:** the maintainer ruled (issue #40, 2026-09-10) that the floor is domain physics and stays. A gene would let a config declare that fatalities may be negative, which no consumer wants. The diagnostic cost — a negative prediction is a signal that clipping erases — is real and is why the `clip_negatives=False` opt-out must remain and must reach every site (C-61).
 
 ---
 
@@ -53,7 +54,7 @@ ADR-010 also cites a deleted method, a nonexistent epsilon, and a deleted test f
 - The clipping contradiction is visible in the register instead of buried in a docstring.
 
 ### Negative
-- One decision is explicitly unresolved. Readers must check D-05 for the current state.
+- The floor erases one diagnostic signal (a model producing negatives). Mitigation: the opt-out must work everywhere (C-61) so raw outputs can be inspected on demand.
 
 ---
 
@@ -61,7 +62,7 @@ ADR-010 also cites a deleted method, a nonexistent epsilon, and a deleted test f
 
 - Precision: `views_r2darts2/dataset/converters.py` (all converters emit `float32`); `views_r2darts2/infrastructure/reproducibility_gate.py` (`audit_frame_schema`).
 - Clipping sites: `views_r2darts2/dataset/base.py` (`ingest_darts_predictions`, `ingest_numpy_predictions`, parameter `clip_negatives`); `views_r2darts2/engines/darts_forecaster.py:515` (unconditional, streaming path); and two unconditional `np.maximum(arr, 0)` floors on the `log_targets` inverse path, `base.py:1520` and `:1559`, applied before `expm1`. (`base.py:1242`, `:1260` floor *inputs* before `log1p` — a domain guard, not a prediction clip.)
-- No code change is required by this ADR. The change required by D-05's eventual ruling touches two sites — the ingest default and the hardcoded streaming clip — plus `DartsForecaster`'s docstring and `docs/CICs/darts_forecaster.md`.
+- The only code change this ADR now implies is the consistency fix in C-61: make `clip_negatives=False` reach `_predict_streaming` (and the two `expm1`-path floors, which are domain guards before the inverse transform and may stay unconditional). No change to the default.
 
 ---
 
@@ -70,18 +71,19 @@ ADR-010 also cites a deleted method, a nonexistent epsilon, and a deleted test f
 - `tests/test_scaler_selector.py` — transform round-trips.
 - `tests/test_parity_e2e.py` — end-to-end precision through fit → predict → inverse.
 - `tests/test_views_dataset.py` — ingest paths, including the `clip_negatives` parameter.
-- Reconsider this ADR if D-05 is ruled, or if `views-evaluation` adopts a floor that overlaps with ingest clipping.
+- Reconsider this ADR if `views-evaluation` adopts a floor that overlaps with ingest clipping, or if a target with a legitimately signed domain is ever added.
 
 ---
 
 ## Open Questions
 
-- D-05: keep, remove, or gene-ify `clip_negatives` — at both sites.
+- None. (D-05 was closed by the maintainer's ruling on 2026-09-10; see the register's Resolved Disagreements.)
 
 ---
 
 ## References
 
 - ADR-010 (superseded), ADR-003, ADR-008, ADR-009.
-- `reports/technical_risk_register.md` — D-05.
+- `reports/technical_risk_register.md` — D-05 (resolved), C-61.
+- `views-r2darts2` issue #40 — the ruling.
 - Commit `a79f23b` ("vdsxr") — the `dataset/` rewrite.

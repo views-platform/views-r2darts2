@@ -17,7 +17,7 @@ All meaningful semantics (architectures, loss functions, scaling strategies, see
 Silent failures, implicit fallbacks, and "best-effort" corrections are forbidden. 
 - **Requirement:** Violations of physical, temporal, or configuration invariants must raise an explicit `ReproducibilityError` or `NumericalSanityError` immediately.
 - **Prohibited:** Using `nan_to_num`, silent clipping, or "sensible defaults" for critical parameters.
-  *Note (2026-09-10):* the data layer currently clips predictions to non-negative (`ViewsDataset.ingest_*_predictions` default `clip_negatives=True`; `DartsForecaster._predict_streaming` unconditionally) — register **D-05** / ADR-016 — and applies `np.nan_to_num(nan=0.0)` on the Darts path for structural sparsity (`dataset/base.py:1645`) — register **D-07**. Both await a ruling.
+  *Note (2026-09-10):* the data layer currently clips predictions to non-negative (`ViewsDataset.ingest_*_predictions` default `clip_negatives=True`; `DartsForecaster._predict_streaming` unconditionally) — sanctioned by ADR-016 decision 3 (ruled 2026-09-10); the `clip_negatives=False` opt-out must reach every site, C-61 — and applies `np.nan_to_num(nan=0.0)` on the Darts path for structural sparsity (`dataset/base.py:1645`) — register **D-07**. Both await a ruling.
 
 ### C. The Numerical Airlock (ADR-016, superseding ADR-010)
 All data entering the system must pass through a numerical airlock.

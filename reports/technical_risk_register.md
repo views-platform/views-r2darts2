@@ -4,10 +4,10 @@
 |-------------------|--------------------------------------|
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
-| Last Updated      | 2026-09-10                           |
-| Total Concerns    | 57                                   |
-| Open Concerns     | 44                                   |
-| Resolved Concerns | 13                                   |
+| Last Updated      | 2026-09-17                           |
+| Total Concerns    | 62                                   |
+| Open Concerns     | 47                                   |
+| Resolved Concerns | 15                                   |
 | Governed by       | ADR-014                              |
 
 ---
@@ -39,8 +39,8 @@
 > re-verified: 11 still present (line numbers refreshed), 2 moved, 9 changed (C-08 and C-22
 > re-tiered down; C-12, C-18, C-32 retitled), 7 resolved (five by the rewrite, two by the
 > `governance-0.2.x` branch), 9 registered (C-35..C-43, of which C-40 was resolved by Stage 5 of this branch), 5 disagreements opened (D-01..D-05). A three-agent drift audit of the re-derived docs (review-base-docs, same date) added C-44..C-48 and D-06..D-07 — including one Tier-2 finding the re-derivation itself had missed (C-44). A max-effort `code-review` of the whole branch (same date) added C-49..C-55 — two more Tier-2s (C-49 scaler leak by default, C-54 lost regression coverage) — re-tiered C-08 to 2, widened D-05 and D-07, and corrected ~40 doc claims, a third of them introduced by the drift-audit commit itself.
-> Two sub-claims are UNVERIFIED pending a `darts==0.46.1` install: C-12 (`_Block` guard collision)
-> and C-18 (patch behaviour against 0.46.1 internals).
+> Two sub-claims were UNVERIFIED pending a Darts install; both were settled on 2026-09-18 against the
+> pinned darts 0.40.0 (see C-12 and C-18 re-derivation bullets). No UNVERIFIED sub-claims remain.
 >
 > The "silent-acceptance seam" concerns (C-07, C-09, C-10, C-24, C-29, plus latent C-08) share a
 > root theme: seams where the otherwise fail-loud pipeline silently accepts a wrong, leaky, or
@@ -132,6 +132,7 @@
 - **Location:** `views_r2darts2/infrastructure/patches.py:938-944` (`apply_all_patches`, no docstring); `_TideModule.forward` set at `:603` by `apply_tide_mc_dropout_patch` and would be overwritten at `:793` by the disabled `apply_tide_skip_layernorm_patch`; `apply_nhits_layernorm_patch:854` and `apply_nbeats_layernorm_patch:917` share the guard attribute name `_Block._views_ln_patch`; `patches.py:3` docstring says "Darts 0.45 internals" against a `==0.46.1` pin.
 - **Narrative:** The original RevIN→TiDE dependency is no longer visible in code (`apply_tide_mc_dropout_patch` `:566-611` never touches RINorm). The same shape of hazard has moved: two patches assign the same `forward`, and two patches share one guard attribute — safe only if the N-HiTS and N-BEATS `_Block` classes are unrelated, which could not be verified here (`darts` not installed). There is still no runtime assertion and no per-patch exception handling, so a Darts-internal change surfaces as an opaque crash or a silent no-op. The version pin moved from `0.40.0` to `0.46.1` while the module docstring still names `0.45`.
 - **re-derivation (2026-09-10, `development` @ `fe7e681`):** **Changed.** Original ordering dependency gone; two new same-shape hazards, one UNVERIFIED pending a `darts==0.46.1` install.
+- **re-derivation (2026-09-18, darts 0.40.0 installed):** the UNVERIFIED sub-claim is settled — `nbeats._Block` and `nhits._Block` are distinct class objects on 0.40 (`NB is NH` → False), so the shared `_views_ln_patch` guard attribute is set on each independently and cannot collide. Each reports `True` after `apply_all_patches()`. The ordering and overwrite concerns above stand.
 
 ---
 
@@ -156,7 +157,7 @@
 - **Narrative:** `_spectral_loss`/`_log_cosh`/`__repr__`/`__init__` are copy-pasted ~6× with no shared base class; docstrings carry embedded v35→v37 changelogs and a self-contradictory version label (class says v37, warning says v36). Competing versions (v36/v37/v46) coexist with no canonical marker. A fix to the shared math must be hand-applied to each copy. Refactor is blocked on C-06 (no tests).
 - **graphify (2026-09-09) corroboration:** Graph extraction over the loss family produced **45 `semantically_similar_to` duplication edges** between the copy-pasted helpers, confirming the duplication is pervasive rather than incidental. It also surfaced a documentation defect not previously recorded: the `SpotlightLossHuber` and `SpotlightLossPowerLaw` docstrings both claim an *"identical architecture as SpotlightLossLogcosh ... KL-DRO"*, but `SpotlightLossLogcosh` is at v46 and uses **per-series sqrt DRO**, not KL-DRO. A reader trusting either docstring will form a wrong model of what the loss actually optimizes. Version strings v33/v35/v36/v37/v46 all coexist across the family with no canonical marker.
 - **re-derivation (2026-09-10, `development` @ `fe7e681`):** **Partly changed.** Resolved: the `spotlight_loss.py` v37-vs-v36 contradiction, the vestigial `alpha` in `spotlight_loss.py` and `spotlight_loss_huber.py` (`spotlight_loss_power_law.py:41-47` now deprecates it with a warning), and the false KL-DRO claim in `spotlight_loss_huber.py`. Still present: the same claim in `spotlight_loss_power_law.py`, five copies each of `_log_cosh` and `_spectral_loss` with no base class, and a self-contradictory version label that moved from `spotlight_loss.py` to `spotlight_loss_asinh.py`.
-- **review-base-docs / code-review (2026-09-10):** `views_r2darts2/math/README.md:89-97` still advertises `"delta": 0.02` as one of "two hyperparameters" for both production losses; neither class accepts it (`LOSS_GENOMES` = `["non_zero_threshold"]`), and its "four-component architecture" heading disagrees with the code's three components. Not edited on `governance-0.2.x` (file lives under `views_r2darts2/`); the root README now says so.
+- **review-base-docs / code-review (2026-09-10):** `views_r2darts2/math/README.md:89-97` still advertises `"delta": 0.02` as one of "two hyperparameters" for both production losses; neither class accepts it (`LOSS_GENOMES` = `["non_zero_threshold"]`), and its "four-component architecture" heading disagrees with the code's three components. Its loss table (`:19`, `:126`) also gives `SpikeFocalLoss` a log_cosh base — the code is `errors**2` (`spike_focal_loss.py:42`) and the root README was corrected to MSE on 2026-09-10, so the two READMEs now disagree. Not edited on `governance-0.2.x` (file lives under `views_r2darts2/`); the root README marks it stale and `docs/loss_cards/README.md` still names it as the substitute for the missing Spotlight cards — a reader following that pointer gets the wrong base loss.
 - **Cross-refs:** C-06 (same modules, testing dimension); C-33 (a stale replica in the test suite, same drift-between-copies root cause).
 
 ---
@@ -174,7 +175,7 @@
 
 ---
 
-### C-18 — Patch layer reaches into Darts internals with no version assertion; module docstring names 0.45 against a 0.46.1 pin
+### C-18 — Patch layer reaches into Darts internals with no version assertion; module docstring names 0.45 against the pin (0.46.1 until 2026-09-17, 0.40.0 since)
 
 - **Tier:** 2 *(the monkey-patches target version-specific Darts internals; a version bump can make a patch fail to apply or silently no-op with no test catching it — silent divergence between intended and shipped behaviour. **Rewritten 2026-09-10**: the original 0.40.0-vs-0.38.0 divergence is gone; the residual is the absence of any guard.)*
 - **Source:** tech-debt-cleanup (survey) + test-review (F-7); re-derived 2026-09-10
@@ -182,6 +183,8 @@
 - **Location:** `pyproject.toml:14` (`darts = "==0.46.1"`); `views_r2darts2/infrastructure/patches.py:3` (docstring: "Darts 0.45 internals"); `patches.py:204-946` (RevIN, TCN, TiDE MC-dropout, N-HiTS and N-BEATS layernorm patches, all reaching into Darts private classes). No test asserts `darts.__version__`. `.github/workflows/run_pytest.yml:31-33` installs the pin fresh each run (no committed lockfile).
 - **Narrative:** CI now installs exactly the pinned version, so the tested/shipped split that motivated this entry is closed. What remains is structural: five patches rebind private Darts classes and methods, guarded only by ad-hoc attribute flags, with no `darts.__version__` assertion and no test that imports the patched classes and checks the rebinding took effect (the one RevIN test, C-33, tests a replica). The module docstring is already one version behind the pin. Whether the patches behave correctly against `0.46.1` internals could not be verified on the audit machine — `darts` is not installed.
 - **Cross-refs:** C-12 (patch ordering/fragility); C-33 (the only patch test, against a replica); C-42 (CI seam).
+- **re-derivation (2026-09-17, `compat-darts040`):** the pin moved *down* to darts 0.40.0 and every patch still applies — the full suite passes — but the docstring's "0.45" is now wrong in the other direction, and there is still no version assertion. Raised with the maintainer on issue #36 (not a priority, his call).
+- **re-derivation (2026-09-17, later the same day):** the "every patch applies" claim above was true of import and of the unit suite, and false of a real fit — `_PatchedTrainingStep` and `ValMetricsCallback` hardcoded Darts 0.46's six-element `_produce_train_output` tuple; 0.40–0.45 take five. The first raised, the second swallowed the error at `DEBUG` (so no `val_metrics/*` were logged and `EarlyStopping` died on a missing monitor). Fixed in `cceed99` by reading the layout from the installed Darts at import (`callbacks.py` `_produce_train_output_takes_target`). This is exactly the failure this entry predicts: a patch on private internals with no version guard, invisible to unit tests because they mock the module. Two other patches (`patches.py`) survived 0.40 unchanged; nothing asserts that they will survive the next pin.
 
 ---
 
@@ -206,7 +209,8 @@
 - **Narrative:** `_get_common_pl_trainer_kwargs` returns `"accelerator": "gpu"` unconditionally for every architecture. PyTorch Lightning raises `MisconfigurationException` at Trainer construction when no GPU is present, so training cannot start on a CPU or MPS host. Two parts of the codebase contradict this: `get_device()` explicitly supports `mps` and `cpu`, and the manager has a CPU-only parallel-prediction branch that a CPU-trained model could never reach. The consequence is not only portability — `.github/workflows/run_pytest.yml` runs on `ubuntu-latest` with no GPU, so **no test in the suite can call a real `model.fit()`**. This is the structural cause of the mock density in the training-path tests and therefore a root cause behind the C-13 / C-30 coverage gaps; `tests/test_darts_forecaster.py` (714 lines) is the 0.2.x successor of the old mock-heavy forecaster suite.
 - **re-derivation (2026-09-10, `development` @ `fe7e681`):** **Still present**, unchanged in substance; `get_device()` moved to `infrastructure/device.py`.
 - **code-review (2026-09-10):** ADR-011 decision 3 permits and encourages CPU parallel prediction "for CPU-only models"; this hardcode means no such model can be trained. ADR-011 now carries a compliance note pointing here.
-- **Cross-refs:** C-13, C-30 (coverage gaps this constraint enforces); C-18 (both concern divergence between what is tested and what ships); C-42 (the other CI seam that hides an install-time failure).
+- **Cross-refs:** C-13, C-30 (coverage gaps this constraint enforces); C-18 (both concern divergence between what is tested and what ships); C-42 (the other CI seam — dependency resolution fails before any test runs).
+- **re-derivation (2026-09-17):** with `_get_common_pl_trainer_kwargs` overridden to `accelerator="cpu"` in a probe, NLinear and TiDE train and predict end-to-end on CPU (darts 0.40). So the hardcode is the *only* thing standing between CI and a real training test. Still unfixed in the catalog.
 
 ---
 
@@ -339,7 +343,7 @@
 - **Location:** `views_r2darts2/transformers/static_covariates.py:133` (`compute_static_covariates`); callers: `views_r2darts2/transformers/__init__.py:18` (export only) and `tests/test_static_covariates.py`; `views_r2darts2/dataset/base.py:1706-1709` attaches only the entity id as a static covariate.
 - **Narrative:** The module reimplements the 0.1.x pandas fingerprint in numpy, claims bit-for-bit parity with it, and is covered by a 420-line test file. Nothing in `views_r2darts2/` calls it. `ViewsDataset.to_darts_timeseries` attaches the entity id and nothing else. So on 0.2.x the "Static Covariate Fingerprints" feature the README advertises does not exist at runtime, while a fully-built implementation of it sits one import away. The parity claim is against an implementation that was deleted.
 - **code-review (2026-09-10):** the README template ships `"static_covariate_stats": {"transform": ...}`; the manager forwards it (`darts_forecasting_model_manager.py:251-252`) into `DartsForecaster(static_covariate_stats=...)`, whose docstring (`darts_forecaster.py:93-94`) says "unused in slim version". A config key that is read, passed, and ignored. README now labels it inert at both sites.
-- **Cross-refs:** C-08 (the latent leakage seam inside this dead module — reconnecting it re-arms that one); C-07 (four architectures would ignore the fingerprint anyway); C-40 (README still advertises the feature).
+- **Cross-refs:** C-08 (the latent leakage seam inside this dead module — reconnecting it re-arms that one); C-07 (four architectures would ignore the fingerprint anyway); C-40 (README still advertises the feature); C-57 (the other inert template keys — resolve or downgrade both together).
 
 ---
 
@@ -388,23 +392,12 @@
 
 ---
 
-### C-42 — `views-r2darts2` (`wandb>=0.28.2`) and every published `views-pipeline-core` (`wandb<0.19`) cannot be resolved together; CI has been red on `main` and `development` since at least 2026-08-26
-
-- **Tier:** 2 *(the live line's test job fails at dependency resolution on every run, so no test has executed in CI for two weeks and the package is uninstallable alongside its own optional dependency; structural, with a trigger on every push and every release)*
-- **Source:** repo-assimilation (2026-09-10) (Phase 6); externally corroborated by `views-r2darts2` issue #34 (filed 2026-09-09)
-- **Trigger:** Cutting a release; or changing any dependency bound in `pyproject.toml` and relying on a green CI run as evidence it resolves.
-- **Location:** `pyproject.toml` (`wandb = ">=0.28.2"`; `views-pipeline-core = {version = ">=3.0.0,<4.0.0", optional = true}` under `[tool.poetry.extras] manager`); `.github/workflows/run_pytest.yml:31-33` (`poetry install`, no committed lockfile). Failing runs: `development` @ `fe7e681` and `5a7ddc7`, `main` @ `cd9db70` and `c34657b` — all at the "Install dependencies" step.
-- **Narrative:** **Corrected 2026-09-10 (ship-it gate).** The first draft of this entry said the two packages "never meet a resolver" because CI does not install the `manager` extra. That is wrong: Poetry resolves optional extras during `poetry install` whether or not they are selected, so the resolver runs on every CI job and fails — `"views-r2darts2 depends on both wandb (>=0.28.2) and views-pipeline-core (>=3.0.0,<4.0.0), version solving failed"` (run 34453001094, 2026-09-10). The conflict is not hidden; it is the reason the live line's CI is red. The `wandb>=0.28.2` bound arrived with the 0.2.x rewrite; every published `views-pipeline-core` (3.0.0–3.2.0) pins `wandb>=0.18.7,<0.19.0`. Verified locally with pip on Python 3.11 → `ResolutionImpossible`. `views-pipeline-core` is the platform's hub and is not to be changed for this; the fix is on the r2darts2 side and is deliberately out of scope for the governance PR.
-- **Cross-refs:** C-21 (the other CI seam — training can't run there either); C-18 (no lockfile, fresh resolve per run).
-
----
-
 ### C-43 — A live sweep config names an entrypoint script that exists only under `reports/archived/`
 
 - **Tier:** 4 *(one W&B sweep config points at a script that is not on any runtime path; the sweep would fail at launch, loudly)*
 - **Source:** repo-assimilation (2026-09-10) (reports audit, Part 3)
 - **Trigger:** Launching `lr_finder_sweep` through W&B.
-- **Location:** `sweep_configs/experimental_sweep_configs/lr_finder_sweep.py:7` on `survey_risk` (the `sweep_configs/` tree is absent from `development`; entry scoped to the 0.1.x line) — `"program": "simple_training_run.py"`; the only file of that name is `reports/archived/simple_training_run.py`.
+- **Location:** `sweep_configs/experimental_sweep_configs/lr_finder_sweep.py:7` at tag `archive/survey_risk-0.1.x` (the `sweep_configs/` tree is absent from `development`; entry scoped to the 0.1.x line) — `"program": "simple_training_run.py"`; the only file of that name is `reports/archived/simple_training_run.py`.
 - **Narrative:** The archived directory carries an `__init__.py` and is therefore importable, which may be why this once worked from a particular working directory. Noted in `reports/archived/README.md` (Stage 0). The sweep file is out of scope for the documentation branch.
 - **Cross-refs:** none.
 
@@ -537,7 +530,7 @@
 - **Source:** code-review (2026-09-10) (efficiency angle)
 - **Trigger:** Renaming or deleting any file under `views_r2darts2/` or `tests/` that a live doc cites, without running the script by hand.
 - **Location:** `.github/workflows/run_pytest.yml` (last step `poetry run pytest tests/`; no docs step); no `.pre-commit-config.yaml`; only mentions are `README.md` and `docs/INSTANTIATION_CHECKLIST.md`.
-- **Narrative:** One workflow step — `run: bash docs/validate_docs.sh` — closes this. The script is fork-bound (~4.5 s; a fork-free rewrite of passes 3 and 7 measured 0.04 s) but that is not a blocker for CI. Two related review findings were fixed on 2026-09-10: pass 7 now scans the root `README.md`, and the script refuses to run on a non-GNU `grep` instead of silently passing.
+- **Narrative:** One workflow step — `run: bash docs/validate_docs.sh` — closes this, **but placement is load-bearing**: appended after `poetry install` in the existing `test` job it would never run, because C-42 keeps that step red and Actions skips later steps of a failed job. It must be its own job, or sit right after checkout before Python setup (it needs no Python). Six sibling repos already run their copy in CI (`views-appwrite`, `views-datafactory`, `views-evaluation`, `views-frames`, `views-impact`, `docs`). The script is fork-bound (~4.5 s; a fork-free rewrite of passes 3 and 7 measured 0.04 s) but that is not a blocker for CI. Two related review findings were fixed on 2026-09-10: pass 7 now scans the root `README.md`, and the script refuses to run on a non-GNU `grep` instead of silently passing.
 - **Cross-refs:** C-40 (the README drift this gate exists to prevent); ADR-005.
 
 ---
@@ -558,12 +551,55 @@
 - **Tier:** 4 *(no runtime effect — the keys are ignored; the cost is a user sweeping or "tuning" a knob that does nothing)*
 - **Source:** falsify (2026-09-10) (probe P9, consumer simulation)
 - **Trigger:** Copying the template and adjusting `time_steps`, `rolling_origin_stride` or `n_jobs` expecting a change in behaviour.
-- **Location:** `README.md` "Production Configuration Template" — `time_steps`, `rolling_origin_stride`, `n_jobs`; `grep -rn` over `views_r2darts2/` → 0 hits for each. `static_covariate_stats` (C-36) is the fourth inert key, already flagged.
+- **Location:** `README.md` "Production Configuration Template" — `time_steps`, `rolling_origin_stride`, `n_jobs`; `grep -rn` over `views_r2darts2/` → 0 hits for `rolling_origin_stride` and `n_jobs`; `time_steps` appears only as a local variable name (e.g. `darts_forecasting_model_manager.py:322`), never as a config key read. `static_covariate_stats` (C-36) is the fourth inert key, already flagged.
 - **Narrative:** `views-pipeline-core` is not installed in the audit environment, so consumption by the manager's base class cannot be ruled out for `time_steps` (a plausible forecast-horizon key). The template now flags all three inline. If pipeline-core does read `time_steps`, downgrade this to a comment; if not, delete the keys.
 - **Cross-refs:** C-36 (the fourth inert key); C-42 (the harness never installs pipeline-core, which is why this cannot be settled locally).
 
 ---
 
+### C-58 — `_resolve_raw_parquet_path` infers the raw-parquet filename by convention instead of using pipeline-core's declared `_get_cached_data_path()`
+
+- **Tier:** 3 *(an ADR-003 "inference over declaration" seam with a warn-only fallback: when the preferred `{run_type}_{source}_df.parquet` is absent the manager silently-but-logged falls through to any other source label, so a stale `viewser` parquet can be loaded when a `datafactory` one was expected. Not Tier 2: the preferred label is tried first, the fallback logs at `WARNING`, and a total miss raises.)*
+- **Source:** survey_risk retirement audit (2026-09-10)
+- **Trigger:** `views-pipeline-core`'s dataloader changing its cache filename or directory convention; or a model whose queryset `source` is none of `viewser` / `views-datafactory` / `synthetic`.
+- **Location:** `views_r2darts2/engines/darts_forecasting_model_manager.py:174-221` (`_infer_cache_source_label`, `_resolve_raw_parquet_path`; fallback warning at `:206-211`), `:223-229` (`_build_dataset`). The declared alternative: pipeline-core 3.2.0 `views_pipeline_core/managers/model/model.py:997` (`_get_cached_data_path`), set at `:1287` from the dataloader (`modules/dataloaders/dataloaders.py:1047`).
+- **Narrative:** The 0.1.x manager was fixed on 2026-04-27 (`c54e356`, "fix(C-59): use `_get_cached_data_path()` instead of hardcoded filename" — that ID belongs to an older numbering, not this register) to take the raw-data path from pipeline-core rather than guess it. The 0.2.x rewrite deleted those call sites and re-solved the problem by enumerating filename candidates. The `survey_risk` branch carried a second copy of the 0.1.x fix (`d847a34`); it was retired unported on 2026-09-10 and this entry replaces it. The sibling managers in `views-hydranet`, `views-baseline` and `views-impact` still use the seam, so this repository is the odd one out. One method (`_build_dataset`) would change: prefer `self._get_cached_data_path()` when set, fall back to the current enumeration.
+- **Cross-refs:** C-51 (the warn-and-continue family); C-42 (why no test of this can run in CI); ADR-003.
+
+---
+
+### C-59 — `ModelCatalog`'s `ModelCheckpoint` has no `dirpath`, so every run writes checkpoints to the current working directory
+
+- **Tier:** 4 *(disk-hygiene, not correctness: the files are written and never read; the `*.ckpt` ignore rule added on 2026-09-10 hides the symptom from `git status` rather than fixing it)*
+- **Source:** code-review (2026-09-15) (Altitude angle, verified against darts 0.46.1 and Lightning 2.5.2 source)
+- **Trigger:** Training with the repository (or any directory you care about) as CWD, then wondering where `lightning_logs/<run_id>/checkpoints/epoch=NNN-best.ckpt` and `last.ckpt` came from and whether anything uses them.
+- **Location:** `views_r2darts2/catalogs/model_catalog.py:181-187` — `ModelCheckpoint(monitor=..., mode="min", save_top_k=1, save_last=True, filename="{epoch:03d}-best")` with no `dirpath`; `grep -rn 'dirpath\|default_root_dir\|work_dir' views_r2darts2` → 0 hits. Darts never sets `default_root_dir`, so Lightning resolves the path to `<WandbLogger.save_dir="."> /lightning_logs/<run_id>/checkpoints/` (or `./checkpoints/` when `logger=False`, `:204`). Reader side: the only checkpoint reload is `darts_forecaster.py:209` `load_weights_from_checkpoint(best=False)`, which reads Darts' own `darts_logs/` folder (already ignored, `.gitignore:206`).
+- **Narrative:** Two checkpoint writers run per training: Darts' own (`darts_logs/…`, read back) and this one (CWD-relative, never read). For TFT/TiDE that is tens to hundreds of MB per run left wherever the process started. Either give the callback `dirpath=<model_path.artifacts>/checkpoints` so the "best" it selects is where the artifacts live, or drop the callback and rely on Darts'. The `.pt.ckpt` sidecar `TorchForecastingModel.save` writes next to every saved artifact is legitimate and separate.
+- **Cross-refs:** C-13 (callbacks untested); C-51 (the `checkpoint_mode='last'` reload that *is* read, and swallows failures).
+
+---
+
+### C-61 — `clip_negatives=False` does not reach the streaming path
+
+- **Tier:** 3 *(a documented opt-out that silently does nothing on the path large runs take; the floor itself is now sanctioned (ADR-016), so the harm is confined to inspection and debugging, not to shipped forecasts)*
+- **Source:** falsify / code-review of PR #38 (2026-09-10), separated from D-05 when that was ruled (2026-09-17)
+- **Trigger:** Passing `clip_negatives=False` to inspect raw model output on a run that goes through `_predict_streaming`, and reading the clipped result as raw.
+- **Location:** `views_r2darts2/engines/darts_forecaster.py:515` (`np.maximum(target_values, 0.0, out=target_values)`, unconditional); `views_r2darts2/dataset/base.py` `ingest_*_predictions` (`clip_negatives=True`, honoured). The `expm1`-path floors at `base.py:1520`, `:1559` are domain guards before the inverse transform and are out of scope.
+- **Narrative:** One policy, two sites, one switch. The maintainer's ruling settles *whether* to clip; this entry is only about the switch reaching both places. The fix is to thread the ingest parameter (or a forecaster-level `clip_negatives`) through to `:515`, and to add a test that pushes a negative prediction through the streaming path with the opt-out set and asserts it survives. Raised with the maintainer on issue #40 as a consistency ask; no reply yet.
+- **Cross-refs:** D-05 (resolved — the design ruling); ADR-016 decision 3.
+
+---
+
+### C-62 — `run_type="test"` sets `logger=False` while `LearningRateMonitor` is always attached, so any test-mode training run dies at `on_train_start`
+
+- **Tier:** 2 *(a documented run type that cannot train at all: Lightning raises `MisconfigurationException: Cannot use LearningRateMonitor callback with Trainer that has no logger` before the first batch. Not silent — but it means the one mode intended for CI/smoke use is the one mode that is unusable, and nothing in the suite exercises it.)*
+- **Source:** compat-darts040 end-to-end probe (2026-09-17) — found while trying to run a real fit with `run_type="test"`; reproduced independent of the Darts version.
+- **Trigger:** Any `ModelCatalog(config)` training with `config["run_type"] == "test"` — the value the catalog itself special-cases to avoid W&B.
+- **Location:** `views_r2darts2/catalogs/model_catalog.py:194-195` (`callbacks.append(LearningRateMonitor(logging_interval="epoch"))`, unconditional) vs `:200-204` (`"logger": False if is_test else WandbLogger(...)`).
+- **Narrative:** The two lines were written for different purposes — the monitor "makes LR reductions visible in WandB", the `logger=False` keeps test runs off W&B — and never met. Fix is one condition: attach the monitor only when a logger exists, or give test runs a `CSVLogger`. The probe used the second. Once fixed, `run_type="test"` plus the C-21 accelerator fix would let CI train a model.
+- **Cross-refs:** C-21 (the other blocker on the same path); C-13 (callbacks untested — this would have been caught by any test that constructs a Trainer from the catalog).
+
+---
 
 ## Disagreements
 
@@ -613,17 +649,6 @@
 | Source | repo-assimilation (2026-09-10) |
 | Perspectives | **ADR-013 §1** — every non-trivial class has exactly one file. **Code** — `dataset/converters.py` (5 converters), `dataset/subclasses.py` (6 LOA datasets, 81 lines total), `transformers/static_covariates.py` (config + result dataclass). Each is a family with one shared contract; splitting `subclasses.py` would produce six ten-line files. |
 | Resolution | Unresolved. Ruling for the ADR → split three files into thirteen. Ruling for the code → extend ADR-013 §3's hub concept to "homogeneous families", and record the three as sanctioned. |
-
----
-
-### D-05: Output semantics — no semantic floors in the data layer (ADR-010/016) vs `clip_negatives=True` (code)
-
-| Field | Value |
-|-------|-------|
-| ID | D-05 |
-| Source | repo-assimilation (2026-09-10) |
-| Perspectives | **ADR-010 §3, carried into ADR-016 as an open question** — clipping in the data layer is a hidden heuristic that masks model behaviour; any floor belongs in evaluation or as a declared gene. **Code** — two sites: `ViewsDataset.ingest_darts_predictions` / `ingest_numpy_predictions` default `clip_negatives=True`, an **unconditional** `np.maximum(target_values, 0.0)` at `engines/darts_forecaster.py:515` on the streaming path with no opt-out, and two more unconditional floors on the `log_targets` inverse path at `dataset/base.py:1520` and `:1559` (before `expm1`); `DartsForecaster`'s docstring lists non-negativity as a guarantee; the argument is that fatality counts cannot be negative and this is physics, not modelling. |
-| Resolution | Unresolved. Ruling for the ADR → flip the ingest default, remove or gate the streaming and `expm1`-path clips (four sites), or add a `prediction_floor` gene; update the forecaster docstring and CIC. Ruling for the code → ADR-016 §3 becomes a decision rather than an open question, distinguishing the physical zero floor from modelling thresholds. |
 
 ---
 
@@ -772,11 +797,58 @@
 
 ---
 
+---
+
+### C-42 — `views-r2darts2[manager]` cannot be installed against any published `views-pipeline-core`; CI red on `development` since 2026-08-15 *(resolved 2026-09-17 — r2darts2 lowered to the platform's versions)*
+
+- **Tier:** 2 *(**rewritten 2026-09-16** after `/code-review` of PR #47 — the earlier text named the wrong live mechanism. The live line's test job fails at dependency resolution on every run, so no test has executed in CI since 2026-07-02; structural, with a trigger on every push and every release. Stays 2 after this repository's edges are closed because the platform edges still make `[manager]` uninstallable.)*
+- **Source:** repo-assimilation (2026-09-10) (Phase 6); the full four-edge analysis is `views-r2darts2` issue #34 (Polichinel, 2026-09-09), which this entry should have followed from the start.
+- **Trigger:** Cutting a release; changing any dependency bound in `pyproject.toml` and relying on a green CI run as evidence it resolves; or reading "CI is green" as evidence that tests ran (see C-60).
+- **Location:** `pyproject.toml:14-24` (`darts`, `dask`, `numpy`, `pandas`, `xarray`, `zarr`, `views-frames`, `wandb`, `views-pipeline-core`); `.github/workflows/run_pytest.yml:33` (`poetry install`, no lockfile — Poetry resolves the optional extra whether or not it is selected). Platform side: pipeline-core 3.0.0–3.2.0 all declare `views-transformation-library>=2.7.2,<3.0.0` (only 2.7.2 exists: `pandas>=1.2.3,<2.0.0`) and `viewser>=6.6.4,<7.0.0` (only 6.6.4 exists: `pandas<2.0.0`, `toolz>=0.11.1,<0.12.0`).
+- **Narrative — what is live now:** two independent platform edges. **pandas:** `darts==0.46.1` and `xarray>=2026.7.0` both need `pandas>=2.2`; the hub's `views-transformation-library` and `viewser` pins both need `pandas<2`. **toolz:** `dask>=2026.7.1` needs `toolz>=0.12`; `viewser` needs `toolz<0.12`. Neither has a version inside pipeline-core's declared ranges that relaxes it; both close only when pipeline-core drops or upgrades those two packages (its `chore/retire-update-viewser` branch — which at `9cdcb0e` still declares `viewser = "^6.6.4"` — and issue #308 / C-112 there). Resolver-verified 2026-09-16 (uv, py3.11): the base install resolves; `--extra manager` fails on pandas, and peeling pandas surfaces toolz. **Not fixable from this repository.** A `views-r2darts2` release is also still needed before consumers see any of this: PyPI 0.2.1 declares `wandb>=0.28.2`, and `publish_package.yml:41` refuses to publish without a version bump (maintainer's step).
+- **re-derivation (2026-09-16, `wandb-unpin` @ `c7fc4c8`, `243afed`):** r2darts2's own edges are closed. (1) The wandb pin `>=0.28.2` (added 2026-08-13 in `b933e34`, one line, message "wandb", the day after 0.28.2 shipped) is replaced by the **floor `>=0.18.7`** issue #34 asked for — as a *main* dependency, because `catalogs/model_catalog.py:204` instantiates `WandbLogger` outside the manager path and PyTorch Lightning declares no wandb of its own. PR #47's first commit (`21df698`) had *deleted* the line instead; that left a base install without wandb and was reverted here. (2) `views-frames` bounded `>=1.10.2,<2.0.0` (#34's second ask). (3) `darts[torch]` and `zarr>=3.0` declared — see C-60; `numpy>=1.26.0` and `pandas>=2.2.0` declared too (imported directly, floors copied from darts 0.46.1 — no change to the resolution, the file just stops relying on a transitive accident). (4) The last `import wandb` (sweep loop) is gone: `WandBModule.initialize_run()` returns the `Run` (`views_pipeline_core/modules/wandb/wandb.py:44-91`), and `run.config` is what `wandb.config` proxies — a local edit, contrary to what the previous draft of this entry, PR #47's body and hydranet #379 said. History corrected: the wandb pin was **one of two independent causes**, never the sole one — `development` went red on 2026-08-15 (`8fc9a3a`), and run 31530136377 (2026-08-11, `3b4ca6c`) already failed on pandas two days before the pin existed; Poetry simply reported wandb first once both were present. Rule this repository now follows (its proper home is an ADR-002 amendment, follow-up): **a spoke declares every package it imports, with hub-compatible floors, never a range the hub excludes.** The earlier "spokes don't pin the hub's dependencies" was wrong for a spoke whose hub is optional and which imports the package itself (pipeline-core's own register treats used-but-undeclared as a defect, C-216/C-253 there).
+- **Cross-refs:** C-60 (why "install passes" would still not mean "tests ran"); C-21 (the other CI seam); C-18 (no lockfile, fresh resolve per run); C-51 (warn-and-continue family, for the `WandbLogger` failure mode when wandb is absent — now moot).
+- **Resolution (2026-09-17, `compat-darts040`):** rather than wait for pipeline-core 4.0, a datafactory cap lift and an 18-model queryset migration (three repos, none of them this one), r2darts2 was pinned *down* to what the platform hosts: darts 0.40.0, pandas <2, numpy <2, xarray 2024.3, zarr 2, dask 2024.2. One code change (`ParquetConverter` reads row groups via pyarrow instead of `dask.dataframe`, a pandas-1/py3.11 wedge). Resolver: `[manager]` resolves against published pipeline-core 3.2.0 + viewser 6.6.4. Suite: 586 passed on that stack, identical to darts 0.46. Every monkey-patch applied unchanged. The platform edges described above still exist; they are no longer this package's problem. Reopen if a future feature needs darts >0.40 or pandas 2 — that reopens the whole chain.
+- **re-derivation (2026-09-18, `compat-darts040`):** the wandb pin is set to the maintainer's `>=0.28.2` again — not the `>=0.18.7` floor — because (a) he reports W&B 5xx errors on 0.18.x (issue #34, 2026-09-17), and (b) pipeline-core `development` widened its ceiling to `wandb <1.0` on 2026-09-18 (PR #520 there), so the two no longer collide. Resolver-verified against pipeline-core `development`'s metadata: wandb 0.30.0 beside viewser 6.6.4 / pandas 1.5.3 / darts 0.40.0. Against *published* pipeline-core 3.2.0 (`<0.19`) it still does not resolve; a PyPI-installable r2darts2 0.2.3 therefore waits on pipeline-core 3.3.0. From source, everything installs today. The wandb edge is closed on both sides; pandas (viewser) is the only edge left, and #308's 2026-09-17 correction makes it a "stop depending on viewser" problem, not a version bump.
+
+---
+
+---
+
+---
+
+### C-60 — torch, pytorch-lightning and zarr were imported at module level and declared nowhere; CI could never have run a test even with the platform edges gone *(resolved 2026-09-17)*
+
+- **Tier:** 2 *(a "green" install step would have been followed by 29 collection errors and 0 tests executed; every "CI is green" reading since July would have been false. Declared as of 2026-09-16 (`{C1}`) but kept open: no CI run can prove collection until C-42's platform edges close.)*
+- **Source:** code-review (2026-09-16) (verified by building the pre-fix base environment: 169 packages, no torch / pytorch-lightning / zarr / wandb; `pytest tests/` → `Interrupted: 29 errors during collection` — 23× `No module named 'torch'`, 6× `No module named 'zarr'`)
+- **Trigger:** Any claim that CI is green, or any dependency edit that relies on `poetry install` having produced a working environment.
+- **Location:** `pyproject.toml:14` (`darts` — its `torch` extra carries `torch>=2.0.0` and `pytorch-lightning>=2.0.0`; darts ≥0.41 dropped them from core), `:21` (`zarr`); imports at `views_r2darts2/dataset/converters.py:20` (`import zarr`) and torch/Lightning across `catalogs/`, `engines/`, `infrastructure/`, `math/`; `.github/workflows/run_pytest.yml:33`.
+- **Narrative:** The last green run (2026-07-02, `e90cb41`) passed only because the pandas<2 edge then forced darts down to 0.40, whose core dependencies still included torch and Lightning. The 0.2.x rewrite pinned darts 0.46.1 and added zarr without declaring either's transitive needs, and CI has failed at install ever since, so the collection failure behind it was never seen. Fixed in `pyproject.toml` by `darts = {{ version = "==0.46.1", extras = ["torch"] }}` and `zarr = ">=3.0"`; verified locally by building the corrected base environment and running the suite (see the `wandb-unpin` PR). Resolve when a CI run on `development` shows tests collected.
+- **Cross-refs:** C-42 (the install-time edges that hide this one); C-21 (`accelerator="gpu"` — the *next* thing CI would hit once tests run); C-18 (no lockfile).
+- **Resolution (2026-09-17):** declared in `pyproject.toml` (`darts[torch]`, `zarr`) on 2026-09-16; with C-42 resolved the same stack now installs in CI, so the next `development` run will show tests collected — the condition this entry was waiting for. Close when that run is green; reopen if collection fails.
+
+---
+
+---
+
+## Resolved Disagreements
+
+### D-05: Output semantics — no semantic floors in the data layer (ADR-010/016) vs `clip_negatives=True` (code) *(resolved 2026-09-17 — ruled for the code)*
+
+| Field | Value |
+|-------|-------|
+| ID | D-05 |
+| Source | repo-assimilation (2026-09-10) |
+| Perspectives | **ADR-010 §3, carried into ADR-016 as an open question** — clipping in the data layer is a hidden heuristic that masks model behaviour; any floor belongs in evaluation or as a declared gene. **Code** — two sites: `ViewsDataset.ingest_darts_predictions` / `ingest_numpy_predictions` default `clip_negatives=True`, an **unconditional** `np.maximum(target_values, 0.0)` at `engines/darts_forecaster.py:515` on the streaming path with no opt-out, and two more unconditional floors on the `log_targets` inverse path at `dataset/base.py:1520` and `:1559` (before `expm1`); `DartsForecaster`'s docstring lists non-negativity as a guarantee; the argument is that fatality counts cannot be negative and this is physics, not modelling. |
+| Resolution | **Ruled for the code.** Maintainer on issue #40 (2026-09-10): "Leave as is. Not a breaking issue." ADR-016 decision 3 rewritten on 2026-09-17 to state the floor as domain physics; ADR-010's prohibition now explicitly excludes it. The residual — `clip_negatives=False` does not reach `_predict_streaming` — is a consistency defect, not a disagreement, and is C-61. Superseded text of the field: Ruling for the ADR → flip the ingest default, remove or gate the streaming and `expm1`-path clips (four sites), or add a `prediction_floor` gene; update the forecaster docstring and CIC. Ruling for the code → ADR-016 §3 becomes a decision rather than an open question, distinguishing the physical zero floor from modelling thresholds. |
+
+---
+
 ## Register Conventions
 
 - **ID format:** `C-xx` for concerns, `D-xx` for disagreements. IDs are permanent — gaps indicate merged or resolved entries.
-- **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `review-base-docs`, `code-review`, `falsify`, `incident`.
-- **Disagreements:** `D-xx` entries record an ADR-vs-code contradiction awaiting a ruling. They are not concerns; they point at the concern (if any) that is the code side.
+- **Sources:** `repo-assimilation`, `expert-review`, `test-review`, `falsification-audit`, `clean-architecture-review`, `pr-review`, `review-diff`, `tech-debt-audit`, `graphify`, `review-base-docs`, `code-review`, `falsify`, `survey_risk retirement audit`, `incident`.
+- **Disagreements:** `D-xx` entries record an ADR-vs-code contradiction awaiting a ruling. Once ruled, the entry moves to **Resolved Disagreements** with the ruling and its source (issue, PR, or conversation) in the Resolution field; the affected ADR is rewritten to state the ruling as a decision. They are not concerns; they point at the concern (if any) that is the code side.
 - **Re-derivation:** when the code moves under an entry, the entry is re-verified and carries a dated `re-derivation` bullet; Location is updated to current line numbers; Tier is changed only with a stated reason.
 - **Resolution:** Move to "Resolved Concerns" with resolution date and one-line summary when addressed. Do not delete.
 - **Header counts:** Manually maintained — update whenever a concern is added or resolved.

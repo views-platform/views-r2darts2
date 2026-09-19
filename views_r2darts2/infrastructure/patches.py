@@ -1,6 +1,7 @@
 """Monkey-patches for Darts internals (pandas-free).
 
-This module applies targeted patches to Darts 0.45 internals to fix bugs and
+This module applies targeted patches to Darts internals (verified on the
+pinned 0.40.0; written against 0.45) to fix bugs and
 add features that the upstream library does not yet expose:
 
     * ``torch.load`` — force ``weights_only=False`` for full artifact loading.

@@ -21,7 +21,7 @@ The `DartsForecaster` is a slim orchestrator that couples one Darts model to one
 - This class does **not** perform model architecture selection (delegated to the Catalog).
 - This class does **not** handle high-level rolling-origin logic (delegated to the Manager).
 - This class does **not** own scalers or log-transforms — `ViewsDataset` does; the forecaster calls `fit_scalers` and `get_scaled_darts_timeseries`.
-- This class **does** clip predictions to non-negative on the streaming path — unconditionally, `darts_forecaster.py:515`, with no opt-out — while the ingest path's `clip_negatives=True` default lives on `ViewsDataset`. Both are register D-05 / ADR-016; this contract records the behaviour, not a decision.
+- This class **does** clip predictions to non-negative on the streaming path — unconditionally, `darts_forecaster.py:515`, with no opt-out — while the ingest path's `clip_negatives=True` default lives on `ViewsDataset`. The floor itself is settled (ADR-016 decision 3, ruled 2026-09-10); the missing opt-out on the streaming path is C-61. This contract records the behaviour, not a decision.
 
 ---
 
@@ -32,7 +32,7 @@ The `DartsForecaster` is a slim orchestrator that couples one Darts model to one
 - **Preserves Probabilistic Calibration:** Target scalers are `global_fit=True`, enforced at construction by `ScalerSelector` (ADR-012).
 - **Device Self-Healing:** `_ensure_model_on_device()` runs before every prediction and moves weights back to the resolved device if Darts drifted them to CPU (ADR-011). *On failure it warns and continues — see §6 and D-01.*
 - **Entropy Lock:** Calls `ReproducibilityGate.Data.lock_entropy(random_state)` before every prediction so probabilistic samples are reproducible.
-- **Non-negative Output:** Predictions are clipped to `>= 0` on ingest into the dataset (the code's own Intent Contract states this as a guarantee; see D-05).
+- **Non-negative Output:** Predictions are clipped to `>= 0` on ingest into the dataset (the code's own Intent Contract states this as a guarantee; ADR-016 decision 3 sanctions it).
 
 ---
 

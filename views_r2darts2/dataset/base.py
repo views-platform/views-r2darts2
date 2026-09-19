@@ -1067,7 +1067,7 @@ class ViewsDataset:
 
         if new_times.size or new_entities.size:
             # Resize: rebuild the store with extended coordinates.
-            # This is the simplest correct approach for zarr v3.
+            # This is the simplest correct approach for a zarr store.
             self._append_fallback(times, entities, cols)
             return
 
@@ -1098,7 +1098,7 @@ class ViewsDataset:
 
         This materializes the full dataset in memory, concatenates the new
         rows, and re-writes the zarr store. Used when new time/entity
-        coordinates need to be added (zarr v3 doesn't support easy resizing).
+        coordinates need to be added (zarr stores don't support easy resizing).
         """
         # Build the new rows as an xarray Dataset.
         time_coord = self._ds[self._time_id].values.astype("int64")

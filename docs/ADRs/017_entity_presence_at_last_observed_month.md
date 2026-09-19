@@ -36,7 +36,7 @@ timestamp**. At ingest, every observational source is reduced to those entities.
    entity at the maximum `time_id`; for an `xarray.Dataset` source, at least one data variable is
    non-NaN for the entity at the maximum `time_id`.
 2. **Default on.** `ViewsDataset(..., filter_entities_at_end=True)` is the default and is passed
-   through to every converter. Passing `False` disables it for that dataset.
+   through to every observational converter. Passing `False` disables it for that dataset.
 3. **Prediction sources are never filtered.** A source with `pred_*` columns, or an `xarray`
    dataset carrying `is_prediction=True`, bypasses the filter unconditionally — predictions are
    about the entities the model was given, not about presence.
@@ -96,10 +96,11 @@ Rejected. A refusal at the end of an hour-long run is a poor place to learn the 
 ## Implementation Notes
 
 - Flag: `views_r2darts2/dataset/base.py:48` (`filter_entities_at_end: bool = True`), forwarded to
-  every converter.
-- Frame sources: `views_r2darts2/dataset/converters.py:47` (`filter_frame_entities_at_end`), called
-  from `DataFrameConverter` (`:218`), `FeatureFrameConverter` (`:367`) and `ParquetConverter`
-  (`:617`); `PredictionFrameConverter` does not call it.
+  every observational converter; `PredictionFrameConverter` neither accepts nor receives it.
+- Frame sources: the rule is implemented three times. `DataFrameConverter` (`:218`) calls
+  `views_r2darts2/dataset/converters.py:47` (`filter_frame_entities_at_end`); `FeatureFrameConverter`
+  (`:367-379`) and `ParquetConverter` (`:617-621`) each carry an inline copy of the same rule and
+  share only the logging helper. A change to the rule must be made in all three places.
 - xarray sources: `views_r2darts2/dataset/converters.py:69` (`filter_dataset_entities_at_end`),
   which returns the dataset untouched when `is_prediction` is set.
 - Logging: `views_r2darts2/dataset/converters.py:30` (`_log_entity_filter`).

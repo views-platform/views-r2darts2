@@ -77,7 +77,7 @@ ADRs numbered 010 and above define specific infrastructure, mathematical, and do
   Documents the correct timestamp extraction pattern (satellite of views-pipeline-core ADR-052).
 
 - **ADR-016** — Numerical Precision, Raw Output, and the Clipping Question  
-  Supersedes ADR-010 for 0.2.x; carries `float32` and raw-output forward, records the `clip_negatives` contradiction as D-05.
+  Supersedes ADR-010 for 0.2.x; carries `float32` and raw-output forward, and records the maintainer's 2026-09-10 ruling that the non-negativity floor stays (formerly D-05).
 
 These must comply with the constitutional ADRs above.
 

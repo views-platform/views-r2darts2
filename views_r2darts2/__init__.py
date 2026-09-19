@@ -27,6 +27,11 @@ from __future__ import annotations
 
 from typing import Any
 
+# Must run before any import of dask (directly, or via darts -> lightgbm) on the
+# platform's pinned stack; see the module docstring. Kept at package root so the
+# order of the lazy imports below cannot defeat it.
+import views_r2darts2.infrastructure.tlz_compat  # noqa: E402,F401
+
 __all__ = [
     "ViewsDataset",
     "DartsForecaster",

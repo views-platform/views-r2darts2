@@ -4,7 +4,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python Version" />
   &nbsp;&nbsp;
-  <img src="https://img.shields.io/badge/darts-0.46.1-green.svg" alt="Darts Version" />
+  <img src="https://img.shields.io/badge/darts-0.40.0-green.svg" alt="Darts Version" />
   &nbsp;&nbsp;
   <img src="https://img.shields.io/badge/pytorch-2.x-orange.svg" alt="PyTorch" />
   &nbsp;&nbsp;
@@ -37,7 +37,7 @@ cd views-r2darts2
 pip install -e .
 ```
 
-Requires `darts==0.46.1`. `views-pipeline-core>=3.0.0,<4.0.0` is an optional extra: `pip install -e ".[manager]"`. It is imported lazily by `DartsForecastingModelManager` and by the four `ViewsDataset` persistence methods (`save_predstore`, `save_appwrite`, `from_predstore_latest`, `from_appwrite_latest`); everything else works without it. For GPU support, install the appropriate PyTorch version for your CUDA setup first. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
+Requires `darts==0.40.0` and pandas 1.x — the newest versions the VIEWS platform can host (its `viewser` / `views-transformation-library` dependencies pin `pandas<2`, `views-datafactory` caps `xarray<2026` and `zarr<3`). `views-pipeline-core>=3.0.0,<4.0.0` is an optional extra: `pip install -e ".[manager]"`. It is imported lazily by `DartsForecastingModelManager` and by the four `ViewsDataset` persistence methods (`save_predstore`, `save_appwrite`, `from_predstore_latest`, `from_appwrite_latest`); everything else works without it. For GPU support, install the appropriate PyTorch version for your CUDA setup first. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
 ---
 
@@ -272,7 +272,7 @@ The repository is governed by:
 - **[Architectural Decision Records (ADRs)](docs/ADRs/README.md)**: Sequential, authoritative records of every major design choice.
 - **[Class Intent Contracts (CICs)](docs/CICs/README.md)**: Explicit declarations of purpose and responsibility for every critical class.
 - **[Reproducibility Manifest](docs/standards/REPRODUCIBILITY_MANIFEST.md)**: The mandatory DNA genome that every experiment must declare before execution.
-- **[Technical Risk Register](reports/technical_risk_register.md)**: Every known, unfixed concern, tiered and triggered (ADR-014); and the open ADR-vs-code disagreements D-01..D-07 (each also filed as a GitHub issue, #39–#45).
+- **[Technical Risk Register](reports/technical_risk_register.md)**: Every known, unfixed concern, tiered and triggered (ADR-014); and the ADR-vs-code disagreements D-01..D-07 (each filed as a GitHub issue, #39–#45; D-05 ruled and closed via #40).
 - `bash docs/validate_docs.sh` checks the documentation set against itself *and* against the code tree — every `views_r2darts2/…py` or `tests/…py` path a live doc (this README included) names must exist. It is run by hand, not by CI (register C-55).
 
 ### Training Stability Callbacks

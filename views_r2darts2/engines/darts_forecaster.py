@@ -467,12 +467,27 @@ class DartsForecaster:
                     past_covariates[start:end] if past_covariates else None
                 )
                 batch_entity_ids = entity_ids[start:end]
+                batch_future_cov = None
+
+                # Darts applies ``add_encoders`` (cyclic month/week encodings)
+                # inside ``fit()`` and again inside ``predict()``. This path
+                # bypasses ``predict()`` for ``predict_from_dataset``, so the
+                # encodings must be regenerated here or the model sees fewer
+                # covariate components at inference than it was trained on.
+                encoders = getattr(self.model, "encoders", None)
+                if encoders is not None and encoders.encoding_available:
+                    batch_cov, batch_future_cov = self.model.generate_predict_encodings(
+                        n=output_length,
+                        series=batch_series,
+                        past_covariates=batch_cov,
+                        future_covariates=batch_future_cov,
+                    )
 
                 inference_dataset = self.model._build_inference_dataset(
                     n=output_length,
                     series=batch_series,
                     past_covariates=batch_cov,
-                    future_covariates=None,
+                    future_covariates=batch_future_cov,
                     stride=0,
                     bounds=None,
                 )

@@ -14,6 +14,41 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _produce_train_output_takes_target() -> bool:
+    """True if this Darts passes ``future_target`` into ``_produce_train_output``.
+
+    Read from the source of ``PLForecastingModule._train_val_step`` once at
+    import: the tuple it builds ends in ``static_covariates`` on Darts <=0.45
+    and in a ``future_target`` expression on 0.46+. Falls back to the version
+    number if the source is unavailable.
+    """
+    import inspect
+
+    import darts
+    from darts.models.forecasting.pl_forecasting_module import PLForecastingModule
+
+    try:
+        src = inspect.getsource(PLForecastingModule._train_val_step)
+        call = src.split("_produce_train_output(", 1)[1]
+        return "future_target" in call.split("loss = ", 1)[0]
+    except Exception:  # source not available (frozen/compiled); fall back
+        major, minor = (int(x) for x in darts.__version__.split(".")[:2])
+        return (major, minor) >= (0, 46)
+
+
+_PRODUCE_TRAIN_OUTPUT_TAKES_TARGET = _produce_train_output_takes_target()
+
+
+def _produce_train_output_inputs(batch, target) -> tuple:
+    """The tuple ``_produce_train_output`` expects, from a Darts training batch.
+
+    Drops ``sample_weight`` and ``future_target`` (the last two elements) and,
+    on Darts 0.46+, re-appends ``future_target`` as the sixth element.
+    """
+    inputs = tuple(batch[:-2])
+    return (*inputs, target) if _PRODUCE_TRAIN_OUTPUT_TAKES_TARGET else inputs
+
+
 class _PatchedTrainingStep:
     """
     Top-level callable that replaces ``pl_module.training_step``.
@@ -40,7 +75,13 @@ class _PatchedTrainingStep:
         # Darts batch: (...inputs..., sample_weight, future_target); skip sample_weight for _produce_train_output.
         sample_weight = train_batch[-2]
         target = train_batch[-1]
-        output = pl_module._produce_train_output((*train_batch[:-2], target))
+        # Darts <=0.45 feeds _produce_train_output the five input tensors only;
+        # 0.46 appends future_target as a sixth element. Mirror what the
+        # installed Darts' own _train_val_step does so this patch tracks the
+        # pinned version rather than one hardcoded layout.
+        output = pl_module._produce_train_output(
+            _produce_train_output_inputs(train_batch, target)
+        )
         loss = pl_module._compute_loss(
             output, target, pl_module.train_criterion, sample_weight
         )
@@ -1111,9 +1152,10 @@ class ValMetricsCallback(Callback):
             return
         try:
             # Darts batch: (...inputs..., sample_weight, future_target)
-            # _produce_train_output needs all fields EXCEPT sample_weight.
+            # _produce_train_output needs all fields EXCEPT sample_weight —
+            # plus future_target on Darts 0.46+ (see _PatchedTrainingStep).
             target = batch[-1]
-            input_batch = (*batch[:-2], target)
+            input_batch = _produce_train_output_inputs(batch, target)
 
             with torch.no_grad():
                 output = pl_module._produce_train_output(input_batch)
@@ -1677,6 +1719,16 @@ class RichLossDiagnosticsCallback(Callback):
 
     def on_train_epoch_end(self, trainer, pl_module):
         if (trainer.current_epoch + 1) % self.log_every_n_epochs != 0:
+            return
+        if not _HAS_RICH:
+            # The import block above tolerates a missing `rich`; honour that
+            # here too instead of dying on an undefined `Table` at epoch end.
+            if not getattr(self, "_warned_no_rich", False):
+                logger.warning(
+                    "RichLossDiagnosticsCallback: `rich` is not installed; "
+                    "console diagnostics disabled for this run."
+                )
+                self._warned_no_rich = True
             return
 
         crit = getattr(pl_module, "train_criterion", None)

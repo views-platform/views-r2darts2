@@ -27,6 +27,7 @@ The converter family is the **Data Airlock** of 0.2.x: one converter per input k
 
 - `DataFrameConverter`, `PredictionFrameConverter`, `FeatureFrameConverter`: sources already in RAM; build one `xarray.Dataset` and sink it in one shot.
 - `ParquetConverter`: the only genuinely out-of-core path; scans in Arrow batches and scatter-writes into a pre-allocated skeleton via `GridWriter`, so peak memory is one batch.
+- **Entity-at-end filter (ADR-017)** — every observational converter keeps only entities present at the source's final timestamp, unless `filter_entities_at_end=False`. The rule exists in three copies plus one function: `DataFrameConverter` (`:218`) calls `filter_frame_entities_at_end` (`converters.py:47`); `FeatureFrameConverter` (`:367-379`) and `ParquetConverter` (`:617-621`, after its coordinate scan) each implement it inline; `filter_dataset_entities_at_end` (`:69`) does it for xarray. All four share `_log_entity_filter` (`:30`). The prediction bypass sits in the callers for frames (`pred_*` columns, `:217-218` and `:617`) and inside the xarray function (`is_prediction` attr, `:71`); `PredictionFrameConverter` has no filter at all.
 - `GridWriter`: pre-allocates a Zarr skeleton and scatter-writes dense grid regions; shared by `ParquetConverter` and `DatasetBuilder`.
 - `build_schema_attrs` resolves column roles (`num2`/`num3`/`text`, `pred_*` detection) and is the single place the store's `.attrs` schema is defined.
 - All numeric output is `np.float32` (`_FLOAT`). `ReproducibilityGate.Data.audit_frame_schema` raises `NumericalSanityError` on anything else — a defensive guard that is unreachable in practice, and in any case never invoked on the production path (C-44) (ADR-016).
@@ -48,7 +49,8 @@ The converter family is the **Data Airlock** of 0.2.x: one converter per input k
 
 ## 6. Failure Modes and Loudness
 
-- `ValueError` — targets not found among columns; shape conflicts. (Spec validation is *not* here — it lives in `builder.py` `_normalize_specs`.)
+- `ValueError` — targets not found among columns; shape conflicts.
+- `ValueError` — observational source empty, or no entity present at its final timestamp (entity-at-end filter, ADR-017). (Spec validation is *not* here — it lives in `builder.py` `_normalize_specs`.)
 - **Silent:** `ParquetConverter` skips any column whose Arrow type is not list/float/int without raising.
 - Pandas is imported here at module level (`:18`) — this, `readers.py` and one local import in `dataset/base.py` are the exceptions to the package's pandas-free claim.
 
@@ -76,7 +78,8 @@ Callers do not use converters directly; `ViewsDataset._ingest` dispatches on `re
 
 ## 10. Test Alignment
 
-- **Indirect only:** `tests/test_builder.py`, `tests/test_frame_builder.py`, `tests/test_parquet_loader.py`, `tests/test_views_dataset.py` exercise every converter through `ViewsDataset`. No test imports `converters` directly.
+- **Indirect (entity filter, via `ViewsDataset`):** `tests/test_views_dataset.py` — nine tests covering default filtering for DataFrame, parquet, FeatureFrame and xarray sources, the opt-out, presence-by-row-not-value, the log line, the empty-source `ValueError`, and the prediction-frame bypass.
+- **Indirect only (everything else):** `tests/test_builder.py`, `tests/test_frame_builder.py`, `tests/test_parquet_loader.py`, `tests/test_views_dataset.py` exercise every converter through `ViewsDataset`. No test imports `converters` directly.
 
 ---
 

@@ -273,7 +273,7 @@ What a run produces, for whoever consumes it. Each point is stated in this repo'
 3. **Units.** Counts: the target scaler's inverse (and `expm1` when `log_targets`) has been applied. Values are then clipped to `>= 0` (ADR-016), so a zero may be a true zero or a clipped negative; the two cannot be told apart downstream.
 4. **Which entities.** Those present at the source's last observed month (ADR-017). Entities absent there are dropped at ingest; the ids are in the `Entity-at-end filter:` log line.
 5. **Where and how it is written.** Decided by views-pipeline-core: ADR-048 (numpy track for evaluation, parquet track for delivery), ADR-053 (`skip_predictions_delivery`), ADR-052 (the directory name carries the *artifact's* training timestamp — re-evaluating the same artifact writes a new directory). `prediction_format` selects the path; the default is `"dataframe"`.
-6. **Reproducibility.** `lock_entropy` seeds torch, numpy and `random` before every prediction. Sampled draws (likelihood or MC dropout) on GPU are not bit-identical across runs (register C-24).
+6. **Reproducibility.** `lock_entropy` seeds `random`, numpy and torch (CUDA included) before every prediction. It does not set the cuDNN determinism flags, so GPU sampled draws are seeded but not guaranteed bit-identical; and with `parallel_workers > 1` on CPU the reseeds race across threads (register C-24).
 
 ## 🛡️ Fortress Architecture & Governance
 

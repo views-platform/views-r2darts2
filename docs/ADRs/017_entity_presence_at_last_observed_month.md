@@ -79,8 +79,10 @@ Rejected. A refusal at the end of an hour-long run is a poor place to learn the 
 ### Positive
 - Forecasts are produced only for entities that exist at the end of the observational window.
 - The set of entities in an output is determined by the data, once, at ingest, and is logged.
-- The structural-sparsity half of D-07 is settled: cells that are NaN *because the entity is absent*
-  no longer reach the Darts path, so any NaN that remains there is a genuinely missing observation.
+- D-07 is narrowed, not settled. Cells that are NaN *because the entity has ceased to exist* no
+  longer reach the Darts path. Cells that are NaN *because the entity had not yet entered the panel*
+  still do, and `nan_to_num` still turns them into leading zeros (C-35). What remains on the Darts
+  path is therefore late entrants' padding plus genuinely missing observations, not the latter alone.
 
 ### Negative
 - An entity that legitimately has no row at the final month — late-arriving data, a partially
@@ -126,6 +128,6 @@ Rejected. A refusal at the end of an hour-long run is a poor place to learn the 
 ## References
 
 - views-pipeline-core ADR-064 — prediction-boundary entity check.
-- `reports/technical_risk_register.md` — C-35 (resolved by this decision), C-63 (residual), D-07.
+- `reports/technical_risk_register.md` — C-35 (the length criterion this decision declined to restore), C-63 (residual), D-07.
 - views-r2darts2 issue #39 — the NaN-policy thread this decision partly settles.
 - Commit `99f00ec` ("fix country exclusion logic") — the decision as made.

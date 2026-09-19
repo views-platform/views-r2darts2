@@ -4,9 +4,9 @@
 |-------------------|--------------------------------------|
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
-| Last Updated      | 2026-09-17                           |
-| Total Concerns    | 62                                   |
-| Open Concerns     | 47                                   |
+| Last Updated      | 2026-09-19                           |
+| Total Concerns    | 63                                   |
+| Open Concerns     | 48                                   |
 | Resolved Concerns | 15                                   |
 | Governed by       | ADR-014                              |
 
@@ -331,7 +331,8 @@
 - **Trigger:** Training on a dataset that contains an entity with fewer than `input_chunk_length + output_chunk_length` observations in the training partition — e.g. a country that enters the panel late — and expecting the 0.1.x exclusion to apply.
 - **Location:** `views_r2darts2/dataset/base.py:1131` (`fit_scalers`) and `:1223-1235` (`_split_targets_covariates`) — no length filter; `git grep 'Training filter\|min_length' development -- views_r2darts2/` → zero hits.
 - **Narrative:** The 0.1.x `_preprocess_timeseries` filtered entities by training-slice length and logged `Training filter: N/M entities passed`. The rewrite deleted that method (resolving C-20) and did not carry the filter anywhere. Every entity now reaches `model.fit` regardless of length. Whether Darts raises, skips, or pads short series depends on the model and could not be checked on the audit machine. Either the filter was intentionally dropped — in which case the decision is undocumented — or it was lost in the rewrite.
-- **Cross-refs:** C-20 (resolved; the method the filter lived in); C-18 (the same missing-`darts` limitation blocks verification).
+- **Update (2026-09-19):** Both halves of the narrative's "either/or" are now answered. (1) The drop is documented: ADR-017 records the maintainer's 0.2.2 entity filter (presence at the source's last month) and lists a restored length criterion as a rejected alternative — length is not presence. (2) What Darts does is verified against darts 0.40.0: a series shorter than `input_chunk_length + output_chunk_length` raises `ValueError` at training (`darts/utils/data/torch_datasets/training_dataset.py:314`). But the dense grid never hands Darts a short series: a late-entering entity arrives full-length with leading NaN, and `to_darts_timeseries` turns those into zeros (`base.py:1664`). So the residual is narrower and silent: **late entrants train on padded zeros, with no raise and no log.** That is the half of D-07 that ADR-017 leaves open.
+- **Cross-refs:** C-20 (resolved; the method the filter lived in); C-18 (the same missing-`darts` limitation blocked verification until 0.2.3); ADR-017; D-07; C-63.
 
 ---
 
@@ -601,6 +602,17 @@
 
 ---
 
+### C-63 — The entity-at-end filter drops an entity with no row at the final month silently
+
+- **Tier:** 3 *(the outcome — fewer entities in every output — is visible in the `dropped=N` log line and in the output's index, so it is not silent corruption; but the only signal is an `INFO` line, and the cause (a partially loaded or late-arriving final month) looks identical to a real dissolution. Maintainability and trust cost, not a Tier 2 fragility.)*
+- **Source:** ADR-017 Consequences (2026-09-19)
+- **Trigger:** Ingesting a source whose final month is incomplete — a fetch that stopped early, a partition boundary that falls before the last data release, or a queryset where some entities report late — and reading the resulting forecasts as if the missing entities had ceased to exist.
+- **Location:** `views_r2darts2/dataset/converters.py:47-66` (`filter_frame_entities_at_end`), `:69-103` (`filter_dataset_entities_at_end`), `:30-44` (`_log_entity_filter`); default at `views_r2darts2/dataset/base.py:48`.
+- **Narrative:** ADR-017 defines presence as "has a row at the source's maximum `time_id`". The definition is correct for its purpose and cannot tell a dissolved entity from one whose last row has not arrived yet. Both are dropped the same way, at `INFO`, with the id list in the log. There is no threshold, no comparison against the previous ingest's entity set, and no error path. An operator who does not read the log sees a shorter output and nothing else. ADR-017's Open Questions leave the threshold undecided.
+- **Cross-refs:** ADR-017; C-35 (the late-entrant half of the same grid problem); D-07.
+
+---
+
 ## Disagreements
 
 > Each D-entry records a contradiction between an accepted ADR and the 0.2.x code, surfaced by the
@@ -670,7 +682,7 @@
 | ID | D-07 |
 | Source | review-base-docs (2026-09-10) |
 | Perspectives | **Fortress protocol §1.B / ADR-003** — `nan_to_num` is named as prohibited; silent value substitution is a "sensible default" for a decision-relevant quantity. **Code** — `dataset/base.py:1645` applies `nan_to_num(nan=0.0)` with the stated premise that a NaN cell in the dense Zarr grid means "entity absent for those time steps", for which zero is the correct count. The grid cannot distinguish that from a genuinely missing observation (C-48). **Also in scope (2026-09-10):** eight `torch.nan_to_num` weight substitutions in the production loss family (C-50) — a different case (weights, not observations) but the same named function. |
-| Resolution | Unresolved. Ruling for the code → amend the protocol to permit structural-sparsity fill with an explicit missing-value policy documented on `ViewsDataset`. Ruling for the protocol → raise on NaN at ingest (re-wire `audit_numerical_sanity`, C-44) and require sources to be dense. Either ruling should say explicitly whether weight-substitution in a loss (C-50) is covered. Filed as issue #39. |
+| Resolution | Unresolved. Ruling for the code → amend the protocol to permit structural-sparsity fill with an explicit missing-value policy documented on `ViewsDataset`. Ruling for the protocol → raise on NaN at ingest (re-wire `audit_numerical_sanity`, C-44) and require sources to be dense. Either ruling should say explicitly whether weight-substitution in a loss (C-50) is covered. Filed as issue #39. **Narrowed 2026-09-19 (ADR-017):** entities absent at the source's last month are now removed at ingest, so their all-NaN rows never reach `nan_to_num`. Late entrants (present at the end, absent at the start) still do — their leading NaN become zeros (C-35). The ruling still has to cover that case and the genuinely-missing-observation case. |
 
 ---
 

@@ -13,7 +13,7 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 ## Before You Start
 
 - [x] Adoption phase: full constitutional set (ADR-000 … ADR-009) plus
-      project-specific ADRs (ADR-010 … ADR-016; ADR-010 superseded by ADR-016) — see `ADRs/README.md`
+      project-specific ADRs (ADR-010 … ADR-017; ADR-010 superseded by ADR-016) — see `ADRs/README.md`
 - [x] Ontological categories identified — see `ADRs/001_ontology_of_the_repository.md`
       (datasets, forecasters/model managers, catalogs, transformers/scalers,
       callbacks, configs, artifacts)
@@ -45,6 +45,7 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 - [x] **ADR-015:** Artifact-prediction timestamp contract
       (satellite of views-pipeline-core ADR-052; cross-repo refs are intentional)
 - [x] **ADR-016:** Numerical precision, raw output, and the non-negativity floor (ruled 2026-09-10)
+- [x] **ADR-017:** Entity presence is decided at the last observed month (maintainer's 0.2.2 filter, recorded 2026-09-19)
 
 ---
 

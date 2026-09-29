@@ -79,14 +79,25 @@ def _make_mock_model() -> Mock:
 
 
 def _make_ready_forecaster(dataset: ViewsDataset) -> DartsForecaster:
-    """A forecaster with scalers fitted, ready to ``predict``."""
-    fc = DartsForecaster(
-        dataset=dataset,
-        model=_make_mock_model(),
-        partition_dict=PARTITION,
-        target_scaler=None,
-        random_state=42,
-    )
+    """A forecaster with scalers fitted, ready to ``predict``.
+
+    The device is pinned to CPU because the mock's parameters always report CPU.
+    On a machine with CUDA or MPS the forecaster would resolve a different
+    device, find the mismatch, and raise ``HardwareIntegrityError`` (issue #41) —
+    so without this these tests would pass or fail depending on the developer's
+    hardware, and CI being CPU-only would hide it.
+    """
+    with patch(
+        "views_r2darts2.engines.darts_forecaster._get_device",
+        return_value="cpu",
+    ):
+        fc = DartsForecaster(
+            dataset=dataset,
+            model=_make_mock_model(),
+            partition_dict=PARTITION,
+            target_scaler=None,
+            random_state=42,
+        )
     fc.dataset.fit_scalers(
         target_scaler=None,
         feature_scaler=None,

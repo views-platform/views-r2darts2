@@ -4,10 +4,10 @@
 |-------------------|--------------------------------------|
 | Project           | views-r2darts2                       |
 | Owner             | Simon Polichinel von der Maase       |
-| Last Updated      | 2026-09-19                           |
+| Last Updated      | 2026-09-29                           |
 | Total Concerns    | 63                                   |
-| Open Concerns     | 48                                   |
-| Resolved Concerns | 15                                   |
+| Open Concerns     | 47                                   |
+| Resolved Concerns | 16                                   |
 | Governed by       | ADR-014                              |
 
 ---
@@ -348,17 +348,6 @@
 
 ---
 
-### C-37 — Device-restore failure logs a warning and continues on CPU, contradicting ADR-008 / ADR-011
-
-- **Tier:** 2 *(the ADRs mandate fail-loud; the code degrades silently to a state the ADR-011 context describes as "massive performance degradation" and a race-condition risk; structural contradiction between a stated invariant and its implementation, with a realistic trigger on any GPU host under memory pressure)*
-- **Source:** repo-assimilation (2026-09-10) (ADR audit, Phase 3)
-- **Trigger:** A prediction run on a CUDA host where `model.to(device)` fails or is refused (OOM, device busy) — the run continues on CPU with only a `WARNING` in the log.
-- **Location:** `views_r2darts2/engines/darts_forecaster.py:633-640` (`_ensure_model_on_device`; `logger.warning("Failed to move model from CPU to %s; continuing on CPU.")` at `:640`).
-- **Narrative:** ADR-008 §1 and ADR-011 §Validation both require that a failed CPU→GPU restoration raise and abort. The implementation warns and proceeds. The 0.1.x code raised `RuntimeError` here; the rewrite softened it. Both ADRs now carry a compliance note pointing to D-01, and the `DartsForecaster` CIC records the current behaviour. This entry is the code side of that disagreement: whichever way D-01 is ruled, one artifact changes.
-- **Cross-refs:** D-01 (the ruling); ADR-008, ADR-011; C-21 (the CPU branch this degrades into is the one that cannot train).
-
----
-
 ### C-38 — `apply_tide_skip_layernorm_patch` is dead-but-callable and would overwrite the live TiDE forward
 
 - **Tier:** 3 *(the C-16 pattern recurring: ~180 LOC of disabled patch code that a caller can still invoke. Not exported this time, so the footgun is one step further away — but invoking it clobbers `_TideModule.forward` set by the live MC-dropout patch, so the consequence is worse than C-16's.)*
@@ -620,17 +609,6 @@
 > the D-entry; the corresponding C-entry (where one exists) is the code side. Whichever way a ruling
 > goes, exactly one artifact changes.
 
-### D-01: Device-restore failure — fail-loud (ADR-008, ADR-011) vs warn-and-continue (code)
-
-| Field | Value |
-|-------|-------|
-| ID | D-01 |
-| Source | repo-assimilation (2026-09-10) |
-| Perspectives | **ADR-008 §1 / ADR-011 §Validation** — a failed CPU→GPU restoration is a structural lie and must raise; ADR-011's own context names silent CPU fallback as a race-condition and performance hazard. **Code** (`darts_forecaster.py:633-640`) — warns and continues; a long evaluation that would otherwise abort completes on CPU. |
-| Resolution | Unresolved — requires maintainer ruling. Ruling for the ADRs → change one line in `_ensure_model_on_device` (C-37). Ruling for the code → soften both ADRs and `docs/standards/logging_and_observability_standard.md` §5.2. |
-
----
-
 ### D-02: Intent Contracts — in-code on every non-trivial class (ADR-006) vs Markdown-only for ten (code)
 
 | Field | Value |
@@ -688,6 +666,15 @@
 
 
 ## Resolved Concerns
+### C-37 — Device-restore failure logged a warning and continued on CPU, contradicting ADR-008 / ADR-011 *(resolved 2026-09-29, PR for issue #41)*
+
+- **Tier:** 2
+- **Source:** repo-assimilation (2026-09-10) (ADR audit, Phase 3)
+- **Location:** Previously `views_r2darts2/engines/darts_forecaster.py:648-659` (`_ensure_model_on_device`).
+- **Resolution:** The method now builds one message naming the configured and the found device, logs it at `ERROR`, and raises `HardwareIntegrityError` (new, in `infrastructure/exceptions.py`, a `ReproducibilityError`) — the shape the logging standard §4 prescribes. Guarded by `tests/test_darts_forecaster.py::TestDartsForecasterDeviceGuard`, four tests pinning both directions: a model stuck on CPU raises and names both devices, a successful restore does not raise, and a CPU-configured run is a no-op. Mutation-checked, 4 of 4 caught. The compliance notes in ADR-008, ADR-011 and the logging standard §5.2 were removed, and the `DartsForecaster` CIC §3/§6/§10/§11 updated. **Incidental finding:** this repo's own laptop has CUDA, so six existing predict-path tests were passing only because the code was lenient; they now pin the device explicitly via a class-scoped fixture, which also makes them hardware-independent. Resolves D-01. The two sibling warn-and-continue sites in the same file (C-51) are untouched.
+
+---
+
 ### C-40 — The shipping `README.md` documents a deleted class and a deleted function *(resolved 2026-09-10, this branch, Stage 5)*
 
 - **Tier:** 3
@@ -844,6 +831,18 @@
 ---
 
 ## Resolved Disagreements
+
+### D-01: Device-restore failure — fail-loud (ADR-008, ADR-011) vs warn-and-continue (code) *(resolved 2026-09-29)*
+
+| Field | Value |
+|-------|-------|
+| ID | D-01 |
+| Source | repo-assimilation (2026-09-10) |
+| Perspectives | **ADR-008 §1 / ADR-011 §Validation** — a failed CPU→GPU restoration is a structural lie and must raise; ADR-011's own context names silent CPU fallback as a race-condition and performance hazard. **Code** (`darts_forecaster.py:633-640`) — warns and continues; a long evaluation that would otherwise abort completes on CPU. |
+| Resolution | **Ruled 2026-09-29 for the ADRs** (issue #41; the maintainer agreed a check was warranted on 2026-09-10). `_ensure_model_on_device` now logs at `ERROR` and raises `HardwareIntegrityError`; no opt-out flag was added, because a CPU-only host configures `cpu` and never reaches the guard, so a flag would only re-enable the silent fallback on exactly the hosts where it matters. Code side closed as C-37. |
+
+---
+
 
 ### D-05: Output semantics — no semantic floors in the data layer (ADR-010/016) vs `clip_negatives=True` (code) *(resolved 2026-09-17 — ruled for the code)*
 

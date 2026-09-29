@@ -54,5 +54,5 @@ This leads to `RuntimeError` (Device Mismatch) or silent, massive performance de
 ## Validation & Monitoring
 
 - **Failure Mode:** If self-healing fails to move the model from CPU to GPU, the system must **fail-loud** and abort the prediction (ADR-008).
-  *Compliance note (2026-09-10):* the current code logs a `WARNING` and continues on CPU. See register **D-01** — this line states intent until that ruling is made.
+  *Implemented 2026-09-29:* `_ensure_model_on_device` raises `HardwareIntegrityError` when the model is still on CPU after the move.
 - **Logs:** Successful restorations should be logged at the `INFO` level.

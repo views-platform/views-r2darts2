@@ -56,7 +56,7 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 
 - **Configuration Gap:** Raises `MissingHyperparameterError` if the DNA is incomplete.
 - **Temporal Gap:** Raises `TemporalDiscontinuityError` if the test set is not contiguous with training.
-- **Hardware Drift:** *Does not raise* — the forecaster warns and continues on CPU (register D-01).
+- **Hardware Drift:** Propagates `HardwareIntegrityError` from the forecaster — a model that cannot be restored to the configured device aborts the run rather than finishing on another device.
 - **Horizon Violation:** Raises `PredictionHorizonError` if a forecast is attempted beyond ground truth.
 
 ---

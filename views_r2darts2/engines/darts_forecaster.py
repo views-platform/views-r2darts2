@@ -32,7 +32,10 @@ from views_frames import PredictionFrame
 
 from views_r2darts2.dataset.base import ViewsDataset
 from views_r2darts2.infrastructure.device import get_device as _get_device
-from views_r2darts2.infrastructure.exceptions import NumericalSanityError
+from views_r2darts2.infrastructure.exceptions import (
+    HardwareIntegrityError,
+    NumericalSanityError,
+)
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 from views_r2darts2.transformers.frame_builder import (
     PredictionScratch,
@@ -686,10 +689,16 @@ class DartsForecaster:
             self._move_model_to_device()
             current_device = next(self.model.model.parameters()).device
             if current_device.type == "cpu":
-                logger.warning(
-                    "Failed to move model from CPU to %s; continuing on CPU.",
-                    self.device,
+                # Continuing here would produce valid numbers on a device the
+                # config and the saved artifact do not name, turning a loud
+                # failure into a slow, puzzling success (ADR-008, ADR-011).
+                message = (
+                    f"Model could not be restored to {self.device!r} before "
+                    f"prediction (parameters are on {current_device}). "
+                    f"Refusing to continue on a different device than configured."
                 )
+                logger.error(message)
+                raise HardwareIntegrityError(message)
 
     # ------------------------------------------------------------------ persistence
 

@@ -103,4 +103,4 @@ Run `bash docs/validate_docs.sh` (from anywhere) to re-verify internal consisten
 - [x] `docs/validate_docs.sh` present and passing
 - [x] Compliance report archived — `archive/ADR_COMPLIANCE_REPORT.md` is marked HISTORICAL
       (it certified the 0.1.x codebase; nothing in it is asserted of 0.2.x). Current
-      compliance state is the register: `reports/technical_risk_register.md` and D-01..D-07 (D-05 resolved).
+      compliance state is the register: `reports/technical_risk_register.md` and D-01..D-07 (D-01 and D-05 resolved).

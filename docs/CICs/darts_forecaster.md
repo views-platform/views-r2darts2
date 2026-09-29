@@ -33,6 +33,9 @@ The `DartsForecaster` is a slim orchestrator that couples one Darts model to one
 - **Device Self-Healing:** `_ensure_model_on_device()` runs before every prediction and moves weights back to the resolved device if Darts drifted them to CPU (ADR-011). *On failure it warns and continues — see §6 and D-01.*
 - **Entropy Lock:** Calls `ReproducibilityGate.Data.lock_entropy(random_state)` before every prediction so probabilistic samples are reproducible.
 - **Non-negative Output:** Predictions are clipped to `>= 0` on ingest into the dataset (the code's own Intent Contract states this as a guarantee; ADR-016 decision 3 sanctions it).
+- **Output shape:** `predict()` returns one `PredictionFrame` per target, values `(N, S)` over a `(time_id, entity_id)` index, where `S` is the run's `num_samples` (`darts_forecaster.py:429-459`, `transformers/frame_builder.py:109,187`). `S = 1` is a point forecast. Consumers read `S` off the array; nothing here promises a fixed `S`.
+- **Output units:** count space — the target scaler's inverse (and `expm1` when `log_targets`) has been applied, then the `>= 0` clip (`darts_forecaster.py:530`). A zero in the output is therefore either a true zero or a clipped negative; the two are not distinguishable downstream.
+- **Output format is not this class's decision:** what is written to disk, and where, is governed by views-pipeline-core ADR-048 (numpy and parquet tracks) and ADR-053 (delivery key), selected by the manager's `prediction_format`. This class produces frames; it never writes them.
 
 ---
 

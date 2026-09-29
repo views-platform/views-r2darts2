@@ -264,6 +264,17 @@ Also use `max_pool_1d=True` in the coarse stack to preserve spike maxima during 
 
 ---
 
+## 📤 Output Contract
+
+What a run produces, for whoever consumes it. Each point is stated in this repo's own terms; the on-disk format is not this repo's decision (see 5).
+
+1. **What.** One `PredictionFrame` per target, indexed by `(time_id, entity_id)`, built in `views_r2darts2/transformers/frame_builder.py`.
+2. **Shape.** Values are `(N, S)`. `S` is the run's `num_samples` — **read it off the array, never assume it.** `S = 1` is a point forecast; `S > 1` needs a source of randomness — a Darts likelihood as `loss_fn` (see the catalog's likelihood registry) or `mc_dropout: True` — and each column is one draw. A point forecast must be evaluated with point metrics (`regression_point_metrics`), a sampled one with sample metrics — that choice lives in the model's `config_meta.py`, and a mismatch fails at evaluation, not here.
+3. **Units.** Counts: the target scaler's inverse (and `expm1` when `log_targets`) has been applied. Values are then clipped to `>= 0` (ADR-016), so a zero may be a true zero or a clipped negative; the two cannot be told apart downstream.
+4. **Which entities.** Those present at the source's last observed month (ADR-017). Entities absent there are dropped at ingest; the ids are in the `Entity-at-end filter:` log line.
+5. **Where and how it is written.** Decided by views-pipeline-core: ADR-048 (numpy track for evaluation, parquet track for delivery), ADR-053 (`skip_predictions_delivery`), ADR-052, implemented here as ADR-015 (prediction names carry the *artifact's* training timestamp, not the run's — so re-evaluating the same artifact overwrites the same location, and only a retrained artifact gets a new one). `prediction_format` selects the path; the default is `"dataframe"`.
+6. **Reproducibility.** `lock_entropy` seeds `random`, numpy and torch (CUDA included) before every prediction. It does not set the cuDNN determinism flags, so GPU sampled draws are seeded but not guaranteed bit-identical; and with `parallel_workers > 1` on CPU the reseeds race across threads (register C-24).
+
 ## 🛡️ Fortress Architecture & Governance
 
 This repository adheres to the **Fortress Architecture**: strict engineering and mathematical standards designed to guarantee scientific integrity and reproducibility in conflict forecasting.
@@ -421,7 +432,7 @@ def get_hp_config():
 
         # Prediction
         "likelihood": None,
-        "num_samples": 1,
+        "num_samples": 1,               # 1 = point forecast → evaluate with regression_point_metrics; >1 (needs a likelihood or mc_dropout) → regression_sample_metrics
         "mc_dropout": False,
         "n_jobs": -1,                   # not read by views_r2darts2 (C-57)
     }

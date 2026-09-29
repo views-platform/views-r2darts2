@@ -21,8 +21,10 @@ so total I/O equals the tensor size with no redundant reads.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
@@ -34,7 +36,7 @@ from views_frames import (
     SpatioTemporalIndex,
 )
 
-__all__ = ["build_prediction_frames_from_dataset"]
+__all__ = ["PredictionScratch", "build_prediction_frames_from_dataset"]
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,83 @@ _DEFAULT_ENTITY_BLOCK = 1024
 
 class PredictionFrameVerificationError(RuntimeError):
     """Raised when a PredictionFrame memmap fails verification after write."""
+
+
+class PredictionScratch:
+    """Owns the scratch directory holding one prediction's memmap files.
+
+    Intent Contract
+    ---------------
+    **Purpose.** Give the ``out_dir`` of
+    :func:`build_prediction_frames_from_dataset` a single, named owner, so the
+    directory is removed exactly once instead of never. On the full PGM grid one
+    of these holds tens of gigabytes, and one is created per ``predict()`` call.
+
+    **Guarantees.** The directory is removed on :meth:`close`, and at
+    interpreter exit if :meth:`close` was never called. :meth:`close` is
+    idempotent and never raises.
+
+    **Non-goal: cleanup on garbage collection.** This deliberately does *not*
+    follow :class:`~views_r2darts2.dataset.zarr_store.ZarrStore`, which frees its
+    directory via ``weakref.finalize`` and ``__del__``. ``ZarrStore`` owns bytes
+    nobody else holds a handle to. The frames built here hand the caller
+    ``np.memmap`` views *into* this directory, and those outlive this object —
+    freeing on collection would delete files still mapped by a live frame. So
+    the ``atexit`` registration holds a strong reference to ``self`` on purpose:
+    the process ending is the only moment cleanup is safe without being told.
+
+    **Who closes it.** The consumer that knows the values have been copied out.
+    ``DartsForecaster.release_prediction_scratch`` is that seam, called by the
+    manager once predictions have been converted to DataFrames. When frames are
+    handed out as frames, no such moment is observable from this package and the
+    directory lives until exit.
+    """
+
+    def __init__(
+        self,
+        *,
+        prefix: str = "pred_frames_",
+        base_dir: Path | str | None = None,
+    ) -> None:
+        """Create the scratch directory.
+
+        Args:
+            prefix: Directory name prefix. The default is what operators grep
+                for when a disk fills.
+            base_dir: Parent directory. ``None`` uses the system temp root.
+        """
+        self._path = Path(
+            tempfile.mkdtemp(
+                prefix=prefix,
+                dir=str(base_dir) if base_dir is not None else None,
+            )
+        )
+        self._closed = False
+        # Strong reference by design — see the Non-goal above.
+        atexit.register(self._close_at_exit)
+
+    @property
+    def path(self) -> Path:
+        """The scratch directory."""
+        return self._path
+
+    @property
+    def closed(self) -> bool:
+        """Whether the directory has been removed."""
+        return self._closed
+
+    def close(self) -> None:
+        """Remove the directory. Idempotent; never raises."""
+        if self._closed:
+            return
+        self._closed = True
+        shutil.rmtree(self._path, ignore_errors=True)
+        atexit.unregister(self._close_at_exit)
+
+    def _close_at_exit(self) -> None:
+        """``atexit`` backstop for a scratch nobody closed."""
+        logger.debug("Removing unreleased prediction scratch %s", self._path)
+        self.close()
 
 
 def build_prediction_frames_from_dataset(
@@ -73,7 +152,10 @@ def build_prediction_frames_from_dataset(
         target_names: Target names to export; each maps to a ``pred_<name>``
             variable in ``ds``.
         out_dir: Directory for the memmap files. Created if missing. **Must stay
-            on disk for as long as the returned frames are used.**
+            on disk for as long as the returned frames are used** — the returned
+            ``values`` memmap them. :class:`PredictionScratch` is the owner that
+            guarantees this, and the caller decides when to close it; passing a
+            durable path instead opts out of managed cleanup entirely.
         entity_block: Entities read per block. Keep a multiple of the Zarr
             entity-chunk size (256) for aligned reads.
         model_name: Recorded in the frame metadata.

@@ -22,7 +22,6 @@ model lifecycle (device, fit, predict, save/load) and the partition windows.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
@@ -36,6 +35,7 @@ from views_r2darts2.infrastructure.device import get_device as _get_device
 from views_r2darts2.infrastructure.exceptions import NumericalSanityError
 from views_r2darts2.infrastructure.reproducibility_gate import ReproducibilityGate
 from views_r2darts2.transformers.frame_builder import (
+    PredictionScratch,
     build_prediction_frames_from_dataset,
 )
 
@@ -140,6 +140,14 @@ class DartsForecaster:
             )
 
         self.scaler_fitted = False
+
+        # Scratch directories holding the memmaps of predictions produced so
+        # far. One per predict() call — evaluation calls predict() once per
+        # rolling-origin sequence, concurrently. Freed by
+        # release_prediction_scratch() once the caller has consumed the frames,
+        # and by each scratch's own atexit backstop otherwise.
+        self._prediction_scratch: list[PredictionScratch] = []
+
         self.device = _get_device()
         logger.info("Using device: %s", self.device)
         self._move_model_to_device()
@@ -570,18 +578,43 @@ class DartsForecaster:
         # entity-aligned blocks, verifies each (shape, readback, no NaN),
         # then DELETES the Zarr store to avoid keeping duplicate prediction
         # data on disk. Peak memory is one entity block — never the full grid.
-        import tempfile
-
-        frames_dir = Path(tempfile.mkdtemp(prefix="pred_frames_"))
+        # The scratch directory must outlive this call: the frames returned
+        # below memmap the files inside it. Ownership is therefore recorded on
+        # the forecaster, not scoped to this function — see PredictionScratch.
+        scratch = PredictionScratch()
+        self._prediction_scratch.append(scratch)
         frames = build_prediction_frames_from_dataset(
             ds,
             target_names,
-            frames_dir,
+            scratch.path,
             entity_block=max(1, entity_batch_size),
             zarr_cleanup=True,  # delete Zarr after verified memmap
         )
         # ds is now closed and its Zarr store deleted by the helper above.
         return frames
+
+    def release_prediction_scratch(self) -> int:
+        """Delete the scratch directories of predictions already consumed.
+
+        Call this once the values handed back by :meth:`predict` have been copied
+        out — converting the frames to DataFrames does that. Calling it while a
+        frame is still in use would invalidate that frame's memmap, so the
+        decision belongs to the consumer, not to this class.
+
+        Safe to call repeatedly and safe to call having predicted nothing.
+
+        Returns:
+            How many scratch directories were removed.
+        """
+        count = len(self._prediction_scratch)
+        if not count:
+            return 0
+        for scratch in self._prediction_scratch:
+            scratch.close()
+        self._prediction_scratch.clear()
+        logger.info("Released %d prediction scratch director%s.",
+                    count, "y" if count == 1 else "ies")
+        return count
 
     def _dataset_level_code(self) -> str:
         """Return the VIEWS LOA code for the dataset's entity level."""

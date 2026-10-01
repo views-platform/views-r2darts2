@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd  # noqa: WPS433 — Darts TimeSeries boundary
@@ -118,6 +118,24 @@ def _seed_mock_predictions(
 
 class TestStreamingPredictViaBuilder:
     """Verify the forecaster's streaming predict path produces correct output."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_device_to_cpu(self):
+        """Resolve the device to CPU for every test in this class.
+
+        These tests hand the forecaster a mock whose parameters always report
+        CPU. On a machine with CUDA or MPS the forecaster resolves a different
+        device, sees the mismatch, and refuses to predict (issue #41) — so
+        without this the tests would pass or fail depending on the developer's
+        hardware. Scoped to this class so it cannot weaken the tests that
+        exercise device resolution itself.
+        """
+        with patch(
+            "views_r2darts2.engines.darts_forecaster._get_device",
+            return_value="cpu",
+        ):
+            yield
+
 
     def test_all_entities_present_in_output(self, tmp_path: Path) -> None:
         """Every entity in the input must appear in the streaming output."""

@@ -76,8 +76,11 @@ ADRs numbered 010 and above define specific infrastructure, mathematical, and do
 - **ADR-015** — Artifact-Prediction Timestamp Contract  
   Documents the correct timestamp extraction pattern (satellite of views-pipeline-core ADR-052).
 
-- **ADR-016** — Numerical Precision, Raw Output, and the Clipping Question  
+- **ADR-016** — Numerical Precision, Raw Output, and the Non-Negativity Floor  
   Supersedes ADR-010 for 0.2.x; carries `float32` and raw-output forward, and records the maintainer's 2026-09-10 ruling that the non-negativity floor stays (formerly D-05).
+
+- **ADR-017** — Entity Presence Is Decided at the Last Observed Month  
+  Observational sources are reduced at ingest to entities present at their final timestamp; prediction sources bypass; dropped ids are logged. Records the maintainer's 0.2.2 decision (`99f00ec`).
 
 These must comply with the constitutional ADRs above.
 

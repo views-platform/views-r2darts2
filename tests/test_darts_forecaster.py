@@ -31,8 +31,15 @@ from typing import Any
 import numpy as np
 import pandas as pd  # noqa: WPS433 — allowed at the Darts TimeSeries boundary
 import pytest
-import torch
-from darts import TimeSeries
+
+# Import the package before darts: its root installs the tlz/dask shims that
+# darts' lightgbm import chain needs on Python >= 3.11.9. Without this line the
+# module cannot be collected on its own — it works in a full-suite run only
+# because an alphabetically earlier module already imported the package.
+import views_r2darts2  # noqa: F401 — imported for its import-time side effect
+
+import torch  # noqa: E402
+from darts import TimeSeries  # noqa: E402
 from darts.models import TCNModel
 from darts.models.forecasting.torch_forecasting_model import (
     TorchForecastingModel,
@@ -46,6 +53,7 @@ from views_frames import (
 )
 from views_r2darts2.dataset.base import ViewsDataset
 from views_r2darts2.engines.darts_forecaster import DartsForecaster
+from views_r2darts2.infrastructure.exceptions import HardwareIntegrityError
 from views_r2darts2.infrastructure.reproducibility_gate import (
     ReproducibilityGate,
 )
@@ -430,6 +438,24 @@ class TestDartsForecasterScalerFlow:
 class TestDartsForecasterPredictContract:
     """Tests for :meth:`DartsForecaster.predict`."""
 
+    @pytest.fixture(autouse=True)
+    def _pin_device_to_cpu(self):
+        """Resolve the device to CPU for every test in this class.
+
+        These tests hand the forecaster a mock whose parameters always report
+        CPU. On a machine with CUDA or MPS the forecaster resolves a different
+        device, sees the mismatch, and refuses to predict (issue #41) — so
+        without this the tests would pass or fail depending on the developer's
+        hardware. Scoped to this class so it cannot weaken the tests that
+        exercise device resolution itself.
+        """
+        with patch(
+            "views_r2darts2.engines.darts_forecaster._get_device",
+            return_value="cpu",
+        ):
+            yield
+
+
     def test_predict_before_fit_raises(
         self, dataset: ViewsDataset
     ) -> None:
@@ -596,6 +622,82 @@ def _make_real_model() -> TCNModel:
         dilation_base=1,
         random_state=42,
     )
+
+
+class TestDartsForecasterDeviceGuard:
+    """Tests for :meth:`DartsForecaster._ensure_model_on_device` (issue #41).
+
+    A model that cannot be moved back to the configured device used to log a
+    ``WARNING`` and continue on CPU, while the artifact still recorded
+    ``accelerator="gpu"``. ADR-008, ADR-011 and the logging standard all require
+    a raise; these tests pin that, and — just as importantly — pin that the guard
+    does *not* fire when there is nothing wrong.
+
+    No GPU is needed. The method reads only ``self.device`` (a plain string) and
+    ``next(self.model.model.parameters()).device``, and ``_make_mock_model``
+    already returns a mock whose parameters always report ``cpu`` — which is
+    exactly "the move did not take effect".
+    """
+
+    @staticmethod
+    def _forecaster_on(device: str, model: Mock) -> DartsForecaster:
+        """Build a forecaster that believes it is configured for ``device``."""
+        with patch(
+            "views_r2darts2.engines.darts_forecaster._get_device",
+            return_value=device,
+        ):
+            return DartsForecaster(
+                dataset=None,  # unused by the device check
+                model=model,
+                partition_dict=PARTITION,
+                target_scaler=None,
+                random_state=42,
+            )
+
+    def test_device_restore_failure_raises(self) -> None:
+        """A model stuck on CPU while ``cuda`` is configured must refuse to run."""
+        fc = self._forecaster_on("cuda", _make_mock_model())
+        with pytest.raises(HardwareIntegrityError, match="could not be restored"):
+            fc._ensure_model_on_device()
+
+    def test_device_restore_failure_message_names_both_devices(self) -> None:
+        """The message must name what was configured and what was found.
+
+        A reader of the traceback should not have to guess which direction the
+        mismatch went (ADR-008, contextual logging).
+        """
+        fc = self._forecaster_on("cuda", _make_mock_model())
+        with pytest.raises(HardwareIntegrityError) as excinfo:
+            fc._ensure_model_on_device()
+        message = str(excinfo.value)
+        assert "cuda" in message, message
+        assert "cpu" in message, message
+
+    def test_successful_restore_does_not_raise(self) -> None:
+        """A move that works must pass silently.
+
+        This is the companion that keeps the guard honest: it fails if the raise
+        is made unconditional. Parameters report ``cpu`` first (drift detected),
+        then ``cuda`` (restored).
+        """
+        model = _make_mock_model()
+        devices = iter(
+            [torch.device("cpu"), torch.device("cuda"), torch.device("cuda")]
+        )
+        model.model.parameters.side_effect = lambda: iter([Mock(device=next(devices))])
+        fc = self._forecaster_on("cuda", model)
+
+        fc._ensure_model_on_device()  # must not raise
+
+    def test_configured_cpu_is_a_noop(self) -> None:
+        """When CPU is the configured device there is nothing to restore."""
+        model = _make_mock_model()
+        fc = self._forecaster_on("cpu", model)
+        model.model.to.reset_mock()
+
+        fc._ensure_model_on_device()  # must not raise
+
+        model.model.to.assert_not_called()
 
 
 class TestDartsForecasterSaveLoad:

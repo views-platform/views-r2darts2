@@ -171,6 +171,20 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
             return predictions
         return self._predictions_to_dataframe(predictions)
 
+    def _release_scratch_if_frames_copied(self, forecaster: Any) -> None:
+        """Free the forecaster's prediction scratch once values were copied out.
+
+        Converting frames to DataFrames copies every value, so the memmaps are
+        dead and their directories can go — on the full grid that is tens of
+        gigabytes per sequence (issue #54). The ``prediction_frame`` path instead
+        hands live memmaps to views-pipeline-core, and nothing here observes when
+        that caller has finished reading them, so those directories are left to
+        each scratch's ``atexit`` backstop.
+        """
+        if self._get_prediction_format() == "prediction_frame":
+            return
+        forecaster.release_prediction_scratch()
+
     # ------------------------------------------------------------------ factory
 
     def _infer_cache_source_label(self) -> str:
@@ -344,7 +358,9 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
                 results[seq_num] = future.result()
                 logger.info("Completed %d/%d", seq_num + 1, total_seq)
 
-        return self._format_eval_predictions(results)
+        predictions = self._format_eval_predictions(results)
+        self._release_scratch_if_frames_copied(forecaster)
+        return predictions
 
     # ------------------------------------------------------------------ forecast
 
@@ -378,7 +394,9 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
 
         predict_kwargs = self._get_predict_kwargs(active_config)
         preds = forecaster.predict(0, max(active_config["steps"]), **predict_kwargs)
-        return self._format_forecast_predictions(preds)
+        predictions = self._format_forecast_predictions(preds)
+        self._release_scratch_if_frames_copied(forecaster)
+        return predictions
 
     # ------------------------------------------------------------------ sweep
 
@@ -443,7 +461,9 @@ class DartsForecastingModelManager(_PARENT_CLASS):  # type: ignore[misc, valid-t
             model.predict(s, time_steps, **predict_kwargs)
             for s in range(total_seq)
         ]
-        return self._format_eval_predictions(raw_preds)
+        predictions = self._format_eval_predictions(raw_preds)
+        self._release_scratch_if_frames_copied(model)
+        return predictions
 
     # ------------------------------------------------------------------ predict kwargs
 

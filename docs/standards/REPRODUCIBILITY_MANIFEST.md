@@ -56,7 +56,7 @@ The following gates are implemented as three nested classes on `ReproducibilityG
 
 ### 2.3 Hardware Invariants (enforced outside the gate)
 There is no `HardwareAudit` class. These invariants live in the engines layer:
-*   **Device Self-Healing**: `DartsForecaster._ensure_model_on_device()` (`views_r2darts2/engines/darts_forecaster.py`) audits the model device before every prediction and restores it if Darts drifted it to CPU (ADR-011). *On restoration failure the current code warns and continues — see register D-01.*
+*   **Device Self-Healing**: `DartsForecaster._ensure_model_on_device()` (`views_r2darts2/engines/darts_forecaster.py`) audits the model device before every prediction and restores it if Darts drifted it to CPU (ADR-011). *On restoration failure it logs at `ERROR` and raises `HardwareIntegrityError`, naming the configured and the found device.*
 *   **Parallelism Lockdown**: `DartsForecastingModelManager._evaluate_model_artifact` forces `max_workers=1` unless `forecaster.device == "cpu"`.
 *   **Device Resolution**: `get_device()` in `views_r2darts2/infrastructure/device.py`.
 

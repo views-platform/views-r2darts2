@@ -46,7 +46,7 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 ## 5. Outputs and Side Effects
 
 - **Artifacts:** Produces persistent `.pt` model artifacts containing weights and coupled scaler states.
-- **Predictions:** Produces `dict[str, PredictionFrame]` per sequence (evaluation) or per run (forecast) when `prediction_format="frames"`; **the default is `"dataframe"`**, so by default `_evaluate_model_artifact` returns `list[pd.DataFrame]` via `_predictions_to_dataframe`.
+- **Predictions:** Produces `dict[str, list[PredictionFrame]]` — one frame per rolling-origin sequence — for evaluation (`_transpose_predictions`, `:146-156`) or `dict[str, PredictionFrame]` for a forecast when `prediction_format="prediction_frame"`; **the default is `"dataframe"`**, so by default `_evaluate_model_artifact` returns `list[pd.DataFrame]` via `_predictions_to_dataframe`. **`num_samples == 1` yields point forecasts**; the evaluation configuration must then declare point metrics (`regression_point_metrics`) rather than sample metrics — this manager cannot check that, because it lives in the model's `config_meta.py`, and the mismatch surfaces only at evaluation time as a views-evaluation `ValueError`.
 - **Logging:** Emits structured logs via `WandbLogger` and standard logging for lifecycle events.
 - **Monkeypatching:** Performs a controlled override of `torch.load` to handle Darts serialization requirements.
 
@@ -56,7 +56,7 @@ The `DartsForecastingModelManager` is the high-level orchestrator for the foreca
 
 - **Configuration Gap:** Raises `MissingHyperparameterError` if the DNA is incomplete.
 - **Temporal Gap:** Raises `TemporalDiscontinuityError` if the test set is not contiguous with training.
-- **Hardware Drift:** *Does not raise* — the forecaster warns and continues on CPU (register D-01).
+- **Hardware Drift:** Propagates `HardwareIntegrityError` from the forecaster — a model that cannot be restored to the configured device aborts the run rather than finishing on another device.
 - **Horizon Violation:** Raises `PredictionHorizonError` if a forecast is attempted beyond ground truth.
 
 ---

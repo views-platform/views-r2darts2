@@ -41,3 +41,7 @@ class TemporalHoleError(ReproducibilityError):
 
 class PredictionHorizonError(ReproducibilityError):
     """The forecast horizon exceeds the ground-truth boundary of the test set."""
+
+
+class HardwareIntegrityError(ReproducibilityError):
+    """The model is not on the configured compute device."""

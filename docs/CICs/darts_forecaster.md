@@ -30,9 +30,12 @@ The `DartsForecaster` is a slim orchestrator that couples one Darts model to one
 - **Guarantees Scaler Coupling:** The scalers fitted on the dataset during `train()` are the ones applied in inverse during `predict()`; `save_model`/`load_model` persist and restore them together with the weights, and `load_model` raises on a target-scaler config mismatch.
 - **Enforces Numerical Precision:** All series reach the model as `float32` (ADR-016).
 - **Preserves Probabilistic Calibration:** Target scalers are `global_fit=True`, enforced at construction by `ScalerSelector` (ADR-012).
-- **Device Self-Healing:** `_ensure_model_on_device()` runs before every prediction and moves weights back to the resolved device if Darts drifted them to CPU (ADR-011). *On failure it warns and continues — see §6 and D-01.*
+- **Device Self-Healing:** `_ensure_model_on_device()` runs before every prediction and moves weights back to the resolved device if Darts drifted them to CPU (ADR-011). **If the move does not take effect it raises `HardwareIntegrityError` rather than continuing on another device** — see §6.
 - **Entropy Lock:** Calls `ReproducibilityGate.Data.lock_entropy(random_state)` before every prediction so probabilistic samples are reproducible.
 - **Non-negative Output:** Predictions are clipped to `>= 0` on ingest into the dataset (the code's own Intent Contract states this as a guarantee; ADR-016 decision 3 sanctions it).
+- **Output shape:** `predict()` returns one `PredictionFrame` per target, values `(N, S)` over a `(time_id, entity_id)` index, where `S` is the run's `num_samples` (`darts_forecaster.py:429-459`, `transformers/frame_builder.py:109,187`). `S = 1` is a point forecast. Consumers read `S` off the array; nothing here promises a fixed `S`.
+- **Output units:** count space — the target scaler's inverse (and `expm1` when `log_targets`) has been applied, then the `>= 0` clip (`darts_forecaster.py:530`). A zero in the output is therefore either a true zero or a clipped negative; the two are not distinguishable downstream.
+- **Output format is not this class's decision:** what is written to disk, and where, is governed by views-pipeline-core ADR-048 (numpy and parquet tracks) and ADR-053 (delivery key), selected by the manager's `prediction_format`. This class produces frames; it never writes them.
 
 ---
 
@@ -57,7 +60,7 @@ The `DartsForecaster` is a slim orchestrator that couples one Darts model to one
 ## 6. Failure Modes and Loudness
 
 - **Unfitted Predict:** Raises `RuntimeError` if prediction is attempted without fitted scalers.
-- **Device Failure:** *Does not raise.* If `_ensure_model_on_device` cannot move the model off CPU it logs a `WARNING` and continues on CPU. This contradicts ADR-008/ADR-011 and is register **D-01**; recorded here as the current behaviour, not the intended one.
+- **Device Failure:** `HardwareIntegrityError` (a `ReproducibilityError`). If `_ensure_model_on_device` re-reads the parameters after the move and still finds them on CPU, it logs at `ERROR` and raises, naming both the configured and the found device. Until 0.2.4 it warned and continued, which turned a loud failure into a slow, puzzling success; that is now aligned with ADR-008 and ADR-011.
 - **Numerical Insanity:** Fails loudly (`NumericalSanityError`) if NaNs or Infs reach the ingest path.
 - **Scaler Config Mismatch on Load:** Raises `ValueError` if the artifact recorded a non-null `target_scaler` config that differs from the current one (`:682`; an artifact that recorded `None` is not compared). The feature-scaler config is *not* checked (register C-09).
 
@@ -99,14 +102,13 @@ frames = forecaster.predict(sequence_number=0)
 - **Adjacent, not this class:** `tests/test_parity_e2e.py` exercises `ViewsDataset.ingest_darts_predictions` and the inverse path directly; it never constructs `DartsForecaster`.
 - **Green Team:** `tests/test_streaming_predict_builder.py` (streaming prediction path).
 - **Red Team:** `tests/test_reproducibility_gate.py` (the gates this class invokes).
-- **Not covered:** device-restore failure (D-01), `parallel_workers > 1` reproducibility (C-24).
+- **Not covered:** `parallel_workers > 1` reproducibility (C-24). *Device-restore failure is covered — `tests/test_darts_forecaster.py::TestDartsForecasterDeviceGuard` pins both that a stuck model raises and that a successful restore does not.*
 
 ---
 
 ## 11. Evolution Notes
 
 ### Known Deviations / Technical Debt
-- **Device failure is not fail-loud** — D-01.
 - **Feature-scaler config not validated on load** — C-09.
 - **`_predict_streaming` is 160 lines** — the largest method in the engine (C-19).
 
